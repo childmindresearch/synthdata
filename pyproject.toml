@@ -1,0 +1,21 @@
+[project]
+name = "synthdata"
+version = "0.1.0"
+description = "Sandbox for synthetic data generation and evaluation"
+authors = [
+    {name = "Alp Erkent", email = "alp.erkent@childmind.org"},
+]
+license = "LGPL-2.1"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "altair>=5.5.0",
+    "marimo>=0.16.5",
+    "pandas>=2.3.3",
+    "sdv>=1.18.0",
+    "ydata-synthetic>=1.4.0",
+]
+
+[tool.pyright]
+reportInvalidTypeForm = "none"
+reportUnusedExpression = "none"
