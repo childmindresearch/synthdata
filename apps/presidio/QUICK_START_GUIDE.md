@@ -1,32 +1,26 @@
 # How to Use Presidio's Streamlit App Offline
 
-## Prerequisites
-
-- Python 3.11+
-- `uv` package manager
-- Internet connection (for initial setup only)
-
 ## Setup (One-Time, Requires Internet)
 
-1. **Clone and navigate to the app directory:**
+1. After setting up the virtual environment and downloading package dependencies (see [README](../../README.md)), navigate to the app directory:
 
    ```bash
    cd apps/presidio
    ```
 
-2. **Install dependencies:**
+2. Install app dependencies:
 
    ```bash
    uv pip install -r requirements.txt
    ```
 
-3. **Download all NLP models:**
+3. Download all NLP models:
 
    ```bash
    uv run python setup_models.py
    ```
 
-   This downloads ~2-3 GB of models. Wait for completion.
+   This downloads ~4-5 GB of models. Wait for completion.
 
 ## Running the App (Works Offline After Setup)
 
