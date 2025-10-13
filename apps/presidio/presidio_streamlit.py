@@ -7,6 +7,8 @@ import traceback
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['HF_DATASETS_OFFLINE'] = '1'
+# Force tldextract to use its bundled snapshot instead of downloading from internet
+os.environ['TLDEXTRACT_CACHE_TIMEOUT'] = '0'  # Never update from internet
 
 import pandas as pd
 import streamlit as st
