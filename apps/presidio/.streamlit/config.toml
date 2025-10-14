@@ -1,0 +1,28 @@
+# Streamlit configuration for offline/PHI-safe operation
+
+[browser]
+# Disable server address gathering which can trigger network requests
+gatherUsageStats = false
+
+[client]
+# Disable telemetry completely
+showErrorDetails = false
+toolbarMode = "minimal"
+
+[runner]
+# Disable automatic rerun on file changes to prevent unexpected behavior
+fastReruns = true
+
+[server]
+# Disable file watcher to prevent network checks
+fileWatcherType = "none"
+enableCORS = false
+enableXsrfProtection = true
+
+[global]
+# CRITICAL: Disable all usage statistics and telemetry
+developmentMode = false
+
+[telemetry]
+# Disable all telemetry to Streamlit/Fivetran
+gatherUsageStats = false

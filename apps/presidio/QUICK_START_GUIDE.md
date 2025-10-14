@@ -1,5 +1,13 @@
 # How to Use Presidio's Streamlit App Offline
 
+## ⚠️ Security Warning for PHI/PII Processing
+
+To minimize the risk of data leakage when processing sensitive information (e.g., PHI, PII), please follow these guidelines:
+
+- **Disconnect the machine from the internet** before loading or processing PHI
+- When finished, **close the browser tab and explicitly terminate the Streamlit process** in the terminal (Ctrl+C) before reconnecting the machine to any network
+- Consider running the monitoring script (see below) to verify no external connections
+
 ## Setup (One-Time, Requires Internet)
 
 1. After setting up the virtual environment and downloading package dependencies (see [README](../../README.md)), navigate to the app directory:
@@ -24,6 +32,8 @@
 
 ## Running the App (Works Offline After Setup)
 
+**⚠️ For PHI/PII: Disconnect from internet first!**
+
 ```bash
 uv run streamlit run presidio_streamlit.py
 ```
@@ -32,10 +42,12 @@ The app will open in your browser at `http://localhost:8501` (or similar port).
 
 ## Using the App
 
-1. Select an NLP model from the dropdown
-2. Enter or paste the text for de-identification
-3. Choose de-identification method (redact, replace, mask, etc.)
-4. Review the de-identified output
+1. **Verify you're offline** (if processing PHI/PII)
+2. Select an NLP model from the dropdown
+3. Enter or paste the text for de-identification
+4. Choose de-identification method (redact, replace, mask, etc.)
+5. Review the de-identified output
+6. **When finished:** Close browser tab, press Ctrl+C in terminal to stop the app, then reconnect to the internet
 
 ## Available Models
 

@@ -9,6 +9,9 @@ os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['HF_DATASETS_OFFLINE'] = '1'
 # Force tldextract to use its bundled snapshot instead of downloading from internet
 os.environ['TLDEXTRACT_CACHE_TIMEOUT'] = '0'  # Never update from internet
+# Disable Streamlit telemetry/usage statistics (prevents Fivetran webhook calls)
+os.environ['STREAMLIT_BROWSER_GATHER_USAGE_STATS'] = 'false'
+os.environ['STREAMLIT_TELEMETRY_ENABLED'] = 'false'
 
 import pandas as pd
 import streamlit as st
@@ -73,8 +76,6 @@ st_model = (
     if st_model_package.lower() not in ("spacy", "stanza", "huggingface")
     else "/".join(st_model.split("/")[1:])
 )
-
-st.sidebar.warning("Note: Models might take some time to download on first use.")
 
 analyzer_params = (st_model_package, st_model, st_ta_key, st_ta_endpoint)
 logger.debug(f"analyzer_params: {analyzer_params}")
@@ -167,6 +168,15 @@ with st.expander("About this demo", expanded=False):
     [Visit Presidio's website](https://microsoft.github.io/presidio) for more info.
     """
     )
+
+st.warning(
+    """
+    To minimize the risk of data leakage when processing sensitive information (e.g., PHI, PII), please follow these guidelines:
+    - Disconnect the machine from the internet before loading or processing PHI.
+    - When finished, close the browser tab and explicitly terminate the Streamlit process in the terminal before reconnecting the machine to any network.
+    """,
+    icon="⚠️",
+)
 
 analyzer_load_state = st.info("Starting Presidio analyzer...")
 
