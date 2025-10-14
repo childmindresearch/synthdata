@@ -7,11 +7,17 @@ import traceback
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['HF_DATASETS_OFFLINE'] = '1'
-# Force tldextract to use its bundled snapshot instead of downloading from internet
-os.environ['TLDEXTRACT_CACHE_TIMEOUT'] = '0'  # Never update from internet
+# Configure tldextract to use only its bundled snapshot (no internet download)
+os.environ['TLDEXTRACT_CACHE'] = os.path.expanduser('~/.cache/python-tldextract')
 # Disable Streamlit telemetry/usage statistics (prevents Fivetran webhook calls)
 os.environ['STREAMLIT_BROWSER_GATHER_USAGE_STATS'] = 'false'
 os.environ['STREAMLIT_TELEMETRY_ENABLED'] = 'false'
+
+# Configure tldextract before presidio imports it - use bundled snapshot only, no internet
+import tldextract
+# Monkey-patch the global extractor to use only bundled data (suffix_list_urls=())
+# This prevents network calls to download the public suffix list
+tldextract.TLD_EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=())  # type: ignore
 
 import pandas as pd
 import streamlit as st

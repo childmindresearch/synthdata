@@ -4,13 +4,7 @@ A sandbox for synthetic data generation and evaluation.
 
 ## Quick Start
 
-Clone the repo and set up a virtual environment using `uv`:
-
-```bash
-uv venv
-```
-
-Install dependencies:
+Clone the repo and set up a virtual environment with dependencies using `uv`:
 
 ```bash
 uv sync

@@ -18,7 +18,7 @@ To minimize the risk of data leakage when processing sensitive information (e.g.
 2. Install app dependencies:
 
    ```bash
-   uv pip install -r requirements.txt
+   uv add -r requirements.txt
    ```
 
 3. Download all NLP models:
