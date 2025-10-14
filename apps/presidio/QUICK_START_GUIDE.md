@@ -6,7 +6,6 @@ To minimize the risk of data leakage when processing sensitive information (e.g.
 
 - **Disconnect the machine from the internet** before loading or processing PHI
 - When finished, **close the browser tab and explicitly terminate the Streamlit process** in the terminal (Ctrl+C) before reconnecting the machine to any network
-- Consider running the monitoring script (see below) to verify no external connections
 
 ## Setup (One-Time, Requires Internet)
 
