@@ -31,11 +31,13 @@ To minimize the risk of data leakage when processing sensitive information (e.g.
 
 ## Running the App (Works Offline After Setup)
 
-**⚠️ For PHI/PII: Disconnect from internet first!**
+**⚠️ For PHI/PII use: Disconnect from internet first!**
 
 ```bash
 uv run streamlit run presidio_streamlit.py
 ```
+
+> Note: The first time you run Streamlit it may prompt for your email. You can press Enter (leave the field blank) to skip this step.
 
 The app will open in your browser at `http://localhost:8501` (or similar port).
 
