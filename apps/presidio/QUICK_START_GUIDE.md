@@ -1,5 +1,7 @@
 # How to Use Presidio's Streamlit App Offline
 
+This Streamlit app is based on the [Huggingface Presidio demo](https://huggingface.co/spaces/presidio/presidio_demo) ([code for the app](https://github.com/microsoft/presidio/tree/main/docs/samples/python/streamlit)) and was modified so it can be used **fully offline** for PHI/PII processing without sending telemetry/usage data to Microsoft, Streamlit, HuggingFace, or other third parties.
+
 ## ⚠️ Security Warning for PHI/PII Processing
 
 To minimize the risk of data leakage when processing sensitive information (e.g., PHI, PII), please follow these guidelines:
