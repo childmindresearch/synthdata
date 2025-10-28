@@ -11,22 +11,16 @@ To minimize the risk of data leakage when processing sensitive information (e.g.
 
 ## Setup (One-Time, Requires Internet)
 
-1. After setting up the virtual environment and downloading package dependencies (see [README](../../README.md)), navigate to the app directory:
+1. After setting up the virtual environment and downloading package dependencies (see [README](../../README.md)), install app dependencies:
 
    ```bash
-   cd apps/presidio
+   uv sync --extra presidio
    ```
 
-2. Install app dependencies:
+2. Download all NLP models:
 
    ```bash
-   uv add -r requirements.txt
-   ```
-
-3. Download all NLP models:
-
-   ```bash
-   uv run python setup_models.py
+   uv run python apps/presidio/setup_models.py
    ```
 
    This downloads ~4-5 GB of models. Wait for completion.
@@ -36,7 +30,7 @@ To minimize the risk of data leakage when processing sensitive information (e.g.
 **⚠️ For PHI/PII use: Disconnect from internet first!**
 
 ```bash
-uv run streamlit run presidio_streamlit.py
+uv run streamlit run apps/presidio/presidio_streamlit.py
 ```
 
 > Note: The first time you run Streamlit it may prompt for your email. You can press Enter (leave the field blank) to skip this step.

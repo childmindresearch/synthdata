@@ -12,6 +12,7 @@ dependencies = [
     "altair>=5.5.0",
     "ipykernel>=6.30.1",
     "marimo[mcp]>=0.16.5",
+    "markdown-analysis>=0.1.5",
     "openai>=2.3.0",
     "pandas>=2.3.3",
     "pip>=25.2",
@@ -22,6 +23,24 @@ dependencies = [
     "ydata-synthetic==1.4.0",
 ]
 
+[project.optional-dependencies]
+presidio = [
+    "presidio-analyzer[transformers,stanza]",
+    "streamlit>=1.37.0",
+    "streamlit-tags",
+    "st-annotated-text",
+    "python-dotenv",
+    "torch>=2.7.0",
+    "flair>=0.15.0",
+]
+
 [tool.pyright]
 reportInvalidTypeForm = "none"
 reportUnusedExpression = "none"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scripts"]
