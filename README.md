@@ -24,4 +24,4 @@ uv sync
 
 ## Scripts
 
-- `scripts/markdown_parser.py`: A parser for extracting hierarchical structure from markdown documents. Separates hash headers (`# Header`) and asterisk headers (`**Bold Header**`) from non-header content, and provides methods to print header trees, export structured data, flatten sections, and batch process dataframes containing markdown content.
+- `scripts/markdown_parser.py`: A parser for extracting hierarchical structure from markdown documents. Separates hash headers (`# Header`) and asterisk headers (`**Bold Header**`) from non-header content, and provides methods to print header trees, export structured data, and batch process dataframes containing markdown content.
