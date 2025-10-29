@@ -27,11 +27,11 @@ def HBN_ReportBreak(text, level):
             pattern = r'\*\*((?:[A-Z]+(?: [A-Z]+)*))\*\*' # Match: ** ALL_CAPS **
             cleanup=1 # excludes ** **
         case 2:
-            pattern = r'\*\*([^\*]+)\*\*'  #  Match: ** Upper or Lower **
-            cleanup=1 # excludes ** **
-        case 3:
             pattern = r'# (?:[A-Z]+(?:\s+[A-Z]+)*)(?=[^A-Za-z]|$)' # Match: # ... ALL_CAPS
             cleanup=0 # includes **section header**
+        case 3:
+            pattern = r'\*\*([^\*]+)\*\*'  #  Match: ** Upper or Lower **
+            cleanup=1 # excludes ** **
 
     result = {}
     if not re.search(pattern, text):
