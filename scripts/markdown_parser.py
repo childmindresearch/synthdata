@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -26,7 +26,7 @@ class Token:
     type: str
     content: str
     line_number: int
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -39,14 +39,14 @@ class HierarchyContext:
     Attributes:
         token: The Token this context is for.
         level: The computed hierarchical level.
-        parents: List of parent header titles (from root to immediate parent).
-        parent_types: List of parent header type signatures (corresponding to parents).
+        parents: list of parent header titles (from root to immediate parent).
+        parent_types: list of parent header type signatures (corresponding to parents).
             Each signature is a string like "#1", "*2-CAPS", "*2-inline", etc.
     """
     token: Token
     level: int
-    parents: List[str]
-    parent_types: List[str]
+    parents: list[str]
+    parent_types: list[str]
 
 
 @dataclass
@@ -96,7 +96,7 @@ class MarkdownParser:
         self,
         text: str,
         asterisk_header_max_words: int = 7,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> None:
         """Initializes the MarkdownParser.
         
@@ -109,12 +109,12 @@ class MarkdownParser:
         """
         self.text: str = text
         self.max_asterisk_words: int = asterisk_header_max_words
-        self.metadata: Dict[str, Any] = metadata if metadata is not None else {}
-        self.tokens: List[Token] = []
-        self.lines: List[str] = self.text.split('\n')
+        self.metadata: dict[str, Any] = metadata if metadata is not None else {}
+        self.tokens: list[Token] = []
+        self.lines: list[str] = self.text.split('\n')
         self.length: int = len(self.lines)
         self.pos: int = 0
-        self._hierarchy_context: Optional[List[HierarchyContext]] = None
+        self._hierarchy_context: Optional[list[HierarchyContext]] = None
     
     ### PARSER METHODS ###
     
@@ -169,7 +169,7 @@ class MarkdownParser:
         return 'mixed_case'
     
     @staticmethod
-    def _get_header_signature(metadata: Dict[str, Any]) -> str:
+    def _get_header_signature(metadata: dict[str, Any]) -> str:
         """Generates a compact string signature for a header based on its metadata.
         
         Format: {marker}{count}[-CAPS][-inline]
@@ -201,7 +201,7 @@ class MarkdownParser:
         
         return signature
     
-    def _try_parse_inline_header(self, line: str, line_number: int) -> Optional[List[Token]]:
+    def _try_parse_inline_header(self, line: str, line_number: int) -> Optional[list[Token]]:
         """Attempts to parse a line as an inline header with colon.
         
         Inline headers have the format: **Label:** content or **Label**: content
@@ -336,7 +336,7 @@ class MarkdownParser:
             re.match(self.INLINE_COLON_PATTERN, line) is not None
         )
     
-    def parse(self) -> List[Token]:
+    def parse(self) -> list[Token]:
         """Parses the markdown text and extracts tokens.
         
         This method processes the markdown text line by line, identifying:
@@ -381,7 +381,7 @@ class MarkdownParser:
                 continue
             
             # Collect non-header lines until the next header
-            non_header_lines: List[str] = []
+            non_header_lines: list[str] = []
             while self.pos < self.length:
                 line = self.lines[self.pos]
                 
@@ -410,7 +410,7 @@ class MarkdownParser:
     def _compute_all_caps_level(
         self,
         state: HierarchyState,
-        header_stack: List[tuple[int, str, Dict[str, Any]]]
+        header_stack: list[tuple[int, str, dict[str, Any]]]
     ) -> int:
         """Computes level for all-caps headers.
         
@@ -440,7 +440,7 @@ class MarkdownParser:
     
     def _compute_inline_level(
         self,
-        header_stack: List[tuple[int, str, Dict[str, Any]]]
+        header_stack: list[tuple[int, str, dict[str, Any]]]
     ) -> int:
         """Computes level for inline headers.
         
@@ -458,7 +458,7 @@ class MarkdownParser:
         self,
         marker_count: int,
         state: HierarchyState,
-        header_stack: List[tuple[int, str, Dict[str, Any]]]
+        header_stack: list[tuple[int, str, dict[str, Any]]]
     ) -> int:
         """Computes level for hash headers.
         
@@ -490,7 +490,7 @@ class MarkdownParser:
         self,
         marker_count: int,
         state: HierarchyState,
-        header_stack: List[tuple[int, str, Dict[str, Any]]]
+        header_stack: list[tuple[int, str, dict[str, Any]]]
     ) -> int:
         """Computes level for asterisk headers.
         
@@ -512,7 +512,7 @@ class MarkdownParser:
             The computed level for the asterisk header.
         """
         # Asterisk count to hierarchical order mapping
-        order_map: Dict[int, int] = {2: 1, 3: 2, 1: 3}
+        order_map: dict[int, int] = {2: 1, 3: 2, 1: 3}
         
         if not header_stack:
             level = 1
@@ -546,7 +546,7 @@ class MarkdownParser:
         self,
         token: Token,
         state: HierarchyState,
-        header_stack: List[tuple[int, str, Dict[str, Any]]]
+        header_stack: list[tuple[int, str, dict[str, Any]]]
     ) -> int:
         """Computes the hierarchical level for a header token.
         
@@ -580,7 +580,7 @@ class MarkdownParser:
         self,
         token: Token,
         level: int,
-        header_stack: List[tuple[int, str, Dict[str, Any]]]
+        header_stack: list[tuple[int, str, dict[str, Any]]]
     ) -> HierarchyContext:
         """Creates a HierarchyContext for a token.
         
@@ -604,7 +604,7 @@ class MarkdownParser:
     
     def _update_header_stack(
         self,
-        header_stack: List[tuple[int, str, Dict[str, Any]]],
+        header_stack: list[tuple[int, str, dict[str, Any]]],
         level: int,
         token: Token
     ) -> None:
@@ -621,7 +621,7 @@ class MarkdownParser:
             header_stack.pop()
         header_stack.append((level, token.content, token.metadata))
     
-    def _should_pop_inline_header(self, context_list: List[HierarchyContext]) -> bool:
+    def _should_pop_inline_header(self, context_list: list[HierarchyContext]) -> bool:
         """Checks if the previous token was an inline header that should be popped.
         
         Args:
@@ -639,7 +639,7 @@ class MarkdownParser:
             prev_context.token.metadata.get('position') == 'inline'
         )
     
-    def _build_hierarchy_context(self) -> List[HierarchyContext]:
+    def _build_hierarchy_context(self) -> list[HierarchyContext]:
         """Builds hierarchical context for all tokens.
         
         This method traverses tokens once and computes complete hierarchical information:
@@ -663,8 +663,8 @@ class MarkdownParser:
         if not self.tokens:
             return []
         
-        context_list: List[HierarchyContext] = []
-        header_stack: List[tuple[int, str, Dict[str, Any]]] = []
+        context_list: list[HierarchyContext] = []
+        header_stack: list[tuple[int, str, dict[str, Any]]] = []
         state = HierarchyState()
         
         for token in self.tokens:
@@ -699,7 +699,7 @@ class MarkdownParser:
         
         return context_list
     
-    def _get_or_build_context(self) -> List[HierarchyContext]:
+    def _get_or_build_context(self) -> list[HierarchyContext]:
         """Gets or builds (and caches) the hierarchy context.
         
         Returns:
@@ -709,7 +709,7 @@ class MarkdownParser:
             self._hierarchy_context = self._build_hierarchy_context()
         return self._hierarchy_context
     
-    def to_hierarchical_dict(self) -> Dict[str, Any]:
+    def to_hierarchical_dict(self) -> dict[str, Any]:
         """Converts parsed tokens into a hierarchical dictionary structure.
         
         This method builds a nested dictionary representation where each header
@@ -724,10 +724,10 @@ class MarkdownParser:
         
         context_list = self._get_or_build_context()
         
-        root: Dict[str, Any] = {**self.metadata, 'sections': []}
+        root: dict[str, Any] = {**self.metadata, 'sections': []}
         
         # Each stack entry: (level, section_dict)
-        stack: List[tuple[int, Dict[str, Any]]] = [(0, root)]
+        stack: list[tuple[int, dict[str, Any]]] = [(0, root)]
         
         # For each token, place it in the correct parent by level
         for ctx in context_list:
@@ -816,7 +816,7 @@ class MarkdownParser:
         print("=" * 80)
         
         # Track the levels and whether they have more siblings
-        level_has_more: Dict[int, bool] = {}
+        level_has_more: dict[int, bool] = {}
         
         for i, ctx in enumerate(header_contexts):
             header = ctx.token
@@ -862,7 +862,7 @@ class MarkdownParser:
             
             print(f"{prefix}{label}")
     
-    def extract_non_header_rows(self) -> List[Dict[str, Any]]:
+    def extract_non_header_rows(self) -> list[dict[str, Any]]:
         """Extracts content tokens with their hierarchical context.
         
         For each content token, this method computes:
@@ -879,7 +879,7 @@ class MarkdownParser:
         # Get hierarchy context
         context_list = self._get_or_build_context()
         
-        rows: List[Dict[str, Any]] = []
+        rows: list[dict[str, Any]] = []
         
         for ctx in context_list:
             if ctx.token.type == 'content':
@@ -903,7 +903,7 @@ def batch_process_markdown_dataframe(
     df: 'pd.DataFrame',
     content_column: str = 'content',
     id_column: Optional[str] = None,
-    metadata_columns: Optional[List[str]] = None,
+    metadata_columns: Optional[list[str]] = None,
     asterisk_header_max_words: int = 7,
 ) -> 'pd.DataFrame':
     """Batch processes a dataframe containing markdown documents.
@@ -914,12 +914,12 @@ def batch_process_markdown_dataframe(
     
     The output dataframe has the following structure:
     - id: Document identifier (from id_column if provided, otherwise a hash of the content)
-    - metadata_columns: List of additional columns from the input dataframe (if specified)
+    - metadata_columns: list of additional columns from the input dataframe (if specified)
     - start_line: Line number where the token starts
     - level: Hierarchical level (last header level + 1, or 1 if no headers)
     - length: Number of characters in the token content
-    - parents: List of parent header titles (from root to immediate parent)
-    - parent_types: List of parent header types (corresponding to parents)
+    - parents: list of parent header titles (from root to immediate parent)
+    - parent_types: list of parent header types (corresponding to parents)
     - content: The actual text content of the token
     
     Args:
@@ -927,7 +927,7 @@ def batch_process_markdown_dataframe(
         content_column: Name of the column containing markdown text. Defaults to 'content'.
         id_column: Name of the column to use as document ID. If None, a hash of the
             content will be generated. Defaults to None.
-        metadata_columns: List of additional column names to include in the output.
+        metadata_columns: list of additional column names to include in the output.
             These columns will be copied from the input dataframe and placed after
             the id column. Defaults to None.
         asterisk_header_max_words: Maximum words for asterisk headers. Defaults to 7.
@@ -962,7 +962,7 @@ def batch_process_markdown_dataframe(
             )
     
     # Process each row
-    all_rows: List[Dict[str, Any]] = []
+    all_rows: list[dict[str, Any]] = []
     
     for _, row in df.iterrows():
         # Get or generate document ID
