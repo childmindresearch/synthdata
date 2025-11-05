@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -95,20 +96,20 @@ class MarkdownParser:
     def __init__(
         self,
         text: str,
-        asterisk_header_max_words: int = 7,
+        header_max_words: int = 10,
         metadata: Optional[dict[str, Any]] = None,
     ) -> None:
         """Initializes the MarkdownParser.
         
         Args:
             text: The markdown text to parse.
-            asterisk_header_max_words: Maximum number of words to consider a line
-                with asterisks as a header. Defaults to 7.
+            header_max_words: Maximum number of words to consider a line as a header
+                (applies to both hash and asterisk headers). Defaults to 10.
             metadata: Additional metadata for the document (e.g., id, filepath, type).
                 Defaults to None.
         """
         self.text: str = text
-        self.max_asterisk_words: int = asterisk_header_max_words
+        self.max_header_words: int = header_max_words
         self.metadata: dict[str, Any] = metadata if metadata is not None else {}
         self.tokens: list[Token] = []
         self.lines: list[str] = self.text.split('\n')
@@ -118,20 +119,53 @@ class MarkdownParser:
     
     ### PARSER METHODS ###
     
-    def _is_asterisk_header(self, line: str) -> bool:
-        """Checks if a line is an asterisk header based on pattern and word count.
+    def _is_valid_header_length(self, content: str) -> bool:
+        """Checks if header content is within the maximum word count limit.
+        
+        Args:
+            content: The header content to check.
+            
+        Returns:
+            True if the content has at most max_header_words words, False otherwise.
+        """
+        return len(content.split()) <= self.max_header_words
+    
+    def _is_valid_header(self, line: str) -> bool:
+        """Lightweight check if a line is a valid header (pattern + word count).
+        
+        This method is optimized for performance in lookahead scenarios where we only
+        need to know IF a line is a header, without creating Token objects or computing
+        metadata like case detection.
         
         Args:
             line: The line to check.
             
         Returns:
-            True if the line matches the asterisk pattern and has at most
-            max_asterisk_words words, False otherwise.
+            True if the line matches any header pattern AND passes word count validation.
         """
-        match = re.match(self.HEADING_ASTERISK_PATTERN, line)
-        if match:
-            content = match.group(2).strip()
-            return len(content.split()) <= self.max_asterisk_words
+        # Check inline header pattern
+        inline_match = re.match(self.INLINE_COLON_PATTERN, line)
+        if inline_match:
+            # Extract label from whichever pattern matched
+            label = (inline_match.group(2) if inline_match.group(1) 
+                    else inline_match.group(5)).strip()
+            if self._is_valid_header_length(label):
+                return True
+        
+        # Check hash header pattern
+        hash_match = re.match(self.HEADING_HASH_PATTERN, line)
+        if hash_match:
+            header_content = hash_match.group(2).strip()
+            if self._is_valid_header_length(header_content):
+                return True
+        
+        # Check asterisk header pattern
+        asterisk_match = re.match(self.HEADING_ASTERISK_PATTERN, line)
+        if asterisk_match:
+            header_content = asterisk_match.group(2).strip()
+            if self._is_valid_header_length(header_content):
+                return True
+        
         return False
     
     @staticmethod
@@ -229,6 +263,10 @@ class MarkdownParser:
             label = inline_match.group(5).strip()
             content = inline_match.group(6).strip()
         
+        # Check word count limit
+        if not self._is_valid_header_length(label):
+            return None
+        
         case = self._detect_case(label)
         
         # Create header token
@@ -272,6 +310,11 @@ class MarkdownParser:
         
         marker_count = len(hash_match.group(1))
         header_content = hash_match.group(2).strip()
+        
+        # Check word count limit
+        if not self._is_valid_header_length(header_content):
+            return None
+        
         case = self._detect_case(header_content)
         
         return Token(
@@ -299,14 +342,17 @@ class MarkdownParser:
         Returns:
             A Token if the line matches an asterisk header, None otherwise.
         """
-        if not self._is_asterisk_header(line):
-            return None
-        
         asterisk_match = re.match(self.HEADING_ASTERISK_PATTERN, line)
-        assert asterisk_match is not None  # Guaranteed by _is_asterisk_header
+        if not asterisk_match:
+            return None
         
         marker_count = len(asterisk_match.group(1))
         header_content = asterisk_match.group(2).strip()
+        
+        # Check word count limit
+        if not self._is_valid_header_length(header_content):
+            return None
+        
         case = self._detect_case(header_content)
         
         return Token(
@@ -319,21 +365,6 @@ class MarkdownParser:
                 'case': case,
                 'position': 'standalone',
             },
-        )
-    
-    def _is_any_header(self, line: str) -> bool:
-        """Checks if a line is any type of header.
-        
-        Args:
-            line: The line to check.
-            
-        Returns:
-            True if the line is a hash header, asterisk header, or inline header with colon.
-        """
-        return (
-            re.match(self.HEADING_HASH_PATTERN, line) is not None or
-            self._is_asterisk_header(line) or
-            re.match(self.INLINE_COLON_PATTERN, line) is not None
         )
     
     def parse(self) -> list[Token]:
@@ -380,13 +411,17 @@ class MarkdownParser:
                 self.pos += 1
                 continue
             
-            # Collect non-header lines until the next header
-            non_header_lines: list[str] = []
+            # If we reach here, the line is not a header (either doesn't match pattern
+            # or matches but exceeds word count). Collect it and subsequent non-header lines.
+            non_header_lines: list[str] = [line]
+            self.pos += 1
+            
+            # Continue collecting non-header lines until we find an actual header
             while self.pos < self.length:
                 line = self.lines[self.pos]
                 
-                # Check if line is any type of header
-                if self._is_any_header(line):
+                # Check if the line is a valid header
+                if self._is_valid_header(line):
                     break
                     
                 non_header_lines.append(line)
@@ -736,16 +771,16 @@ class MarkdownParser:
             if token.type == 'header':
                 section = {
                     'type': token.type,
-                    'title': token.content,
+                    'text': token.content,
                     'level': ctx.level,
                     'line_number': token.line_number,
                     'metadata': token.metadata,
-                    'content': [],
                     'sections': []
                 }
                 
                 # Find parent: pop until parent level < current level
-                while stack and stack[-1][0] >= ctx.level:
+                # But always keep at least the root in the stack
+                while len(stack) > 1 and stack[-1][0] >= ctx.level:
                     stack.pop()
                 
                 parent = stack[-1][1]
@@ -754,7 +789,8 @@ class MarkdownParser:
             
             elif token.type == 'content':
                 # Find parent: pop until parent level < current level
-                while stack and stack[-1][0] >= ctx.level:
+                # But always keep at least the root in the stack
+                while len(stack) > 1 and stack[-1][0] >= ctx.level:
                     stack.pop()
                 
                 parent = stack[-1][1]
@@ -762,8 +798,8 @@ class MarkdownParser:
                 content_item = {
                     'type': 'content',
                     'text': token.content,
-                    'line_number': token.line_number,
                     'level': ctx.level,
+                    'line_number': token.line_number,
                 }
                 
                 parent['sections'].append(content_item)
@@ -772,24 +808,50 @@ class MarkdownParser:
     
     ### OUTPUT METHODS ###
     
-    def export_to_json(self, filepath: str, indent: int = 2) -> str:
+    def export_to_json(
+        self,
+        filepath: str,
+        indent: int = 2,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> str:
         """Exports the parsed tokens to a JSON file with hierarchical structure.
         
         Args:
             filepath: Path to the output JSON file.
             indent: Indentation level for pretty printing. Defaults to 2.
+            metadata: Optional metadata dictionary to add at the root level of the JSON.
+                If provided, these key-value pairs will be added alongside the 'sections'
+                key. Defaults to None.
         
         Returns:
             Path to the created file.
         """
         hierarchical_data = self.to_hierarchical_dict()
         
+        # Add metadata to root level if provided
+        if metadata:
+            # Insert metadata before 'sections' key for better readability
+            output_data: dict[str, Any] = {}
+            for key, value in metadata.items():
+                output_data[key] = value
+            # Add all other keys from hierarchical_data
+            for key, value in hierarchical_data.items():
+                output_data[key] = value
+        else:
+            output_data = hierarchical_data
+        
         with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(hierarchical_data, f, indent=indent, ensure_ascii=False)
+            json.dump(output_data, f, indent=indent, ensure_ascii=False)
         
         return filepath
     
-    def print_tree(self, show_line_numbers: bool = True, show_type: bool = True) -> None:
+    def print_tree(
+        self,
+        show_line_numbers: bool = True,
+        show_type: bool = True,
+        return_string: bool = False,
+        metadata_header: Optional[dict[str, Any]] = None,
+    ) -> Optional[str]:
         """Prints the header structure as an ASCII tree.
         
         This method displays the document's hierarchical structure using
@@ -798,6 +860,13 @@ class MarkdownParser:
         Args:
             show_line_numbers: Whether to show line numbers. Defaults to True.
             show_type: Whether to show header type indicators. Defaults to True.
+            return_string: If True, returns the tree as a string instead of printing.
+                Defaults to False.
+            metadata_header: Optional dictionary of metadata to display at the top
+                of the tree output. Defaults to None.
+        
+        Returns:
+            The tree structure as a string if return_string is True, None otherwise.
         """
         # Get hierarchy context
         context_list = self._get_or_build_context()
@@ -808,12 +877,26 @@ class MarkdownParser:
             if ctx.token.type == 'header'
         ]
         
-        if not header_contexts:
-            print("No headers found")
-            return
+        lines: list[str] = []
         
-        print("Document Structure")
-        print("=" * 80)
+        # Add metadata header if provided
+        if metadata_header:
+            lines.append("Metadata")
+            lines.append("-" * 80)
+            for key, value in metadata_header.items():
+                lines.append(f"{key}: {value}")
+            lines.append("")
+        
+        if not header_contexts:
+            lines.append("No headers found")
+            if return_string:
+                return '\n'.join(lines)
+            else:
+                print('\n'.join(lines))
+                return None
+        
+        lines.append("Document Structure")
+        lines.append("=" * 80)
         
         # Track the levels and whether they have more siblings
         level_has_more: dict[int, bool] = {}
@@ -860,7 +943,13 @@ class MarkdownParser:
             if show_line_numbers:
                 label += f" (line {header.line_number})"
             
-            print(f"{prefix}{label}")
+            lines.append(f"{prefix}{label}")
+        
+        if return_string:
+            return '\n'.join(lines)
+        else:
+            print('\n'.join(lines))
+            return None
     
     def extract_non_header_rows(self) -> list[dict[str, Any]]:
         """Extracts content tokens with their hierarchical context.
@@ -904,7 +993,11 @@ def batch_process_markdown_dataframe(
     content_column: str = 'content',
     id_column: Optional[str] = None,
     metadata_columns: Optional[list[str]] = None,
-    asterisk_header_max_words: int = 7,
+    header_max_words: int = 10,
+    export_tree: bool = False,
+    export_json: bool = False,
+    export_parquet: bool = False,
+    output_dir: Optional[str] = None,
 ) -> 'pd.DataFrame':
     """Batch processes a dataframe containing markdown documents.
     
@@ -930,7 +1023,16 @@ def batch_process_markdown_dataframe(
         metadata_columns: list of additional column names to include in the output.
             These columns will be copied from the input dataframe and placed after
             the id column. Defaults to None.
-        asterisk_header_max_words: Maximum words for asterisk headers. Defaults to 7.
+        header_max_words: Maximum number of words to consider a line as a header
+            (applies to both hash and asterisk headers). Defaults to 10.
+        export_tree: If True, exports the tree structure of each document to individual
+            text files in output_dir/tree/. Defaults to False.
+        export_json: If True, exports the hierarchical structure of each document to
+            individual JSON files in output_dir/json/. Defaults to False.
+        export_parquet: If True, exports the parsed dataframe to a parquet file in
+            output_dir/parsed_data.parquet. Defaults to False.
+        output_dir: Directory path where exported files will be saved. Required if
+            export_tree, export_json, or export_parquet is True. Defaults to None.
     
     Returns:
         A new dataframe where each row represents a non-header token with its
@@ -939,7 +1041,8 @@ def batch_process_markdown_dataframe(
     
     Raises:
         ValueError: If the specified content_column, id_column, or any metadata_columns
-            don't exist in the dataframe.
+            don't exist in the dataframe, or if export_tree/export_json/export_parquet
+            is True but output_dir is not provided.
     """    
     if content_column not in df.columns:
         raise ValueError(
@@ -961,10 +1064,26 @@ def batch_process_markdown_dataframe(
                 f"Available columns: {list(df.columns)}"
             )
     
+    if (export_tree or export_json or export_parquet) and output_dir is None:
+        raise ValueError(
+            "output_dir must be provided when export_tree, export_json, or export_parquet is True"
+        )
+    
+    # Create output directories if needed
+    tree_dir = None
+    json_dir = None
+    if output_dir is not None:
+        if export_tree:
+            tree_dir = os.path.join(output_dir, 'tree')
+            os.makedirs(tree_dir, exist_ok=True)
+        if export_json:
+            json_dir = os.path.join(output_dir, 'json')
+            os.makedirs(json_dir, exist_ok=True)
+    
     # Process each row
     all_rows: list[dict[str, Any]] = []
     
-    for _, row in df.iterrows():
+    for idx, row in df.iterrows():
         # Get or generate document ID
         if id_column is not None:
             doc_id = row[id_column]
@@ -982,9 +1101,49 @@ def batch_process_markdown_dataframe(
         # Parse the markdown content
         parser = MarkdownParser(
             text=row[content_column],
-            asterisk_header_max_words=asterisk_header_max_words,
+            header_max_words=header_max_words,
         )
         parser.parse()
+        
+        # Export tree structure if requested
+        if export_tree and tree_dir is not None:
+            # Create metadata header for the tree output
+            tree_metadata = {'id': doc_id}
+            if metadata_columns is not None:
+                for col in metadata_columns:
+                    tree_metadata[col] = row[col]
+            
+            # Get tree structure as string
+            tree_str = parser.print_tree(
+                show_line_numbers=True,
+                show_type=True,
+                return_string=True,
+                metadata_header=tree_metadata,
+            )
+            
+            # Write to file using doc_id as filename
+            if tree_str is not None:
+                tree_filename = f"{doc_id}.txt"
+                tree_filepath = os.path.join(tree_dir, tree_filename)
+                with open(tree_filepath, 'w', encoding='utf-8') as f:
+                    f.write(tree_str)
+        
+        # Export JSON structure if requested
+        if export_json and json_dir is not None:
+            # Create metadata for JSON export
+            json_metadata = {'id': doc_id}
+            if metadata_columns is not None:
+                for col in metadata_columns:
+                    json_metadata[col] = row[col]
+            
+            # Export to JSON file
+            json_filename = f"{doc_id}.json"
+            json_filepath = os.path.join(json_dir, json_filename)
+            parser.export_to_json(
+                filepath=json_filepath,
+                indent=2,
+                metadata=json_metadata,
+            )
         
         # Extract non-header rows
         non_header_rows = parser.extract_non_header_rows()
@@ -1013,5 +1172,11 @@ def batch_process_markdown_dataframe(
             base_columns.extend(metadata_columns)
         base_columns.extend(['start_line', 'level', 'length', 'parents', 'parent_types', 'content'])
         result_df = pd.DataFrame(columns=base_columns)
+    
+    # Export to parquet if requested
+    if export_parquet and output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        parquet_filepath = os.path.join(output_dir, 'parsed_data.parquet')
+        result_df.to_parquet(parquet_filepath, index=False)
     
     return result_df

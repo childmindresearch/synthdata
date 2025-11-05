@@ -1,6 +1,7 @@
 # Core Presidio packages
 presidio-analyzer[transformers]
 presidio-analyzer[stanza]
+presidio-analyzer[gliner]
 presidio-anonymizer
 
 # Streamlit UI
