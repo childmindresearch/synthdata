@@ -238,3 +238,60 @@ class MarkdownSectionLoader:
             filtered_df.to_parquet(output_path, index=False)
         
         return filtered_df
+    
+    def add_name(self) -> "MarkdownSectionLoader":
+        """Adds a 'name' column by extracting content from Name sections.
+        
+        For each unique `id` in the DataFrame, this method finds the row where
+        `parents == ["Name"]` and `parent_types == ["*2-inline"]`, extracts the
+        `content` value, and adds it as a new column called `name` for all rows
+        with that `id`.
+        
+        Returns:
+            Self (MarkdownSectionLoader instance) for method chaining.
+        
+        Raises:
+            ValueError: If required columns ('id', 'parents', 'parent_types',
+                'content') are missing from the DataFrame.
+        
+        Example:
+            >>> loader = MarkdownSectionLoader("parsed_data.parquet")
+            >>> df = loader.add_name().filter_sections("REASON FOR VISIT")
+        """
+        # Validate required columns
+        required_cols = ['id', 'parents', 'parent_types', 'content']
+        missing_cols = [col for col in required_cols if col not in self.df.columns]
+        if missing_cols:
+            raise ValueError(
+                f"DataFrame missing required columns: {missing_cols}. "
+                f"Available columns: {list(self.df.columns)}"
+            )
+        
+        # Create a mapping of id -> name
+        name_map = {}
+        
+        for id_value in self.df['id'].unique():
+            # Filter rows for this id
+            id_rows = self.df[self.df['id'] == id_value]
+            
+            # Find the row with parents == ["Name"] and parent_types == ["*2-inline"]
+            mask_parents = id_rows['parents'].apply(
+                lambda x: len(x) > 0 and x[-1] == "Name"
+            )
+            mask_parent_types = id_rows['parent_types'].apply(
+                lambda x: len(x) > 0 and x[-1] == "*2-inline"
+            )
+            
+            name_row = id_rows[mask_parents & mask_parent_types]
+            
+            # If found, extract the content
+            if not name_row.empty:
+                name_map[id_value] = name_row.iloc[0]['content']
+            else:
+                # If no matching row found, set name to None
+                name_map[id_value] = None
+        
+        # Add the name column to the DataFrame
+        self.df['name'] = self.df['id'].map(name_map)
+        
+        return self
