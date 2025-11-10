@@ -5,7 +5,7 @@ description = "Sandbox for synthetic data generation and evaluation"
 authors = [
     {name = "Alp Erkent", email = "alp.erkent@childmind.org"},
 ]
-license = "LGPL-2.1"
+license = "LGPL-2.1-only"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
