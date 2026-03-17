@@ -2,6 +2,9 @@
 cache/
 data/
 experiments/
+output/
+notebooks/checkpoints/
+notebooks/workspace/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

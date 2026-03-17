@@ -1,0 +1,6 @@
+[submodule "submodules/syntheval"]
+	path = submodules/syntheval
+	url = https://github.com/alperkent-cmi/syntheval.git
+[submodule "submodules/synthcity"]
+	path = submodules/synthcity
+	url = https://github.com/alperkent-cmi/synthcity.git

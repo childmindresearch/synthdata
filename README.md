@@ -2,26 +2,41 @@
 
 A sandbox for synthetic data generation and evaluation.
 
+It keeps forks of [`syntheval`](https://github.com/schneiderkamplab/syntheval) and [`synthcity`](https://github.com/vanderschaarlab/synthcity) as editable submodules to make it easy to test new features and bug fixes in those libraries. It also contains some early versions of apps, notebooks, and scripts for testing out different synthetic data generation and evaluation techniques.
+
 ## Quick Start
 
-Clone the repo and set up a virtual environment with dependencies using `uv`:
+Clone the repo, initialize submodules, and install the main environment with [`uv`](https://docs.astral.sh/uv/):
 
 ```bash
+git clone git@github.com:childmindresearch/synthdata.git
+git submodule update --init --recursive
 uv sync
 ```
 
-## List of Apps/Notebooks
+`uv sync` installs the newer synthcity and syntheval workflow by default. Install optional extras when you need the older experiment tracks:
 
-- `apps/presidio/presidio_streamlit.py`: Presidio's Streamlit app, modified for offline use.
+```bash
+uv sync --extra ydata
+uv sync --extra presidio
+```
 
-    See [QUICK START GUIDE](apps/presidio/QUICK_START_GUIDE.md) for details.
+## Apps
 
-- `notebooks/ydata-test.py`: Testing ydata-synthetic library for tabular data synthesis. To edit using `marimo`:
+- [`apps/presidio/presidio_streamlit.py`](apps/presidio/presidio_streamlit.py): Presidio's Streamlit app, modified for offline use. For the full version of the anonymizer, see [`anonymize-pii`](https://github.com/childmindresearch/anonymize-pii).
+
+    See [PRESIDIO APP GUIDE](apps/presidio/PRESIDIO_APP_GUIDE.md) for details.
+
+## Notebooks
+
+- [`notebooks/ydata-test.py`](notebooks/ydata-test.py): Testing ydata-synthetic library for tabular data synthesis. To run using [`marimo`](https://github.com/marimo-team/marimo):
 
     ```bash
-    uv run marimo edit notebooks/ydata-test.py
+    uv run --extra ydata marimo run notebooks/ydata-test.py
     ```
+
+- [`notebooks/test_hepatitis_data.ipynb`](notebooks/test_hepatitis_data.ipynb): Testing synthcity generators and syntheval & synthcity evaluations on the hepatitis dataset.
 
 ## Scripts
 
-- `scripts/markdown_parser.py`: A parser for extracting hierarchical structure from markdown documents. Separates hash headers (`# Header`) and asterisk headers (`**Bold Header**`) from non-header content, and provides methods to print header trees, export structured data, and batch process dataframes containing markdown content.
+- [`scripts/markdown_parser.py`](scripts/markdown_parser.py): Early, monolithic version of the markdown parser. For the full version, see [`headhunter`](https://github.com/childmindresearch/headhunter).
