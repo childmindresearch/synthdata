@@ -9,7 +9,8 @@ It keeps forks of [`syntheval`](https://github.com/schneiderkamplab/syntheval) a
 Clone the repo, initialize submodules, and install the main environment with [`uv`](https://docs.astral.sh/uv/):
 
 ```bash
-git clone git@github.com:childmindresearch/synthdata.git
+git clone https://github.com/childmindresearch/synthdata.git
+cd synthdata
 git submodule update --init --recursive
 uv sync
 ```
