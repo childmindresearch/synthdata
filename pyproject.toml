@@ -7,13 +7,14 @@ authors = [
 ]
 license = "MIT"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = "==3.11.*"
 dependencies = [
     "altair",
     "jupyter",
     "marimo",
     "numpy",
     "pandas",
+    "openpyxl",
     "pyarrow",
     "scikit-learn",
     "scipy",
@@ -41,6 +42,24 @@ ydata = [
     "openai",
     "sdv",
     "ydata-synthetic==1.4.0",
+]
+
+tabpfn = [
+    "tabpfgen",
+    "tabpfn==8.0.8",
+    "tabpfn-extensions[unsupervised]==0.4.2",
+]
+
+[tool.uv]
+override-dependencies = [
+    "scikit-learn>=1.6.0",
+]
+
+conflicts = [
+    [
+        { extra = "ydata" },
+        { extra = "tabpfn" },
+    ],
 ]
 
 [tool.uv.sources]

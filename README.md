@@ -36,7 +36,9 @@ uv sync --extra presidio
     uv run --extra ydata marimo run notebooks/ydata-test.py
     ```
 
-- [`notebooks/test_hepatitis_data.ipynb`](notebooks/test_hepatitis_data.ipynb): Testing synthcity generators and syntheval & synthcity evaluations on the hepatitis dataset.
+- [`notebooks/test_hepatitis_data.ipynb`](notebooks/test_hepatitis_data.ipynb): Testing synthcity generators (+TabPFN) and syntheval & synthcity evaluations on the hepatitis dataset.
+
+- [`notebooks/tabpfn_demo.ipynb`](notebooks/tabpfn_demo.ipynb): Testing classification and synthetic data generation with TabPFN. Add a `TABPFN_TOKEN` (and optionally `HF_TOKEN`) to an `.env` file at the root of the project to access the TabPFN API (and download HuggingFace models faster).
 
 ## Scripts
 
