@@ -20,9 +20,9 @@ dependencies = [
     "scipy",
     "matplotlib",
     "plotly",
-    "pmlb",
     "syntheval",
     "synthcity",
+    "ucimlrepo",
 ]
 
 [project.optional-dependencies]
@@ -48,11 +48,13 @@ tabpfn = [
     "tabpfgen",
     "tabpfn==8.0.8",
     "tabpfn-extensions[unsupervised]==0.4.2",
+    "tabimpute",
 ]
 
 [tool.uv]
 override-dependencies = [
     "scikit-learn>=1.6.0",
+    "tabpfn==8.0.8",
 ]
 
 conflicts = [

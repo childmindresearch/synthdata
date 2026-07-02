@@ -7,7 +7,10 @@ conflicts = [[
 ]]
 
 [manifest]
-overrides = [{ name = "scikit-learn", specifier = ">=1.6.0" }]
+overrides = [
+    { name = "scikit-learn", specifier = ">=1.6.0" },
+    { name = "tabpfn", specifier = "==8.0.8" },
+]
 
 [[package]]
 name = "absl-py"
@@ -2360,15 +2363,15 @@ wheels = [
 
 [[package]]
 name = "loguru"
-version = "0.7.3"
+version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
     { name = "win32-setctime", marker = "sys_platform == 'win32' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3a/05/a1dae3dffd1116099471c643b8924f5aa6524411dc6c63fdae648c4f1aca/loguru-0.7.3.tar.gz", hash = "sha256:19480589e77d47b8d85b2c827ad95d49bf31b0dcde16593892eb51dd18706eb6", size = 63559, upload-time = "2024-12-06T11:20:56.608Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/75/1f/d3818863e4be96bd641c4643c535a98f0fa2a12efa7c8ba35f763fa778ee/loguru-0.6.0.tar.gz", hash = "sha256:066bd06758d0a513e9836fd9c6b5a75bfb3fd36841f4b996bc60b547a309d41c", size = 123158, upload-time = "2022-01-29T13:47:31.879Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0c/29/0348de65b8cc732daa3e33e67806420b2ae89bdce2b04af740289c5c6c8c/loguru-0.7.3-py3-none-any.whl", hash = "sha256:31a33c10c8e1e10422bfd431aeb5d351c7cf7fa671e3c4df004162264b28220c", size = 61595, upload-time = "2024-12-06T11:20:54.538Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/21/e1d1da2586865a159fc73b611f36bdd50b6c4043cb6132d3d5e972988028/loguru-0.6.0-py3-none-any.whl", hash = "sha256:4e2414d534a2ab57573365b3e6d0234dfb1d84b68b7f3b948e6fb743860a77c3", size = 58317, upload-time = "2022-01-29T13:47:29.921Z" },
 ]
 
 [[package]]
@@ -3412,8 +3415,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pandas" },
     { name = "pyyaml" },
-    { name = "requests", version = "2.30.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-9-synthdata-ydata'" },
-    { name = "requests", version = "2.34.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-9-synthdata-tabpfn' or extra != 'extra-9-synthdata-ydata'" },
+    { name = "requests", version = "2.30.0", source = { registry = "https://pypi.org/simple" } },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/6a/db/187a171dd5fcf2fca01691c79f83533e08cdeed2d8abd8a404698aaea31b/pmlb-1.0.1.post3.tar.gz", hash = "sha256:ff1195abf0b54f2e06ea8f30c95a746e6561c5d5e01ef83950158cb7ff58a315", size = 11041, upload-time = "2020-09-10T22:53:54.901Z" }
 wheels = [
@@ -4983,12 +4985,12 @@ dependencies = [
     { name = "openpyxl" },
     { name = "pandas" },
     { name = "plotly" },
-    { name = "pmlb" },
     { name = "pyarrow" },
     { name = "scikit-learn" },
     { name = "scipy" },
     { name = "synthcity" },
     { name = "syntheval" },
+    { name = "ucimlrepo" },
 ]
 
 [package.optional-dependencies]
@@ -5002,6 +5004,7 @@ presidio = [
     { name = "streamlit-tags" },
 ]
 tabpfn = [
+    { name = "tabimpute" },
     { name = "tabpfgen" },
     { name = "tabpfn" },
     { name = "tabpfn-extensions", marker = "extra == 'extra-9-synthdata-tabpfn'" },
@@ -5028,7 +5031,6 @@ requires-dist = [
     { name = "openpyxl" },
     { name = "pandas" },
     { name = "plotly" },
-    { name = "pmlb" },
     { name = "presidio-analyzer", extras = ["transformers", "stanza", "gliner"], marker = "extra == 'presidio'" },
     { name = "presidio-anonymizer", marker = "extra == 'presidio'" },
     { name = "pyarrow" },
@@ -5043,9 +5045,11 @@ requires-dist = [
     { name = "streamlit-tags", marker = "extra == 'presidio'" },
     { name = "synthcity", editable = "submodules/synthcity" },
     { name = "syntheval", editable = "submodules/syntheval" },
+    { name = "tabimpute", marker = "extra == 'tabpfn'" },
     { name = "tabpfgen", marker = "extra == 'tabpfn'" },
     { name = "tabpfn", marker = "extra == 'tabpfn'", specifier = "==8.0.8" },
     { name = "tabpfn-extensions", extras = ["unsupervised"], marker = "extra == 'tabpfn'", specifier = "==0.4.2" },
+    { name = "ucimlrepo" },
     { name = "ydata-synthetic", marker = "extra == 'ydata'", specifier = "==1.4.0" },
 ]
 provides-extras = ["presidio", "ydata", "tabpfn"]
@@ -5081,6 +5085,23 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.14.1" },
     { name = "seaborn" },
     { name = "tqdm" },
+]
+
+[[package]]
+name = "tabimpute"
+version = "0.0.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "einops" },
+    { name = "huggingface-hub" },
+    { name = "networkx" },
+    { name = "numpy" },
+    { name = "tabpfn" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/75/1a/8c642f707741a9cd90f653cbcd11ed83b01395e83fac62bcb3b16db0fd7c/tabimpute-0.0.4.tar.gz", hash = "sha256:131aac4b10d85c728b0f460bef881eb49e807f1ff51bc2abc3a83676a989355d", size = 187762, upload-time = "2026-03-07T23:11:33.427Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ee/0c/daaaa7b390b8ccdf5a1c2dec8650a697ae8082977095e6a245fd93a0781a/tabimpute-0.0.4-py3-none-any.whl", hash = "sha256:a7a1d317832b33b913d7a2b9cb9adef3b00aacc9b191a693e91435465ff1e35a", size = 211144, upload-time = "2026-03-07T23:11:32.051Z" },
 ]
 
 [[package]]
@@ -5709,6 +5730,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/5e/a7/c202b344c5ca7daf398f3b8a477eeb205cf3b6f32e7ec3a6bac0629ca975/tzdata-2025.3.tar.gz", hash = "sha256:de39c2ca5dc7b0344f2eba86f49d614019d29f060fc4ebc8a417896a620b56a7", size = 196772, upload-time = "2025-12-13T17:45:35.667Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c7/b0/003792df09decd6849a5e39c28b513c06e84436a54440380862b5aeff25d/tzdata-2025.3-py2.py3-none-any.whl", hash = "sha256:06a47e5700f3081aab02b2e513160914ff0694bce9947d6b76ebd6bf57cfc5d1", size = 348521, upload-time = "2025-12-13T17:45:33.889Z" },
+]
+
+[[package]]
+name = "ucimlrepo"
+version = "0.0.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "certifi" },
+    { name = "pandas" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/87/7c/f5a400cc99a5365d153609ebf803084f78b4638b0f7925aa31d9abb62b8e/ucimlrepo-0.0.7.tar.gz", hash = "sha256:4cff3f9e814367dd60956da999ace473197237b9fce4c07e9a689e77b4ffb59a", size = 9369, upload-time = "2024-05-21T06:06:41.465Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3b/07/1252560194df2b4fad1cb3c46081b948331c63eb1bb0b97620d508d12a53/ucimlrepo-0.0.7-py3-none-any.whl", hash = "sha256:0a5ce7e21d7ec850a0da4427c47f9dd96fcc6532f1c7e95dcec63eeb40f08026", size = 8041, upload-time = "2024-05-21T06:06:39.826Z" },
 ]
 
 [[package]]
