@@ -23,6 +23,7 @@ dependencies = [
     "syntheval",
     "synthcity",
     "ucimlrepo",
+    "optuna",
 ]
 
 [project.optional-dependencies]
