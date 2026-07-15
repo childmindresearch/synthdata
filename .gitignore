@@ -5,6 +5,7 @@ experiments/
 output/
 notebooks/checkpoints/
 notebooks/workspace/
+workspace/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

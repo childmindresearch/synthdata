@@ -1,0 +1,151 @@
+# =============================================================================
+# synthdata pipeline configuration
+# =============================================================================
+# This single file drives all four pipeline stages:
+#   synthdata-impute   --config configs/config.yaml
+#   synthdata-generate --config configs/config.yaml
+#   synthdata-evaluate --config configs/config.yaml
+#   synthdata-plot     --config configs/config.yaml
+#
+# This example reproduces the notebooks/test_hepatitis_data.ipynb and
+# notebooks/ctgan_hpo_hepatitis.ipynb pipelines on the UCI Hepatitis dataset.
+# To run on your own data: copy this file, set data.source/path/target_column/
+# sensitive_columns below, and adjust paths as needed. Every path is resolved
+# relative to the directory you run the commands from (repo root).
+#
+# Every `synthdata-generate` run is tracked as a new "experiment" (see
+# synthdata/experiment.py): its synthetic data / evaluation / plot artifacts
+# are nested under <output_dir>/<experiment_id>/, and a manifest.json under
+# output/<name>/experiments/<experiment_id>/ records what each stage produced.
+# `synthdata-evaluate`/`synthdata-plot` automatically target the most recent
+# experiment unless you pass `--experiment-id` (see experiment: below and the
+# --tag/--experiment-id flags on each command).
+# =============================================================================
+
+name: hepatitis
+seed: 42
+device: auto # auto | cpu | cuda | mps
+
+experiment:
+  # Freeform label for the next `synthdata-generate` run, e.g. "baseline",
+  # "hpo-v2". Included in the auto-generated experiment id. Overridable with
+  # `synthdata-generate --tag <label>`.
+  tag: null
+  # Explicit experiment id to resume/extend instead of starting a new one
+  # (also used by `synthdata-evaluate`/`synthdata-plot` to target a specific
+  # past experiment instead of the most recent one). Overridable with
+  # `--experiment-id <id>` on any of the four commands.
+  id: null
+
+data:
+  source: uci # "uci" (fetch by id, cached locally) or "csv" (local file)
+  uci_id: 46 # UCI Hepatitis dataset
+  path: null # e.g. "data/my_dataset.csv" when source: csv
+
+  # Freeform dataset version label (e.g. "v1", "2024-06-01"). If set, cached
+  # raw/imputed/split CSVs are nested under data_dir/<version>/, and a
+  # dataset_manifest.json records the source/config that produced them.
+  # Overridable with `synthdata-impute --dataset-version <label>`.
+  version: null
+
+  target_column: target
+  raw_target_column: CLASS # hepatitis-specific: UCI names the target column "CLASS"
+  sensitive_columns: [AGE, SEX]
+  drop_columns: []
+
+  categorical_columns: auto # "auto" or an explicit list of column names
+  auto_categorical_unique_threshold: 10
+
+  uppercase_columns: true # hepatitis-specific: UCI feature names -> upper case
+  remap_binary_one_two: true # hepatitis-specific: recode {1,2} columns -> {0,1}
+
+  train_size: 0.6667
+  stratify: true
+
+  data_dir: data/hepatitis
+  raw_cache_subdir: raw
+
+imputation:
+  enabled: true
+  method: tabimpute
+  device: auto
+  round_rules:
+    BILIRUBIN: 2
+    ALBUMIN: 1
+  round_to_int_default: true
+  cache: true
+  validation_margin: 0.2
+
+generation:
+  n_samples: 200
+  output_dir: output/hepatitis/synthetic_data # nested under <output_dir>/<experiment_id>/ per run
+  force_retrain: false
+
+  synthcity:
+    enabled: true
+    names: [ctgan, tvae, adsgan, bayesian_network, pategan, rtvae, ddpm]
+    # privbayes/decaf excluded: unstable training on this dataset (see notebook)
+
+  tabpfn:
+    enabled: true
+    variants: [standard, custom]
+
+  tabpfgen:
+    enabled: true
+    variants: [standard, custom]
+    standard_params: {} # TabPFGen() library defaults
+    custom_params: { n_sgld_steps: 1000, sgld_noise_scale: 0.1 }
+
+  hpo:
+    enabled: true
+    n_trials: 10
+    timeout_seconds: 300
+    n_iter_cap: 300
+    model_iter_caps: { pategan: 50 }
+    sgld_step_cap: 500
+    metric_config:
+      stats: [prdc, alpha_precision, wasserstein_dist, inv_kl_divergence]
+      sanity: [nearest_syn_neighbor_distance]
+      performance: [xgb]
+      privacy: [identifiability_score, DomiasMIA_prior]
+    storage: null # defaults to sqlite:///<experiment generation dir>/../optuna_studies.db
+    best_params_path: null # defaults to <experiment generation dir>/../hpo_best_params.json
+    final_n_iter_override: null # e.g. 2000 to retrain the final HPO model longer
+
+evaluation:
+  output_dir: output/hepatitis/evaluation # nested under <output_dir>/<experiment_id>/ per run
+  models: null # null = evaluate every generated model; or list specific names
+  positive_class: 1
+
+  synthcity:
+    enabled: true
+    categories: null # null = all; or subset of [utility, privacy]
+    metrics: null # or an explicit list of metric names (overrides categories)
+
+  syntheval:
+    enabled: true
+    categories: null # null = all; or subset of [utility, privacy, fairness]
+    metrics: null
+
+  custom:
+    enabled: true
+    categories: null # fairness is the only custom type today
+    metrics: null # e.g. ["log_disparity"] to skip equalized_odds/equal_opportunity
+
+  syntheval_preset: complete_eval
+  ranking_strategy: linear # linear | summation
+
+  log_disparity:
+    protected_columns: [SEX, AGE] # defaults to data.sensitive_columns if empty
+    target_map: { 0: died, 1: survived }
+    protected_map: [{ 0: male, 1: female }, null]
+    protected_bins: [null, [7, 18, 30, 45, 60, 78]]
+
+  save_per_model_syntheval_plots: true
+
+plots:
+  output_dir: output/hepatitis/plots # "data"/"imputation" sections write here directly;
+  # "generation"/"hpo"/"evaluation" sections nest under <output_dir>/<experiment_id>/
+  sections: [data, imputation, generation, hpo, evaluation]
+  dpi: 150
+  formats: [png]
