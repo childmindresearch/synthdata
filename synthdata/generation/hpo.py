@@ -127,6 +127,14 @@ def run_study(
     )
     n_remaining = max(hpo_cfg.n_trials - n_done, 0)
     if n_remaining > 0:
+        logger.info(
+            "[%s] starting hyperparameter optimization: %d trial(s) remaining "
+            "(%d already completed, target=%d)",
+            study_name,
+            n_remaining,
+            n_done,
+            hpo_cfg.n_trials,
+        )
         study.optimize(
             objective_fn,
             n_trials=n_remaining,

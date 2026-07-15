@@ -25,6 +25,8 @@ dependencies = [
     "synthcity",
     "ucimlrepo",
     "optuna",
+    "torch>=2.7.1",
+    "torchvision>=0.22.1",
 ]
 
 [project.scripts]
@@ -75,6 +77,17 @@ conflicts = [
 [tool.uv.sources]
 syntheval = { path = "submodules/syntheval", editable = true }
 synthcity = { path = "submodules/synthcity", editable = true }
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.pyright]
 reportInvalidTypeForm = "none"

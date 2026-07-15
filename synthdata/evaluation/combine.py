@@ -182,3 +182,22 @@ def build_combined_table(
     )
     combined = combined.sort_values((_ALL, "overall", _RANK), ascending=False)
     return combined
+
+
+def simple_rank_summary(combined: pd.DataFrame) -> pd.DataFrame:
+    """Flatten ``combined`` down to a plain model x {overall,utility,privacy,fairness}
+    rank table (one row per model, sorted best-to-worst) for readable printing.
+    """
+    columns = {}
+    if (_ALL, "overall", _RANK) in combined.columns:
+        columns["overall"] = combined[(_ALL, "overall", _RANK)]
+    for type_ in ("utility", "privacy", "fairness"):
+        key = (_ALL, type_, _RANK)
+        if key in combined.columns:
+            columns[type_] = combined[key]
+
+    summary = pd.DataFrame(columns)
+    summary.index.name = "model"
+    if "overall" in summary.columns:
+        summary = summary.sort_values("overall", ascending=False)
+    return summary.round(3)

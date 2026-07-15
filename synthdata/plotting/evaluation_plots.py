@@ -116,6 +116,10 @@ def save_per_model_syntheval_plots(
     """
     from syntheval import AnalysisConfig, SynthEval
 
+    # Resolve to an absolute path *before* chdir-ing into per-model subdirectories
+    # below, otherwise a relative path would no longer point at the right file.
+    preset_path = Path(preset_path).resolve()
+
     analysis_config = AnalysisConfig(
         dataset=dataset.train_imputed_df,
         target_vars=dataset.target_column,

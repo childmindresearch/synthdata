@@ -24,6 +24,21 @@ import matplotlib
 
 matplotlib.use("Agg", force=True)
 
+# pgmpy's TreeSearch (used by synthcity's "bayesian_network" plugin for
+# Chow-Liu/TAN structure learning) scores candidate edges with sklearn's
+# mutual-information *clustering* metrics, which warn loudly whenever a
+# column looks continuous/multiclass rather than a strict clustering label --
+# harmless here since it's being (ab)used as an information-theoretic score,
+# not an actual clustering evaluation. These warnings fire inside joblib
+# worker subprocesses, so a `warnings.filterwarnings()` call in this process
+# doesn't reach them; setting PYTHONWARNINGS before those subprocesses spawn
+# does, since child processes inherit the environment.
+import os
+
+os.environ.setdefault(
+    "PYTHONWARNINGS", "ignore:Clustering metrics expects discrete values:UserWarning"
+)
+
 from synthdata.config import Config, load_config
 
 __all__ = ["Config", "load_config"]

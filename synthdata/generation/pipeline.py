@@ -17,7 +17,7 @@ from synthdata.generation import hpo as hpo_mod
 from synthdata.generation import synthcity_backend as sc
 from synthdata.generation import tabpfgen_backend as tpfgen
 from synthdata.generation import tabpfn_backend as tpfn
-from synthdata.utils import ensure_dir, get_logger
+from synthdata.utils import ensure_dir, get_logger, resolve_device
 
 logger = get_logger(__name__)
 
@@ -40,6 +40,7 @@ def run_generation(
     output_dir = ensure_dir(gen_cfg.output_dir)
     n_samples = gen_cfg.n_samples
     seed = cfg.seed
+    device = resolve_device(cfg.device)
 
     best_params_path = gen_cfg.hpo.best_params_path or hpo_mod.default_best_params_path(
         output_dir
@@ -85,14 +86,25 @@ def run_generation(
             _cached_or_build(
                 name,
                 lambda name=name: sc.fit_generate(
-                    name, {}, train_loader, n_samples, seed, workspace=output_dir / "synthcity_workspace"
+                    name,
+                    {},
+                    train_loader,
+                    n_samples,
+                    seed,
+                    workspace=output_dir / "synthcity_workspace",
+                    device=device,
                 ),
             )
 
             if gen_cfg.hpo.enabled:
                 if not best_params.has("synthcity", name):
                     objective = sc.build_synthcity_objective(
-                        name, train_loader, gen_cfg.hpo, seed, workspace=output_dir / "synthcity_workspace"
+                        name,
+                        train_loader,
+                        gen_cfg.hpo,
+                        seed,
+                        workspace=output_dir / "synthcity_workspace",
+                        device=device,
                     )
                     params = hpo_mod.run_study(
                         f"hpo_{name}", objective, gen_cfg.hpo, output_dir, seed
@@ -107,7 +119,13 @@ def run_generation(
                 _cached_or_build(
                     f"{name}_hpo",
                     lambda name=name, params=params: sc.fit_generate(
-                        name, params, train_loader, n_samples, seed, workspace=output_dir / "synthcity_workspace"
+                        name,
+                        params,
+                        train_loader,
+                        n_samples,
+                        seed,
+                        workspace=output_dir / "synthcity_workspace",
+                        device=device,
                     ),
                 )
 

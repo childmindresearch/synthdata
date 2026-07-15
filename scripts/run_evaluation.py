@@ -20,6 +20,7 @@ import pandas as pd
 from synthdata.config import load_config
 from synthdata.data import load_dataset, load_imputed_splits
 from synthdata.evaluation import run_evaluation
+from synthdata.evaluation.combine import simple_rank_summary
 from synthdata.experiment import load_experiment
 from synthdata.utils import get_logger, set_global_seed
 
@@ -76,8 +77,8 @@ def main() -> None:
 
     combined, extras = run_evaluation(cfg, dataset, synthetic_datasets)
     logger.info(
-        "Combined evaluation table (top 10 by overall rank):\n%s",
-        combined.head(10).to_string(),
+        "Combined evaluation summary (ranked, higher=better):\n%s",
+        simple_rank_summary(combined).to_string(),
     )
 
     if args.plot:

@@ -35,7 +35,7 @@ def make_loader(
 def get_plugin_class(name: str):
     from synthcity.plugins import Plugins
 
-    return type(Plugins().get(name))
+    return Plugins().get_type(name)
 
 
 def plugin_accepts(name: str, param_name: str) -> bool:
@@ -51,6 +51,7 @@ def fit_generate(
     n_samples: int,
     random_state: int = 42,
     workspace: str | None = None,
+    device: str | None = None,
 ) -> pd.DataFrame:
     from pathlib import Path
 
@@ -59,6 +60,8 @@ def fit_generate(
     plugin_kwargs = dict(params)
     if workspace is not None and plugin_accepts(name, "workspace"):
         plugin_kwargs["workspace"] = Path(workspace)
+    if device is not None and "device" not in plugin_kwargs and plugin_accepts(name, "device"):
+        plugin_kwargs["device"] = torch.device(device)
 
     model = Plugins().get(name, **plugin_kwargs)
     model.fit(train_loader)
@@ -71,14 +74,16 @@ def build_synthcity_objective(
     hpo_cfg: HPOConfig,
     seed: int,
     workspace: str | None = None,
+    device: str = "cpu",
 ):
     """Build an Optuna objective for a synthcity plugin's native hyperparameter space.
 
     Mirrors the hepatitis notebook's HPO cell: samples from the plugin's own
     ``sample_hyperparameters_optuna``, caps ``n_iter`` for speed (only if the
-    plugin exposes it), forces CPU for pytorch-based plugins (MPS lacks the
-    float64 support synthcity's metrics need internally), and scores each trial
-    via a single-model, single-repeat ``Benchmarks.evaluate`` call.
+    plugin exposes it), forces CPU for MPS (which lacks the float64 support
+    synthcity's metrics need internally) but otherwise uses ``device``, and
+    scores each trial via a single-model, single-repeat ``Benchmarks.evaluate``
+    call.
     """
     from pathlib import Path
 
@@ -89,6 +94,7 @@ def build_synthcity_objective(
     accepts_iter = plugin_accepts(name, "n_iter")
     iter_cap = hpo_cfg.model_iter_caps.get(name, hpo_cfg.n_iter_cap)
     workspace_path = Path(workspace) if workspace else Path("workspace")
+    trial_device = "cpu" if device == "mps" else device
 
     def objective(trial: optuna.Trial) -> float:
         params = plugin_cls.sample_hyperparameters_optuna(trial)
@@ -96,7 +102,7 @@ def build_synthcity_objective(
             params["n_iter"] = min(params.get("n_iter", iter_cap), iter_cap)
         params["random_state"] = seed
         if accepts_device:
-            params["device"] = torch.device("cpu")
+            params["device"] = torch.device(trial_device)
 
         trial_id = f"trial_{trial.number}"
         try:
