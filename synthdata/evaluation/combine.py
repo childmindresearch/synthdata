@@ -181,7 +181,15 @@ def build_combined_table(
         combined.columns, names=["framework", "type", "metric"]
     )
     combined = combined.sort_values((_ALL, "overall", _RANK), ascending=False)
+    combined.index.name = "model"
     return combined
+
+
+def load_combined_table(path: "str") -> pd.DataFrame:
+    """Load a ``combined_evaluation.csv`` written by :func:`build_combined_table`,
+    reconstructing its 3-level ``(framework, type, metric)`` column MultiIndex.
+    """
+    return pd.read_csv(path, header=[0, 1, 2], index_col=0)
 
 
 def simple_rank_summary(combined: pd.DataFrame) -> pd.DataFrame:
