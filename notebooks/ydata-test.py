@@ -37,8 +37,11 @@ def _():
     from ydata_synthetic.synthesizers import ModelParameters, TrainParameters
     from ydata_synthetic.synthesizers.regular import RegularSynthesizer
 
-    # Path to models directory
-    MODELS_DIR = "models"
+    # Path to models directory (relative to repo root). Gitignored -- these
+    # are generated training artifacts, not committed to the repo -- so
+    # ensure it exists on a fresh checkout instead of assuming it's present.
+    MODELS_DIR = "notebooks/models"
+    os.makedirs(MODELS_DIR, exist_ok=True)
 
     # Sample size for visualization
     SAMPLE_SIZE = 1000
@@ -101,7 +104,7 @@ def _(fetch_data, mo):
 
 
 @app.cell
-def _(contextlib, io, json, os, re):
+def _(MODELS_DIR, contextlib, io, json, os, re):
     def parse_training_output(output_text, model_type):
         """Parse training output to extract losses."""
         losses = {"epoch": [], "generator_loss": [], "critic_loss": []}
@@ -139,7 +142,7 @@ def _(contextlib, io, json, os, re):
         losses = parse_training_output(output, model_type)
 
         # Save losses to JSON
-        loss_path = os.path.join("models", f"{model_name}_losses.json")
+        loss_path = os.path.join(MODELS_DIR, f"{model_name}_losses.json")
         with open(loss_path, "w") as file:
             json.dump(losses, file)
 
@@ -147,7 +150,7 @@ def _(contextlib, io, json, os, re):
 
     def load_losses(model_name):
         """Load losses from JSON file."""
-        loss_path = os.path.join("models", f"{model_name}_losses.json")
+        loss_path = os.path.join(MODELS_DIR, f"{model_name}_losses.json")
         if os.path.exists(loss_path):
             with open(loss_path, "r") as file:
                 return json.load(file)

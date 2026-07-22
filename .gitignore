@@ -5,6 +5,7 @@ experiments/
 output/
 notebooks/checkpoints/
 notebooks/workspace/
+notebooks/models/
 workspace/
 tmp/
 docs/internal/
