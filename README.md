@@ -85,6 +85,23 @@ version is typically reused across many generation experiments.
 
 See `configs/config.yaml` for the full set of options (all documented inline).
 
+## Testing & linting
+
+```bash
+uv sync --extra tabpfn        # dev tools (pytest/ruff) are installed by default via [dependency-groups]
+uv run pytest                 # runs everything except @pytest.mark.slow/network tests
+uv run ruff check .           # lint (scoped to synthdata/, scripts/*.py, tests/)
+uv run ruff format .          # format
+pre-commit install            # optional: run ruff automatically on commit
+```
+
+Tests live under `tests/`, mirroring `synthdata/`'s module layout, with shared
+fixtures in `tests/conftest.py`. Markers (`unit`, `cache`, `integration`, `slow`,
+`network`; see `[tool.pytest.ini_options]` in `pyproject.toml`) let you scope a run,
+e.g. `uv run pytest -m unit`. CI (`.github/workflows/ci.yml`) runs `ruff check`/
+`ruff format --check` plus `pytest -m "not slow and not network"` against base
+dependencies only (no `tabpfn` extra, CPU-only torch) on every push/PR.
+
 ## Apps
 
 These are older, less actively maintained tracks -- install their extras separately with `uv sync --extra <name>` when you need them.

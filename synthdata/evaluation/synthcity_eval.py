@@ -37,9 +37,9 @@ class PregeneratedSyntheticModel:
         return self
 
     def sample(self, count: int, random_state: int = 0) -> pd.DataFrame:
-        return self._df.sample(
-            n=count, replace=True, random_state=random_state
-        ).reset_index(drop=True)
+        return self._df.sample(n=count, replace=True, random_state=random_state).reset_index(
+            drop=True
+        )
 
 
 class _ExternalGeneratorAdapter:
@@ -66,8 +66,14 @@ def _align_dtypes(x_syn: pd.DataFrame, x_ref: pd.DataFrame) -> pd.DataFrame:
         if x_ref[col].dtype != x_syn[col].dtype:
             try:
                 x_syn[col] = x_syn[col].astype(x_ref[col].dtype)
-            except (ValueError, TypeError):
-                pass
+            except (ValueError, TypeError) as exc:
+                logger.warning(
+                    "[_align_dtypes] cast failed for column %s (ref dtype=%s, syn dtype=%s): %s",
+                    col,
+                    x_ref[col].dtype,
+                    x_syn[col].dtype,
+                    exc,
+                )
     return x_syn
 
 
@@ -146,8 +152,7 @@ def resolve_metric_config(selection_cfg) -> dict:
         name_to_type,
     )
     metric_config = {
-        cat: [n for n in names if n in selected]
-        for cat, names in SYNTHCITY_METRIC_CONFIG.items()
+        cat: [n for n in names if n in selected] for cat, names in SYNTHCITY_METRIC_CONFIG.items()
     }
     return {cat: names for cat, names in metric_config.items() if names}
 
@@ -190,6 +195,7 @@ def run_synthcity_evaluation(
                 random_state=seed,
                 workspace=workspace,
             )
-        except Exception as exc:  # noqa: BLE001 - one model failing shouldn't halt evaluation
+        except (ValueError, RuntimeError) as exc:
             logger.warning("[synthcity] evaluation failed for %s: %s", name, exc)
+            results[name] = pd.DataFrame({"error": [str(exc)], "error_type": [type(exc).__name__]})
     return results

@@ -110,7 +110,7 @@ def cached_json(
     """Load a dict from a JSON file if it exists (and use_cache), else build+save it."""
     p = Path(path)
     if use_cache and p.exists():
-        with open(p, "r") as f:
+        with open(p) as f:
             return json.load(f)
     data = build_fn()
     ensure_dir(p.parent)
@@ -123,7 +123,7 @@ def load_json(path: str | Path, default: dict | None = None) -> dict:
     p = Path(path)
     if not p.exists():
         return {} if default is None else default
-    with open(p, "r") as f:
+    with open(p) as f:
         return json.load(f)
 
 

@@ -1,0 +1,26 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.1
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      # Scoped to the synthdata pipeline (package/CLI entrypoints/tests) --
+      # these two hooks *rewrite* files, so unlike the read-only checks below
+      # they must not touch apps/, notebooks/, scripts/document_pipeline/, or
+      # vendored submodules/.
+      - id: trailing-whitespace
+        files: '^(synthdata/|scripts/(?!document_pipeline/)|tests/).*\.py$'
+      - id: end-of-file-fixer
+        files: '^(synthdata/|scripts/(?!document_pipeline/)|tests/).*\.py$'
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+
+exclude: ^submodules/

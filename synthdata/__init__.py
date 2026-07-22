@@ -15,12 +15,21 @@ Everything is driven by a single YAML config file (see ``configs/config.yaml``),
 :func:`synthdata.config.load_config`.
 """
 
+# Load .env (TABPFN_TOKEN, HF_TOKEN, PYTORCH_CUDA_ALLOC_CONF, ...) into the
+# process environment as early as possible: variables like
+# PYTORCH_CUDA_ALLOC_CONF only take effect if set *before* the CUDA context is
+# initialized (i.e. before anything imports torch), and merely having them in
+# .env does nothing on its own -- nothing else in this package reads that file.
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # Force a non-interactive matplotlib backend before anything else (including
 # SynthEval/synthcity internals) can import matplotlib.pyplot and pick a GUI
 # backend (e.g. "macosx"). This package only ever saves figures to disk
 # (savefig/write_html/write_image) and never displays them interactively, so
 # there is no reason for a Python/plot window (or its Dock icon) to appear.
-import matplotlib
+import matplotlib  # noqa: E402
 
 matplotlib.use("Agg", force=True)
 
@@ -33,12 +42,12 @@ matplotlib.use("Agg", force=True)
 # worker subprocesses, so a `warnings.filterwarnings()` call in this process
 # doesn't reach them; setting PYTHONWARNINGS before those subprocesses spawn
 # does, since child processes inherit the environment.
-import os
+import os  # noqa: E402
 
 os.environ.setdefault(
     "PYTHONWARNINGS", "ignore:Clustering metrics expects discrete values:UserWarning"
 )
 
-from synthdata.config import Config, load_config
+from synthdata.config import Config, load_config  # noqa: E402
 
 __all__ = ["Config", "load_config"]

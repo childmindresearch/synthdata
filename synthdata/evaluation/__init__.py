@@ -12,7 +12,9 @@ from synthdata.utils import ensure_dir, get_logger
 logger = get_logger(__name__)
 
 
-def select_models(cfg: Config, synthetic_datasets: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+def select_models(
+    cfg: Config, synthetic_datasets: dict[str, pd.DataFrame]
+) -> dict[str, pd.DataFrame]:
     """Restrict to cfg.evaluation.models if set, else evaluate everything generated."""
     if not cfg.evaluation.models:
         return synthetic_datasets

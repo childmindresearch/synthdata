@@ -39,7 +39,7 @@ def plot_rank_tradeoff(
 
     models = list(combined.index)
     base_models = sorted({_base_model(m) for m in models})
-    palette = dict(zip(base_models, plt.cm.tab20.colors[: len(base_models)]))
+    palette = dict(zip(base_models, plt.cm.tab20.colors[: len(base_models)], strict=True))
 
     fig, ax = plt.subplots(figsize=(11, 7))
     for model in models:
@@ -71,10 +71,32 @@ def plot_rank_tradeoff(
         for b in base_models
     ]
     type_handles = [
-        Line2D([0], [0], marker="o", color="grey", markersize=9, markeredgecolor="none", label="Regular"),
-        Line2D([0], [0], marker="*", color="grey", markersize=12, markeredgecolor="black", linewidth=0, label="HPO"),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="grey",
+            markersize=9,
+            markeredgecolor="none",
+            label="Regular",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="*",
+            color="grey",
+            markersize=12,
+            markeredgecolor="black",
+            linewidth=0,
+            label="HPO",
+        ),
     ]
-    ax.legend(handles=color_handles + [Line2D([], [], linestyle="none")] + type_handles, loc="best", fontsize=8, ncol=2)
+    ax.legend(
+        handles=color_handles + [Line2D([], [], linestyle="none")] + type_handles,
+        loc="best",
+        fontsize=8,
+        ncol=2,
+    )
     fig.tight_layout()
     return fig
 
@@ -82,19 +104,38 @@ def plot_rank_tradeoff(
 def save_rank_tradeoff_plots(cfg: Config, combined: pd.DataFrame, output_dir: str | Path) -> None:
     output_dir = Path(output_dir) / "evaluation"
     pairs = [
-        (("__all__", "utility", "rank"), ("__all__", "privacy", "rank"), "Utility vs Privacy Trade-off", "utility_vs_privacy"),
-        (("__all__", "utility", "rank"), ("__all__", "fairness", "rank"), "Utility vs Fairness Trade-off", "utility_vs_fairness"),
-        (("__all__", "privacy", "rank"), ("__all__", "fairness", "rank"), "Privacy vs Fairness Trade-off", "privacy_vs_fairness"),
+        (
+            ("__all__", "utility", "rank"),
+            ("__all__", "privacy", "rank"),
+            "Utility vs Privacy Trade-off",
+            "utility_vs_privacy",
+        ),
+        (
+            ("__all__", "utility", "rank"),
+            ("__all__", "fairness", "rank"),
+            "Utility vs Fairness Trade-off",
+            "utility_vs_fairness",
+        ),
+        (
+            ("__all__", "privacy", "rank"),
+            ("__all__", "fairness", "rank"),
+            "Privacy vs Fairness Trade-off",
+            "privacy_vs_fairness",
+        ),
     ]
     for x_key, y_key, title, fname in pairs:
         if x_key not in combined.columns or y_key not in combined.columns:
             continue
-        fig = plot_rank_tradeoff(combined, x_key, y_key, x_key[1].title() + " rank", y_key[1].title() + " rank", title)
+        fig = plot_rank_tradeoff(
+            combined, x_key, y_key, x_key[1].title() + " rank", y_key[1].title() + " rank", title
+        )
         save_matplotlib_figure(fig, output_dir / fname, cfg.plots.dpi, cfg.plots.formats)
         plt.close(fig)
 
 
-def save_log_disparity_plots(log_disparity_reports: dict[str, dict], output_dir: str | Path) -> None:
+def save_log_disparity_plots(
+    log_disparity_reports: dict[str, dict], output_dir: str | Path
+) -> None:
     output_dir = Path(output_dir) / "evaluation" / "log_disparity"
     for name, report in log_disparity_reports.items():
         fig = report.get("report_figure")
@@ -148,7 +189,7 @@ def save_per_model_syntheval_plots(
                 plt.close("all")
                 new_pngs = sorted(set(glob.glob("SE_*.png")) - before)
                 logger.info("[syntheval plots] %s: %d new figures", name, len(new_pngs))
-            except Exception as exc:  # noqa: BLE001
+            except (ValueError, RuntimeError, KeyError, OSError) as exc:
                 logger.warning("[syntheval plots] failed for %s: %s", name, exc)
             finally:
                 os.chdir(original_dir)

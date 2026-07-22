@@ -32,7 +32,7 @@ def plot_observed_vs_imputed(
     fig, axes = plt.subplots(nrows, ncols, figsize=(3.5 * ncols, 3 * nrows))
     axes_flat = np.atleast_1d(axes).flatten()
 
-    for ax, col in zip(axes_flat, columns_with_missing):
+    for ax, col in zip(axes_flat, columns_with_missing, strict=False):
         missing_mask = full_df[col].isna()
         observed = full_df.loc[~missing_mask, col]
         imputed = full_imputed_df.loc[missing_mask, col]
@@ -43,8 +43,18 @@ def plot_observed_vs_imputed(
             categories = sorted(set(obs_counts.index) | set(imp_counts.index))
             positions = np.arange(len(categories))
             width = 0.4
-            ax.bar(positions - width / 2, [obs_counts.get(c, 0) for c in categories], width, label="observed")
-            ax.bar(positions + width / 2, [imp_counts.get(c, 0) for c in categories], width, label="imputed")
+            ax.bar(
+                positions - width / 2,
+                [obs_counts.get(c, 0) for c in categories],
+                width,
+                label="observed",
+            )
+            ax.bar(
+                positions + width / 2,
+                [imp_counts.get(c, 0) for c in categories],
+                width,
+                label="imputed",
+            )
             ax.set_xticks(positions)
             ax.set_xticklabels(categories)
         else:
@@ -53,7 +63,7 @@ def plot_observed_vs_imputed(
         ax.set_title(col, fontsize=9)
         ax.legend(fontsize=7)
 
-    for ax in axes_flat[len(columns_with_missing):]:
+    for ax in axes_flat[len(columns_with_missing) :]:
         ax.axis("off")
 
     fig.suptitle("Observed vs. imputed distributions", fontsize=13, fontweight="bold")
@@ -83,9 +93,7 @@ def save_imputation_plots(
     cfg: Config, dataset: Dataset, validation_df: pd.DataFrame, output_dir: str | Path
 ) -> None:
     output_dir = Path(output_dir)
-    columns_with_missing = [
-        c for c in dataset.feature_columns if dataset.full_df[c].isna().any()
-    ]
+    columns_with_missing = [c for c in dataset.feature_columns if dataset.full_df[c].isna().any()]
     fig1 = plot_observed_vs_imputed(
         dataset.full_df, dataset.full_imputed_df, columns_with_missing, dataset.categorical_columns
     )

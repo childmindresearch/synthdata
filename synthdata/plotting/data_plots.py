@@ -24,7 +24,7 @@ def plot_column_distributions(
     fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 3 * nrows))
     axes_flat = np.atleast_1d(axes).flatten()
 
-    for ax, col in zip(axes_flat, columns):
+    for ax, col in zip(axes_flat, columns, strict=False):
         series = df[col].dropna()
         if col in categorical_columns:
             counts = series.value_counts().sort_index()
@@ -34,7 +34,7 @@ def plot_column_distributions(
         ax.set_title(col, fontsize=9)
         ax.grid(True, linestyle="--", alpha=0.4, zorder=0)
 
-    for ax in axes_flat[len(columns):]:
+    for ax in axes_flat[len(columns) :]:
         ax.axis("off")
 
     fig.suptitle("Column distributions", fontsize=13, fontweight="bold")
@@ -62,7 +62,9 @@ def plot_missingness(df: pd.DataFrame, feature_columns: list):
     return fig
 
 
-def save_data_plots(dataset: Dataset, output_dir: str | Path, dpi: int = 150, formats=("png",)) -> None:
+def save_data_plots(
+    dataset: Dataset, output_dir: str | Path, dpi: int = 150, formats=("png",)
+) -> None:
     output_dir = Path(output_dir)
     fig1 = plot_column_distributions(
         dataset.full_df, dataset.feature_columns, dataset.categorical_columns

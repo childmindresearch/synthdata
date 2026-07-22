@@ -48,6 +48,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.stats import chi2_contingency
 
+from synthdata.utils import get_logger
+
+logger = get_logger(__name__)
+
 # ============================================================================
 # Constants and Configuration
 # ============================================================================
@@ -106,9 +110,7 @@ def rate_calculation(subgroup_n: int, total_n: int) -> float:
     return subgroup_n / total_n
 
 
-def log_disparate_impact(
-    alpha_rate: float, beta_rate: float, for_plot: bool = False
-) -> float:
+def log_disparate_impact(alpha_rate: float, beta_rate: float, for_plot: bool = False) -> float:
     """Compute log disparate impact from background and observed rates.
 
     The metric is defined as:
@@ -202,12 +204,7 @@ def compare_population_proportion(
     background_neg = background_total - background_pos
 
     # Check sample size requirements for chi-squared test
-    if (
-        observed_pos >= 5
-        and observed_neg >= 5
-        and background_pos >= 5
-        and background_neg >= 5
-    ):
+    if observed_pos >= 5 and observed_neg >= 5 and background_pos >= 5 and background_neg >= 5:
         # Construct 2x2 contingency table
         table = np.array(
             [[observed_pos, observed_neg], [background_pos, background_neg]],
@@ -218,7 +215,15 @@ def compare_population_proportion(
             # Perform chi-squared test without continuity correction
             _, p_value, _, _ = chi2_contingency(table, correction=False)
             return float(p_value)
-        except Exception:
+        except ValueError:
+            logger.warning(
+                "chi2_contingency degenerate table observed=(%d,%d) background=(%d,%d); "
+                "returning insufficient-data sentinel",
+                observed_pos,
+                observed_neg,
+                background_pos,
+                background_neg,
+            )
             return float(SENTINEL_INSUFFICIENT)
 
     return float(SENTINEL_INSUFFICIENT)
@@ -525,16 +530,11 @@ def prepare_data_for_analysis(
             include_lowest=True,
             right=True,
         )
-        out["TARGET_LABEL"] = (
-            target_binned.astype("object").fillna("OutOfRange").astype(str)
-        )
+        out["TARGET_LABEL"] = target_binned.astype("object").fillna("OutOfRange").astype(str)
         target_order = target_labels + ["OutOfRange"]
     elif target_map is not None:
         out["TARGET_LABEL"] = (
-            out[target_col]
-            .map(target_map)
-            .fillna(out[target_col].astype(str))
-            .astype(str)
+            out[target_col].map(target_map).fillna(out[target_col].astype(str)).astype(str)
         )
         target_order = list(dict.fromkeys(target_map.values()))
     else:
@@ -680,15 +680,9 @@ def compute_log_disparity_report(
     # Aggregate counts
     group_cols = protected_group_cols + ["TARGET_LABEL"]
     baseline_counts = (
-        real_prepared.groupby(group_cols, dropna=False)
-        .size()
-        .reset_index(name="background_n")
+        real_prepared.groupby(group_cols, dropna=False).size().reset_index(name="background_n")
     )
-    user_counts = (
-        synth_prepared.groupby(group_cols, dropna=False)
-        .size()
-        .reset_index(name="user_n")
-    )
+    user_counts = synth_prepared.groupby(group_cols, dropna=False).size().reset_index(name="user_n")
 
     total_background = int(baseline_counts["background_n"].sum())
     total_user = int(user_counts["user_n"].sum())
@@ -713,8 +707,7 @@ def compute_log_disparity_report(
 
     # Create display tables
     protected_display_names = {
-        p_col: _prettify_name(p_col.replace("__GROUP", ""))
-        for p_col in protected_group_cols
+        p_col: _prettify_name(p_col.replace("__GROUP", "")) for p_col in protected_group_cols
     }
 
     subgroup_table = _build_subgroup_equity_table(
@@ -743,17 +736,13 @@ def compute_log_disparity_report(
     ) & ~np.isinf(leaf["EquityValue"])
     valid_values = leaf.loc[valid_mask, "EquityValue"]
     sig_share = (
-        leaf["BH_p"].between(0, SIG_THRESHOLD, inclusive="both").mean()
-        if len(leaf)
-        else np.nan
+        leaf["BH_p"].between(0, SIG_THRESHOLD, inclusive="both").mean() if len(leaf) else np.nan
     )
 
     summary_stats = {
         "model": model_name,
         "n_subgroups": len(leaf),
-        "mean_abs_log_disparity": float(valid_values.abs().mean())
-        if len(valid_values)
-        else np.nan,
+        "mean_abs_log_disparity": float(valid_values.abs().mean()) if len(valid_values) else np.nan,
         "median_abs_log_disparity": float(valid_values.abs().median())
         if len(valid_values)
         else np.nan,
@@ -761,9 +750,7 @@ def compute_log_disparity_report(
     }
 
     label_counts = (
-        leaf.groupby(["Model", "EquityLabel"], dropna=False)
-        .size()
-        .reset_index(name="count")
+        leaf.groupby(["Model", "EquityLabel"], dropna=False).size().reset_index(name="count")
     )
 
     return {
@@ -857,11 +844,7 @@ def _build_hierarchy_frame(
     # Aggregate at each level
     level_frames = []
     for level_name, cols in levels:
-        bg = (
-            baseline_counts.groupby(cols, dropna=False)["background_n"]
-            .sum()
-            .reset_index()
-        )
+        bg = baseline_counts.groupby(cols, dropna=False)["background_n"].sum().reset_index()
         us = user_counts.groupby(cols, dropna=False)["user_n"].sum().reset_index()
 
         merged = bg.merge(us, on=cols, how="outer")
@@ -915,15 +898,11 @@ def _build_subgroup_equity_table(
     table = pd.concat(table_parts, ignore_index=True)
 
     # Order rows
-    char_order = {
-        display_names.get(col, col): i for i, col in enumerate(protected_group_cols)
-    }
+    char_order = {display_names.get(col, col): i for i, col in enumerate(protected_group_cols)}
     char_order["Target"] = len(protected_group_cols)
     table["_char_order"] = table["Characteristic"].map(char_order).fillna(999)
     table["_sub_order"] = (
-        table.groupby("Characteristic")["Protected Subgroup"]
-        .rank(method="dense")
-        .astype(int)
+        table.groupby("Characteristic")["Protected Subgroup"].rank(method="dense").astype(int)
     )
 
     # Format values
@@ -981,9 +960,7 @@ def _build_leaf_equity_table(
     part["Characteristic"] = "Intersectional"
     part["Protected Subgroup"] = subgroup_labels
     part["_sub_order"] = (
-        part.groupby("Characteristic")["Protected Subgroup"]
-        .rank(method="dense")
-        .astype(int)
+        part.groupby("Characteristic")["Protected Subgroup"].rank(method="dense").astype(int)
     )
     part["Equity Value"] = part.apply(
         lambda r: _format_equity_with_star(r["EquityValue"], r["BH_p"]),
@@ -1334,9 +1311,7 @@ def _build_model_report_figure(
                     subgroup_table["BH-adjusted p-value"],
                 ],
                 fill_color=[white_col, white_col, row_colors, white_col],
-                font=dict(
-                    color=["#111111", "#111111", row_text_colors, "#111111"], size=11
-                ),
+                font=dict(color=["#111111", "#111111", row_text_colors, "#111111"], size=11),
                 align="left",
                 height=24,
             ),
@@ -1459,9 +1434,7 @@ def summarize_multi_model_reports(
 
     # Count equity labels
     label_counts = (
-        all_leaf.groupby(["Model", "EquityLabel"], dropna=False)
-        .size()
-        .reset_index(name="count")
+        all_leaf.groupby(["Model", "EquityLabel"], dropna=False).size().reset_index(name="count")
     )
 
     label_counts_pivot = (

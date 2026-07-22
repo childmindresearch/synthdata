@@ -11,9 +11,8 @@ downstream stage (imputation, generation, evaluation, plotting).
 
 import dataclasses
 import json
-import os
 import types
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -114,7 +113,7 @@ def _load_uci(cfg: Config, data_dir: Path) -> tuple:
     df = pd.concat([repo.data.features, repo.data.targets], axis=1)
     variable_types = None
     if hasattr(repo, "variables") and repo.variables is not None:
-        variable_types = dict(zip(repo.variables["name"], repo.variables["type"]))
+        variable_types = dict(zip(repo.variables["name"], repo.variables["type"], strict=True))
     return df, variable_types
 
 
@@ -147,20 +146,18 @@ def infer_categorical_columns(
         return [c for c in explicit if c in feature_columns]
 
     if uci_variable_types is not None:
-        cats = [
-            c
-            for c in feature_columns
-            if uci_variable_types.get(c) == "Categorical"
-        ]
+        cats = [c for c in feature_columns if uci_variable_types.get(c) == "Categorical"]
         if cats:
             return cats
 
     cats = []
     for c in feature_columns:
         dtype = df[c].dtype
-        if dtype == object or str(dtype) == "category" or dtype == bool:
-            cats.append(c)
-        elif df[c].nunique(dropna=True) <= unique_threshold:
+        if (
+            dtype in (object, bool)
+            or str(dtype) == "category"
+            or df[c].nunique(dropna=True) <= unique_threshold
+        ):
             cats.append(c)
     return cats
 
@@ -168,9 +165,7 @@ def infer_categorical_columns(
 def remap_binary_one_two(df: pd.DataFrame) -> pd.DataFrame:
     """Remap any column whose only non-null unique values are {1, 2} to {0, 1}."""
     out = df.copy()
-    binary_cols = [
-        c for c in out.columns if set(out[c].dropna().unique().tolist()) == {1, 2}
-    ]
+    binary_cols = [c for c in out.columns if set(out[c].dropna().unique().tolist()) == {1, 2}]
     if binary_cols:
         out[binary_cols] = out[binary_cols] - 1
     return out
@@ -192,6 +187,93 @@ def cast_integer_like_columns(df: pd.DataFrame, columns: list) -> pd.DataFrame:
             continue
         if np.all(np.mod(series, 1) == 0):
             out[c] = series.astype(int)
+    return out
+
+
+def label_encode_non_numeric_columns(df: pd.DataFrame, columns: list) -> tuple[pd.DataFrame, dict]:
+    """Factorize any non-numeric (e.g. string-valued) columns to integer codes.
+
+    Some backends (``TabImputeCategorical``, TabPFN) require a fully numeric
+    matrix, but a plain CSV source (unlike the pre-encoded UCI hepatitis
+    example) commonly has string-valued categorical columns (e.g.
+    "Light"/"Heavy"/...). Missing values are preserved as NaN so they're still
+    treated as missing rather than a category. Returns the encoded frame plus
+    ``{column: categories}``, needed to decode output back to the original
+    labels via :func:`decode_label_encoded_columns`. Already-numeric columns
+    pass through unchanged.
+    """
+    encoded = df[columns].copy()
+    category_maps = {}
+    for col in columns:
+        if pd.api.types.is_numeric_dtype(encoded[col]):
+            continue
+        codes, categories = pd.factorize(encoded[col], sort=True)
+        codes = codes.astype(float)
+        codes[codes == -1] = np.nan  # factorize maps NaN -> -1
+        encoded[col] = codes
+        category_maps[col] = categories
+    return encoded, category_maps
+
+
+def decode_label_encoded_columns(df: pd.DataFrame, category_maps: dict) -> pd.DataFrame:
+    """Invert :func:`label_encode_non_numeric_columns`, mapping codes back to labels."""
+    decoded = df.copy()
+    for col, categories in category_maps.items():
+        if col not in decoded.columns:
+            continue
+        codes = decoded[col].round().clip(0, len(categories) - 1).astype(int)
+        decoded[col] = categories.take(codes)
+    return decoded
+
+
+def mask_outliers_as_missing(df: pd.DataFrame, columns: list, threshold: float) -> pd.DataFrame:
+    """Set numeric values beyond ``threshold`` std-devs of their column mean to NaN.
+
+    Plain (non-robust) mean/std, not a robust median/MAD-based z-score: many of
+    this kind of column are zero-/mode-inflated ordinal-ish measures (e.g. a
+    day-count column with median=MAD=1 but a legitimate long tail out to 30),
+    for which MAD-based z-scores false-positive heavily on real boundary values
+    (confirmed empirically) while under-flagging true outliers whenever the
+    "bulk" of the column has zero MAD (all-too-common for zero-inflated
+    columns). Plain std is itself inflated by genuine outliers, but for a
+    single (or few) extreme value(s) among ``n`` otherwise-plausible ones its
+    z-score stays roughly ``sqrt(n)`` regardless of how extreme the value is,
+    which is more than enough separation at this dataset's scale. Catches both
+    "not administered" sentinel codes (e.g. a lone 999 among otherwise 0-30
+    values) and corrupt outlier rows (e.g. a derived metric blown up by a
+    division artifact), either of which can otherwise cause float32 overflow
+    inside TabPFN/TabImpute. Non-numeric and constant (zero-std) columns are
+    left untouched.
+
+    Deliberately a single pass (not iterative): re-fitting mean/std after each
+    removal and repeating would catch smaller residual outliers, but also
+    cascades into masking legitimate boundary values (confirmed empirically --
+    e.g. removing a 999 sentinel from a 0-31 day-count column shrinks std
+    enough that a legitimate, repeated 30 then looks like an "outlier" too).
+    A single pass only removes the most egregious values -- exactly what's
+    needed to avoid literal float32 infinity/overflow -- and leaves smaller
+    (still-plausible) residual outliers alone.
+    """
+    out = df.copy()
+    for col in columns:
+        if col not in out.columns or not pd.api.types.is_numeric_dtype(out[col]):
+            continue
+        series = out[col]
+        mean = series.mean()
+        std = series.std()
+        if not std or np.isnan(std):
+            continue
+        z = (series - mean).abs() / std
+        outliers = z > threshold
+        if outliers.any():
+            logger.info(
+                "Masking %d outlier value(s) in %r as missing (|z| > %.1f, e.g. %s)",
+                int(outliers.sum()),
+                col,
+                threshold,
+                series[outliers].tolist()[:5],
+            )
+            out.loc[outliers, col] = np.nan
     return out
 
 
@@ -225,7 +307,7 @@ def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
         "n_train": int(len(dataset.train_df)),
         "n_test": int(len(dataset.test_df)),
         "seed": cfg.seed,
-        "last_loaded_at": datetime.now(timezone.utc).isoformat(),
+        "last_loaded_at": datetime.now(UTC).isoformat(),
         "git_commit": git_commit(),
     }
     with open(manifest_path, "w") as f:
@@ -267,9 +349,20 @@ def load_dataset(cfg: Config) -> Dataset:
     target_column = cfg.data.target_column
     if target_column not in df.columns:
         raise KeyError(
-            f"target_column '{target_column}' not found in loaded data columns: "
-            f"{list(df.columns)}"
+            f"target_column '{target_column}' not found in loaded data columns: {list(df.columns)}"
         )
+
+    if cfg.data.drop_rows_missing_target:
+        n_before = len(df)
+        df = df[df[target_column].notna()].reset_index(drop=True)
+        n_dropped = n_before - len(df)
+        if n_dropped:
+            logger.info(
+                "Dropped %d/%d rows with missing target_column %r",
+                n_dropped,
+                n_before,
+                target_column,
+            )
 
     feature_columns = [c for c in df.columns if c != target_column]
     categorical_columns = infer_categorical_columns(
@@ -285,6 +378,14 @@ def load_dataset(cfg: Config) -> Dataset:
     # from dtype (object/int) rather than cardinality, so a float-typed {0.0, 1.0}
     # target/categorical column would otherwise silently be treated as continuous.
     df = cast_integer_like_columns(df, categorical_columns + [target_column])
+
+    if cfg.data.outlier_zscore_threshold is not None and cfg.data.outlier_columns:
+        outlier_columns = [
+            c
+            for c in cfg.data.outlier_columns
+            if c in feature_columns and c not in categorical_columns
+        ]
+        df = mask_outliers_as_missing(df, outlier_columns, cfg.data.outlier_zscore_threshold)
 
     missing_sensitive = [c for c in cfg.data.sensitive_columns if c not in df.columns]
     if missing_sensitive:

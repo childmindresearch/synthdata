@@ -114,9 +114,9 @@ def build_synthcity_objective(
                 task_type="classification",
                 workspace=workspace_path,
             )
-        except Exception as exc:  # noqa: BLE001 - HPO trials should soft-fail
+        except (ValueError, RuntimeError) as exc:
             logger.warning("[%s] trial %d failed: %s", name, trial.number, exc)
-            raise optuna.TrialPruned()
+            raise optuna.TrialPruned() from exc
         return hpo_score(report[trial_id])
 
     return objective

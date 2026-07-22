@@ -8,7 +8,6 @@ appended as extra columns in the same table, both per ``(framework, type)`` grou
 and rolled up across frameworks per ``type``, plus one overall rank.
 """
 
-import numpy as np
 import pandas as pd
 
 from synthdata.evaluation.catalog import (
@@ -30,17 +29,31 @@ _RANK = "rank"
 def _synthcity_frames(
     synthcity_results: dict[str, pd.DataFrame], model_names: list
 ) -> "tuple[pd.DataFrame, pd.DataFrame]":
-    """Build (raw, oriented) models x metric-key tables from synthcity results."""
+    """Build (raw, oriented) models x metric-key tables from synthcity results.
+
+    Entries with an "error" column (a model whose synthcity evaluation failed,
+    see ``synthcity_eval.run_synthcity_evaluation``) are excluded from the
+    metric table -- they carry no "mean"/"direction" data to combine -- but
+    are logged so the exclusion is visible, not silent.
+    """
     if not synthcity_results:
         empty = pd.DataFrame(index=model_names)
         return empty, empty
 
-    raw = pd.DataFrame(
-        {name: res["mean"] for name, res in synthcity_results.items()}
-    ).T
+    failed = {name for name, res in synthcity_results.items() if "error" in res.columns}
+    if failed:
+        logger.warning(
+            "[synthcity] excluding failed models from combined table: %s", sorted(failed)
+        )
+    ok_results = {name: res for name, res in synthcity_results.items() if name not in failed}
+    if not ok_results:
+        empty = pd.DataFrame(index=model_names)
+        return empty, empty
+
+    raw = pd.DataFrame({name: res["mean"] for name, res in ok_results.items()}).T
 
     directions = {}
-    for res in synthcity_results.values():
+    for res in ok_results.values():
         for metric_key, direction in res["direction"].items():
             directions.setdefault(metric_key, direction)
     sign = pd.Series(directions).map({"maximize": 1.0, "minimize": -1.0})
@@ -81,8 +94,7 @@ def _syntheval_frames(
         return "custom" if metric in SYNTHEVAL_CUSTOM_FAIRNESS_KEYS else "syntheval"
 
     columns = [
-        (_framework(col), SYNTHEVAL_METRIC_TYPE.get(col, "utility"), col)
-        for col in raw.columns
+        (_framework(col), SYNTHEVAL_METRIC_TYPE.get(col, "utility"), col) for col in raw.columns
     ]
     raw.columns = pd.MultiIndex.from_tuples(columns)
     oriented.columns = pd.MultiIndex.from_tuples(columns)
@@ -163,7 +175,15 @@ def build_combined_table(
     combined = raw_df.copy()
 
     # Per (framework, type) sub-rank.
-    groups = sorted(set(zip(scaled_df.columns.get_level_values(0), scaled_df.columns.get_level_values(1))))
+    groups = sorted(
+        set(
+            zip(
+                scaled_df.columns.get_level_values(0),
+                scaled_df.columns.get_level_values(1),
+                strict=True,
+            )
+        )
+    )
     for framework, type_ in groups:
         cols = [c for c in scaled_df.columns if c[0] == framework and c[1] == type_]
         combined[(framework, type_, _RANK)] = scaled_df[cols].sum(axis=1, skipna=True)

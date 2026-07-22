@@ -48,30 +48,23 @@ class TabPFGenSGLDLabels(TabPFGen):
                 sample_idx = np.random.choice(idx, size=n_per_class)
                 x_parts.append(
                     x_train[sample_idx]
-                    + torch.randn(n_per_class, X_train.shape[1], device=self.device)
-                    * 0.01
+                    + torch.randn(n_per_class, X_train.shape[1], device=self.device) * 0.01
                 )
                 y_parts.append(torch.full((n_per_class,), cls, device=self.device))
             x_synth = torch.cat(x_parts)
             y_synth = torch.cat(y_parts)
         else:
-            x_synth = (
-                torch.randn(n_samples, X_train.shape[1], device=self.device) * 0.01
-            )
-            y_synth = torch.randint(
-                0, len(np.unique(y_train)), (n_samples,), device=self.device
-            )
+            x_synth = torch.randn(n_samples, X_train.shape[1], device=self.device) * 0.01
+            y_synth = torch.randint(0, len(np.unique(y_train)), (n_samples,), device=self.device)
 
-        for step in range(self.n_sgld_steps):
+        for _step in range(self.n_sgld_steps):
             x_synth = self._sgld_step(x_synth, y_synth, x_train, y_train_t)
 
         # Re-assign labels based on nearest neighbor in the scaled training set:
         # SGLD may drift samples across class boundaries, so this reflects final
         # positions rather than initialization assignments.
         x_synth_np = x_synth.detach().cpu().numpy()
-        sq_dists = np.sum(
-            (x_synth_np[:, None, :] - x_scaled[None, :, :]) ** 2, axis=-1
-        )
+        sq_dists = np.sum((x_synth_np[:, None, :] - x_scaled[None, :, :]) ** 2, axis=-1)
         nn_indices = np.argmin(sq_dists, axis=1)
         y_synth_drifted = y_train[nn_indices]
 
@@ -152,7 +145,9 @@ def generate_tabpfgen_custom(
     n_per_class_needed = int(np.ceil(n_samples * train_proportions.max()))
     n_to_generate = n_per_class_needed * n_classes
 
-    generator = TabPFGenSGLDLabels(**(sgld_params or {"n_sgld_steps": 1000, "sgld_noise_scale": 0.1}))
+    generator = TabPFGenSGLDLabels(
+        **(sgld_params or {"n_sgld_steps": 1000, "sgld_noise_scale": 0.1})
+    )
     x_synth_all, y_synth_all = generator.generate_classification(
         x_train, y_train, n_samples=n_to_generate, balance_classes=True
     )
@@ -163,18 +158,14 @@ def generate_tabpfgen_custom(
         synth_all[col] = synth_all[col].round().clip(0, n_cats - 1).astype(int)
 
     n_classes_enc = train_imputed_df[target_column].nunique()
-    synth_all[target_column] = (
-        pd.Series(y_synth_all.astype(int)).clip(0, n_classes_enc - 1).values
-    )
+    synth_all[target_column] = pd.Series(y_synth_all.astype(int)).clip(0, n_classes_enc - 1).values
 
     parts = []
     for orig_cls, proportion in train_proportions.items():
         n_needed = round(n_samples * proportion)
         cls_rows = synth_all[synth_all[target_column] == orig_cls]
         parts.append(
-            cls_rows.sample(
-                n=n_needed, replace=len(cls_rows) < n_needed, random_state=seed
-            )
+            cls_rows.sample(n=n_needed, replace=len(cls_rows) < n_needed, random_state=seed)
         )
     return pd.concat(parts).sample(frac=1, random_state=seed).reset_index(drop=True)
 
@@ -211,9 +202,9 @@ def build_tabpfgen_standard_objective(
             clf = TabPFNClassifier()
             clf.fit(x_feat, y_label)
             syn[target_column] = clf.predict(syn.to_numpy())
-        except Exception as exc:  # noqa: BLE001
+        except (ValueError, RuntimeError) as exc:
             logger.warning("tabpfgen_standard trial %d failed: %s", trial.number, exc)
-            raise optuna.TrialPruned()
+            raise optuna.TrialPruned() from exc
         return eval_fn(syn)
 
     return objective
@@ -253,19 +244,19 @@ def build_tabpfgen_custom_objective(
             for c in categorical_columns:
                 all_df[c] = all_df[c].round().clip(0, train_imputed_df[c].nunique() - 1).astype(int)
             all_df[target_column] = (
-                pd.Series(y_s.astype(int)).clip(0, train_imputed_df[target_column].nunique() - 1).values
+                pd.Series(y_s.astype(int))
+                .clip(0, train_imputed_df[target_column].nunique() - 1)
+                .values
             )
             parts = []
             for cls, prop in proportions.items():
                 n_need = round(n_samples * prop)
                 rows = all_df[all_df[target_column] == cls]
-                parts.append(
-                    rows.sample(n=n_need, replace=len(rows) < n_need, random_state=seed)
-                )
+                parts.append(rows.sample(n=n_need, replace=len(rows) < n_need, random_state=seed))
             syn = pd.concat(parts).sample(frac=1, random_state=seed).reset_index(drop=True)
-        except Exception as exc:  # noqa: BLE001
+        except (ValueError, RuntimeError) as exc:
             logger.warning("tabpfgen_custom trial %d failed: %s", trial.number, exc)
-            raise optuna.TrialPruned()
+            raise optuna.TrialPruned() from exc
         return eval_fn(syn)
 
     return objective

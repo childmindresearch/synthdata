@@ -1,22 +1,77 @@
 """TabPFN-based synthetic data generation (two variants).
 
-Both variants use TabPFN's unsupervised-experiment API (``tabpfn_extensions``)
-and operate on the *original* (pre-imputation) train split, since TabPFN's
-foundation model handles missing values natively.
+Both variants use TabPFN's unsupervised-experiment API (``tabpfn_extensions``).
+TabPFN's foundation model handles missing values natively, so the caller may
+pass either the original (pre-imputation) train split or the imputed one --
+see ``generation.tabpfn.data_variants`` in the pipeline config, which drives
+:func:`synthdata.generation.pipeline.run_generation`.
 """
 
 import numpy as np
 import pandas as pd
+import torch
 
+from synthdata.data import decode_label_encoded_columns, label_encode_non_numeric_columns
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def _patch_use_classifier_nan_bug():
+    """Work around a tabpfn_extensions bug where a column's classifier-vs-
+    regressor decision is inconsistent between ``density_`` (which picks the
+    model) and ``sample_from_model_prediction_`` (which picks the predict
+    API), causing e.g. ``TabPFNClassifier.predict() got an unexpected keyword
+    argument 'output_type'``.
+
+    Root cause: ``use_classifier_`` counts unique values via
+    ``torch.unique``/``np.unique`` without dropping NaNs first. Since NaN !=
+    NaN, every missing entry counts as its own "unique" value. ``density_``
+    calls it on a target-observed-filtered (NaN-free) column, while
+    ``sample_from_model_prediction_`` calls it again on the raw column
+    (which, for imputation/synthesis, is mostly NaN) -- inflating the unique
+    count past ``max_classes`` and flipping the decision for genuinely
+    low-cardinality categorical columns. Filtering NaNs before counting
+    makes both call sites agree. Safe/idempotent to call repeatedly; patches
+    the class in place since there's no supported extension point.
+
+    Tracking: distinct from the categorical-inference bug fixed by upstream
+    PRs #326/#312 (see ``/memories/repo/synthdata-tabpfn-notes.md``) -- this
+    is `TabPFNUnsupervisedModel.use_classifier_` in
+    ``tabpfn_extensions/unsupervised/unsupervised.py``, still present as of
+    the git-main commit this repo pins in ``pyproject.toml``
+    (``tabpfn-extensions = { git = ..., branch = "main" }``). No upstream
+    issue/PR has been filed for this specific bug yet -- if you file one,
+    add the link here and re-check whether this patch is still needed before
+    deleting it.
+    """
+    from tabpfn_extensions import unsupervised
+    from tabpfn_extensions.utils import get_max_num_classes
+
+    def use_classifier_(self, column_idx, y):
+        is_categorical = column_idx in self.categorical_features
+        if self.tabpfn_clf is None:
+            return is_categorical
+        max_classes = get_max_num_classes(self.tabpfn_clf)
+        if torch.is_tensor(y):
+            y_valid = y[~torch.isnan(y)] if torch.is_floating_point(y) else y
+            n_unique = torch.unique(y_valid).numel()
+        else:
+            y_arr = np.asarray(y)
+            if np.issubdtype(y_arr.dtype, np.floating):
+                y_arr = y_arr[~np.isnan(y_arr)]
+            n_unique = len(np.unique(y_arr))
+        return is_categorical and (max_classes is None or n_unique <= max_classes)
+
+    unsupervised.TabPFNUnsupervisedModel.use_classifier_ = use_classifier_
 
 
 def _make_experiment():
     from tabpfn import TabPFNClassifier, TabPFNRegressor
     from tabpfn_extensions import unsupervised
     from tabpfn_extensions.unsupervised import experiments
+
+    _patch_use_classifier_nan_bug()
 
     model_unsupervised = unsupervised.TabPFNUnsupervisedModel(
         tabpfn_clf=TabPFNClassifier(), tabpfn_reg=TabPFNRegressor()
@@ -43,7 +98,13 @@ def generate_tabpfn_standard(
     """
     from tabpfn import TabPFNClassifier
 
-    x = train_df[feature_columns].to_numpy()
+    # TabPFN requires a purely numeric array; the raw (pre-imputation) train
+    # split may still have string-valued categorical columns (e.g. a plain CSV
+    # source, unlike the pre-encoded UCI hepatitis example) that aren't caught
+    # by ``categorical_columns`` alone -- encode every feature column, NaN
+    # preserved so TabPFN's native missing-value handling still applies.
+    encoded_features, category_maps = label_encode_non_numeric_columns(train_df, feature_columns)
+    x = encoded_features.to_numpy(dtype=float)
     y = train_df[target_column].to_numpy()
     attribute_names = list(feature_columns)
     categorical_indices = [
@@ -63,11 +124,20 @@ def generate_tabpfn_standard(
     )
     experiment.data = experiment.data.reset_index(drop=True)
 
-    synthetic_data = experiment.data_synthetic[attribute_names].reset_index(drop=True)
+    # Not experiment.data_synthetic: tabpfn_extensions unconditionally resamples
+    # (with replacement) data_synthetic to match len(data_real) for its internal
+    # pairplot, even with should_plot=False -- reading it back would silently
+    # give ``len(train_df)`` rows instead of the requested n_samples.
+    synthetic_encoded = pd.DataFrame(
+        experiment.synthetic_X.detach().cpu().numpy(), columns=attribute_names
+    )
 
     clf = TabPFNClassifier()
     clf.fit(x, y)
-    synthetic_data[target_column] = clf.predict(synthetic_data.to_numpy())
+    target_values = clf.predict(synthetic_encoded.to_numpy(dtype=float))
+
+    synthetic_data = decode_label_encoded_columns(synthetic_encoded, category_maps)
+    synthetic_data[target_column] = target_values
 
     return synthetic_data, experiment
 
@@ -82,7 +152,10 @@ def generate_tabpfn_custom(
 
     Returns ``(synthetic_df, experiment)``.
     """
-    train_array = train_df.values
+    encoded_train, category_maps = label_encode_non_numeric_columns(
+        train_df, train_df.columns.tolist()
+    )
+    train_array = encoded_train.to_numpy(dtype=float)
     attribute_names = train_df.columns.tolist()
     categorical_indices = [
         attribute_names.index(c)
@@ -103,8 +176,10 @@ def generate_tabpfn_custom(
     )
     experiment.data = experiment.data.reset_index(drop=True)
 
-    synthetic_data = pd.DataFrame(
-        experiment.data_synthetic.drop(columns=["real_or_synthetic"]),
-        columns=train_df.columns,
+    # See the comment in generate_tabpfn_standard: experiment.data_synthetic is
+    # resampled to match len(data_real), not n_samples -- use the raw array instead.
+    synthetic_encoded = pd.DataFrame(
+        experiment.synthetic_X.detach().cpu().numpy(), columns=attribute_names
     )
+    synthetic_data = decode_label_encoded_columns(synthetic_encoded, category_maps)
     return synthetic_data, experiment

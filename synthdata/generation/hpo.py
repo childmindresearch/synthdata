@@ -64,9 +64,9 @@ def build_synthetic_eval_fn(
         )
 
     def eval_fn(syn_df: pd.DataFrame) -> float:
-        ref_df = syn_df.sample(
-            n=len(syn_df), replace=True, random_state=seed + 1
-        ).reset_index(drop=True)
+        ref_df = syn_df.sample(n=len(syn_df), replace=True, random_state=seed + 1).reset_index(
+            drop=True
+        )
         x_aug = pd.concat([train_reference_df, syn_df], ignore_index=True)
         report = Metrics.evaluate(
             _loader(holdout_df),
@@ -122,9 +122,7 @@ def run_study(
     generation should fall back to the plugin's own default instead.
     """
     study = create_study(study_name, hpo_cfg, output_dir, seed)
-    n_done = len(
-        [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-    )
+    n_done = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     n_remaining = max(hpo_cfg.n_trials - n_done, 0)
     if n_remaining > 0:
         logger.info(
@@ -142,13 +140,9 @@ def run_study(
             show_progress_bar=False,
         )
 
-    completed = [
-        t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE
-    ]
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     if not completed:
-        logger.warning(
-            "[%s] all trials pruned/failed; falling back to defaults", study_name
-        )
+        logger.warning("[%s] all trials pruned/failed; falling back to defaults", study_name)
         return {}
 
     best = {k: v for k, v in study.best_params.items() if k not in drop_keys}

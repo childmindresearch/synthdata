@@ -89,6 +89,11 @@ generation:
   tabpfn:
     enabled: true
     variants: [standard, custom]
+    # "raw" fits on the original pre-imputation train split (TabPFN handles
+    # missing values natively); "imputed" fits on the same imputed split used
+    # by every other model. Include both to compare TabPFN with vs. without
+    # imputation -- imputed outputs are cached as e.g. "tabpfn_standard_imputed".
+    data_variants: [raw, imputed]
 
   tabpfgen:
     enabled: true

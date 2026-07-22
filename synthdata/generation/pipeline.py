@@ -15,23 +15,50 @@ from synthdata.config import Config
 from synthdata.data import Dataset
 from synthdata.generation import hpo as hpo_mod
 from synthdata.generation import synthcity_backend as sc
-from synthdata.generation import tabpfgen_backend as tpfgen
 from synthdata.generation import tabpfn_backend as tpfn
 from synthdata.utils import ensure_dir, get_logger, resolve_device
+
+# tabpfgen_backend is imported lazily (see the `gen_cfg.tabpfgen.enabled` branch
+# below) because it does `from tabpfgen import TabPFGen` at module scope (to
+# subclass TabPFGenSGLDLabels), which requires the optional `tabpfn` extra.
+# Keeping it out of this module's top-level imports lets `synthdata.generation`
+# (and anything testing config/caching/other-backend logic) import cleanly with
+# only the base dependencies installed.
 
 logger = get_logger(__name__)
 
 
+def needs_imputed_data(gen_cfg) -> bool:
+    """Whether any configured model actually requires the imputed train split.
+
+    synthcity and TabPFGen always fit on ``train_imputed_df``. TabPFN can fit on
+    either split (see ``TabPFNConfig.data_variants``); it only needs imputed data
+    if "imputed" is one of the requested variants.
+    """
+    return (
+        (gen_cfg.synthcity.enabled and bool(gen_cfg.synthcity.names))
+        or gen_cfg.tabpfgen.enabled
+        or (gen_cfg.tabpfn.enabled and "imputed" in gen_cfg.tabpfn.data_variants)
+    )
+
+
 def run_generation(
-    cfg: Config, dataset: Dataset, plot_callback: Callable | None = None
+    cfg: Config,
+    dataset: Dataset,
+    plot_callback: Callable | None = None,
+    experiment=None,
 ) -> dict[str, pd.DataFrame]:
     """Generate (or load cached) synthetic datasets for every configured model.
 
     ``plot_callback(name, synthetic_df, extra)`` is invoked right after each
     dataset is (re)generated (not when loaded from cache), so callers can save
     real-vs-synthetic figures inline; see :mod:`synthdata.plotting.generation_plots`.
+    If ``experiment`` (a :class:`synthdata.experiment.Experiment`) is given, a
+    failed plot callback is recorded to its manifest (``stage="generation_plot_failed"``)
+    in addition to the console warning, so the skip is visible from the
+    output directory alone.
     """
-    if dataset.train_imputed_df is None:
+    if dataset.train_imputed_df is None and needs_imputed_data(cfg.generation):
         raise RuntimeError(
             "Dataset must be imputed before generation (run synthdata.imputation.run_imputation first)"
         )
@@ -42,9 +69,7 @@ def run_generation(
     seed = cfg.seed
     device = resolve_device(cfg.device)
 
-    best_params_path = gen_cfg.hpo.best_params_path or hpo_mod.default_best_params_path(
-        output_dir
-    )
+    best_params_path = gen_cfg.hpo.best_params_path or hpo_mod.default_best_params_path(output_dir)
     best_params = hpo_mod.BestParamsCache(best_params_path)
 
     synthetic_datasets: dict[str, pd.DataFrame] = {}
@@ -65,8 +90,18 @@ def run_generation(
         if plot_callback is not None:
             try:
                 plot_callback(name, df, extra)
-            except Exception as exc:  # noqa: BLE001 - plotting must never break generation
+            except (ValueError, TypeError, OSError, RuntimeError) as exc:
+                # Plotting must never break generation: skip just this
+                # figure, but persist the skip to the experiment manifest so
+                # it's visible from the output directory, not just the console.
                 logger.warning("[%s] plot callback failed: %s", name, exc)
+                if experiment is not None:
+                    experiment.record(
+                        "generation_plot_failed",
+                        model=name,
+                        error=str(exc),
+                        error_type=type(exc).__name__,
+                    )
         return df
 
     # ------------------------------------------------------------------
@@ -130,35 +165,46 @@ def run_generation(
                 )
 
     # ------------------------------------------------------------------
-    # TabPFN models (no HPO; use the original, pre-imputation train split)
+    # TabPFN models (no HPO; can fit on the original pre-imputation train
+    # split and/or the imputed one -- see gen_cfg.tabpfn.data_variants)
     # ------------------------------------------------------------------
     if gen_cfg.tabpfn.enabled:
-        if "standard" in gen_cfg.tabpfn.variants:
-            _cached_or_build(
-                "tabpfn_standard",
-                lambda: tpfn.generate_tabpfn_standard(
-                    dataset.train_df,
-                    dataset.feature_columns,
-                    dataset.categorical_columns,
-                    dataset.target_column,
-                    n_samples,
-                ),
-            )
-        if "custom" in gen_cfg.tabpfn.variants:
-            _cached_or_build(
-                "tabpfn_custom",
-                lambda: tpfn.generate_tabpfn_custom(
-                    dataset.train_df,
-                    dataset.categorical_columns,
-                    dataset.target_column,
-                    n_samples,
-                ),
-            )
+        for data_variant in gen_cfg.tabpfn.data_variants:
+            if data_variant == "imputed":
+                train_df_variant = dataset.train_imputed_df
+                suffix = "_imputed"
+            else:
+                train_df_variant = dataset.train_df
+                suffix = ""
+
+            if "standard" in gen_cfg.tabpfn.variants:
+                _cached_or_build(
+                    f"tabpfn_standard{suffix}",
+                    lambda train_df_variant=train_df_variant: tpfn.generate_tabpfn_standard(
+                        train_df_variant,
+                        dataset.feature_columns,
+                        dataset.categorical_columns,
+                        dataset.target_column,
+                        n_samples,
+                    ),
+                )
+            if "custom" in gen_cfg.tabpfn.variants:
+                _cached_or_build(
+                    f"tabpfn_custom{suffix}",
+                    lambda train_df_variant=train_df_variant: tpfn.generate_tabpfn_custom(
+                        train_df_variant,
+                        dataset.categorical_columns,
+                        dataset.target_column,
+                        n_samples,
+                    ),
+                )
 
     # ------------------------------------------------------------------
     # TabPFGen models (use the imputed train split)
     # ------------------------------------------------------------------
     if gen_cfg.tabpfgen.enabled:
+        from synthdata.generation import tabpfgen_backend as tpfgen
+
         eval_fn = None
         if gen_cfg.hpo.enabled:
             eval_fn = hpo_mod.build_synthetic_eval_fn(
@@ -169,7 +215,6 @@ def run_generation(
                 gen_cfg.hpo.metric_config,
                 seed,
                 workspace=output_dir / "synthcity_workspace",
-
             )
 
         if "standard" in gen_cfg.tabpfgen.variants:
@@ -270,5 +315,9 @@ def run_generation(
                     ),
                 )
 
-    logger.info("Generated/loaded %d synthetic datasets: %s", len(synthetic_datasets), sorted(synthetic_datasets))
+    logger.info(
+        "Generated/loaded %d synthetic datasets: %s",
+        len(synthetic_datasets),
+        sorted(synthetic_datasets),
+    )
     return synthetic_datasets

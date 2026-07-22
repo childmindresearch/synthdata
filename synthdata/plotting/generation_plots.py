@@ -33,7 +33,7 @@ def plot_real_vs_synthetic(
     fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.5 * nrows))
     axes_flat = np.atleast_1d(axes).flatten()
 
-    for ax, col in zip(axes_flat, feature_columns):
+    for ax, col in zip(axes_flat, feature_columns, strict=False):
         if col not in real_df.columns or col not in synth_df.columns:
             ax.axis("off")
             continue
@@ -43,8 +43,18 @@ def plot_real_vs_synthetic(
             categories = sorted(set(real_freq.index) | set(synth_freq.index))
             positions = np.arange(len(categories))
             width = 0.4
-            ax.bar(positions - width / 2, [real_freq.get(c, 0) for c in categories], width, label="real")
-            ax.bar(positions + width / 2, [synth_freq.get(c, 0) for c in categories], width, label="synthetic")
+            ax.bar(
+                positions - width / 2,
+                [real_freq.get(c, 0) for c in categories],
+                width,
+                label="real",
+            )
+            ax.bar(
+                positions + width / 2,
+                [synth_freq.get(c, 0) for c in categories],
+                width,
+                label="synthetic",
+            )
             ax.set_xticks(positions)
             ax.set_xticklabels(categories)
             ax.set_ylabel("frequency")
@@ -55,7 +65,7 @@ def plot_real_vs_synthetic(
         ax.set_title(col, fontsize=9)
         ax.legend(fontsize=7)
 
-    for ax in axes_flat[len(feature_columns):]:
+    for ax in axes_flat[len(feature_columns) :]:
         ax.axis("off")
 
     fig.tight_layout()
@@ -85,7 +95,7 @@ def save_generation_plots(
         try:
             fig = plot_real_vs_synthetic(real_df, synth_df, all_columns, categorical)
             save_matplotlib_figure(fig, output_dir / name, cfg.plots.dpi, cfg.plots.formats)
-        except Exception as exc:  # noqa: BLE001
+        except (ValueError, TypeError, OSError, RuntimeError) as exc:
             logger.warning("real-vs-synthetic plot failed for %s: %s", name, exc)
         finally:
             plt.close("all")
@@ -139,10 +149,10 @@ def save_hpo_plots(cfg: Config, output_dir: str | Path) -> None:
                 plot_optimization_history(study), output_dir / f"{study_name}_history", ("html",)
             )
             save_plotly_figure(
-                plot_param_importances(study), output_dir / f"{study_name}_param_importances", ("html",)
+                plot_param_importances(study),
+                output_dir / f"{study_name}_param_importances",
+                ("html",),
             )
-            save_plotly_figure(
-                plot_slice(study), output_dir / f"{study_name}_slice", ("html",)
-            )
-        except Exception as exc:  # noqa: BLE001
+            save_plotly_figure(plot_slice(study), output_dir / f"{study_name}_slice", ("html",))
+        except (ValueError, RuntimeError, OSError) as exc:
             logger.warning("HPO plots failed for %s: %s", study_name, exc)

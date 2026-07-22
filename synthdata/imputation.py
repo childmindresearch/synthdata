@@ -11,7 +11,11 @@ import numpy as np
 import pandas as pd
 
 from synthdata.config import Config
-from synthdata.data import Dataset
+from synthdata.data import (
+    Dataset,
+    decode_label_encoded_columns,
+    label_encode_non_numeric_columns,
+)
 from synthdata.utils import ensure_dir, get_logger, resolve_device
 
 logger = get_logger(__name__)
@@ -69,14 +73,14 @@ def impute_dataframe(
 
     imputer = TabImputeCategorical(device=device)
 
-    x_full = df[feature_columns].values.astype(float)
-    cat_indices = [
-        feature_columns.index(c) for c in categorical_columns if c in feature_columns
-    ]
+    encoded, category_maps = label_encode_non_numeric_columns(df, feature_columns)
+    x_full = encoded.values.astype(float)
+    cat_indices = [feature_columns.index(c) for c in categorical_columns if c in feature_columns]
 
     x_imputed = imputer.impute(x_full.copy(), categorical_columns=cat_indices)
 
     imputed_df = pd.DataFrame(x_imputed, columns=feature_columns, index=df.index)
+    imputed_df = decode_label_encoded_columns(imputed_df, category_maps)
     imputed_df[target_column] = df[target_column].values
     return imputed_df[list(df.columns)]
 
@@ -87,9 +91,15 @@ def apply_rounding(
     round_rules: dict,
     round_to_int_default: bool = True,
 ) -> pd.DataFrame:
-    """Apply post-imputation rounding: explicit per-column decimals, else nearest int."""
+    """Apply post-imputation rounding: explicit per-column decimals, else nearest int.
+
+    Non-numeric columns (e.g. string categories decoded by ``impute_dataframe``)
+    are left untouched regardless of ``round_to_int_default``.
+    """
     out = df.copy()
     for col in feature_columns:
+        if not pd.api.types.is_numeric_dtype(out[col]):
+            continue
         if col in round_rules:
             out[col] = out[col].round(round_rules[col])
         elif round_to_int_default:
@@ -105,15 +115,18 @@ def validate_imputed_column(
 ) -> dict:
     """Check that imputed values are plausible given the observed distribution.
 
-    Categorical columns: imputed values must be integral and within the observed
-    category set. Continuous columns: imputed values must fall within
-    ``[obs_min - margin * range, obs_max + margin * range]``.
+    Categorical columns: imputed values must be within the observed category set
+    (and, for numerically-coded categories, integral). Continuous columns:
+    imputed values must fall within ``[obs_min - margin * range, obs_max + margin * range]``.
     """
     if is_categorical:
         observed_categories = set(observed.dropna().unique().tolist())
-        ok = imputed.apply(
-            lambda v: (float(v).is_integer()) and (round(v) in observed_categories)
-        )
+        if pd.api.types.is_numeric_dtype(observed):
+            ok = imputed.apply(
+                lambda v: (float(v).is_integer()) and (round(v) in observed_categories)
+            )
+        else:
+            ok = imputed.isin(observed_categories)
     else:
         obs_min, obs_max = observed.min(), observed.max()
         span = obs_max - obs_min
@@ -150,6 +163,12 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
     if not cfg.imputation.enabled:
         logger.info("Imputation disabled; using rows with complete cases only")
         full_imputed = dataset.full_df.dropna().copy()
+        if full_imputed.empty:
+            raise RuntimeError(
+                "imputation.enabled=false requires complete-case rows, but every row has "
+                "at least one missing feature value (0 complete cases out of "
+                f"{len(dataset.full_df)}). Set imputation.enabled: true in the config."
+            )
     else:
         device = resolve_device(cfg.imputation.device)
         n_missing = int(dataset.full_df[dataset.feature_columns].isna().sum().sum())
@@ -176,8 +195,22 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
     ensure_dir(dataset.data_dir)
     full_imputed.to_csv(paths["full_imputed"], index=False)
 
-    train_imputed = full_imputed.loc[dataset.train_df.index]
-    test_imputed = full_imputed.loc[dataset.test_df.index]
+    # When imputation is disabled, full_imputed is a complete-case subset of
+    # full_df (dropna()), so its index may no longer contain every train/test
+    # row -- intersect rather than assume a full match (still a strict subset
+    # when imputation ran, since full_imputed then shares full_df's index).
+    train_imputed = full_imputed.loc[full_imputed.index.intersection(dataset.train_df.index)]
+    test_imputed = full_imputed.loc[full_imputed.index.intersection(dataset.test_df.index)]
+    if not cfg.imputation.enabled and (
+        len(train_imputed) < len(dataset.train_df) or len(test_imputed) < len(dataset.test_df)
+    ):
+        logger.info(
+            "Complete-case filtering dropped train %d->%d, test %d->%d rows",
+            len(dataset.train_df),
+            len(train_imputed),
+            len(dataset.test_df),
+            len(test_imputed),
+        )
     train_imputed.to_csv(paths["train_imputed"], index=False)
     test_imputed.to_csv(paths["test_imputed"], index=False)
 
@@ -203,6 +236,7 @@ def build_validation_report(cfg: Config, dataset: Dataset) -> pd.DataFrame:
         observed = full_df.loc[~missing_mask, col]
         imputed = full_imputed.loc[missing_mask, col]
         is_categorical = col in dataset.categorical_columns
+        is_numeric = pd.api.types.is_numeric_dtype(observed)
         result = validate_imputed_column(
             observed, imputed, is_categorical, cfg.imputation.validation_margin
         )
@@ -211,10 +245,10 @@ def build_validation_report(cfg: Config, dataset: Dataset) -> pd.DataFrame:
                 "column": col,
                 "categorical": is_categorical,
                 "n_missing": n_missing,
-                "obs_mean": float(observed.mean()) if len(observed) else np.nan,
-                "obs_std": float(observed.std()) if len(observed) else np.nan,
-                "imp_mean": float(imputed.mean()) if len(imputed) else np.nan,
-                "imp_std": float(imputed.std()) if len(imputed) else np.nan,
+                "obs_mean": float(observed.mean()) if is_numeric and len(observed) else np.nan,
+                "obs_std": float(observed.std()) if is_numeric and len(observed) else np.nan,
+                "imp_mean": float(imputed.mean()) if is_numeric and len(imputed) else np.nan,
+                "imp_std": float(imputed.std()) if is_numeric and len(imputed) else np.nan,
                 **result,
             }
         )

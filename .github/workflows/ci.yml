@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Avoid piling up redundant runs when new commits land on the same PR/branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      # Lint doesn't need the project installed at all -- just ruff itself.
+      - run: uvx ruff check .
+      - run: uvx ruff format --check .
+
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-latest
+    env:
+      # This repo's base deps pin torch to the CUDA 12.8 wheel index for local
+      # GPU development (see [tool.uv.sources] in pyproject.toml). GitHub-hosted
+      # runners have no GPU, so force the CPU wheel here to keep CI installs
+      # fast -- this only affects dependency resolution for this job, not the
+      # pinned config used by local/production installs.
+      UV_TORCH_BACKEND: cpu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # submodules/syntheval and submodules/synthcity are real git
+          # submodules, installed editable via [tool.uv.sources] path entries.
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v3
+      # Base dependencies only -- deliberately not the optional `tabpfn` extra
+      # (tabpfgen/tabpfn/tabpfn-extensions/tabimpute), which is heavy (git
+      # dependency) and not needed for the current test suite. See
+      # synthdata/generation/pipeline.py's lazy tabpfgen_backend import, which
+      # is what makes this possible.
+      - run: uv sync
+      - name: Run tests (excluding slow/network-marked tests)
+        run: uv run pytest -m "not slow and not network" --cov=synthdata --cov-report=term-missing

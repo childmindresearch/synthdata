@@ -47,6 +47,12 @@ class DataConfig:
     sensitive_columns: list = dataclasses.field(default_factory=list)
     #: Columns to drop entirely before any modeling (e.g. free-text/ID columns).
     drop_columns: list = dataclasses.field(default_factory=list)
+    #: Drop rows where target_column is null before splitting/imputing. Every
+    #: downstream stage assumes a fully-observed target (imputation only fills
+    #: feature_columns; the target is passed through as-is), so datasets whose
+    #: label is only sometimes assessed (e.g. an optional clinical scale) need
+    #: this set to True -- otherwise stratified train_test_split raises on NaN.
+    drop_rows_missing_target: bool = False
 
     #: "auto" to infer categorical columns (nunique <= auto_categorical_unique_threshold,
     #: or dtype object/category/bool), or an explicit list of column names.
@@ -57,6 +63,24 @@ class DataConfig:
     uppercase_columns: bool = False
     #: Dataset-specific quirk: remap columns whose only non-null values are {1, 2} to {0, 1}.
     remap_binary_one_two: bool = False
+
+    #: If set (together with a non-empty ``outlier_columns``), numeric values in
+    #: those columns further than this many std-devs from their column mean are
+    #: treated as missing (NaN) rather than passed through as-is. Catches both
+    #: "not administered" sentinel codes (e.g. a lone 999 among otherwise 0-30
+    #: values) and corrupt outlier rows (e.g. a derived metric blown up by a
+    #: division artifact), either of which can otherwise cause float32 overflow
+    #: inside TabPFN/TabImpute. None (default) disables this check entirely.
+    outlier_zscore_threshold: float | None = None
+    #: Explicit list of columns to apply ``outlier_zscore_threshold`` to (no
+    #: effect if that's None). Deliberately opt-in per-column rather than
+    #: "all numeric columns": a blanket z-score check false-positives heavily
+    #: on zero-/mode-inflated ordinal/Likert-style columns common in survey
+    #: data (e.g. a 0-3 severity scale where 0 is the overwhelming majority --
+    #: confirmed empirically, legitimate 2s/3s got flagged as "outliers" with
+    #: z-scores >10), so only list columns confirmed to have genuine
+    #: sentinel/corrupted values, not just a skewed distribution.
+    outlier_columns: list = dataclasses.field(default_factory=list)
 
     #: Train/test split.
     train_size: float = 0.6667
@@ -118,6 +142,12 @@ class TabPFNConfig:
     #: "standard" (features only, label assigned post-hoc) and/or
     #: "custom" (features + target modeled jointly).
     variants: list = dataclasses.field(default_factory=lambda: ["standard", "custom"])
+    #: Which train split(s) to fit on: "raw" (original data, pre-imputation --
+    #: TabPFN handles missing values natively) and/or "imputed" (same imputed
+    #: split used by every other model). Include both to compare how TabPFN
+    #: performs with vs. without imputation; imputed-variant outputs are
+    #: cached as e.g. "tabpfn_standard_imputed" (raw keeps the unsuffixed name).
+    data_variants: list = dataclasses.field(default_factory=lambda: ["raw"])
 
 
 @dataclasses.dataclass
@@ -172,9 +202,7 @@ class GenerationConfig:
     n_samples: int = 200
     output_dir: str = "output/dataset/synthetic_data"
     force_retrain: bool = False
-    synthcity: SynthcityModelsConfig = dataclasses.field(
-        default_factory=SynthcityModelsConfig
-    )
+    synthcity: SynthcityModelsConfig = dataclasses.field(default_factory=SynthcityModelsConfig)
     tabpfn: TabPFNConfig = dataclasses.field(default_factory=TabPFNConfig)
     tabpfgen: TabPFGenConfig = dataclasses.field(default_factory=TabPFGenConfig)
     hpo: HPOConfig = dataclasses.field(default_factory=HPOConfig)
@@ -220,16 +248,12 @@ class EvaluationConfig:
     syntheval: FrameworkSelectionConfig = dataclasses.field(
         default_factory=FrameworkSelectionConfig
     )
-    custom: FrameworkSelectionConfig = dataclasses.field(
-        default_factory=FrameworkSelectionConfig
-    )
+    custom: FrameworkSelectionConfig = dataclasses.field(default_factory=FrameworkSelectionConfig)
 
     syntheval_preset: str = "complete_eval"
     #: "linear" (min-max scale + sum) or "summation" (SynthEval's built-in strategy).
     ranking_strategy: str = "linear"
-    log_disparity: LogDisparityConfig = dataclasses.field(
-        default_factory=LogDisparityConfig
-    )
+    log_disparity: LogDisparityConfig = dataclasses.field(default_factory=LogDisparityConfig)
     save_per_model_syntheval_plots: bool = True
 
 
@@ -316,10 +340,8 @@ def _from_dict(cls, data: dict | None):
     for key, value in data.items():
         if key not in field_types:
             raise ValueError(
-                f"Unknown config key '{key}' for {cls.__name__}. "
-                f"Valid keys: {sorted(field_types)}"
+                f"Unknown config key '{key}' for {cls.__name__}. Valid keys: {sorted(field_types)}"
             )
-        field_type = field_types[key]
         nested_cls = _NESTED_DATACLASSES.get((cls, key))
         if nested_cls is not None and isinstance(value, dict):
             kwargs[key] = _from_dict(nested_cls, value)
@@ -354,7 +376,7 @@ def load_config(path: str | Path) -> Config:
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    with open(config_path, "r") as f:
+    with open(config_path) as f:
         raw = yaml.safe_load(f) or {}
 
     cfg = _from_dict(Config, raw)
@@ -378,4 +400,10 @@ def _validate(cfg: Config) -> None:
         raise ValueError(
             "evaluation.ranking_strategy must be 'linear' or 'summation', "
             f"got {cfg.evaluation.ranking_strategy!r}"
+        )
+    bad_data_variants = set(cfg.generation.tabpfn.data_variants) - {"raw", "imputed"}
+    if bad_data_variants:
+        raise ValueError(
+            "generation.tabpfn.data_variants entries must be 'raw' and/or 'imputed', "
+            f"got {sorted(bad_data_variants)}"
         )

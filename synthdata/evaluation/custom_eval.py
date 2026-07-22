@@ -61,15 +61,28 @@ def run_log_disparity_evaluation(
                 protected_map=log_disparity_cfg.protected_map,
                 protected_bins=log_disparity_cfg.protected_bins,
             )
-        except Exception as exc:  # noqa: BLE001
+        except (KeyError, ValueError) as exc:
             logger.warning("[custom] log_disparity failed for %s: %s", name, exc)
+            reports[name] = {"error": str(exc), "error_type": type(exc).__name__}
     return reports
 
 
 def build_log_disparity_summary_table(reports: dict[str, dict]) -> pd.DataFrame:
-    """Models x {log_disparity_mean_abs, log_disparity_median_abs, log_disparity_share_significant}."""
+    """Models x {log_disparity_mean_abs, log_disparity_median_abs, log_disparity_share_significant}.
+
+    Models whose report failed (see ``run_log_disparity_evaluation``'s
+    ``{"error": ...}`` entries) get all-NaN rows here rather than being
+    silently dropped, so a failure is still visible in the summary table.
+    """
     rows = {}
     for name, report in reports.items():
+        if "error" in report:
+            rows[name] = {
+                "log_disparity_mean_abs": None,
+                "log_disparity_median_abs": None,
+                "log_disparity_share_significant": None,
+            }
+            continue
         stats = report["summary_stats"]
         rows[name] = {
             "log_disparity_mean_abs": stats.get("mean_abs_log_disparity"),

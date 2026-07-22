@@ -20,9 +20,7 @@ def main() -> None:
         description="Load a dataset and run TabImpute-based missing-data imputation."
     )
     parser.add_argument("--config", required=True, help="Path to the YAML config file.")
-    parser.add_argument(
-        "--plot", action="store_true", help="Also save data + imputation QA plots."
-    )
+    parser.add_argument("--plot", action="store_true", help="Also save data + imputation QA plots.")
     parser.add_argument(
         "--dataset-version",
         default=None,

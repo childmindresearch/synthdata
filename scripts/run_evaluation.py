@@ -59,9 +59,7 @@ def main() -> None:
     dataset = load_dataset(cfg)
     dataset = load_imputed_splits(dataset)
     if dataset.train_imputed_df is None:
-        raise SystemExit(
-            "No imputed data found. Run `synthdata-impute --config <path>` first."
-        )
+        raise SystemExit("No imputed data found. Run `synthdata-impute --config <path>` first.")
 
     experiment = load_experiment(cfg)
     cfg.generation.output_dir = str(experiment.generation_dir)

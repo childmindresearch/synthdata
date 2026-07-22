@@ -57,8 +57,17 @@ ydata = [
 tabpfn = [
     "tabpfgen",
     "tabpfn",
-    "tabpfn-extensions[unsupervised]==0.4.2",
+    "tabpfn-extensions[unsupervised]",
     "tabimpute",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "pytest-mock",
+    "ruff",
+    "pre-commit",
 ]
 
 [tool.uv]
@@ -77,6 +86,7 @@ conflicts = [
 [tool.uv.sources]
 syntheval = { path = "submodules/syntheval", editable = true }
 synthcity = { path = "submodules/synthcity", editable = true }
+tabpfn-extensions = { git = "https://github.com/PriorLabs/tabpfn-extensions", branch = "main" }
 torch = [
     { index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
@@ -92,6 +102,44 @@ explicit = true
 [tool.pyright]
 reportInvalidTypeForm = "none"
 reportUnusedExpression = "none"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+# Scope linting to the synthdata pipeline itself: the package, its CLI
+# entrypoints, and its tests. `include` only affects directory *discovery*
+# (e.g. plain `ruff check .`) -- it has no effect on files passed explicitly
+# on the command line (as pre-commit does), so apps/, notebooks/,
+# scripts/document_pipeline/, and submodules/ (vendored syntheval/synthcity)
+# must also be listed in `extend-exclude` below to stay out of scope in both
+# invocation styles.
+include = ["synthdata/**/*.py", "scripts/**/*.py", "tests/**/*.py"]
+extend-exclude = ["scripts/document_pipeline", "apps", "notebooks", "submodules"]
+# pre-commit passes explicit file paths on the command line, which ruff
+# otherwise always lints regardless of exclude/extend-exclude (force-exclude
+# defaults to false). Without this, `pre-commit run` would lint apps/,
+# notebooks/, and scripts/document_pipeline/ despite the excludes above.
+force-exclude = true
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "BLE", "SIM"]
+ignore = [
+    "E501",  # line length is handled by the formatter, not the linter
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "unit: fast, pure-logic tests with no I/O or external dependencies",
+    "cache: tests exercising file/SQLite caching and resumability logic",
+    "integration: multi-module orchestration tests (may use tmp_path, mocks)",
+    "slow: exercises real model training (synthcity/tabpfgen/tabpfn); not run by default in CI",
+    "network: requires a live external/hosted API (e.g. hosted TabPFN); skipped in CI",
+]
 
 [build-system]
 requires = ["hatchling"]

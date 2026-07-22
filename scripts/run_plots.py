@@ -119,7 +119,9 @@ def main() -> None:
             )
 
     if experiment is not None:
-        experiment.record("plots", artifacts={"plots_dir": str(experiment.plots_dir)}, sections=sorted(sections))
+        experiment.record(
+            "plots", artifacts={"plots_dir": str(experiment.plots_dir)}, sections=sorted(sections)
+        )
 
     logger.info("Done. Figures saved under %s", cfg.plots.output_dir)
 

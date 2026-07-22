@@ -17,7 +17,7 @@ so any artifact can be traced back to exactly the run that produced it.
 
 import dataclasses
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +30,7 @@ _LATEST_FILENAME = "latest.json"
 
 
 def _timestamp_id(tag: str | None = None) -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"{ts}_{tag}" if tag else ts
 
 
@@ -61,7 +61,7 @@ class Experiment:
         """Append a stage entry to this experiment's manifest.json."""
         entry = {
             "stage": stage,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "git_commit": git_commit(),
             "artifacts": artifacts or {},
             **extra,
@@ -108,7 +108,7 @@ def _build_experiment(experiment_id: str, cfg: Config) -> Experiment:
         evaluation_dir=evaluation_dir,
         plots_dir=plots_dir,
         manifest_path=manifest_path,
-        created_at=datetime.now(timezone.utc).isoformat(),
+        created_at=datetime.now(UTC).isoformat(),
         git_commit=git_commit(),
     )
 

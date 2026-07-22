@@ -19,6 +19,7 @@ from synthdata.config import load_config
 from synthdata.data import load_dataset, load_imputed_splits
 from synthdata.experiment import start_experiment
 from synthdata.generation import run_generation
+from synthdata.generation.pipeline import needs_imputed_data
 from synthdata.utils import get_logger, set_global_seed
 
 logger = get_logger("run_generation")
@@ -30,7 +31,9 @@ def main() -> None:
     )
     parser.add_argument("--config", required=True, help="Path to the YAML config file.")
     parser.add_argument(
-        "--plot", action="store_true", help="Save real-vs-synthetic + HPO plots inline as models complete."
+        "--plot",
+        action="store_true",
+        help="Save real-vs-synthetic + HPO plots inline as models complete.",
     )
     parser.add_argument(
         "--tag", default=None, help="Freeform label for this experiment (overrides experiment.tag)."
@@ -52,10 +55,8 @@ def main() -> None:
 
     dataset = load_dataset(cfg)
     dataset = load_imputed_splits(dataset)
-    if dataset.train_imputed_df is None:
-        raise SystemExit(
-            "No imputed data found. Run `synthdata-impute --config <path>` first."
-        )
+    if dataset.train_imputed_df is None and needs_imputed_data(cfg.generation):
+        raise SystemExit("No imputed data found. Run `synthdata-impute --config <path>` first.")
 
     experiment = start_experiment(cfg)
     # Nest this run's artifacts under the experiment id (also relocates HPO
@@ -71,8 +72,13 @@ def main() -> None:
         from synthdata.plotting.generation_plots import plot_real_vs_synthetic
 
         def plot_callback(name, df, extra):  # noqa: ARG001 - extra unused, kept for interface symmetry
+            real_df = (
+                dataset.train_imputed_df
+                if dataset.train_imputed_df is not None
+                else dataset.train_df
+            )
             fig = plot_real_vs_synthetic(
-                dataset.train_imputed_df,
+                real_df,
                 df,
                 dataset.feature_columns + [dataset.target_column],
                 dataset.all_categorical_columns,
@@ -85,7 +91,9 @@ def main() -> None:
             )
             plt.close(fig)
 
-    synthetic_datasets = run_generation(cfg, dataset, plot_callback=plot_callback)
+    synthetic_datasets = run_generation(
+        cfg, dataset, plot_callback=plot_callback, experiment=experiment
+    )
 
     if args.plot:
         from synthdata.plotting.generation_plots import save_hpo_plots
