@@ -59,6 +59,18 @@ class DataConfig:
     categorical_columns: str | list = "auto"
     auto_categorical_unique_threshold: int = 10
 
+    #: Explicit natural-order encoding for ordinal columns stored as text
+    #: (e.g. ``{"activity_level": ["Very Light", "Light", "Moderate", "Heavy",
+    #: "Exceptional"]}``, lowest to highest). Applied before categorical_columns
+    #: is resolved, so these columns are encoded to integers preserving their
+    #: true order and then treated as plain numeric (never one-hot/binary
+    #: encoded) -- must not overlap with categorical_columns. Every value
+    #: observed in the column must appear in its configured list (raises
+    #: otherwise). Columns not listed here that still contain non-numeric
+    #: values fall back to alphabetical label-encoding at the imputation/
+    #: generation model boundary (see synthdata.data.warn_non_numeric_feature_columns).
+    ordinal_column_categories: dict = dataclasses.field(default_factory=dict)
+
     #: Uppercase all column names on load (matches the hepatitis notebook convention).
     uppercase_columns: bool = False
     #: Dataset-specific quirk: remap columns whose only non-null values are {1, 2} to {0, 1}.
@@ -97,9 +109,41 @@ class DataConfig:
 
 
 @dataclasses.dataclass
+class RefiDiffConfig:
+    """Hyperparameters for the RefiDiff imputation backend (arXiv:2505.14451).
+
+    Only used when ``ImputationConfig.method == "refidiff"``. Requires the
+    `refidiff` extra (`uv sync --extra refidiff`); see
+    synthdata/imputation/refidiff_backend.py for the ported algorithm.
+    """
+
+    #: Denoiser hidden width (diamond up/down-sampling network width).
+    hidden_dim: int = 32
+    #: Max training epochs (early stopping usually halts well before this).
+    epochs: int = 10001
+    #: Stop training if val loss hasn't improved for this many epochs.
+    early_stopping_patience: int = 500
+    batch_size: int = 8192
+    #: Number of reverse-diffusion (EDM/VE-SDE) sampling steps.
+    num_steps: int = 50
+    #: Number of independent reverse-diffusion trajectories averaged together.
+    num_trials: int = 10
+    #: "auto" (use mamba-ssm if importable, else fall back to the MLP
+    #: denoiser), "mamba" (require mamba-ssm, error if unavailable), or "mlp"
+    #: (always use the plain residual-MLP denoiser, e.g. for CPU-only runs).
+    denoiser: str = "auto"
+    #: Save a training checkpoint every N epochs so an interrupted run
+    #: (shared-GPU preemption/OOM) can resume instead of retraining from
+    #: scratch.
+    checkpoint_every: int = 1000
+
+
+@dataclasses.dataclass
 class ImputationConfig:
     enabled: bool = True
-    #: Currently only "tabimpute" is supported.
+    #: "tabimpute" (default, TabPFN-based) or "refidiff" (predictive+diffusion
+    #: hybrid; better suited to wide datasets where tabimpute's one-hot
+    #: categorical encoding OOMs -- see synthdata/imputation/refidiff_backend.py).
     method: str = "tabimpute"
     #: "auto" | "cpu" | "cuda" | "mps"
     device: str = "auto"
@@ -113,6 +157,8 @@ class ImputationConfig:
     cache: bool = True
     #: Fractional margin used when validating imputed continuous values fall within range.
     validation_margin: float = 0.2
+    #: Only used when method == "refidiff".
+    refidiff: RefiDiffConfig = dataclasses.field(default_factory=RefiDiffConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +405,7 @@ _NESTED_DATACLASSES = {
     (Config, "evaluation"): EvaluationConfig,
     (Config, "plots"): PlotsConfig,
     (Config, "experiment"): ExperimentConfig,
+    (ImputationConfig, "refidiff"): RefiDiffConfig,
     (GenerationConfig, "synthcity"): SynthcityModelsConfig,
     (GenerationConfig, "tabpfn"): TabPFNConfig,
     (GenerationConfig, "tabpfgen"): TabPFGenConfig,
@@ -396,6 +443,15 @@ def _validate(cfg: Config) -> None:
         raise ValueError("data.target_column must be set")
     if cfg.device not in ("auto", "cpu", "cuda", "mps"):
         raise ValueError(f"device must be one of auto/cpu/cuda/mps, got {cfg.device!r}")
+    if cfg.imputation.method not in ("tabimpute", "refidiff"):
+        raise ValueError(
+            f"imputation.method must be 'tabimpute' or 'refidiff', got {cfg.imputation.method!r}"
+        )
+    if cfg.imputation.refidiff.denoiser not in ("auto", "mamba", "mlp"):
+        raise ValueError(
+            "imputation.refidiff.denoiser must be 'auto', 'mamba', or 'mlp', "
+            f"got {cfg.imputation.refidiff.denoiser!r}"
+        )
     if cfg.evaluation.ranking_strategy not in ("linear", "summation"):
         raise ValueError(
             "evaluation.ranking_strategy must be 'linear' or 'summation', "
@@ -407,3 +463,16 @@ def _validate(cfg: Config) -> None:
             "generation.tabpfn.data_variants entries must be 'raw' and/or 'imputed', "
             f"got {sorted(bad_data_variants)}"
         )
+    if isinstance(cfg.data.categorical_columns, list):
+        overlap = set(cfg.data.ordinal_column_categories) & set(cfg.data.categorical_columns)
+        if overlap:
+            raise ValueError(
+                "data.ordinal_column_categories and data.categorical_columns must not overlap "
+                f"(a column is either nominal/categorical or ordinal, not both): {sorted(overlap)}"
+            )
+    for col, categories in cfg.data.ordinal_column_categories.items():
+        if not isinstance(categories, list) or len(categories) != len(set(categories)):
+            raise ValueError(
+                f"data.ordinal_column_categories[{col!r}] must be a list of unique values, "
+                f"got {categories!r}"
+            )

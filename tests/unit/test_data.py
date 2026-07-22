@@ -1,5 +1,7 @@
 """Unit tests for the pure column-typing/transform helpers in synthdata.data."""
 
+import logging
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -7,10 +9,12 @@ import pytest
 from synthdata.data import (
     cast_integer_like_columns,
     decode_label_encoded_columns,
+    encode_ordinal_columns,
     infer_categorical_columns,
     label_encode_non_numeric_columns,
     mask_outliers_as_missing,
     remap_binary_one_two,
+    warn_non_numeric_feature_columns,
 )
 
 pytestmark = pytest.mark.unit
@@ -155,6 +159,54 @@ class TestLabelEncodeRoundtrip:
         df = pd.DataFrame({"other": [1, 2]})
         decoded = decode_label_encoded_columns(df, {"color": pd.Index(["red", "blue"])})
         assert list(decoded.columns) == ["other"]
+
+
+class TestEncodeOrdinalColumns:
+    def test_encodes_in_configured_order_not_alphabetical(self):
+        df = pd.DataFrame({"activity": ["Heavy", "Light", "Very Light", None]})
+        out = encode_ordinal_columns(
+            df, {"activity": ["Very Light", "Light", "Moderate", "Heavy", "Exceptional"]}
+        )
+        assert out["activity"].tolist()[:3] == [3.0, 1.0, 0.0]
+        assert np.isnan(out["activity"].iloc[3])
+
+    def test_raises_on_unknown_observed_category(self):
+        df = pd.DataFrame({"activity": ["Light", "Unheard Of"]})
+        with pytest.raises(ValueError, match="Unheard Of"):
+            encode_ordinal_columns(df, {"activity": ["Light", "Heavy"]})
+
+    def test_raises_on_missing_column(self):
+        df = pd.DataFrame({"other": [1, 2]})
+        with pytest.raises(KeyError, match="activity"):
+            encode_ordinal_columns(df, {"activity": ["Light", "Heavy"]})
+
+
+class TestWarnNonNumericFeatureColumns:
+    def test_no_warning_when_all_declared_numeric_columns_are_numeric(self, caplog):
+        df = pd.DataFrame({"num": [1.0, 2.0], "cat": ["a", "b"]})
+        backend_logger = logging.getLogger("synthdata.data")
+        backend_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level("WARNING"):
+                offending = warn_non_numeric_feature_columns(df, ["num", "cat"], ["cat"])
+        finally:
+            backend_logger.removeHandler(caplog.handler)
+        assert offending == []
+        assert caplog.text == ""
+
+    def test_warns_on_string_valued_column_not_declared_categorical(self, caplog):
+        # "activity" is not in categorical_columns, so it's assumed numeric,
+        # but actually holds text values (e.g. an ordinal band never encoded).
+        df = pd.DataFrame({"num": [1.0, 2.0], "activity": ["Light", "Heavy"]})
+        backend_logger = logging.getLogger("synthdata.data")
+        backend_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level("WARNING"):
+                offending = warn_non_numeric_feature_columns(df, ["num", "activity"], [])
+        finally:
+            backend_logger.removeHandler(caplog.handler)
+        assert offending == ["activity"]
+        assert "activity" in caplog.text
 
 
 class TestMaskOutliersAsMissing:

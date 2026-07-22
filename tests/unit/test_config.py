@@ -8,6 +8,8 @@ from synthdata.config import (
     DataConfig,
     GenerationConfig,
     HPOConfig,
+    ImputationConfig,
+    RefiDiffConfig,
     _from_dict,
     _validate,
     load_config,
@@ -59,6 +61,18 @@ class TestFromDict:
     def test_unknown_nested_key_raises(self):
         with pytest.raises(ValueError, match="Unknown config key"):
             _from_dict(Config, {"data": {"not_a_real_field": 1}})
+
+    def test_refidiff_nested_dict_builds_nested_dataclass(self):
+        cfg = _from_dict(
+            Config,
+            {"imputation": {"method": "refidiff", "refidiff": {"hidden_dim": 64}}},
+        )
+        assert isinstance(cfg.imputation, ImputationConfig)
+        assert isinstance(cfg.imputation.refidiff, RefiDiffConfig)
+        assert cfg.imputation.method == "refidiff"
+        assert cfg.imputation.refidiff.hidden_dim == 64
+        # Sibling RefiDiffConfig defaults are preserved.
+        assert cfg.imputation.refidiff.denoiser == "auto"
 
 
 class TestValidate:
@@ -126,6 +140,55 @@ class TestValidate:
         cfg = self._base_valid()
         cfg.generation.tabpfn.data_variants = ["raw", "imputed"]
         _validate(cfg)  # should not raise
+
+    def test_bad_imputation_method_raises(self):
+        cfg = self._base_valid()
+        cfg.imputation.method = "bogus"
+        with pytest.raises(ValueError, match="imputation.method"):
+            _validate(cfg)
+
+    @pytest.mark.parametrize("method", ["tabimpute", "refidiff"])
+    def test_valid_imputation_methods_pass(self, method):
+        cfg = self._base_valid()
+        cfg.imputation.method = method
+        _validate(cfg)  # should not raise
+
+    def test_bad_refidiff_denoiser_raises(self):
+        cfg = self._base_valid()
+        cfg.imputation.refidiff.denoiser = "bogus"
+        with pytest.raises(ValueError, match="imputation.refidiff.denoiser"):
+            _validate(cfg)
+
+    @pytest.mark.parametrize("denoiser", ["auto", "mamba", "mlp"])
+    def test_valid_refidiff_denoisers_pass(self, denoiser):
+        cfg = self._base_valid()
+        cfg.imputation.refidiff.denoiser = denoiser
+        _validate(cfg)  # should not raise
+
+    def test_ordinal_column_overlapping_categorical_columns_raises(self):
+        cfg = self._base_valid()
+        cfg.data.categorical_columns = ["activity"]
+        cfg.data.ordinal_column_categories = {"activity": ["Light", "Heavy"]}
+        with pytest.raises(ValueError, match="ordinal_column_categories"):
+            _validate(cfg)
+
+    def test_ordinal_column_not_overlapping_categorical_columns_passes(self):
+        cfg = self._base_valid()
+        cfg.data.categorical_columns = ["other_cat"]
+        cfg.data.ordinal_column_categories = {"activity": ["Light", "Heavy"]}
+        _validate(cfg)  # should not raise
+
+    def test_ordinal_column_categories_not_a_list_raises(self):
+        cfg = self._base_valid()
+        cfg.data.ordinal_column_categories = {"activity": "Light"}
+        with pytest.raises(ValueError, match="ordinal_column_categories"):
+            _validate(cfg)
+
+    def test_ordinal_column_categories_with_duplicates_raises(self):
+        cfg = self._base_valid()
+        cfg.data.ordinal_column_categories = {"activity": ["Light", "Light"]}
+        with pytest.raises(ValueError, match="ordinal_column_categories"):
+            _validate(cfg)
 
 
 class TestLoadConfig:

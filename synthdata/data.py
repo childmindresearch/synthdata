@@ -162,6 +162,83 @@ def infer_categorical_columns(
     return cats
 
 
+def encode_ordinal_columns(df: pd.DataFrame, ordinal_categories: dict) -> pd.DataFrame:
+    """Map declared-ordinal columns to integers in their configured natural order.
+
+    ``ordinal_categories`` maps a column name to its category values ordered
+    from lowest to highest (e.g. ``{"activity_level": ["Very Light", "Light",
+    "Moderate", "Heavy", "Exceptional"]}``, see ``data.ordinal_column_categories``
+    in :class:`~synthdata.config.DataConfig`). Unlike
+    :func:`label_encode_non_numeric_columns`'s alphabetical fallback (used for
+    columns nobody declared an order for), this preserves the column's true
+    real-world ordering -- which matters for every backend that treats a
+    "numeric" column as continuous, since their natural numeric order is
+    exactly what a plain-numeric imputation/generation pass relies on to
+    model it correctly. Missing values are preserved as NaN.
+
+    Raises if a configured column is missing from ``df``, or if the column
+    contains an observed value not present in its configured category list
+    (fail loudly rather than silently coercing an unrecognized category to
+    NaN or an arbitrary position).
+    """
+    out = df.copy()
+    for col, categories in ordinal_categories.items():
+        if col not in out.columns:
+            raise KeyError(
+                f"data.ordinal_column_categories references column {col!r}, which is not "
+                f"present in the loaded data. Available columns: {list(out.columns)}"
+            )
+        cat_to_idx = {cat: idx for idx, cat in enumerate(categories)}
+        observed = set(out[col].dropna().unique().tolist())
+        unknown = observed - set(cat_to_idx)
+        if unknown:
+            raise ValueError(
+                f"data.ordinal_column_categories[{col!r}] does not include observed value(s) "
+                f"{sorted(unknown, key=str)}; every value present in the data must be listed "
+                f"in its configured order (configured categories={categories})."
+            )
+        out[col] = out[col].map(cat_to_idx).astype(float)
+    return out
+
+
+def warn_non_numeric_feature_columns(
+    df: pd.DataFrame, feature_columns: list, categorical_columns: list
+) -> list:
+    """Log a loud warning for any feature column declared numeric but not actually numeric.
+
+    A column not listed in ``categorical_columns`` is assumed to already be
+    numeric (e.g. an ordinal column pre-encoded to integers), but a plain CSV
+    source can still surprise us with a string-valued column that was
+    correctly excluded from ``categorical_columns`` (e.g. an ordinal band
+    stored as text like "Light"/"Heavy") yet was never actually numeric-encoded
+    at the source. Every downstream imputation/generation backend that builds
+    a numeric matrix falls back to label-encoding such columns (see
+    :func:`label_encode_non_numeric_columns`), so this check doesn't change
+    behavior -- it exists purely to surface the issue immediately at
+    dataset-load time (this function is the single source of truth for this
+    check; call it here rather than re-deriving the same "numeric_columns"
+    filter independently in each backend), rather than it being discovered
+    (or, worse, silently missed) deep inside whichever backend happens to run
+    first.
+
+    Returns the list of offending column names (empty if none).
+    """
+    numeric_columns = [c for c in feature_columns if c not in categorical_columns]
+    offending = [c for c in numeric_columns if not pd.api.types.is_numeric_dtype(df[c])]
+    if offending:
+        logger.warning(
+            "%d feature column(s) are not listed in data.categorical_columns (so are assumed "
+            "numeric) but actually contain non-numeric values: %s. Every backend falls back to "
+            "label-encoding these columns (preserves missingness, but does not guarantee "
+            "categories are numbered in their true ordinal order -- alphabetical by default). "
+            "Add them to data.categorical_columns (if nominal), or map them to an explicit "
+            "ordinal-to-integer encoding in load_dataset (if ordinal), for more correct treatment.",
+            len(offending),
+            offending,
+        )
+    return offending
+
+
 def remap_binary_one_two(df: pd.DataFrame) -> pd.DataFrame:
     """Remap any column whose only non-null unique values are {1, 2} to {0, 1}."""
     out = df.copy()
@@ -365,6 +442,10 @@ def load_dataset(cfg: Config) -> Dataset:
             )
 
     feature_columns = [c for c in df.columns if c != target_column]
+
+    if cfg.data.ordinal_column_categories:
+        df = encode_ordinal_columns(df, cfg.data.ordinal_column_categories)
+
     categorical_columns = infer_categorical_columns(
         df,
         feature_columns,
@@ -372,6 +453,7 @@ def load_dataset(cfg: Config) -> Dataset:
         unique_threshold=cfg.data.auto_categorical_unique_threshold,
         uci_variable_types=variable_types,
     )
+    warn_non_numeric_feature_columns(df, feature_columns, categorical_columns)
 
     # Cast whole-numbered categorical columns (incl. target) to a proper int dtype.
     # Some downstream tooling (e.g. SynthEval's AnalysisConfig) infers "categorical"

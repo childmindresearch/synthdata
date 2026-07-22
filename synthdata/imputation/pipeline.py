@@ -1,88 +1,51 @@
-"""TabImpute-based missing data imputation.
+"""Method-agnostic imputation pipeline: caching, dispatch, rounding, validation.
 
-Wraps ``tabimpute.interface.TabImputeCategorical`` (a TabPFN-based imputer that
-one-hot encodes designated categorical columns before imputing, then recovers
-category values via softmax + argmax). Includes a small compatibility shim for
-version drift between the pinned ``tabpfn`` version and the one ``tabimpute`` was
-built against (see the shim's docstring for details).
+:func:`run_imputation` dispatches to the configured backend's
+``impute_dataframe`` (``synthdata.imputation.tabimpute_backend`` by default, or
+``synthdata.imputation.refidiff_backend`` when ``imputation.method ==
+"refidiff"``), then applies shared post-processing (rounding, caching to CSV,
+validation reporting) identically regardless of which backend produced the
+imputed values.
 """
 
 import numpy as np
 import pandas as pd
 
 from synthdata.config import Config
-from synthdata.data import (
-    Dataset,
-    decode_label_encoded_columns,
-    label_encode_non_numeric_columns,
-)
+from synthdata.data import Dataset
 from synthdata.utils import ensure_dir, get_logger, resolve_device
 
 logger = get_logger(__name__)
 
-_SHIM_APPLIED = False
 
+def _impute_dataframe(cfg: Config, df: pd.DataFrame, dataset: Dataset, device: str) -> pd.DataFrame:
+    """Dispatch to the configured imputation backend's ``impute_dataframe``."""
+    method = cfg.imputation.method
+    if method == "tabimpute":
+        from synthdata.imputation.tabimpute_backend import impute_dataframe
 
-def _apply_tabpfn_compat_shim() -> None:
-    """Patch missing tabpfn encoder classes used by an older tabimpute release.
+        return impute_dataframe(
+            df,
+            dataset.feature_columns,
+            dataset.categorical_columns,
+            dataset.target_column,
+            device=device,
+        )
+    if method == "refidiff":
+        from synthdata.imputation.refidiff_backend import impute_dataframe
 
-    ``tabimpute`` was built against an older ``tabpfn`` release and imports a few
-    encoder classes directly from ``tabpfn.model.encoders``. If the installed
-    ``tabpfn`` version has moved/renamed those classes, we backfill them from
-    ``tabimpute.model.encoders`` (which vendors compatible copies) so that
-    ``TabImputeCategorical`` can be imported/instantiated without patching either
-    library. This is a no-op if the classes already exist.
-    """
-    global _SHIM_APPLIED
-    if _SHIM_APPLIED:
-        return
-
-    import tabpfn.model.encoders as _tabpfn_enc
-
-    try:
-        import tabimpute.model.encoders as _ti_enc
-    except ImportError:
-        _SHIM_APPLIED = True
-        return
-
-    for cls_name in (
-        "SequentialEncoder",
-        "VariableNumFeaturesEncoderStep",
-        "InputNormalizationEncoderStep",
-    ):
-        if not hasattr(_tabpfn_enc, cls_name) and hasattr(_ti_enc, cls_name):
-            setattr(_tabpfn_enc, cls_name, getattr(_ti_enc, cls_name))
-
-    _SHIM_APPLIED = True
-
-
-def impute_dataframe(
-    df: pd.DataFrame,
-    feature_columns: list,
-    categorical_columns: list,
-    target_column: str,
-    device: str = "cpu",
-) -> pd.DataFrame:
-    """Impute missing values in ``feature_columns`` of ``df`` via TabImputeCategorical.
-
-    The target column is assumed fully observed and is passed through unchanged.
-    Returns a new DataFrame with the same column order as ``df``.
-    """
-    _apply_tabpfn_compat_shim()
-    from tabimpute.interface import TabImputeCategorical
-
-    imputer = TabImputeCategorical(device=device)
-
-    encoded, category_maps = label_encode_non_numeric_columns(df, feature_columns)
-    x_full = encoded.values.astype(float)
-    cat_indices = [feature_columns.index(c) for c in categorical_columns if c in feature_columns]
-
-    x_imputed = imputer.impute(x_full.copy(), categorical_columns=cat_indices)
-
-    imputed_df = pd.DataFrame(x_imputed, columns=feature_columns, index=df.index)
-    imputed_df = decode_label_encoded_columns(imputed_df, category_maps)
-    imputed_df[target_column] = df[target_column].values
-    return imputed_df[list(df.columns)]
+        return impute_dataframe(
+            df,
+            dataset.feature_columns,
+            dataset.categorical_columns,
+            dataset.target_column,
+            device=device,
+            refidiff_cfg=cfg.imputation.refidiff,
+            data_dir=dataset.data_dir,
+        )
+    # Unreachable in practice: Config._validate() already restricts
+    # imputation.method to {"tabimpute", "refidiff"} before this runs.
+    raise ValueError(f"Unknown imputation.method: {method!r}")
 
 
 def apply_rounding(
@@ -173,18 +136,13 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
         device = resolve_device(cfg.imputation.device)
         n_missing = int(dataset.full_df[dataset.feature_columns].isna().sum().sum())
         logger.info(
-            "Imputing %d missing values across %d feature columns on device=%s",
+            "Imputing %d missing values across %d feature columns via method=%s on device=%s",
             n_missing,
             len(dataset.feature_columns),
+            cfg.imputation.method,
             device,
         )
-        full_imputed = impute_dataframe(
-            dataset.full_df,
-            dataset.feature_columns,
-            dataset.categorical_columns,
-            dataset.target_column,
-            device=device,
-        )
+        full_imputed = _impute_dataframe(cfg, dataset.full_df, dataset, device)
         full_imputed = apply_rounding(
             full_imputed,
             dataset.feature_columns,

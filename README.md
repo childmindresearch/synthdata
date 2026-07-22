@@ -15,7 +15,7 @@ git submodule update --init --recursive
 uv sync --extra tabpfn
 ```
 
-The `tabpfn` extra (TabPFN, TabPFGen, TabImpute) is required to run the imputation/generation/evaluation pipeline below.
+The `tabpfn` extra (TabPFN, TabPFGen, TabImpute) is required to run the imputation/generation/evaluation pipeline below. An optional `refidiff` extra (`uv sync --extra tabpfn --extra refidiff`) adds RefiDiff, an alternative imputation backend (`imputation.method: refidiff`) for wide datasets where TabImpute's one-hot encoding runs out of GPU memory -- see the Imputation summary below.
 
 ## Pipeline: imputation -> generation -> evaluation -> plots
 
@@ -63,8 +63,16 @@ version is typically reused across many generation experiments.
 
  Summary of the four stages:
 
-- **Imputation** (`synthdata/imputation.py`): TabImpute-based missing-data imputation
-  with categorical-aware one-hot handling and post-imputation validation.
+- **Imputation** (`synthdata/imputation/`): missing-data imputation with
+  categorical-aware handling and post-imputation validation, via one of two
+  backends selected by `imputation.method`:
+  - `tabimpute` (default): TabImpute-based, one-hot categorical encoding.
+  - `refidiff`: per-column XGBoost/CatBoost warm-up + Mamba-based EDM diffusion
+    refinement, with binary (log2(k)-bit) categorical encoding. Scales better
+    to wide datasets (many categorical columns) where TabImpute's one-hot
+    encoding runs out of GPU memory -- see `configs/config_loris.yaml` for an
+    example. Requires the `refidiff` extra; falls back to a plain MLP denoiser
+    (`imputation.refidiff.denoiser: mlp`) if `mamba-ssm` isn't installed/importable.
 - **Generation** (`synthdata/generation/`): synthcity plugins (CTGAN, TVAE, ADS-GAN,
   Bayesian network, PATE-GAN, RTVAE, DDPM, ...), TabPFN (standard/custom unsupervised
   synthesis), and TabPFGen (standard/custom SGLD-based synthesis), each with an
