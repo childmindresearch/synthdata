@@ -38,9 +38,10 @@ experiment:
   id: null
 
 data:
-  source: uci # "uci" (fetch by id, cached locally) or "csv" (local file)
+  source: uci # "uci" (fetch by id, cached locally), or "csv"/"parquet" (local file --
+              # reader is auto-detected from path's extension either way)
   uci_id: 46 # UCI Hepatitis dataset
-  path: null # e.g. "data/my_dataset.csv" when source: csv
+  path: null # e.g. "data/my_dataset.csv" or "data/my_dataset.parquet" when source: csv/parquet
 
   # Freeform dataset version label (e.g. "v1", "2024-06-01"). If set, cached
   # raw/imputed/split CSVs are nested under data_dir/<version>/, and a

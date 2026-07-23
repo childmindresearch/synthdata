@@ -87,7 +87,7 @@ class TestValidate:
 
     def test_bad_data_source_raises(self):
         cfg = self._base_valid()
-        cfg.data.source = "parquet"
+        cfg.data.source = "json"
         with pytest.raises(ValueError, match="data.source"):
             _validate(cfg)
 
@@ -104,6 +104,15 @@ class TestValidate:
         cfg = Config(data=DataConfig(source="csv", path=None, target_column="target"))
         with pytest.raises(ValueError, match="data.path"):
             _validate(cfg)
+
+    def test_parquet_requires_path(self):
+        cfg = Config(data=DataConfig(source="parquet", path=None, target_column="target"))
+        with pytest.raises(ValueError, match="data.path"):
+            _validate(cfg)
+
+    def test_parquet_with_path_is_valid(self):
+        cfg = Config(data=DataConfig(source="parquet", path="x.parquet", target_column="target"))
+        _validate(cfg)  # should not raise
 
     def test_empty_target_column_raises(self):
         cfg = self._base_valid()

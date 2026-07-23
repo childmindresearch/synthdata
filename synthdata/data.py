@@ -3,7 +3,9 @@
 Supports two data sources so a collaborator can point the pipeline at their own data:
 
 - ``source: uci``: fetch (and locally cache) a dataset from the UCI ML repository by id.
-- ``source: csv``: load a local CSV file directly.
+- ``source: csv``/``source: parquet``: load a local CSV or Parquet file directly
+  (the reader used is auto-detected from ``data.path``'s file extension --
+  ``.csv`` vs. ``.parquet``/``.pq`` -- rather than from ``source`` itself).
 
 The same :class:`Dataset` object is produced either way and consumed by every
 downstream stage (imputation, generation, evaluation, plotting).
@@ -117,8 +119,31 @@ def _load_uci(cfg: Config, data_dir: Path) -> tuple:
     return df, variable_types
 
 
-def _load_csv(cfg: Config) -> tuple:
-    df = pd.read_csv(cfg.data.path)
+#: File extensions read via :func:`pandas.read_parquet` in :func:`_load_local_file`;
+#: anything else falls back to :func:`pandas.read_csv`.
+_PARQUET_SUFFIXES = (".parquet", ".pq")
+
+
+def _load_local_file(cfg: Config) -> tuple:
+    """Load a local CSV or Parquet file, auto-detected from ``cfg.data.path``'s extension.
+
+    Dispatches on the file extension rather than ``cfg.data.source`` so a
+    mismatched ``source`` value (e.g. ``source: csv`` pointing at a ``.parquet``
+    file) still loads correctly instead of silently mis-parsing the file.
+    """
+    path = Path(cfg.data.path)
+    suffix = path.suffix.lower()
+    if suffix in _PARQUET_SUFFIXES:
+        logger.info("Loading local Parquet file: %s", path)
+        df = pd.read_parquet(path)
+    elif suffix == ".csv":
+        logger.info("Loading local CSV file: %s", path)
+        df = pd.read_csv(path)
+    else:
+        raise ValueError(
+            f"Unsupported file extension {suffix!r} for data.path={cfg.data.path!r}; "
+            "expected one of .csv, .parquet, .pq"
+        )
     return df, None
 
 
@@ -404,8 +429,8 @@ def load_dataset(cfg: Config) -> Dataset:
 
     if cfg.data.source == "uci":
         df, variable_types = _load_uci(cfg, data_dir)
-    elif cfg.data.source == "csv":
-        df, variable_types = _load_csv(cfg)
+    elif cfg.data.source in ("csv", "parquet"):
+        df, variable_types = _load_local_file(cfg)
     else:
         raise ValueError(f"Unknown data.source: {cfg.data.source!r}")
 

@@ -25,11 +25,14 @@ import yaml
 class DataConfig:
     """Where the raw dataset comes from and how columns should be interpreted."""
 
-    #: "uci" to fetch+cache from the UCI ML repository, or "csv" for a local file.
+    #: "uci" to fetch+cache from the UCI ML repository, or "csv"/"parquet" for a
+    #: local file (the actual reader used is auto-detected from ``path``'s file
+    #: extension -- ".csv" vs. ".parquet"/".pq" -- regardless of which of the two
+    #: local values is set here, so either works so long as it matches ``path``).
     source: str = "uci"
     #: UCI dataset id (only used when source == "uci").
     uci_id: int | None = None
-    #: Path to a local CSV (only used when source == "csv").
+    #: Path to a local CSV or Parquet file (only used when source == "csv"/"parquet").
     path: str | None = None
 
     #: Freeform dataset version label (e.g. "v1", "2024-06-01"). If set, cached
@@ -433,12 +436,12 @@ def load_config(path: str | Path) -> Config:
 
 
 def _validate(cfg: Config) -> None:
-    if cfg.data.source not in ("uci", "csv"):
-        raise ValueError(f"data.source must be 'uci' or 'csv', got {cfg.data.source!r}")
+    if cfg.data.source not in ("uci", "csv", "parquet"):
+        raise ValueError(f"data.source must be 'uci', 'csv', or 'parquet', got {cfg.data.source!r}")
     if cfg.data.source == "uci" and cfg.data.uci_id is None:
         raise ValueError("data.uci_id is required when data.source == 'uci'")
-    if cfg.data.source == "csv" and not cfg.data.path:
-        raise ValueError("data.path is required when data.source == 'csv'")
+    if cfg.data.source in ("csv", "parquet") and not cfg.data.path:
+        raise ValueError("data.path is required when data.source == 'csv'/'parquet'")
     if not cfg.data.target_column:
         raise ValueError("data.target_column must be set")
     if cfg.device not in ("auto", "cpu", "cuda", "mps"):

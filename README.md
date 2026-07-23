@@ -24,7 +24,8 @@ exploratory work from `notebooks/test_hepatitis_data.ipynb` and
 `notebooks/ctgan_hpo_hepatitis.ipynb` into a reusable, config-driven pipeline that any
 user can run on their own local data. A single YAML file drives everything --
 copy [`configs/config.yaml`](configs/config.yaml) (a working example on the UCI
-Hepatitis dataset) and edit the `data:` section to point at your own CSV.
+Hepatitis dataset) and edit the `data:` section to point at your own CSV or
+Parquet file.
 
 ```bash
 synthdata-impute   --config configs/config.yaml --plot   # load + impute missing data

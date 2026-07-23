@@ -6,7 +6,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from synthdata.config import Config, DataConfig
 from synthdata.data import (
+    _load_local_file,
     cast_integer_like_columns,
     decode_label_encoded_columns,
     encode_ordinal_columns,
@@ -240,3 +242,41 @@ class TestMaskOutliersAsMissing:
         out = mask_outliers_as_missing(df, ["x"], threshold=3.0)
         assert np.isnan(out["x"].iloc[-1])  # 999 masked
         assert out["x"].iloc[-2] == 30  # legitimate boundary value kept
+
+
+class TestLoadLocalFile:
+    """``_load_local_file`` dispatches on the file extension (CSV vs. Parquet),
+    regardless of the configured ``data.source`` string -- see its docstring.
+    """
+
+    def _cfg(self, path) -> Config:
+        return Config(data=DataConfig(source="csv", path=str(path), target_column="target"))
+
+    def test_reads_csv_file(self, tmp_path):
+        df = pd.DataFrame({"a": [1, 2], "target": [0, 1]})
+        path = tmp_path / "data.csv"
+        df.to_csv(path, index=False)
+        out, variable_types = _load_local_file(self._cfg(path))
+        pd.testing.assert_frame_equal(out, df)
+        assert variable_types is None
+
+    def test_reads_parquet_file(self, tmp_path):
+        df = pd.DataFrame({"a": [1, 2], "target": [0, 1]})
+        path = tmp_path / "data.parquet"
+        df.to_parquet(path, index=False)
+        out, variable_types = _load_local_file(self._cfg(path))
+        pd.testing.assert_frame_equal(out, df)
+        assert variable_types is None
+
+    def test_reads_pq_extension_as_parquet(self, tmp_path):
+        df = pd.DataFrame({"a": [1, 2], "target": [0, 1]})
+        path = tmp_path / "data.pq"
+        df.to_parquet(path, index=False)
+        out, _ = _load_local_file(self._cfg(path))
+        pd.testing.assert_frame_equal(out, df)
+
+    def test_unsupported_extension_raises(self, tmp_path):
+        path = tmp_path / "data.json"
+        path.write_text("{}")
+        with pytest.raises(ValueError, match="Unsupported file extension"):
+            _load_local_file(self._cfg(path))
