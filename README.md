@@ -27,11 +27,15 @@ copy [`configs/config.yaml`](configs/config.yaml) (a working example on the UCI
 Hepatitis dataset) and edit the `data:` section to point at your own CSV or
 Parquet file.
 
+Activate the virtual environment first (`source .venv/bin/activate`), or prefix
+each command with `uv run`, so the `synthdata-*` commands resolve against this
+repo's pinned dependencies rather than a system Python.
+
 ```bash
 synthdata-impute   --config configs/config.yaml --plot   # load + impute missing data
 synthdata-generate --config configs/config.yaml --plot   # synthcity + TabPFN + TabPFGen (+ Optuna HPO)
 synthdata-evaluate --config configs/config.yaml --plot   # synthcity + SynthEval + custom fairness metrics
-synthdata-plot      --config configs/config.yaml         # (re)generate every figure from cached artifacts
+synthdata-plot     --config configs/config.yaml          # (re)generate every figure from cached artifacts
 ```
 
 Each stage caches its outputs to disk (imputed data under `data/<name>/`, synthetic
