@@ -70,72 +70,80 @@ def _patch_regression_sample_inf_bug():
     """Work around a tabpfn upstream numerical bug where sampling from a
     continuous column's predicted distribution can return +-inf, which later
     trips sklearn's finite-value check once that value is used as an *input*
-    feature for a subsequent column in the same permutation (the
-    ``TabPFNValidationError: Input X contains infinity or a value too large
-    for dtype('float32')`` failure this patch fixes).
+    feature for a subsequent column (the ``TabPFNValidationError: Input X
+    contains infinity or a value too large for dtype('float32')`` failure
+    this patch fixes).
 
-    Root cause: ``FullSupportBarDistribution.sample()`` calls the inherited
-    ``BarDistribution.icdf()``, which maps a sampled left-tail probability to
-    a position within the bucket ``searchsorted`` selects via
+    Root cause: ``BarDistribution.icdf()`` (inherited unchanged by
+    ``FullSupportBarDistribution``) maps a sampled left-tail probability to a
+    position within the bucket ``searchsorted`` selects via
     ``left_border + (right_border - left_border) * rest_prob / bucket_prob``.
     For a column the model is very confident about (near-constant, or a
     sharply peaked ordinal/count column -- common in this dataset's ~1038
     raw-numeric feature columns), ``softmax`` can underflow an individual
     bucket's probability to exactly ``0.0`` in float32 while ``rest_prob`` is
-    a tiny positive residual; the division then returns +inf. That value is
-    written into ``impute_X`` for this column and poisons every later column
-    prediction that conditions on it.
+    a tiny positive residual; the division then returns +inf.
 
-    Fix: after sampling, replace any non-finite value with the
-    distribution's mean (``BarDistribution.mean``, itself always finite --
-    a weighted sum of finite bucket means plus a finite half-normal tail
-    mean) so the row stays usable instead of silently corrupting the rest of
-    the permutation.
+    Originally this was patched one level up, by wrapping
+    ``TabPFNUnsupervisedModel.sample_from_model_prediction_`` (used by
+    ``impute_single_permutation_``) and sanitizing its returned sample. That
+    missed a second, separate call site: the public ``impute_()`` method
+    (used by ``generate_synthetic_data``, default ``n_permutations=3``) draws
+    ``n_permutations`` per-permutation predictions via
+    ``impute_single_permutation_``, then -- for regression columns --
+    merges them with ``average_bar_distributions_into_this`` and calls
+    ``criterion.sample(pred_merged, t=t)`` **directly**, bypassing
+    ``sample_from_model_prediction_`` entirely. That unpatched ensemble-level
+    sample is what actually gets written into ``impute_X`` and propagates
+    to every later column, so the one-level-up patch could still let an
+    +-inf through (confirmed via traceback: the crash happens inside
+    ``impute_()`` -> ``impute_single_permutation_``'s *next* column's
+    ``predict_proba``, i.e. a previously-written ``impute_X`` value was
+    already infinite going in).
+
+    Fix: patch ``BarDistribution.icdf`` itself instead -- the single true
+    chokepoint every ``.sample()``/``.median()``/``.quantile()`` call goes
+    through, regardless of which of tabpfn_extensions' call sites invokes
+    it. After computing the original result, replace any non-finite element
+    with the distribution's mean (``BarDistribution.mean``, itself always
+    finite -- a weighted sum of finite bucket means plus a finite
+    half-normal tail mean) so the row stays usable instead of silently
+    corrupting later columns. Guarded by a flag attribute so repeated
+    ``_make_experiment()`` calls within one process (one per
+    generate_tabpfn_standard/custom call) don't stack redundant wrappers.
 
     Tracking: see ``/memories/repo/synthdata-tabpfn-notes.md``. No upstream
     issue has been filed for this ``icdf`` underflow yet -- if you file one,
     add the link here and re-check whether this patch is still needed before
     deleting it.
     """
-    from tabpfn_extensions import unsupervised
+    from tabpfn.architectures.base.bar_distribution import BarDistribution
 
-    original = unsupervised.TabPFNUnsupervisedModel.sample_from_model_prediction_
+    if getattr(BarDistribution, "_synthdata_icdf_patched", False):
+        return
 
-    def sample_from_model_prediction_(self, column_idx, X_fit, model, X_predict, t):
-        pred, pred_sampled = original(self, column_idx, X_fit, model, X_predict, t)
-        if self.use_classifier_(column_idx, X_fit[:, column_idx]):
-            return pred, pred_sampled
+    original_icdf = BarDistribution.icdf
 
-        non_finite = ~torch.isfinite(pred_sampled)
+    def icdf(self, logits, left_prob):
+        result = original_icdf(self, logits, left_prob)
+        non_finite = ~torch.isfinite(result)
         if non_finite.any():
-            logits = pred["logits"]
-            logits_tensor = (
-                logits.clone().detach() if torch.is_tensor(logits) else torch.as_tensor(logits)
-            )
-            fallback = pred["criterion"].mean(logits_tensor).to(pred_sampled.dtype)
-            attribute_names = getattr(self, "_synthdata_attribute_names", None)
-            column_label = (
-                attribute_names[column_idx]
-                if attribute_names is not None and column_idx < len(attribute_names)
-                else column_idx
-            )
+            fallback = self.mean(logits).to(result.dtype)
             logger.warning(
-                "[tabpfn] column %s: %d/%d sampled value(s) non-finite "
-                "(upstream BarDistribution.icdf underflow) -- replaced with "
-                "the distribution mean",
-                column_label,
+                "[tabpfn] %d/%d sampled value(s) non-finite (upstream "
+                "BarDistribution.icdf underflow) -- replaced with the "
+                "distribution mean",
                 int(non_finite.sum()),
-                pred_sampled.numel(),
+                result.numel(),
             )
-            pred_sampled = torch.where(non_finite, fallback, pred_sampled)
-        return pred, pred_sampled
+            result = torch.where(non_finite, fallback, result)
+        return result
 
-    unsupervised.TabPFNUnsupervisedModel.sample_from_model_prediction_ = (
-        sample_from_model_prediction_
-    )
+    BarDistribution.icdf = icdf
+    BarDistribution._synthdata_icdf_patched = True
 
 
-def _make_experiment(attribute_names: list | None = None):
+def _make_experiment():
     from tabpfn import TabPFNClassifier, TabPFNRegressor
     from tabpfn_extensions import unsupervised
     from tabpfn_extensions.unsupervised import experiments
@@ -146,9 +154,6 @@ def _make_experiment(attribute_names: list | None = None):
     model_unsupervised = unsupervised.TabPFNUnsupervisedModel(
         tabpfn_clf=TabPFNClassifier(), tabpfn_reg=TabPFNRegressor()
     )
-    # Stashed only for the diagnostic log in _patch_regression_sample_inf_bug
-    # (column names instead of bare indices); not read by tabpfn_extensions itself.
-    model_unsupervised._synthdata_attribute_names = attribute_names
     experiment = experiments.GenerateSyntheticDataExperiment(task_type="unsupervised")
     # Disable the internal auto-plot: should_plot=False is not respected by this
     # version and self.data has duplicate indices after pd.concat, which breaks
@@ -192,7 +197,7 @@ def generate_tabpfn_standard(
         attribute_names.index(c) for c in categorical_columns if c in attribute_names
     ]
 
-    experiment, model_unsupervised = _make_experiment(attribute_names)
+    experiment, model_unsupervised = _make_experiment()
     experiment.run(
         tabpfn=model_unsupervised,
         X=x,
@@ -249,7 +254,7 @@ def generate_tabpfn_custom(
         if c in attribute_names
     ]
 
-    experiment, model_unsupervised = _make_experiment(attribute_names)
+    experiment, model_unsupervised = _make_experiment()
     experiment.run(
         tabpfn=model_unsupervised,
         X=train_array,

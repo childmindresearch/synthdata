@@ -12,6 +12,7 @@ import pandas as pd
 import torch
 from tabpfgen import TabPFGen
 
+from synthdata.data import decode_label_encoded_columns, label_encode_non_numeric_columns
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -96,7 +97,18 @@ def generate_tabpfgen_standard(
     the HPO-tuned variant in the notebook, since it was found empirically more
     stable across sampled hyperparameters).
     """
-    x_train = train_imputed_df[feature_columns].values.astype(float)
+    # TabPFGen's SGLD sampler requires a purely numeric input array. The
+    # imputed train split can still have string-valued declared-categorical
+    # columns (e.g. Pegboard__peg_dom_hand's "Left"/"Right"/"Ambidexterous"),
+    # since imputation decodes categorical columns back to their original
+    # labels. Mirror generate_tabpfn_standard: force-factorize every declared
+    # categorical_columns entry (even if already numeric) to integer codes,
+    # then decode the synthesized categorical columns back afterward via the
+    # same category_maps -- see synthdata.data.label_encode_non_numeric_columns.
+    encoded_features, category_maps = label_encode_non_numeric_columns(
+        train_imputed_df, feature_columns, categorical_columns=categorical_columns
+    )
+    x_train = encoded_features.to_numpy(dtype=float)
     y_train = train_imputed_df[target_column].values
 
     generator = TabPFGen(**(tabpfgen_params or {}))
@@ -104,21 +116,20 @@ def generate_tabpfgen_standard(
         X_train=x_train, y_train=y_train, n_samples=n_samples, balance_classes=True
     )
 
-    synthetic = pd.DataFrame(x_synth, columns=feature_columns)
-    for col in categorical_columns:
-        n_cats = train_imputed_df[col].nunique()
-        synthetic[col] = synthetic[col].round().clip(0, n_cats - 1).astype(int)
+    synthetic_encoded = pd.DataFrame(x_synth, columns=feature_columns)
 
     if relabel_with_classifier:
         from tabpfn import TabPFNClassifier
 
         clf = TabPFNClassifier()
         clf.fit(x_train, y_train)
-        synthetic[target_column] = clf.predict(synthetic.to_numpy())
+        target_values = clf.predict(synthetic_encoded.to_numpy(dtype=float))
     else:
         n_cls = train_imputed_df[target_column].nunique()
-        synthetic[target_column] = pd.Series(y_synth.astype(int)).clip(0, n_cls - 1).values
+        target_values = pd.Series(y_synth.astype(int)).clip(0, n_cls - 1).values
 
+    synthetic = decode_label_encoded_columns(synthetic_encoded, category_maps)
+    synthetic[target_column] = target_values
     return synthetic
 
 
@@ -137,7 +148,12 @@ def generate_tabpfgen_custom(
     so to recover the true training class distribution we over-generate and then
     subsample proportionally.
     """
-    x_train = train_imputed_df[feature_columns].values.astype(float)
+    # See the comment in generate_tabpfgen_standard for why declared
+    # categorical_columns must be force-factorized before the float cast.
+    encoded_features, category_maps = label_encode_non_numeric_columns(
+        train_imputed_df, feature_columns, categorical_columns=categorical_columns
+    )
+    x_train = encoded_features.to_numpy(dtype=float)
     y_train = train_imputed_df[target_column].values
 
     train_proportions = train_imputed_df[target_column].value_counts(normalize=True)
@@ -152,10 +168,8 @@ def generate_tabpfgen_custom(
         x_train, y_train, n_samples=n_to_generate, balance_classes=True
     )
 
-    synth_all = pd.DataFrame(x_synth_all, columns=feature_columns)
-    for col in categorical_columns:
-        n_cats = train_imputed_df[col].nunique()
-        synth_all[col] = synth_all[col].round().clip(0, n_cats - 1).astype(int)
+    synth_all_encoded = pd.DataFrame(x_synth_all, columns=feature_columns)
+    synth_all = decode_label_encoded_columns(synth_all_encoded, category_maps)
 
     n_classes_enc = train_imputed_df[target_column].nunique()
     synth_all[target_column] = pd.Series(y_synth_all.astype(int)).clip(0, n_classes_enc - 1).values
@@ -182,7 +196,12 @@ def build_tabpfgen_standard_objective(
     """Optuna objective searching TabPFGen's SGLD hyperparameters (standard variant)."""
     from tabpfn import TabPFNClassifier
 
-    x_feat = train_imputed_df[feature_columns].values.astype(float)
+    # See the comment in generate_tabpfgen_standard for why declared
+    # categorical_columns must be force-factorized before the float cast.
+    encoded_features, category_maps = label_encode_non_numeric_columns(
+        train_imputed_df, feature_columns, categorical_columns=categorical_columns
+    )
+    x_feat = encoded_features.to_numpy(dtype=float)
     y_label = train_imputed_df[target_column].values
 
     def objective(trial: optuna.Trial) -> float:
@@ -196,12 +215,12 @@ def build_tabpfgen_standard_objective(
             x_s, _ = gen.generate_classification(
                 X_train=x_feat, y_train=y_label, n_samples=n_samples, balance_classes=True
             )
-            syn = pd.DataFrame(x_s, columns=feature_columns)
-            for c in categorical_columns:
-                syn[c] = syn[c].round().clip(0, train_imputed_df[c].nunique() - 1).astype(int)
+            syn_encoded = pd.DataFrame(x_s, columns=feature_columns)
             clf = TabPFNClassifier()
             clf.fit(x_feat, y_label)
-            syn[target_column] = clf.predict(syn.to_numpy())
+            target_values = clf.predict(syn_encoded.to_numpy(dtype=float))
+            syn = decode_label_encoded_columns(syn_encoded, category_maps)
+            syn[target_column] = target_values
         except (ValueError, RuntimeError) as exc:
             logger.warning("tabpfgen_standard trial %d failed: %s", trial.number, exc)
             raise optuna.TrialPruned() from exc
@@ -221,7 +240,12 @@ def build_tabpfgen_custom_objective(
     seed: int = 42,
 ):
     """Optuna objective searching TabPFGenSGLDLabels's SGLD hyperparameters."""
-    x_feat = train_imputed_df[feature_columns].values.astype(float)
+    # See the comment in generate_tabpfgen_standard for why declared
+    # categorical_columns must be force-factorized before the float cast.
+    encoded_features, category_maps = label_encode_non_numeric_columns(
+        train_imputed_df, feature_columns, categorical_columns=categorical_columns
+    )
+    x_feat = encoded_features.to_numpy(dtype=float)
     y_label = train_imputed_df[target_column].values
     proportions = train_imputed_df[target_column].value_counts(normalize=True)
 
@@ -240,9 +264,8 @@ def build_tabpfgen_custom_objective(
                 n_samples=n_per * len(proportions),
                 balance_classes=True,
             )
-            all_df = pd.DataFrame(x_s, columns=feature_columns)
-            for c in categorical_columns:
-                all_df[c] = all_df[c].round().clip(0, train_imputed_df[c].nunique() - 1).astype(int)
+            all_df_encoded = pd.DataFrame(x_s, columns=feature_columns)
+            all_df = decode_label_encoded_columns(all_df_encoded, category_maps)
             all_df[target_column] = (
                 pd.Series(y_s.astype(int))
                 .clip(0, train_imputed_df[target_column].nunique() - 1)
