@@ -80,10 +80,26 @@ _CATBOOST_WARMUP_ITERATIONS = 100
 
 
 def _fit_categorical_binary_encoders(df: pd.DataFrame, categorical_columns: list) -> dict:
-    """Build a category<->index<->binary-code map per categorical column."""
+    """Build a category<->index<->binary-code map per categorical column.
+
+    Categories are sorted by their natural value where possible (numeric sort),
+    falling back to string sort only when values aren't mutually comparable
+    (e.g. genuinely unordered/nominal text categories, where any consistent
+    order is fine). This matters specifically for ordinal columns (see
+    ``Dataset.ordinal_columns``): by the time this runs, an ordinal column is
+    always already numeric-coded in its true order (either natively, or via
+    ``synthdata.data.encode_ordinal_columns`` for text-valued ones upstream),
+    so a numeric sort assigns bit-pattern indices that follow that true order
+    rather than an arbitrary/alphabetical one -- a string sort would otherwise
+    scramble multi-digit numeric codes (e.g. "10" sorting before "2").
+    """
     encoders = {}
     for col in categorical_columns:
-        categories = sorted(df[col].dropna().unique().tolist(), key=str)
+        categories = df[col].dropna().unique().tolist()
+        try:
+            categories = sorted(categories)
+        except TypeError:
+            categories = sorted(categories, key=str)
         n_categories = max(len(categories), 1)
         n_bits = max((n_categories - 1).bit_length(), 1)
         cat_to_idx = {cat: idx for idx, cat in enumerate(categories)}

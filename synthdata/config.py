@@ -57,21 +57,42 @@ class DataConfig:
     #: this set to True -- otherwise stratified train_test_split raises on NaN.
     drop_rows_missing_target: bool = False
 
-    #: "auto" to infer categorical columns (nunique <= auto_categorical_unique_threshold,
-    #: or dtype object/category/bool), or an explicit list of column names.
-    categorical_columns: str | list = "auto"
-    auto_categorical_unique_threshold: int = 10
+    #: "auto" to infer nominal (unordered categorical) columns (nunique <=
+    #: auto_nominal_unique_threshold, or dtype object/category/bool), or an
+    #: explicit list of column names. Columns listed in ``ordinal_columns`` are
+    #: always excluded here (they're a separate, ordered role -- see below),
+    #: even under "auto".
+    nominal_columns: str | list = "auto"
+    auto_nominal_unique_threshold: int = 10
 
-    #: Explicit natural-order encoding for ordinal columns stored as text
-    #: (e.g. ``{"activity_level": ["Very Light", "Light", "Moderate", "Heavy",
-    #: "Exceptional"]}``, lowest to highest). Applied before categorical_columns
-    #: is resolved, so these columns are encoded to integers preserving their
-    #: true order and then treated as plain numeric (never one-hot/binary
-    #: encoded) -- must not overlap with categorical_columns. Every value
-    #: observed in the column must appear in its configured list (raises
-    #: otherwise). Columns not listed here that still contain non-numeric
-    #: values fall back to alphabetical label-encoding at the imputation/
-    #: generation model boundary (see synthdata.data.warn_non_numeric_feature_columns).
+    #: Explicit list of ordinal (ordered, discrete) feature columns -- e.g.
+    #: Likert-scale/severity-band columns. Unlike ``nominal_columns`` there is no
+    #: "auto" inference (a generic cardinality heuristic can't tell an ordered
+    #: category set from an unordered one), so every ordinal column must be
+    #: listed here explicitly. Encoded/decoded through the exact same
+    #: categorical backend machinery as ``nominal_columns`` (see
+    #: ``Dataset.categorical_columns`` = ``nominal_columns + ordinal_columns``),
+    #: so every ordinal column is guaranteed to come back as one of its observed
+    #: valid category values -- it can no longer silently fall through to being
+    #: imputed/generated as a plain continuous column just because someone forgot
+    #: to also add it to the (formerly single) categorical column list. Must not
+    #: overlap ``nominal_columns``.
+    ordinal_columns: list = dataclasses.field(default_factory=list)
+
+    #: Explicit natural-order encoding for ``ordinal_columns`` entries stored as
+    #: text (e.g. ``{"activity_level": ["Very Light", "Light", "Moderate",
+    #: "Heavy", "Exceptional"]}``, lowest to highest). Applied before
+    #: ``nominal_columns``/``ordinal_columns`` are resolved into
+    #: ``Dataset.categorical_columns``, so these columns are encoded to integers
+    #: preserving their true order first. Every key here must also appear in
+    #: ``ordinal_columns`` (raises otherwise -- this is exactly the mistake that
+    #: caused a real bug: a column had its category order configured here but
+    #: was never actually routed through the categorical encode/decode path, so
+    #: it silently came back as a continuous value instead of one of its 5 valid
+    #: codes). Every value observed in the column must appear in its configured
+    #: list (raises otherwise). ``ordinal_columns`` entries not listed here are
+    #: assumed to already be numeric-coded in their true order (e.g. a 0-4
+    #: Likert code).
     ordinal_column_categories: dict = dataclasses.field(default_factory=dict)
 
     #: Uppercase all column names on load (matches the hepatitis notebook convention).
@@ -156,7 +177,14 @@ class ImputationConfig:
     #: round_rules are rounded to the nearest integer after imputation. Set to False for
     #: datasets with genuinely continuous features that shouldn't be integer-snapped.
     round_to_int_default: bool = True
-    #: Reuse a previously cached imputed CSV if present.
+    #: Reuse previously cached imputed CSVs if present *and* still valid: validity
+    #: is determined by comparing a hash of the imputation-relevant config fields
+    #: (nominal_columns, ordinal_columns, ordinal_column_categories, method,
+    #: round_rules, round_to_int_default, refidiff params) against the sidecar
+    #: ``.imputation_cache_key.json`` written alongside the cached CSVs, so
+    #: editing e.g. ``data.nominal_columns``/``data.ordinal_columns`` and
+    #: rerunning correctly retrains instead of silently reusing stale imputed
+    #: data (see synthdata.imputation.pipeline.run_imputation).
     cache: bool = True
     #: Fractional margin used when validating imputed continuous values fall within range.
     validation_margin: float = 0.2
@@ -285,6 +313,35 @@ class LogDisparityConfig:
 
 
 @dataclasses.dataclass
+class BinaryTargetConfig:
+    """Collapse a multi-class target into a binary (0/1) variable for a
+    *second, separate* SynthEval pass, so metrics that require exactly 2
+    target classes (auroc_diff, statistical_parity, equalized_odds,
+    equal_opportunity) can run even when the real target has 3+ classes.
+
+    This is evaluation-only: it never touches ``data.target_column``,
+    generation, or any other metric's target -- the collapse is applied to
+    disposable copies of the real/synthetic dataframes used only for this
+    extra pass, replacing the target column's values in place (same column
+    name, so it still gets excluded from the model's feature set exactly
+    like the original target -- no leakage risk from the original,
+    finer-grained labels lingering as a feature).
+
+    ``positive_classes``/``negative_classes`` must together cover every
+    observed value of the target column (fails loudly otherwise -- see
+    :func:`synthdata.evaluation.syntheval_eval.build_binary_target_series`).
+    """
+
+    enabled: bool = False
+    #: Column to collapse; defaults to data.target_column if left None.
+    column: str | None = None
+    #: Original class values mapped to the binary "positive" (1) outcome.
+    positive_classes: list = dataclasses.field(default_factory=list)
+    #: Original class values mapped to the binary "negative"/reference (0) outcome.
+    negative_classes: list = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
 class EvaluationConfig:
     output_dir: str = "output/dataset/evaluation"
     #: Restrict evaluation to a subset of generated model names (None = all found on disk).
@@ -304,6 +361,7 @@ class EvaluationConfig:
     ranking_strategy: str = "linear"
     log_disparity: LogDisparityConfig = dataclasses.field(default_factory=LogDisparityConfig)
     save_per_model_syntheval_plots: bool = True
+    binary_target: BinaryTargetConfig = dataclasses.field(default_factory=BinaryTargetConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +475,7 @@ _NESTED_DATACLASSES = {
     (EvaluationConfig, "syntheval"): FrameworkSelectionConfig,
     (EvaluationConfig, "custom"): FrameworkSelectionConfig,
     (EvaluationConfig, "log_disparity"): LogDisparityConfig,
+    (EvaluationConfig, "binary_target"): BinaryTargetConfig,
 }
 
 
@@ -466,16 +525,37 @@ def _validate(cfg: Config) -> None:
             "generation.tabpfn.data_variants entries must be 'raw' and/or 'imputed', "
             f"got {sorted(bad_data_variants)}"
         )
-    if isinstance(cfg.data.categorical_columns, list):
-        overlap = set(cfg.data.ordinal_column_categories) & set(cfg.data.categorical_columns)
+    if isinstance(cfg.data.nominal_columns, list):
+        overlap = set(cfg.data.nominal_columns) & set(cfg.data.ordinal_columns)
         if overlap:
             raise ValueError(
-                "data.ordinal_column_categories and data.categorical_columns must not overlap "
-                f"(a column is either nominal/categorical or ordinal, not both): {sorted(overlap)}"
+                "data.nominal_columns and data.ordinal_columns must not overlap (a column is "
+                f"either nominal or ordinal, not both): {sorted(overlap)}"
             )
+    missing_ordinal = set(cfg.data.ordinal_column_categories) - set(cfg.data.ordinal_columns)
+    if missing_ordinal:
+        raise ValueError(
+            "data.ordinal_column_categories references column(s) not listed in "
+            f"data.ordinal_columns: {sorted(missing_ordinal)} -- add them to ordinal_columns so "
+            "they're actually treated as ordinal/categorical instead of silently falling through "
+            "to plain continuous numeric imputation/generation."
+        )
     for col, categories in cfg.data.ordinal_column_categories.items():
         if not isinstance(categories, list) or len(categories) != len(set(categories)):
             raise ValueError(
                 f"data.ordinal_column_categories[{col!r}] must be a list of unique values, "
                 f"got {categories!r}"
+            )
+    if cfg.evaluation.binary_target.enabled:
+        bt = cfg.evaluation.binary_target
+        if not bt.positive_classes or not bt.negative_classes:
+            raise ValueError(
+                "evaluation.binary_target.positive_classes and .negative_classes must both be "
+                "non-empty when evaluation.binary_target.enabled is true."
+            )
+        overlap = set(bt.positive_classes) & set(bt.negative_classes)
+        if overlap:
+            raise ValueError(
+                "evaluation.binary_target.positive_classes and .negative_classes must not "
+                f"overlap: {sorted(overlap, key=str)}"
             )

@@ -4,6 +4,7 @@ import pytest
 import yaml
 
 from synthdata.config import (
+    BinaryTargetConfig,
     Config,
     DataConfig,
     GenerationConfig,
@@ -73,6 +74,24 @@ class TestFromDict:
         assert cfg.imputation.refidiff.hidden_dim == 64
         # Sibling RefiDiffConfig defaults are preserved.
         assert cfg.imputation.refidiff.denoiser == "auto"
+
+    def test_evaluation_binary_target_nested_dict_builds_nested_dataclass(self):
+        cfg = _from_dict(
+            Config,
+            {
+                "evaluation": {
+                    "binary_target": {
+                        "enabled": True,
+                        "positive_classes": [0, 1],
+                        "negative_classes": [2],
+                    }
+                }
+            },
+        )
+        assert isinstance(cfg.evaluation.binary_target, BinaryTargetConfig)
+        assert cfg.evaluation.binary_target.enabled is True
+        assert cfg.evaluation.binary_target.positive_classes == [0, 1]
+        assert cfg.evaluation.binary_target.negative_classes == [2]
 
 
 class TestValidate:
@@ -174,17 +193,30 @@ class TestValidate:
         cfg.imputation.refidiff.denoiser = denoiser
         _validate(cfg)  # should not raise
 
-    def test_ordinal_column_overlapping_categorical_columns_raises(self):
+    def test_ordinal_column_not_in_ordinal_columns_raises(self):
         cfg = self._base_valid()
-        cfg.data.categorical_columns = ["activity"]
+        cfg.data.ordinal_columns = []
         cfg.data.ordinal_column_categories = {"activity": ["Light", "Heavy"]}
         with pytest.raises(ValueError, match="ordinal_column_categories"):
             _validate(cfg)
 
-    def test_ordinal_column_not_overlapping_categorical_columns_passes(self):
+    def test_ordinal_column_in_ordinal_columns_passes(self):
         cfg = self._base_valid()
-        cfg.data.categorical_columns = ["other_cat"]
+        cfg.data.ordinal_columns = ["activity"]
         cfg.data.ordinal_column_categories = {"activity": ["Light", "Heavy"]}
+        _validate(cfg)  # should not raise
+
+    def test_nominal_and_ordinal_columns_overlap_raises(self):
+        cfg = self._base_valid()
+        cfg.data.nominal_columns = ["activity"]
+        cfg.data.ordinal_columns = ["activity"]
+        with pytest.raises(ValueError, match="nominal_columns"):
+            _validate(cfg)
+
+    def test_nominal_and_ordinal_columns_disjoint_passes(self):
+        cfg = self._base_valid()
+        cfg.data.nominal_columns = ["other_cat"]
+        cfg.data.ordinal_columns = ["activity"]
         _validate(cfg)  # should not raise
 
     def test_ordinal_column_categories_not_a_list_raises(self):
@@ -198,6 +230,38 @@ class TestValidate:
         cfg.data.ordinal_column_categories = {"activity": ["Light", "Light"]}
         with pytest.raises(ValueError, match="ordinal_column_categories"):
             _validate(cfg)
+
+    def test_binary_target_disabled_by_default_passes(self):
+        cfg = self._base_valid()
+        _validate(cfg)  # should not raise
+
+    def test_binary_target_enabled_without_classes_raises(self):
+        cfg = self._base_valid()
+        cfg.evaluation.binary_target.enabled = True
+        with pytest.raises(ValueError, match="binary_target"):
+            _validate(cfg)
+
+    def test_binary_target_enabled_with_only_positive_raises(self):
+        cfg = self._base_valid()
+        cfg.evaluation.binary_target.enabled = True
+        cfg.evaluation.binary_target.positive_classes = [0, 1]
+        with pytest.raises(ValueError, match="binary_target"):
+            _validate(cfg)
+
+    def test_binary_target_overlapping_classes_raises(self):
+        cfg = self._base_valid()
+        cfg.evaluation.binary_target.enabled = True
+        cfg.evaluation.binary_target.positive_classes = [0, 1]
+        cfg.evaluation.binary_target.negative_classes = [1, 2]
+        with pytest.raises(ValueError, match="binary_target"):
+            _validate(cfg)
+
+    def test_binary_target_valid_config_passes(self):
+        cfg = self._base_valid()
+        cfg.evaluation.binary_target.enabled = True
+        cfg.evaluation.binary_target.positive_classes = [0, 1]
+        cfg.evaluation.binary_target.negative_classes = [2]
+        _validate(cfg)  # should not raise
 
 
 class TestLoadConfig:

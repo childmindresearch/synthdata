@@ -8,6 +8,11 @@ validation reporting) identically regardless of which backend produced the
 imputed values.
 """
 
+import dataclasses
+import hashlib
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -16,6 +21,10 @@ from synthdata.data import Dataset
 from synthdata.utils import ensure_dir, get_logger, resolve_device
 
 logger = get_logger(__name__)
+
+#: Sidecar filename (under ``dataset.data_dir``) recording the config fields that
+#: determined the currently-cached imputed CSVs -- see :func:`_cache_key_record`.
+_CACHE_KEY_FILENAME = ".imputation_cache_key.json"
 
 
 def _impute_dataframe(cfg: Config, df: pd.DataFrame, dataset: Dataset, device: str) -> pd.DataFrame:
@@ -102,26 +111,115 @@ def validate_imputed_column(
     }
 
 
+def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
+    """Build the dict of config/dataset fields that determine imputed values.
+
+    Deliberately narrower than "the whole Config": only fields that actually
+    change what :func:`_impute_dataframe`/:func:`apply_rounding` produce, so an
+    unrelated config edit (e.g. ``evaluation.*``, ``imputation.validation_margin``,
+    which only affects the post-hoc report, not the imputed values themselves)
+    doesn't force an unnecessary retrain. Uses ``dataset.feature_columns``/
+    ``dataset.nominal_columns``/``dataset.ordinal_columns`` (the already-resolved
+    lists) rather than ``cfg.data.nominal_columns``/``cfg.data.ordinal_columns``
+    directly, so two differently-*written* configs (e.g. an explicit list vs.
+    an ``"auto"`` heuristic that resolves to the same columns) correctly hash
+    identically.
+    """
+    imp_cfg = cfg.imputation
+    payload = {
+        "seed": cfg.seed,
+        "target_column": dataset.target_column,
+        "feature_columns": sorted(dataset.feature_columns),
+        "nominal_columns": sorted(dataset.nominal_columns),
+        "ordinal_columns": sorted(dataset.ordinal_columns),
+        "ordinal_column_categories": cfg.data.ordinal_column_categories,
+        "imputation_enabled": imp_cfg.enabled,
+        "imputation_method": imp_cfg.method,
+        "round_rules": imp_cfg.round_rules,
+        "round_to_int_default": imp_cfg.round_to_int_default,
+    }
+    if imp_cfg.method == "refidiff":
+        payload["refidiff"] = dataclasses.asdict(imp_cfg.refidiff)
+    return payload
+
+
+def _cache_key_record(cfg: Config, dataset: Dataset) -> dict:
+    """``_cache_key_payload`` plus its own sha256 digest under ``"cache_key"``."""
+    payload = _cache_key_payload(cfg, dataset)
+    encoded = json.dumps(payload, sort_keys=True, default=str)
+    record = dict(payload)
+    record["cache_key"] = hashlib.sha256(encoded.encode()).hexdigest()
+    return record
+
+
+def _load_cached_key(path: Path) -> str | None:
+    """Read a previous run's ``cache_key`` from ``path``, or ``None`` if absent/unreadable.
+
+    A missing file means either no cache exists yet or it predates this
+    cache-key feature -- either way, treated as "no recorded key" (cache miss)
+    rather than an error. A present-but-corrupt file (rare -- e.g. truncated by
+    an interrupted write) is narrowly caught, logged, and also treated as a
+    cache miss: safe to self-heal by retraining and rewriting the file, since
+    this is cache metadata, not a scientific artifact.
+    """
+    if not path.exists():
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f).get("cache_key")
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "Failed to parse imputation cache-key file %s (%s); treating cached imputed data "
+            "as stale and retraining",
+            path,
+            exc,
+        )
+        return None
+
+
 def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
     """Impute ``dataset.full_df`` and populate the ``*_imputed`` splits.
 
     Caches to ``full_imputed.csv``/``train_imputed.csv``/``test_imputed.csv`` under
     ``cfg.data.data_dir``; reused on subsequent runs unless ``cfg.imputation.cache``
-    is False.
+    is False. Reuse also requires the cache-key sidecar file
+    (``.imputation_cache_key.json``, also under ``data_dir``) to match a fresh
+    hash of the current config's imputation-relevant fields (see
+    :func:`_cache_key_payload`) -- so editing e.g. ``nominal_columns``/
+    ``ordinal_columns`` or ``imputation.method`` and rerunning correctly
+    retrains instead of silently reusing stale imputed CSVs from before the
+    change.
     """
     paths = dataset.paths()
+    cache_key_path = dataset.data_dir / _CACHE_KEY_FILENAME
+    cache_record = _cache_key_record(cfg, dataset)
+    current_key = cache_record["cache_key"]
+    cached_key = _load_cached_key(cache_key_path)
 
-    if (
-        cfg.imputation.cache
-        and paths["full_imputed"].exists()
+    cached_csvs_exist = (
+        paths["full_imputed"].exists()
         and paths["train_imputed"].exists()
         and paths["test_imputed"].exists()
-    ):
-        logger.info("Using cached imputed data at %s", dataset.data_dir)
+    )
+
+    if cfg.imputation.cache and cached_csvs_exist and cached_key == current_key:
+        logger.info(
+            "Using cached imputed data at %s (cache_key=%s)", dataset.data_dir, current_key[:16]
+        )
         dataset.full_imputed_df = pd.read_csv(paths["full_imputed"])
         dataset.train_imputed_df = pd.read_csv(paths["train_imputed"])
         dataset.test_imputed_df = pd.read_csv(paths["test_imputed"])
         return dataset
+
+    if cfg.imputation.cache and cached_csvs_exist and cached_key != current_key:
+        logger.info(
+            "Imputation-relevant config changed since the cached imputed data at %s was "
+            "produced (cached cache_key=%s, current=%s) -- retraining instead of reusing "
+            "the stale cache",
+            dataset.data_dir,
+            cached_key[:16] if cached_key else None,
+            current_key[:16],
+        )
 
     if not cfg.imputation.enabled:
         logger.info("Imputation disabled; using rows with complete cases only")
@@ -171,6 +269,9 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
         )
     train_imputed.to_csv(paths["train_imputed"], index=False)
     test_imputed.to_csv(paths["test_imputed"], index=False)
+    with open(cache_key_path, "w") as f:
+        json.dump(cache_record, f, indent=2, sort_keys=True, default=str)
+    logger.info("Wrote imputation cache-key %s to %s", current_key[:16], cache_key_path)
 
     dataset.full_imputed_df = full_imputed
     dataset.train_imputed_df = train_imputed

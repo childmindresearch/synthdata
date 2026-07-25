@@ -3,17 +3,14 @@ scatter plots, per-model SynthEval diagnostic plots, and log-disparity sunburst
 reports.
 """
 
-import glob
-import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
 
 from synthdata.config import Config
-from synthdata.data import Dataset
 from synthdata.plotting import save_matplotlib_figure, save_plotly_figure
-from synthdata.utils import ensure_dir, get_logger
+from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
 
@@ -142,56 +139,3 @@ def save_log_disparity_plots(
         if fig is None:
             continue
         save_plotly_figure(fig, output_dir / name, ("html",))
-
-
-def save_per_model_syntheval_plots(
-    dataset: Dataset,
-    synthetic_datasets: dict[str, pd.DataFrame],
-    preset_path: str | Path,
-    output_dir: str | Path,
-) -> None:
-    """Re-run SynthEval per model with plotting enabled to capture its native PNGs.
-
-    SynthEval writes PNGs (``SE_*.png``) to the current working directory, so this
-    temporarily chdirs into a per-model subdirectory of ``output_dir``.
-    """
-    from syntheval import AnalysisConfig, SynthEval
-
-    # Resolve to an absolute path *before* chdir-ing into per-model subdirectories
-    # below, otherwise a relative path would no longer point at the right file.
-    preset_path = Path(preset_path).resolve()
-
-    analysis_config = AnalysisConfig(
-        dataset=dataset.train_imputed_df,
-        target_vars=dataset.target_column,
-        confounder_vars=None,
-        sensitive_vars=dataset.sensitive_columns,
-    )
-    se = SynthEval(
-        dataset.train_imputed_df,
-        holdout_dataframe=dataset.test_imputed_df,
-        cat_cols=dataset.all_categorical_columns,
-        verbose=False,
-        enable_plots=True,
-        console="off",
-        show_warnings=False,
-    )
-
-    base_dir = ensure_dir(Path(output_dir) / "evaluation" / "syntheval_plots")
-    original_dir = os.getcwd()
-    try:
-        for name, syn_df in synthetic_datasets.items():
-            model_dir = ensure_dir(base_dir / name)
-            os.chdir(model_dir)
-            try:
-                before = set(glob.glob("SE_*.png"))
-                se.evaluate(syn_df, analysis_target=analysis_config, presets_file=str(preset_path))
-                plt.close("all")
-                new_pngs = sorted(set(glob.glob("SE_*.png")) - before)
-                logger.info("[syntheval plots] %s: %d new figures", name, len(new_pngs))
-            except (ValueError, RuntimeError, KeyError, OSError) as exc:
-                logger.warning("[syntheval plots] failed for %s: %s", name, exc)
-            finally:
-                os.chdir(original_dir)
-    finally:
-        os.chdir(original_dir)

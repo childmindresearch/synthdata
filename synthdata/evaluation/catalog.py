@@ -127,6 +127,52 @@ SYNTHEVAL_METRIC_TYPE = {
     "equal_opportunity": "fairness",
 }
 
+#: Some SynthEval metrics' RESULT COLUMN names differ from their preset/
+#: selection key, or add extra per-(target_var[, protected_attribute])
+#: breakdown columns when `full_output: True` is set (as SYNTHEVAL_PRESET
+#: does for the 3 fairness metrics) -- none of these are literal keys in
+#: SYNTHEVAL_METRIC_TYPE above, so a plain dict lookup would silently
+#: misclassify them as "utility" (the fallback default). See:
+#: - metric_auroc_difference.py: primary column is "auroc" (not "auroc_diff"),
+#:   per-target sub-columns are "auroc_<target_var>".
+#: - metric_statistical_parity.py / metric_equal_opportunity.py /
+#:   metric_equalized_odds.py: per-(target_var, protected_attribute)
+#:   sub-columns are "sp_"/"eo_"/"eqo_" + "<target_var>_<protected_attribute>".
+_SYNTHEVAL_SUBMETRIC_PREFIX_TYPE = {
+    "auroc_": "utility",
+    "sp_": "fairness",
+    "eo_": "fairness",
+    "eqo_": "fairness",
+}
+
+#: Same idea, for which of these prefixed sub-columns belong to the custom
+#: (fork-only) fairness metrics -- see SYNTHEVAL_CUSTOM_FAIRNESS_KEYS below.
+_SYNTHEVAL_CUSTOM_SUBMETRIC_PREFIXES = ("eo_", "eqo_")
+
+
+def classify_syntheval_metric(name: str) -> str:
+    """Classify a SynthEval RESULT COLUMN name (not necessarily its preset/
+    selection key -- see _SYNTHEVAL_SUBMETRIC_PREFIX_TYPE above) into
+    utility/privacy/fairness.
+    """
+    if name in SYNTHEVAL_METRIC_TYPE:
+        return SYNTHEVAL_METRIC_TYPE[name]
+    for prefix, type_ in _SYNTHEVAL_SUBMETRIC_PREFIX_TYPE.items():
+        if name.startswith(prefix):
+            return type_
+    return "utility"
+
+
+def is_custom_syntheval_metric(name: str) -> bool:
+    """Whether a SynthEval RESULT COLUMN name belongs to one of this repo's
+    fork-only fairness metrics (SYNTHEVAL_CUSTOM_FAIRNESS_KEYS), including
+    their full_output=True per-(target_var, protected_attribute) sub-columns.
+    """
+    return name in SYNTHEVAL_CUSTOM_FAIRNESS_KEYS or name.startswith(
+        _SYNTHEVAL_CUSTOM_SUBMETRIC_PREFIXES
+    )
+
+
 #: Custom additions to the syntheval fork (see submodules/syntheval fairness/): these
 #: are computed via SynthEval's `evaluate()` call but re-tagged framework="custom"
 #: in the combined evaluation table, since they are not part of upstream SynthEval.

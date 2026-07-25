@@ -101,22 +101,17 @@ def main() -> None:
         from synthdata.evaluation import run_evaluation
         from synthdata.plotting.evaluation_plots import (
             save_log_disparity_plots,
-            save_per_model_syntheval_plots,
             save_rank_tradeoff_plots,
         )
 
-        combined, extras = run_evaluation(cfg, dataset, synthetic_datasets)
+        combined, extras = run_evaluation(
+            cfg, dataset, synthetic_datasets, enable_syntheval_plots=True
+        )
         save_rank_tradeoff_plots(cfg, combined, cfg.plots.output_dir)
         save_log_disparity_plots(extras["log_disparity_reports"], cfg.plots.output_dir)
-
-        if (
-            cfg.evaluation.save_per_model_syntheval_plots
-            and extras["syntheval_benchmark_results"] is not None
-        ):
-            preset_path = Path(cfg.evaluation.output_dir) / "syntheval_preset.json"
-            save_per_model_syntheval_plots(
-                dataset, extras["selected_datasets"], preset_path, cfg.plots.output_dir
-            )
+        # Native per-model SynthEval plots (SE_*.png) are produced as a side effect of
+        # run_evaluation()'s syntheval benchmark pass above (via enable_syntheval_plots),
+        # so no separate/redundant recomputation pass is needed here.
 
     if experiment is not None:
         experiment.record(

@@ -53,12 +53,34 @@ data:
   raw_target_column: CLASS # hepatitis-specific: UCI names the target column "CLASS"
   sensitive_columns: [AGE, SEX]
   drop_columns: []
+  # Drop rows where target_column is null before splitting/imputing (every
+  # downstream stage assumes a fully-observed target). Not needed here -- the
+  # UCI hepatitis dataset's CLASS column has no missing values.
+  drop_rows_missing_target: false
 
-  categorical_columns: auto # "auto" or an explicit list of column names
-  auto_categorical_unique_threshold: 10
+  nominal_columns: auto # "auto" or an explicit list of column names
+  auto_nominal_unique_threshold: 10
+  # No ordinal columns in the UCI hepatitis dataset, so both default to empty
+  # (see configs/config_loris.yaml for a real example that uses them).
+  # ordinal_columns: explicit list of ordered/discrete feature columns (e.g.
+  # Likert-scale/severity-band columns) -- unlike nominal_columns there's no
+  # "auto" inference, so every ordinal column must be listed here explicitly.
+  ordinal_columns: []
+  # ordinal_column_categories: natural-order encoding for ordinal_columns
+  # entries stored as text rather than an already-numeric code, e.g.
+  # {activity_level: [Very Light, Light, Moderate, Heavy, Exceptional]}.
+  ordinal_column_categories: {}
 
   uppercase_columns: true # hepatitis-specific: UCI feature names -> upper case
   remap_binary_one_two: true # hepatitis-specific: recode {1,2} columns -> {0,1}
+
+  # If set (together with a non-empty outlier_columns), numeric values in those
+  # columns further than this many std-devs from their column mean are treated
+  # as missing (NaN) rather than passed through as-is -- catches "not
+  # administered" sentinel codes and corrupt outlier rows. Not needed here;
+  # see configs/config_loris.yaml for a real example.
+  outlier_zscore_threshold: null
+  outlier_columns: []
 
   train_size: 0.6667
   stratify: true
@@ -76,6 +98,18 @@ imputation:
   round_to_int_default: true
   cache: true
   validation_margin: 0.2
+
+  # Only used when method: refidiff (see configs/config_loris.yaml for a real
+  # example) -- shown here with library defaults for reference.
+  refidiff:
+    hidden_dim: 32 # denoiser hidden width
+    epochs: 10001 # max training epochs (early stopping usually halts well before this)
+    early_stopping_patience: 500
+    batch_size: 8192
+    num_steps: 50 # reverse-diffusion (EDM/VE-SDE) sampling steps
+    num_trials: 10 # independent reverse-diffusion trajectories averaged together
+    denoiser: auto # auto | mamba | mlp -- "auto" uses mamba-ssm if importable, else an MLP denoiser
+    checkpoint_every: 1000 # epochs between training checkpoints (resumable on preemption/OOM)
 
 generation:
   n_samples: 200
@@ -148,6 +182,18 @@ evaluation:
     protected_bins: [null, [7, 18, 30, 45, 60, 78]]
 
   save_per_model_syntheval_plots: true
+
+  # auroc_diff/statistical_parity/equalized_odds/equal_opportunity all require
+  # a target with EXACTLY 2 classes. If data.target_column has 3+ classes,
+  # enable this to run those 4 metrics against a second, separate SynthEval
+  # pass over a disposable binary collapse of the target -- this never affects
+  # any other metric (which keep using the real target) or the generated data.
+  # Not needed here (hepatitis's target is already binary), so left disabled.
+  binary_target:
+    enabled: false
+    column: null # defaults to data.target_column
+    positive_classes: [] # e.g. [0, 1] -- original class values -> binary 1
+    negative_classes: [] # e.g. [2] -- original class values -> binary 0
 
 plots:
   output_dir: output/hepatitis/plots # "data"/"imputation" sections write here directly;

@@ -17,6 +17,23 @@ from synthdata.utils import get_logger
 logger = get_logger(__name__)
 
 
+def _category_value_counts(series: pd.Series) -> pd.Series:
+    """Frequency table for one categorical column's observed values.
+
+    Most nominal/ordinal columns are integer-coded (round+cast to int to collapse
+    float noise like 1.0000001 before counting), but some nominal columns are
+    genuinely text-valued (e.g. ``Pegboard__peg_dom_hand``: 'Left'/'Right'/
+    'Ambidexterous' -- unlike most categorical columns, no upstream step maps
+    it to numeric codes). Rounding/casting those raises
+    ``TypeError: Expected numeric dtype, got object instead.`` from
+    ``Series.round()``, so only do it for numeric-dtype columns.
+    """
+    values = series.dropna()
+    if pd.api.types.is_numeric_dtype(values):
+        values = values.round().astype(int)
+    return values.value_counts(normalize=True)
+
+
 def plot_real_vs_synthetic(
     real_df: pd.DataFrame,
     synth_df: pd.DataFrame,
@@ -38,9 +55,15 @@ def plot_real_vs_synthetic(
             ax.axis("off")
             continue
         if col in categorical_columns:
-            real_freq = real_df[col].dropna().round().astype(int).value_counts(normalize=True)
-            synth_freq = synth_df[col].dropna().round().astype(int).value_counts(normalize=True)
-            categories = sorted(set(real_freq.index) | set(synth_freq.index))
+            real_freq = _category_value_counts(real_df[col])
+            synth_freq = _category_value_counts(synth_df[col])
+            all_categories = set(real_freq.index) | set(synth_freq.index)
+            try:
+                categories = sorted(all_categories)
+            except TypeError:
+                # Mixed types (e.g. real is text-valued but synthesis produced a
+                # stray numeric code) -- fall back to a stable, comparable order.
+                categories = sorted(all_categories, key=str)
             positions = np.arange(len(categories))
             width = 0.4
             ax.bar(

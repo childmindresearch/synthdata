@@ -36,6 +36,7 @@ def plot_observed_vs_imputed(
         missing_mask = full_df[col].isna()
         observed = full_df.loc[~missing_mask, col]
         imputed = full_imputed_df.loc[missing_mask, col]
+        n_imputed = int(missing_mask.sum())
 
         if col in categorical_columns:
             obs_counts = observed.value_counts(normalize=True).sort_index()
@@ -60,13 +61,12 @@ def plot_observed_vs_imputed(
         else:
             ax.hist(observed, bins=15, density=True, alpha=0.6, label="observed")
             ax.hist(imputed, bins=15, density=True, alpha=0.6, label="imputed")
-        ax.set_title(col, fontsize=9)
+        ax.set_title(f"{col} (n_imputed = {n_imputed})", fontsize=9)
         ax.legend(fontsize=7)
 
     for ax in axes_flat[len(columns_with_missing) :]:
         ax.axis("off")
 
-    fig.suptitle("Observed vs. imputed distributions", fontsize=13, fontweight="bold")
     fig.tight_layout()
     return fig
 
@@ -80,12 +80,11 @@ def plot_validation_summary(validation_df: pd.DataFrame):
         pass_rate = validation_df["n_valid"] / validation_df["n_imputed"].replace(0, np.nan)
         colors = ["#2a9d8f" if ok else "#e76f51" for ok in validation_df["all_valid"]]
         ax.bar(validation_df["column"], pass_rate.fillna(1.0), color=colors, zorder=3)
-        ax.tick_params(axis="x", rotation=45)
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
         ax.set_ylim(0, 1.05)
-    ax.set_ylabel("Fraction of imputed values within plausible range")
+    ax.set_ylabel("Fraction of imputed values\nwithin plausible range")
     ax.set_title("Imputation validation summary")
     ax.grid(True, linestyle="--", alpha=0.4, axis="y", zorder=0)
-    fig.tight_layout()
     return fig
 
 

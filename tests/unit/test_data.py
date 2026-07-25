@@ -12,7 +12,7 @@ from synthdata.data import (
     cast_integer_like_columns,
     decode_label_encoded_columns,
     encode_ordinal_columns,
-    infer_categorical_columns,
+    infer_nominal_columns,
     label_encode_non_numeric_columns,
     mask_outliers_as_missing,
     remap_binary_one_two,
@@ -22,17 +22,24 @@ from synthdata.data import (
 pytestmark = pytest.mark.unit
 
 
-class TestInferCategoricalColumns:
+class TestInferNominalColumns:
     def test_explicit_list_wins_and_is_filtered_to_features(self):
         df = pd.DataFrame({"a": [1, 2, 3], "b": [1.0, 2.0, 3.0]})
-        result = infer_categorical_columns(
+        result = infer_nominal_columns(
             df, feature_columns=["a", "b"], explicit=["a", "not_a_feature"]
+        )
+        assert result == ["a"]
+
+    def test_explicit_list_excludes_ordinal_columns(self):
+        df = pd.DataFrame({"a": [1, 2, 3], "b": [1.0, 2.0, 3.0]})
+        result = infer_nominal_columns(
+            df, feature_columns=["a", "b"], explicit=["a", "b"], ordinal_columns=["b"]
         )
         assert result == ["a"]
 
     def test_uci_metadata_used_when_no_explicit_list(self):
         df = pd.DataFrame({"a": [1, 2, 3], "b": [1.5, 2.5, 3.5]})
-        result = infer_categorical_columns(
+        result = infer_nominal_columns(
             df,
             feature_columns=["a", "b"],
             explicit="auto",
@@ -42,7 +49,7 @@ class TestInferCategoricalColumns:
 
     def test_falls_back_to_heuristic_when_no_uci_categorical_tags(self):
         df = pd.DataFrame({"a": np.linspace(0, 100, 20), "b": ["x", "y"] * 10})
-        result = infer_categorical_columns(
+        result = infer_nominal_columns(
             df,
             feature_columns=["a", "b"],
             explicit="auto",
@@ -61,7 +68,7 @@ class TestInferCategoricalColumns:
                 "high_card_numeric": np.linspace(0, 1, 3),
             }
         )
-        result = infer_categorical_columns(
+        result = infer_nominal_columns(
             df,
             feature_columns=list(df.columns),
             explicit="auto",
@@ -69,9 +76,20 @@ class TestInferCategoricalColumns:
         )
         assert set(result) == {"obj_col", "bool_col", "low_card_numeric"}
 
+    def test_heuristic_excludes_ordinal_columns(self):
+        df = pd.DataFrame({"obj_col": ["x", "y", "z"], "low_card_numeric": [1, 1, 2]})
+        result = infer_nominal_columns(
+            df,
+            feature_columns=list(df.columns),
+            explicit="auto",
+            ordinal_columns=["low_card_numeric"],
+            unique_threshold=2,
+        )
+        assert result == ["obj_col"]
+
     def test_no_categorical_columns_inferred(self):
         df = pd.DataFrame({"x": np.linspace(0, 100, 20)})
-        result = infer_categorical_columns(
+        result = infer_nominal_columns(
             df, feature_columns=["x"], explicit="auto", unique_threshold=2
         )
         assert result == []
@@ -162,6 +180,33 @@ class TestLabelEncodeRoundtrip:
         decoded = decode_label_encoded_columns(df, {"color": pd.Index(["red", "blue"])})
         assert list(decoded.columns) == ["other"]
 
+    def test_categorical_columns_forces_factorize_of_numeric_column(self):
+        # A numeric-but-categorical column with a non-zero-indexed/gapped
+        # domain (e.g. a real 5-level ordinal stored as {1..5}, or a nominal
+        # stored as {0, 2}) must be factorized like a string column when
+        # declared in categorical_columns, not passed through raw -- some
+        # backends' categorical handling returns compact 0-indexed codes
+        # regardless of the input's actual values, silently shifting the
+        # column's domain in their output unless it goes through this same
+        # factorize/decode round-trip.
+        df = pd.DataFrame({"marital_status": [1, 3, 5, 1]})
+        encoded, maps = label_encode_non_numeric_columns(
+            df, ["marital_status"], categorical_columns=["marital_status"]
+        )
+        assert "marital_status" in maps
+        assert encoded["marital_status"].tolist() == [0.0, 1.0, 2.0, 0.0]
+        decoded = decode_label_encoded_columns(encoded, maps)
+        assert decoded["marital_status"].tolist() == df["marital_status"].tolist()
+
+    def test_categorical_columns_does_not_affect_uncategorical_numeric_columns(self):
+        df = pd.DataFrame({"num": [1, 2, 3], "cat": [1, 3, 5]})
+        encoded, maps = label_encode_non_numeric_columns(
+            df, ["num", "cat"], categorical_columns=["cat"]
+        )
+        assert "num" not in maps
+        assert encoded["num"].tolist() == [1, 2, 3]
+        assert "cat" in maps
+
 
 class TestEncodeOrdinalColumns:
     def test_encodes_in_configured_order_not_alphabetical(self):
@@ -197,8 +242,9 @@ class TestWarnNonNumericFeatureColumns:
         assert caplog.text == ""
 
     def test_warns_on_string_valued_column_not_declared_categorical(self, caplog):
-        # "activity" is not in categorical_columns, so it's assumed numeric,
-        # but actually holds text values (e.g. an ordinal band never encoded).
+        # "activity" is not in nominal_columns/ordinal_columns, so it's assumed
+        # numeric, but actually holds text values (e.g. an ordinal band never
+        # encoded).
         df = pd.DataFrame({"num": [1.0, 2.0], "activity": ["Light", "Heavy"]})
         backend_logger = logging.getLogger("synthdata.data")
         backend_logger.addHandler(caplog.handler)

@@ -83,13 +83,15 @@ def make_dataset(tmp_path, sample_mixed_df):
         df: pd.DataFrame | None = None,
         target_column: str = "target",
         feature_columns: list | None = None,
-        categorical_columns: list | None = None,
+        nominal_columns: list | None = None,
+        ordinal_columns: list | None = None,
         sensitive_columns: list | None = None,
         name: str = "testds",
     ) -> Dataset:
         df = sample_mixed_df.copy() if df is None else df
         feature_columns = feature_columns or [c for c in df.columns if c != target_column]
-        categorical_columns = categorical_columns if categorical_columns is not None else []
+        nominal_columns = nominal_columns if nominal_columns is not None else []
+        ordinal_columns = ordinal_columns if ordinal_columns is not None else []
         sensitive_columns = sensitive_columns if sensitive_columns is not None else []
         data_dir = ensure_dir(tmp_path / "data" / name)
         train_df, test_df = train_test_split(df, train_size=0.7, random_state=0)
@@ -97,7 +99,8 @@ def make_dataset(tmp_path, sample_mixed_df):
             name=name,
             target_column=target_column,
             feature_columns=feature_columns,
-            categorical_columns=categorical_columns,
+            nominal_columns=nominal_columns,
+            ordinal_columns=ordinal_columns,
             sensitive_columns=sensitive_columns,
             data_dir=data_dir,
             full_df=df,

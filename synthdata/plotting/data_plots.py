@@ -37,28 +37,26 @@ def plot_column_distributions(
     for ax in axes_flat[len(columns) :]:
         ax.axis("off")
 
-    fig.suptitle("Column distributions", fontsize=13, fontweight="bold")
     fig.tight_layout()
     return fig
 
 
 def plot_missingness(df: pd.DataFrame, feature_columns: list):
-    """Bar chart of missing-value counts per feature column."""
+    """Bar chart of missing-value fractions per feature column."""
     import matplotlib.pyplot as plt
 
-    missing = df[feature_columns].isna().sum()
+    missing = df[feature_columns].isna().mean()
     missing = missing[missing > 0].sort_values(ascending=False)
 
     fig, ax = plt.subplots(figsize=(max(6, 0.4 * len(missing)), 4))
     if len(missing):
         ax.bar(missing.index.astype(str), missing.values, zorder=3)
-        ax.tick_params(axis="x", rotation=45)
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
     else:
         ax.text(0.5, 0.5, "No missing values", ha="center", va="center", transform=ax.transAxes)
-    ax.set_ylabel("# missing")
+    ax.set_ylabel("Fraction missing")
     ax.set_title("Missing values per column")
     ax.grid(True, linestyle="--", alpha=0.4, axis="y", zorder=0)
-    fig.tight_layout()
     return fig
 
 

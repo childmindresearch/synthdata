@@ -42,6 +42,12 @@ Each stage caches its outputs to disk (imputed data under `data/<name>/`, synthe
 CSVs + Optuna studies under `output/<name>/synthetic_data/`, the combined evaluation
 table under `output/<name>/evaluation/`, figures under `output/<name>/plots/`) so
 later stages -- or a re-run of `synthdata-plot` -- don't require recomputation.
+Imputation's cache is config-aware: alongside the cached `*_imputed.csv` files,
+`synthdata-impute` writes a `.imputation_cache_key.json` hashing the config fields
+that determine imputed values (`nominal_columns`, `ordinal_columns`,
+`ordinal_column_categories`, `imputation.method`, etc.), so changing one of those
+and rerunning correctly retrains instead of reusing stale imputed data. Set
+`imputation.cache: false` to always retrain regardless.
 
 ### Experiment tracking & dataset versioning
 
@@ -91,6 +97,11 @@ version is typically reused across many generation experiments.
   (`framework in {synthcity, syntheval, custom}`, `type in {utility, privacy, fairness}`),
   plus per-group, per-type, and overall ranking columns. Supports partial selection
   of metrics, either by `type` category or by explicit metric name, per framework.
+  `auroc_diff`/`statistical_parity`/`equalized_odds`/`equal_opportunity` require an
+  exactly-2-class target; `evaluation.binary_target` (see `configs/config.yaml`/
+  `configs/config_loris.yaml`) optionally runs those 4 against a second, disposable
+  binary collapse of a multi-class target so they can still run, without affecting
+  any other metric or the generated data.
 - **Plotting** (`synthdata/plotting/`): every figure from the notebooks (column/
   missingness distributions, observed-vs-imputed validation, real-vs-synthetic
   comparisons, Optuna diagnostics, utility/privacy/fairness rank trade-offs,

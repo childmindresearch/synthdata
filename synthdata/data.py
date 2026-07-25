@@ -34,7 +34,8 @@ class Dataset:
     name: str
     target_column: str
     feature_columns: list
-    categorical_columns: list
+    nominal_columns: list
+    ordinal_columns: list
     sensitive_columns: list
     data_dir: Path
 
@@ -54,9 +55,24 @@ class Dataset:
     test_imputed_df: pd.DataFrame | None = None
 
     @property
+    def categorical_columns(self) -> list:
+        """All categorical-encoded feature columns: nominal + ordinal.
+
+        Every backend that discretely encodes categorical columns (bit-encoding
+        in refidiff, one-hot in tabimpute, etc.) doesn't itself need to
+        distinguish nominal from ordinal -- both are encoded/decoded to exact
+        observed category values the same way, the only difference is whether
+        an order is preserved for the ordinal ones (see
+        synthdata.imputation.refidiff_backend._fit_categorical_binary_encoders).
+        So most call sites want this combined list; use ``nominal_columns``/
+        ``ordinal_columns`` directly only when the distinction actually matters.
+        """
+        return list(self.nominal_columns) + list(self.ordinal_columns)
+
+    @property
     def all_categorical_columns(self) -> list:
         """Categorical feature columns plus the target column."""
-        return list(self.categorical_columns) + [self.target_column]
+        return self.categorical_columns + [self.target_column]
 
     def paths(self) -> dict:
         d = self.data_dir
@@ -138,7 +154,15 @@ def _load_local_file(cfg: Config) -> tuple:
         df = pd.read_parquet(path)
     elif suffix == ".csv":
         logger.info("Loading local CSV file: %s", path)
-        df = pd.read_csv(path)
+        # low_memory=False: read the whole file in one pass rather than pandas'
+        # default chunked read, which can infer a different dtype per chunk for
+        # a column that's almost entirely NaN except for a handful of string
+        # values far down the file (e.g. loris_combined.csv's >99%-missing
+        # DailyMeds__med_type_0X columns) -- emits `DtypeWarning: Columns (...)
+        # have mixed types` and silently mixes float/object dtype for the same
+        # column across chunks. Same eventual per-column dtype either way, just
+        # inferred consistently in one pass instead of reconciled after the fact.
+        df = pd.read_csv(path, low_memory=False)
     else:
         raise ValueError(
             f"Unsupported file extension {suffix!r} for data.path={cfg.data.path!r}; "
@@ -152,31 +176,45 @@ def _load_local_file(cfg: Config) -> tuple:
 # ---------------------------------------------------------------------------
 
 
-def infer_categorical_columns(
+def infer_nominal_columns(
     df: pd.DataFrame,
     feature_columns: list,
     explicit: str | list,
+    ordinal_columns: list | None = None,
     unique_threshold: int = 10,
     uci_variable_types: dict | None = None,
 ) -> list:
-    """Determine which feature columns should be treated as categorical.
+    """Determine which feature columns should be treated as nominal (unordered categorical).
 
     Resolution order:
         1. An explicit list of column names in the config always wins.
         2. If UCI variable metadata is available, use its "Categorical" tag.
         3. Otherwise fall back to a dtype/cardinality heuristic
            (object/category/bool dtype, or nunique <= unique_threshold).
+
+    ``ordinal_columns`` (a dataset's separately-configured ordered-categorical
+    columns) are excluded from every resolution path above, regardless of
+    source -- they're a distinct first-class role handled by the caller, never
+    folded back into "nominal" just because they'd otherwise match the heuristic.
     """
+    ordinal_set = set(ordinal_columns or [])
+
     if isinstance(explicit, list):
-        return [c for c in explicit if c in feature_columns]
+        return [c for c in explicit if c in feature_columns and c not in ordinal_set]
 
     if uci_variable_types is not None:
-        cats = [c for c in feature_columns if uci_variable_types.get(c) == "Categorical"]
+        cats = [
+            c
+            for c in feature_columns
+            if uci_variable_types.get(c) == "Categorical" and c not in ordinal_set
+        ]
         if cats:
             return cats
 
     cats = []
     for c in feature_columns:
+        if c in ordinal_set:
+            continue
         dtype = df[c].dtype
         if (
             dtype in (object, bool)
@@ -231,20 +269,21 @@ def warn_non_numeric_feature_columns(
 ) -> list:
     """Log a loud warning for any feature column declared numeric but not actually numeric.
 
-    A column not listed in ``categorical_columns`` is assumed to already be
-    numeric (e.g. an ordinal column pre-encoded to integers), but a plain CSV
-    source can still surprise us with a string-valued column that was
-    correctly excluded from ``categorical_columns`` (e.g. an ordinal band
-    stored as text like "Light"/"Heavy") yet was never actually numeric-encoded
-    at the source. Every downstream imputation/generation backend that builds
-    a numeric matrix falls back to label-encoding such columns (see
-    :func:`label_encode_non_numeric_columns`), so this check doesn't change
-    behavior -- it exists purely to surface the issue immediately at
-    dataset-load time (this function is the single source of truth for this
-    check; call it here rather than re-deriving the same "numeric_columns"
-    filter independently in each backend), rather than it being discovered
-    (or, worse, silently missed) deep inside whichever backend happens to run
-    first.
+    ``categorical_columns`` here is the caller's already-combined
+    ``nominal_columns + ordinal_columns`` list (see ``Dataset.categorical_columns``).
+    A column not listed in it is assumed to already be numeric (e.g. an ordinal
+    column pre-encoded to integers), but a plain CSV source can still surprise
+    us with a string-valued column that was correctly excluded (e.g. an ordinal
+    band stored as text like "Light"/"Heavy") yet was never actually
+    numeric-encoded at the source. Every downstream imputation/generation
+    backend that builds a numeric matrix falls back to label-encoding such
+    columns (see :func:`label_encode_non_numeric_columns`), so this check
+    doesn't change behavior -- it exists purely to surface the issue
+    immediately at dataset-load time (this function is the single source of
+    truth for this check; call it here rather than re-deriving the same
+    "numeric_columns" filter independently in each backend), rather than it
+    being discovered (or, worse, silently missed) deep inside whichever
+    backend happens to run first.
 
     Returns the list of offending column names (empty if none).
     """
@@ -252,12 +291,13 @@ def warn_non_numeric_feature_columns(
     offending = [c for c in numeric_columns if not pd.api.types.is_numeric_dtype(df[c])]
     if offending:
         logger.warning(
-            "%d feature column(s) are not listed in data.categorical_columns (so are assumed "
-            "numeric) but actually contain non-numeric values: %s. Every backend falls back to "
-            "label-encoding these columns (preserves missingness, but does not guarantee "
-            "categories are numbered in their true ordinal order -- alphabetical by default). "
-            "Add them to data.categorical_columns (if nominal), or map them to an explicit "
-            "ordinal-to-integer encoding in load_dataset (if ordinal), for more correct treatment.",
+            "%d feature column(s) are not listed in data.nominal_columns/data.ordinal_columns "
+            "(so are assumed numeric) but actually contain non-numeric values: %s. Every backend "
+            "falls back to label-encoding these columns (preserves missingness, but does not "
+            "guarantee categories are numbered in their true order -- alphabetical by default). "
+            "Add them to data.nominal_columns (if unordered) or data.ordinal_columns (with an "
+            "entry in data.ordinal_column_categories if not already numeric-coded) for correct "
+            "treatment.",
             len(offending),
             offending,
         )
@@ -292,22 +332,44 @@ def cast_integer_like_columns(df: pd.DataFrame, columns: list) -> pd.DataFrame:
     return out
 
 
-def label_encode_non_numeric_columns(df: pd.DataFrame, columns: list) -> tuple[pd.DataFrame, dict]:
-    """Factorize any non-numeric (e.g. string-valued) columns to integer codes.
+def label_encode_non_numeric_columns(
+    df: pd.DataFrame, columns: list, categorical_columns: list | None = None
+) -> tuple[pd.DataFrame, dict]:
+    """Factorize non-numeric columns (and any declared categorical ones) to integer codes.
 
     Some backends (``TabImputeCategorical``, TabPFN) require a fully numeric
     matrix, but a plain CSV source (unlike the pre-encoded UCI hepatitis
     example) commonly has string-valued categorical columns (e.g.
-    "Light"/"Heavy"/...). Missing values are preserved as NaN so they're still
-    treated as missing rather than a category. Returns the encoded frame plus
-    ``{column: categories}``, needed to decode output back to the original
-    labels via :func:`decode_label_encoded_columns`. Already-numeric columns
-    pass through unchanged.
+    "Light"/"Heavy"/...) -- those are always factorized regardless of
+    ``categorical_columns``. Missing values are preserved as NaN so they're
+    still treated as missing rather than a category. Returns the encoded
+    frame plus ``{column: categories}``, needed to decode output back to the
+    original labels via :func:`decode_label_encoded_columns`.
+
+    ``categorical_columns`` (if given) additionally forces factorization for
+    columns that are *already numeric* but represent a category, not a
+    continuous quantity -- e.g. a 5-level ordinal stored as raw values
+    ``{1..5}``, or a binary variable stored as ``{0, 2}``. Without this, such
+    a column would pass through unencoded, and some backends' internal
+    categorical handling returns *compact 0-indexed class predictions*
+    regardless of the input's actual value domain (confirmed for TabPFN's
+    unsupervised experiment API): a 5-class column's synthetic output would
+    come back as ``{0..4}`` instead of the true ``{1..5}``, and a ``{0, 2}``
+    binary column's as ``{0, 1}`` instead of ``{0, 2}`` -- silently shifting/
+    relabeling the column's entire domain in the synthetic output. Routing
+    every declared categorical column through the same factorize/decode
+    round-trip as string columns (regardless of dtype) guarantees the model
+    only ever sees/produces compact 0-indexed codes internally, and that
+    :func:`decode_label_encoded_columns` always maps back to the true
+    observed domain afterward. Already-numeric columns *not* listed in
+    ``categorical_columns`` (i.e. genuinely continuous ones) still pass
+    through unchanged.
     """
     encoded = df[columns].copy()
     category_maps = {}
+    force_factorize = set(categorical_columns or [])
     for col in columns:
-        if pd.api.types.is_numeric_dtype(encoded[col]):
+        if pd.api.types.is_numeric_dtype(encoded[col]) and col not in force_factorize:
             continue
         codes, categories = pd.factorize(encoded[col], sort=True)
         codes = codes.astype(float)
@@ -403,7 +465,8 @@ def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
         "path": cfg.data.path,
         "target_column": dataset.target_column,
         "feature_columns": dataset.feature_columns,
-        "categorical_columns": dataset.categorical_columns,
+        "nominal_columns": dataset.nominal_columns,
+        "ordinal_columns": dataset.ordinal_columns,
         "sensitive_columns": dataset.sensitive_columns,
         "n_rows": int(len(dataset.full_df)),
         "n_train": int(len(dataset.train_df)),
@@ -471,13 +534,16 @@ def load_dataset(cfg: Config) -> Dataset:
     if cfg.data.ordinal_column_categories:
         df = encode_ordinal_columns(df, cfg.data.ordinal_column_categories)
 
-    categorical_columns = infer_categorical_columns(
+    ordinal_columns = [c for c in cfg.data.ordinal_columns if c in feature_columns]
+    nominal_columns = infer_nominal_columns(
         df,
         feature_columns,
-        cfg.data.categorical_columns,
-        unique_threshold=cfg.data.auto_categorical_unique_threshold,
+        cfg.data.nominal_columns,
+        ordinal_columns=ordinal_columns,
+        unique_threshold=cfg.data.auto_nominal_unique_threshold,
         uci_variable_types=variable_types,
     )
+    categorical_columns = nominal_columns + ordinal_columns
     warn_non_numeric_feature_columns(df, feature_columns, categorical_columns)
 
     # Cast whole-numbered categorical columns (incl. target) to a proper int dtype.
@@ -509,7 +575,8 @@ def load_dataset(cfg: Config) -> Dataset:
         name=cfg.name,
         target_column=target_column,
         feature_columns=feature_columns,
-        categorical_columns=categorical_columns,
+        nominal_columns=nominal_columns,
+        ordinal_columns=ordinal_columns,
         sensitive_columns=list(cfg.data.sensitive_columns),
         data_dir=data_dir,
         full_df=df,
@@ -526,13 +593,15 @@ def load_dataset(cfg: Config) -> Dataset:
     write_dataset_manifest(cfg, dataset)
 
     logger.info(
-        "Loaded dataset '%s' (version=%s): %d rows, %d features (%d categorical), "
-        "target=%r, sensitive=%s, train=%d/test=%d",
+        "Loaded dataset '%s' (version=%s): %d rows, %d features (%d categorical: %d nominal + "
+        "%d ordinal), target=%r, sensitive=%s, train=%d/test=%d",
         cfg.name,
         cfg.data.version or "unversioned",
         len(df),
         len(feature_columns),
         len(categorical_columns),
+        len(nominal_columns),
+        len(ordinal_columns),
         target_column,
         dataset.sensitive_columns,
         len(train_df),

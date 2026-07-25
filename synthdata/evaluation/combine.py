@@ -13,8 +13,8 @@ import pandas as pd
 from synthdata.evaluation.catalog import (
     LOG_DISPARITY_METRICS,
     SYNTHCITY_CATEGORY_TO_TYPE,
-    SYNTHEVAL_CUSTOM_FAIRNESS_KEYS,
-    SYNTHEVAL_METRIC_TYPE,
+    classify_syntheval_metric,
+    is_custom_syntheval_metric,
 )
 from synthdata.evaluation.custom_eval import build_log_disparity_summary_table
 from synthdata.evaluation.syntheval_eval import extract_oriented_values, extract_raw_values
@@ -80,8 +80,9 @@ def _syntheval_frames(
 ) -> "tuple[pd.DataFrame, pd.DataFrame]":
     """Build (raw, oriented) models x metric-name tables from SynthEval results.
 
-    Metrics in SYNTHEVAL_CUSTOM_FAIRNESS_KEYS (fork-only additions) are tagged
-    framework="custom" instead of "syntheval".
+    Metrics matching is_custom_syntheval_metric() (fork-only additions, plus
+    their full_output=True per-(target_var, protected_attribute) sub-columns)
+    are tagged framework="custom" instead of "syntheval".
     """
     if benchmark_results is None:
         empty = pd.DataFrame(index=model_names)
@@ -91,11 +92,9 @@ def _syntheval_frames(
     oriented = extract_oriented_values(benchmark_ranks).reindex(model_names)
 
     def _framework(metric: str) -> str:
-        return "custom" if metric in SYNTHEVAL_CUSTOM_FAIRNESS_KEYS else "syntheval"
+        return "custom" if is_custom_syntheval_metric(metric) else "syntheval"
 
-    columns = [
-        (_framework(col), SYNTHEVAL_METRIC_TYPE.get(col, "utility"), col) for col in raw.columns
-    ]
+    columns = [(_framework(col), classify_syntheval_metric(col), col) for col in raw.columns]
     raw.columns = pd.MultiIndex.from_tuples(columns)
     oriented.columns = pd.MultiIndex.from_tuples(columns)
     return raw, oriented
