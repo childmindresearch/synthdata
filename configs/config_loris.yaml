@@ -20,8 +20,8 @@ seed: 42
 device: auto # auto | cpu | cuda | mps
 
 experiment:
-  tag: second_try
-  id: "0.2"
+  tag: try_all_models_hpo
+  id: "0.3"
 
 data:
   source: csv
@@ -1041,7 +1041,7 @@ imputation:
 generation:
   n_samples: 1000
   output_dir: output/loris/synthetic_data
-  force_retrain: true
+  force_retrain: false
 
   synthcity:
     enabled: true
@@ -1051,11 +1051,25 @@ generation:
     # example (unstable training). Re-test the rest of the list at this scale
     # before assuming timings from the hepatitis notebook transfer directly --
     # expect meaningfully longer per-model fit times than a 19-column dataset.
-    names: [ctgan]
+    #
+    # ddpm excluded: its training loss (mloss, the multinomial/categorical
+    # term) reliably goes inf -> NaN within the first couple of optimizer
+    # steps on this dataset (reproduced on a fresh CPU-only run with as few as
+    # 1-5 epochs, independent of lr/batch_size, and independent of the 14
+    # literally-constant declared-categorical columns e.g. DrugScreen__*).
+    # Traced step-by-step (log_x_cat/model_out/compute_Lt/kl_prior all finite
+    # on step 1; mloss is already NaN by step 2) without finding the exact
+    # internal culprit -- plausibly the ~822-categorical-column multinomial
+    # diffusion term itself being numerically unstable at this width/dtype
+    # mix, upstream in synthcity's plugin_ddpm/gaussian_multinomial_diffsuion.
+    # Not investigated further since ddpm is one of six synthcity backends
+    # here; revisit (or file upstream against vanderschaarlab/synthcity) if
+    # ddpm output specifically becomes needed.
+    names: [ctgan, tvae, adsgan, pategan, rtvae]
 
   tabpfn:
     enabled: true
-    variants: [standard]
+    variants: [standard, custom]
     # TabPFN officially supports up to 2000 features but only ensembles over
     # random 500-feature subsets beyond that (tabpfn/inference_config.py:
     # MAX_NUMBER_OF_FEATURES). This dataset has ~1000 feature columns after the
@@ -1065,13 +1079,13 @@ generation:
 
   tabpfgen:
     enabled: true
-    variants: [standard]
+    variants: [standard, custom]
     standard_params: {}
     custom_params: { n_sgld_steps: 1000, sgld_noise_scale: 0.1 }
 
   hpo:
     enabled: true
-    n_trials: 10
+    n_trials: 100
     timeout_seconds: 300
     n_iter_cap: 300
     model_iter_caps: { pategan: 50 }
@@ -1088,8 +1102,13 @@ generation:
 evaluation:
   output_dir: output/loris/evaluation
   models: null
-  positive_class: 0 # class 0 = severe impairment (CGAS <=44); the smallest/highest-concern
-  # class -- change if a different class is the more meaningful "positive" outcome.
+  # Which class counts as "positive" for statistical_parity/equalized_odds/
+  # equal_opportunity (fairness metrics) -- only takes effect if data.target_column
+  # is exactly 2 classes. CGAS_class has 3+ classes here, so these metrics only
+  # ever run via the binary_target pass below (which fixes its own positive class
+  # via binary_target.positive_classes) -- this field is currently a no-op for
+  # loris specifically; kept set for if/when the target is ever naturally binary.
+  positive_class: 0
 
   synthcity:
     enabled: true
@@ -1106,7 +1125,6 @@ evaluation:
     categories: null
     metrics: null
 
-  syntheval_preset: complete_eval
   ranking_strategy: linear
 
   log_disparity:
@@ -1133,6 +1151,37 @@ evaluation:
     column: null # defaults to data.target_column (CGAS_class)
     positive_classes: [0, 1] # severe + moderate -> "clinically significant impairment"
     negative_classes: [2] # typical -> reference/negative outcome
+
+  # Weight applied to each type's rollup rank when computing the overall rank
+  # (see synthdata/evaluation/combine.py's mean-of-means aggregation). Default
+  # is equal weight; the privacy_gate below (pass/fail) is this project's
+  # primary safeguard for sensitive data, not this weight -- raise "privacy"
+  # here too if it should also influence relative ranking among gate-passing
+  # models, not just gate them.
+  rank_weights:
+    utility: 1.0
+    privacy: 1.0
+    fairness: 1.0
+
+  # Absolute (not merely relative-to-other-models) privacy safety floor -- see
+  # configs/config.yaml's evaluation.privacy_gate comment for the full
+  # rationale/caveats. Same defaults reused here; adjust if loris-specific
+  # domain/compliance guidance differs from hepatitis's.
+  privacy_gate:
+    enabled: true
+    thresholds:
+      mia_recall: { bound: max, value: 0.6 }
+      mia_precision: { bound: max, value: 0.6 }
+      hit_rate: { bound: max, value: 0.05 }
+      att_discl_risk: { bound: max, value: 0.6 }
+      privacy.identifiability_score.score_OC: { bound: max, value: 0.3 }
+      privacy.k-anonymization.syn: { bound: min, value: 5.0 }
+      privacy.k-map.score: { bound: min, value: 5.0 }
+
+  # Whether to write a human-readable report.md (run metadata, ranked summary,
+  # privacy gate results, recommended model, fairness highlights, plot links)
+  # alongside combined_evaluation.csv.
+  generate_report: true
 
 plots:
   output_dir: output/loris/plots

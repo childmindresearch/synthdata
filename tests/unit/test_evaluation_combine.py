@@ -78,6 +78,26 @@ class TestSynthcityFrames:
         raw, oriented = _synthcity_frames({"model_a": failed_result}, model_names=["model_a"])
         assert raw.empty
 
+    def test_redundant_naive_alpha_precision_submetrics_excluded(self):
+        result = pd.DataFrame(
+            {
+                "mean": [0.9, 0.9, 0.5, 0.5],
+                "direction": ["maximize", "maximize", "maximize", "maximize"],
+            },
+            index=[
+                "stats.alpha_precision.authenticity_OC",
+                "stats.alpha_precision.delta_precision_alpha_OC",
+                "stats.alpha_precision.authenticity_naive",
+                "stats.alpha_precision.delta_precision_alpha_naive",
+            ],
+        )
+        raw, oriented = _synthcity_frames({"model_a": result}, model_names=["model_a"])
+        raw_metrics = raw.columns.get_level_values(2)
+        assert "stats.alpha_precision.authenticity_OC" in raw_metrics
+        assert "stats.alpha_precision.authenticity_naive" not in raw_metrics
+        assert "stats.alpha_precision.delta_precision_alpha_naive" not in raw_metrics
+        assert oriented.columns.get_level_values(2).tolist() == raw_metrics.tolist()
+
 
 class TestSyntheEvalFrames:
     def _benchmark_results(self):
@@ -137,6 +157,23 @@ class TestLogDisparityFrames:
         assert raw_val == pytest.approx(0.4)
         assert oriented_val == pytest.approx(-0.4)  # all log_disparity metrics minimize
 
+    def test_median_abs_present_in_raw_but_excluded_from_oriented(self):
+        # log_disparity_median_abs is redundant with mean_abs (same underlying
+        # per-subgroup array) -- still shown in the raw table (informational)
+        # but excluded from the oriented/ranked table to avoid double-counting.
+        reports = {
+            "model_a": {
+                "summary_stats": {
+                    "mean_abs_log_disparity": 0.4,
+                    "median_abs_log_disparity": 0.3,
+                    "share_significant_bh": 0.1,
+                }
+            }
+        }
+        raw, oriented = _log_disparity_frames(reports, model_names=["model_a"])
+        assert ("custom", "fairness", "log_disparity_median_abs") in raw.columns
+        assert ("custom", "fairness", "log_disparity_median_abs") not in oriented.columns
+
     def test_failed_model_yields_nan_row(self):
         reports = {"model_a": {"error": "boom", "error_type": "KeyError"}}
         raw, _ = _log_disparity_frames(reports, model_names=["model_a"])
@@ -185,3 +222,96 @@ class TestBuildCombinedTable:
         )
         assert ("__all__", "fairness", "rank") in combined.columns
         assert ("__all__", "utility", "rank") in combined.columns
+
+    def test_metric_count_imbalance_does_not_dominate_type_rollup(self):
+        # synthcity contributes 5 utility metrics, syntheval contributes 1 --
+        # under the old flat-sum scheme, synthcity's group would dominate the
+        # utility rollup purely by column count. Under mean-of-means, both
+        # groups' RANK contributes equally to the utility rollup regardless
+        # of how many raw metrics compose each group.
+        synthcity_results = {
+            "model_a": pd.DataFrame(
+                {"mean": [1.0] * 5, "direction": ["maximize"] * 5},
+                index=[f"stats.metric_{i}" for i in range(5)],
+            ),
+            "model_b": pd.DataFrame(
+                {"mean": [0.0] * 5, "direction": ["maximize"] * 5},
+                index=[f"stats.metric_{i}" for i in range(5)],
+            ),
+        }
+        benchmark_results = pd.DataFrame(index=["model_a", "model_b"])
+        benchmark_results[("cls_acc", "value")] = [0.0, 1.0]
+        benchmark_results.columns = pd.MultiIndex.from_tuples(benchmark_results.columns)
+        benchmark_ranks = pd.DataFrame(
+            {"cls_acc": [0.0, 1.0], "rank": [0.0, 1.0]}, index=["model_a", "model_b"]
+        )
+        combined = build_combined_table(
+            synthcity_results,
+            benchmark_results,
+            benchmark_ranks,
+            {},
+            model_names=["model_a", "model_b"],
+        )
+        # synthcity favors model_a (scaled 1.0 vs 0.0), syntheval favors
+        # model_b (scaled 0.0 vs 1.0) -- with equal group weighting these
+        # exactly cancel out in the utility rollup regardless of synthcity
+        # having 5x the raw metric columns.
+        assert combined.loc["model_a", ("__all__", "utility", "rank")] == pytest.approx(0.5)
+        assert combined.loc["model_b", ("__all__", "utility", "rank")] == pytest.approx(0.5)
+
+    def test_rank_weights_zero_excludes_type_from_overall(self):
+        synthcity_results = {
+            "model_a": pd.DataFrame(
+                {"mean": [1.0], "direction": ["maximize"]}, index=["privacy.identifiability_score"]
+            ),
+            "model_b": pd.DataFrame(
+                {"mean": [0.0], "direction": ["maximize"]}, index=["privacy.identifiability_score"]
+            ),
+        }
+        combined = build_combined_table(
+            synthcity_results,
+            None,
+            None,
+            {},
+            model_names=["model_a", "model_b"],
+            rank_weights={"utility": 1.0, "privacy": 0.0, "fairness": 1.0},
+        )
+        assert combined[("__all__", "overall", "rank")].tolist() == [0.0, 0.0]
+
+    def test_rank_weights_asymmetric_changes_sort_order(self):
+        synthcity_results = {
+            "model_a": pd.DataFrame(
+                {"mean": [1.0, 0.0], "direction": ["maximize", "maximize"]},
+                index=["stats.utility_metric", "privacy.identifiability_score"],
+            ),
+            "model_b": pd.DataFrame(
+                {"mean": [0.0, 1.0], "direction": ["maximize", "maximize"]},
+                index=["stats.utility_metric", "privacy.identifiability_score"],
+            ),
+        }
+        combined = build_combined_table(
+            synthcity_results,
+            None,
+            None,
+            {},
+            model_names=["model_a", "model_b"],
+            rank_weights={"utility": 5.0, "privacy": 0.1, "fairness": 1.0},
+        )
+        # model_a wins on utility (weighted heavily); model_b wins on privacy
+        # (weighted lightly) -- utility-heavy weighting should make model_a
+        # rank first overall.
+        assert combined.index[0] == "model_a"
+
+    def test_default_rank_weights_used_when_none_passed(self):
+        synthcity_results = {
+            "model_a": pd.DataFrame(
+                {"mean": [0.9], "direction": ["maximize"]}, index=["stats.ks_test"]
+            ),
+            "model_b": pd.DataFrame(
+                {"mean": [0.1], "direction": ["maximize"]}, index=["stats.ks_test"]
+            ),
+        }
+        combined = build_combined_table(
+            synthcity_results, None, None, {}, model_names=["model_a", "model_b"]
+        )
+        assert combined.index[0] == "model_a"

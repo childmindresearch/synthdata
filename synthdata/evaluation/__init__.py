@@ -8,7 +8,14 @@ import pandas as pd
 
 from synthdata.config import Config
 from synthdata.data import Dataset
-from synthdata.evaluation import combine, custom_eval, synthcity_eval, syntheval_eval
+from synthdata.evaluation import (
+    combine,
+    custom_eval,
+    privacy_gate,
+    report,
+    synthcity_eval,
+    syntheval_eval,
+)
 from synthdata.utils import ensure_dir, get_logger
 
 logger = get_logger(__name__)
@@ -33,6 +40,7 @@ def run_evaluation(
     dataset: Dataset,
     synthetic_datasets: dict[str, pd.DataFrame],
     enable_syntheval_plots: bool = False,
+    experiment=None,
 ) -> tuple[pd.DataFrame, dict]:
     """Run the full evaluation stage.
 
@@ -46,6 +54,10 @@ def run_evaluation(
     ``save_per_model_syntheval_plots`` helper afterwards, as that would redundantly
     recompute every metric (including the expensive ``corr_diff``/``mi_diff`` ones) a
     second time just to get plots that this call already produced.
+
+    ``experiment`` (optional :class:`synthdata.experiment.Experiment`) is only used to
+    include the experiment id in the generated Markdown report (see
+    ``cfg.evaluation.generate_report``); it has no effect on any other stage output.
     """
     eval_cfg = cfg.evaluation
     output_dir = ensure_dir(eval_cfg.output_dir)
@@ -80,6 +92,7 @@ def run_evaluation(
         ranking_strategy=eval_cfg.ranking_strategy,
         output_folder=output_dir / "syntheval_benchmark",
         plots_output_dir=plots_output_dir,
+        positive_class=eval_cfg.positive_class,
     )
 
     if eval_cfg.binary_target.enabled:
@@ -106,7 +119,11 @@ def run_evaluation(
         benchmark_ranks,
         log_disparity_reports,
         model_names,
+        rank_weights=eval_cfg.rank_weights,
     )
+
+    gate_result = privacy_gate.evaluate_privacy_gate(combined, eval_cfg.privacy_gate)
+    combined = privacy_gate.merge_privacy_gate_results(combined, gate_result)
 
     combined.to_csv(output_dir / "combined_evaluation.csv")
 
@@ -116,5 +133,11 @@ def run_evaluation(
         "syntheval_benchmark_results": benchmark_results,
         "syntheval_benchmark_ranks": benchmark_ranks,
         "log_disparity_reports": log_disparity_reports,
+        "privacy_gate_result": gate_result,
     }
+
+    if eval_cfg.generate_report:
+        report_path = report.save_evaluation_report(cfg, dataset, combined, extras, experiment)
+        extras["report_path"] = str(report_path)
+
     return combined, extras

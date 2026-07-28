@@ -10,6 +10,7 @@ from synthdata.config import (
     GenerationConfig,
     HPOConfig,
     ImputationConfig,
+    PrivacyGateConfig,
     RefiDiffConfig,
     _from_dict,
     _validate,
@@ -92,6 +93,24 @@ class TestFromDict:
         assert cfg.evaluation.binary_target.enabled is True
         assert cfg.evaluation.binary_target.positive_classes == [0, 1]
         assert cfg.evaluation.binary_target.negative_classes == [2]
+
+    def test_evaluation_privacy_gate_nested_dict_builds_nested_dataclass(self):
+        cfg = _from_dict(
+            Config,
+            {
+                "evaluation": {
+                    "privacy_gate": {
+                        "enabled": False,
+                        "thresholds": {"mia_recall": {"bound": "max", "value": 0.7}},
+                    }
+                }
+            },
+        )
+        assert isinstance(cfg.evaluation.privacy_gate, PrivacyGateConfig)
+        assert cfg.evaluation.privacy_gate.enabled is False
+        assert cfg.evaluation.privacy_gate.thresholds == {
+            "mia_recall": {"bound": "max", "value": 0.7}
+        }
 
 
 class TestValidate:
@@ -262,6 +281,60 @@ class TestValidate:
         cfg.evaluation.binary_target.positive_classes = [0, 1]
         cfg.evaluation.binary_target.negative_classes = [2]
         _validate(cfg)  # should not raise
+
+    def test_rank_weights_default_passes(self):
+        cfg = self._base_valid()
+        _validate(cfg)  # should not raise
+
+    def test_rank_weights_missing_key_raises(self):
+        cfg = self._base_valid()
+        cfg.evaluation.rank_weights = {"utility": 1.0, "privacy": 1.0}
+        with pytest.raises(ValueError, match="rank_weights"):
+            _validate(cfg)
+
+    def test_rank_weights_extra_key_raises(self):
+        cfg = self._base_valid()
+        cfg.evaluation.rank_weights = {
+            "utility": 1.0,
+            "privacy": 1.0,
+            "fairness": 1.0,
+            "bogus": 1.0,
+        }
+        with pytest.raises(ValueError, match="rank_weights"):
+            _validate(cfg)
+
+    def test_rank_weights_negative_value_raises(self):
+        cfg = self._base_valid()
+        cfg.evaluation.rank_weights = {"utility": 1.0, "privacy": -0.5, "fairness": 1.0}
+        with pytest.raises(ValueError, match="rank_weights"):
+            _validate(cfg)
+
+    def test_rank_weights_zero_is_allowed(self):
+        cfg = self._base_valid()
+        cfg.evaluation.rank_weights = {"utility": 1.0, "privacy": 0.0, "fairness": 1.0}
+        _validate(cfg)  # should not raise
+
+    def test_privacy_gate_default_thresholds_pass(self):
+        cfg = self._base_valid()
+        _validate(cfg)  # should not raise
+
+    def test_privacy_gate_missing_bound_or_value_raises(self):
+        cfg = self._base_valid()
+        cfg.evaluation.privacy_gate.thresholds = {"mia_recall": {"value": 0.6}}
+        with pytest.raises(ValueError, match="privacy_gate.thresholds"):
+            _validate(cfg)
+
+    def test_privacy_gate_bad_bound_raises(self):
+        cfg = self._base_valid()
+        cfg.evaluation.privacy_gate.thresholds = {"mia_recall": {"bound": "sideways", "value": 0.6}}
+        with pytest.raises(ValueError, match="privacy_gate.thresholds"):
+            _validate(cfg)
+
+    def test_privacy_gate_non_numeric_value_raises(self):
+        cfg = self._base_valid()
+        cfg.evaluation.privacy_gate.thresholds = {"mia_recall": {"bound": "max", "value": "high"}}
+        with pytest.raises(ValueError, match="privacy_gate.thresholds"):
+            _validate(cfg)
 
 
 class TestLoadConfig:

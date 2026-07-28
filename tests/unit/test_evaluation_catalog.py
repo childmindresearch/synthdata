@@ -6,8 +6,10 @@ SynthEval result-column classification helpers.
 import pytest
 
 from synthdata.evaluation.catalog import (
+    LOG_DISPARITY_METRICS,
     classify_syntheval_metric,
     is_custom_syntheval_metric,
+    is_redundant_synthcity_submetric,
     resolve_selection,
 )
 
@@ -88,3 +90,41 @@ class TestIsCustomSynthevalMetric:
 
     def test_unrelated_metric(self):
         assert is_custom_syntheval_metric("dwm") is False
+
+
+class TestIsRedundantSynthcitySubmetric:
+    @pytest.mark.parametrize(
+        "metric_key",
+        [
+            "stats.alpha_precision.delta_precision_alpha_naive",
+            "stats.alpha_precision.delta_coverage_beta_naive",
+            "stats.alpha_precision.authenticity_naive",
+        ],
+    )
+    def test_naive_alpha_precision_submetrics_flagged_redundant(self, metric_key):
+        assert is_redundant_synthcity_submetric(metric_key) is True
+
+    @pytest.mark.parametrize(
+        "metric_key",
+        [
+            "stats.alpha_precision.delta_precision_alpha_OC",
+            "stats.alpha_precision.delta_coverage_beta_OC",
+            "stats.alpha_precision.authenticity_OC",
+            "stats.ks_test.marginal",
+            "privacy.identifiability_score.score_OC",
+        ],
+    )
+    def test_non_naive_submetrics_not_flagged(self, metric_key):
+        assert is_redundant_synthcity_submetric(metric_key) is False
+
+
+class TestLogDisparityMetricsExcludesMedian:
+    def test_median_abs_not_a_ranked_metric(self):
+        # log_disparity_median_abs is computed from the exact same per-subgroup
+        # value array as log_disparity_mean_abs (see metric_log_disparity.py) --
+        # deliberately excluded here to avoid double-counting one signal.
+        assert "log_disparity_median_abs" not in LOG_DISPARITY_METRICS
+
+    def test_mean_abs_and_share_significant_still_ranked(self):
+        assert "log_disparity_mean_abs" in LOG_DISPARITY_METRICS
+        assert "log_disparity_share_significant" in LOG_DISPARITY_METRICS

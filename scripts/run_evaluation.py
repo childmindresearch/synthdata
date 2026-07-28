@@ -74,7 +74,7 @@ def main() -> None:
         )
 
     combined, extras = run_evaluation(
-        cfg, dataset, synthetic_datasets, enable_syntheval_plots=args.plot
+        cfg, dataset, synthetic_datasets, enable_syntheval_plots=args.plot, experiment=experiment
     )
     logger.info(
         "Combined evaluation summary (ranked, higher=better):\n%s",
@@ -93,11 +93,26 @@ def main() -> None:
         # run_evaluation()'s syntheval benchmark pass above (via enable_syntheval_plots),
         # so no separate/redundant recomputation pass is needed here.
 
+        if cfg.evaluation.generate_report:
+            # The report was already written once inside run_evaluation(), but its
+            # "Plots" section links to files that only exist *after* the plotting
+            # calls above -- re-save it now (cheap: just re-renders markdown from
+            # already-computed results, no metric recomputation) so those links
+            # are accurate.
+            from synthdata.evaluation.report import save_evaluation_report
+
+            report_path = save_evaluation_report(cfg, dataset, combined, extras, experiment)
+            extras["report_path"] = str(report_path)
+
+    if "report_path" in extras:
+        logger.info("Evaluation report written to %s", extras["report_path"])
+
     experiment.record(
         "evaluation",
         artifacts={
             "evaluation_dir": str(experiment.evaluation_dir),
             "combined_table": str(Path(cfg.evaluation.output_dir) / "combined_evaluation.csv"),
+            **({"report": extras["report_path"]} if "report_path" in extras else {}),
         },
         n_models=len(synthetic_datasets),
     )

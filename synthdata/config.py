@@ -342,6 +342,52 @@ class BinaryTargetConfig:
 
 
 @dataclasses.dataclass
+class PrivacyGateConfig:
+    """Absolute (not merely relative-to-other-models) privacy safety floor.
+
+    Unlike the ranked/scaled columns in the combined evaluation table (which
+    only say "better/worse than the other candidate models in this run" via
+    per-metric min-max scaling), this checks each model's RAW metric value
+    against a fixed threshold, so a model can't look "best on privacy" by
+    comparison alone while still leaking an unacceptable absolute amount.
+    Gate failures are surfaced (a ``privacy_gate_pass``/
+    ``privacy_gate_violations`` column pair in the combined table, plus a
+    WARNING log line) but never silently remove a model from the ranked
+    table -- see :mod:`synthdata.evaluation.privacy_gate`.
+
+    ``thresholds`` maps a metric's exact result-column name (as it appears in
+    the combined table -- e.g. ``"mia_recall"`` or
+    ``"privacy.identifiability_score.score_OC"``) to
+    ``{"bound": "max"|"min", "value": <float>}``. ``"max"`` means the metric's
+    raw value must be ``<= value`` to pass; ``"min"`` means it must be
+    ``>= value`` to pass. A metric not computed this run (selection/failure)
+    is excluded from the gate check (logged), never silently treated as a pass.
+
+    CAUTION: the defaults below are reasonable *starting points* (grounded in
+    "meaningfully above chance/baseline"), NOT validated against any specific
+    regulatory standard (e.g. HIPAA Safe Harbor/Expert Determination) -- get a
+    domain/compliance sign-off before treating this as a real go/no-go gate
+    for an actual data release or challenge submission.
+    """
+
+    enabled: bool = True
+    thresholds: dict = dataclasses.field(
+        default_factory=lambda: {
+            # syntheval metrics (exact result-column names -- see catalog.py /
+            # syntheval_eval.py's normalize_output-derived column names).
+            "mia_recall": {"bound": "max", "value": 0.6},  # chance level ~0.5
+            "mia_precision": {"bound": "max", "value": 0.6},  # chance level ~0.5
+            "hit_rate": {"bound": "max", "value": 0.05},  # >5% near-duplicate rate
+            "att_discl_risk": {"bound": "max", "value": 0.6},
+            # synthcity metrics (dotted "category.metric.subkey" names).
+            "privacy.identifiability_score.score_OC": {"bound": "max", "value": 0.3},
+            "privacy.k-anonymization.syn": {"bound": "min", "value": 5.0},
+            "privacy.k-map.score": {"bound": "min", "value": 5.0},
+        }
+    )
+
+
+@dataclasses.dataclass
 class EvaluationConfig:
     output_dir: str = "output/dataset/evaluation"
     #: Restrict evaluation to a subset of generated model names (None = all found on disk).
@@ -356,12 +402,28 @@ class EvaluationConfig:
     )
     custom: FrameworkSelectionConfig = dataclasses.field(default_factory=FrameworkSelectionConfig)
 
-    syntheval_preset: str = "complete_eval"
     #: "linear" (min-max scale + sum) or "summation" (SynthEval's built-in strategy).
     ranking_strategy: str = "linear"
     log_disparity: LogDisparityConfig = dataclasses.field(default_factory=LogDisparityConfig)
     save_per_model_syntheval_plots: bool = True
     binary_target: BinaryTargetConfig = dataclasses.field(default_factory=BinaryTargetConfig)
+
+    #: Per-"type" (utility/privacy/fairness) weight applied when rolling up
+    #: type-level ranks into the overall rank (see
+    #: synthdata.evaluation.combine.build_combined_table). Keys must be
+    #: exactly {"utility","privacy","fairness"}; values must be non-negative.
+    #: Default is equal weight -- ``privacy_gate`` (pass/fail) below is this
+    #: project's primary safeguard for sensitive data, not this weight; raise
+    #: "privacy" here too if you also want privacy to influence relative
+    #: ranking among gate-passing models.
+    rank_weights: dict = dataclasses.field(
+        default_factory=lambda: {"utility": 1.0, "privacy": 1.0, "fairness": 1.0}
+    )
+    privacy_gate: PrivacyGateConfig = dataclasses.field(default_factory=PrivacyGateConfig)
+    #: Whether to generate a human-readable Markdown evaluation report
+    #: (report.md, alongside combined_evaluation.csv) summarizing the ranked
+    #: table, privacy gate results, and a recommended model.
+    generate_report: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +538,7 @@ _NESTED_DATACLASSES = {
     (EvaluationConfig, "custom"): FrameworkSelectionConfig,
     (EvaluationConfig, "log_disparity"): LogDisparityConfig,
     (EvaluationConfig, "binary_target"): BinaryTargetConfig,
+    (EvaluationConfig, "privacy_gate"): PrivacyGateConfig,
 }
 
 
@@ -558,4 +621,35 @@ def _validate(cfg: Config) -> None:
             raise ValueError(
                 "evaluation.binary_target.positive_classes and .negative_classes must not "
                 f"overlap: {sorted(overlap, key=str)}"
+            )
+    rank_weight_keys = set(cfg.evaluation.rank_weights)
+    if rank_weight_keys != {"utility", "privacy", "fairness"}:
+        raise ValueError(
+            "evaluation.rank_weights must have exactly keys {'utility', 'privacy', 'fairness'}, "
+            f"got {sorted(rank_weight_keys)}"
+        )
+    negative_weights = {
+        k: v
+        for k, v in cfg.evaluation.rank_weights.items()
+        if not isinstance(v, (int, float)) or v < 0
+    }
+    if negative_weights:
+        raise ValueError(
+            f"evaluation.rank_weights values must be non-negative numbers, got {negative_weights}"
+        )
+    for metric, spec in cfg.evaluation.privacy_gate.thresholds.items():
+        if not isinstance(spec, dict) or "bound" not in spec or "value" not in spec:
+            raise ValueError(
+                f"evaluation.privacy_gate.thresholds[{metric!r}] must be a dict with 'bound' and "
+                f"'value' keys, got {spec!r}"
+            )
+        if spec["bound"] not in ("max", "min"):
+            raise ValueError(
+                f"evaluation.privacy_gate.thresholds[{metric!r}]['bound'] must be 'max' or 'min', "
+                f"got {spec['bound']!r}"
+            )
+        if not isinstance(spec["value"], (int, float)):
+            raise ValueError(
+                f"evaluation.privacy_gate.thresholds[{metric!r}]['value'] must be a number, "
+                f"got {spec['value']!r}"
             )

@@ -102,6 +102,26 @@ version is typically reused across many generation experiments.
   `configs/config_loris.yaml`) optionally runs those 4 against a second, disposable
   binary collapse of a multi-class target so they can still run, without affecting
   any other metric or the generated data.
+  - **Ranking** (`synthdata/evaluation/combine.py`): a hierarchical mean-of-means,
+    each `(framework, type)` group's rank is the *mean* of its scaled metrics, each `type`
+    rollup is the mean of its *group* ranks across frameworks, and the overall rank is a
+    **weighted** sum of the 3 type rollups via `evaluation.rank_weights` (default: equal
+    weight for utility/privacy/fairness -- raise `privacy`'s weight if it should also
+    influence relative ranking, not just the gate below).
+  - **Privacy gate** (`synthdata/evaluation/privacy_gate.py`, `evaluation.privacy_gate`):
+    an *absolute* privacy safety floor -- checks each model's raw `mia_recall`/`mia_precision`/
+    `hit_rate`/`att_discl_risk`/`identifiability_score`/`k-anonymization`/`k-map`
+    value against a fixed threshold. Failures are surfaced (a
+    `("__all__", "privacy_gate", "pass"/"violations")` column pair, plus a WARNING
+    log line) but never silently remove a model from the ranked table. **The
+    default thresholds are reasonable starting points, not validated against any
+    regulatory standard yet.**
+  - **Report** (`synthdata/evaluation/report.py`, `evaluation.generate_report`,
+    default on): writes a human-readable `report.md` alongside
+    `combined_evaluation.csv`, with run metadata, the ranked summary, privacy gate
+    results, a recommended model (chosen only among gate-passing models -- if none
+    pass, the report says so explicitly rather than recommending a failing one),
+    fairness highlights, and links to any plots generated via `--plot`.
 - **Plotting** (`synthdata/plotting/`): every figure from the notebooks (column/
   missingness distributions, observed-vs-imputed validation, real-vs-synthetic
   comparisons, Optuna diagnostics, utility/privacy/fairness rank trade-offs,

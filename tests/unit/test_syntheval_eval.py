@@ -1,17 +1,25 @@
 """Unit tests for the pure-function parts of synthdata.evaluation.syntheval_eval:
 the binary-target collapsing helpers used to let auroc_diff/statistical_parity/
-equalized_odds/equal_opportunity run against a target with more than 2 classes.
+equalized_odds/equal_opportunity run against a target with more than 2 classes,
+and the syntheval benchmark result caching helpers.
 """
+
+import json
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from synthdata.config import FrameworkSelectionConfig
+from synthdata.evaluation.catalog import FAIRNESS_METRICS_WITH_POSITIVE_CLASS, SYNTHEVAL_PRESET
 from synthdata.evaluation.syntheval_eval import (
     BINARY_ONLY_METRICS,
+    _compute_cache_key,
+    _load_syntheval_cache,
+    _save_syntheval_cache,
     build_binary_preset,
     build_binary_target_series,
+    build_preset,
     merge_binary_target_results,
 )
 
@@ -48,6 +56,35 @@ class TestBuildBinaryTargetSeries:
         series = pd.Series([0, 1, 2], name="t")
         with pytest.raises(ValueError, match=r"\[1\]"):
             build_binary_target_series(series, positive_classes=[0], negative_classes=[2])
+
+
+class TestBuildPreset:
+    def _selection(self, **overrides) -> FrameworkSelectionConfig:
+        return FrameworkSelectionConfig(**overrides)
+
+    def test_default_positive_class_matches_preset_default(self):
+        preset = build_preset(self._selection())
+        for name in FAIRNESS_METRICS_WITH_POSITIVE_CLASS:
+            assert preset[name]["positive_class"] == 1
+
+    def test_positive_class_override_applies_to_fairness_metrics_only(self):
+        preset = build_preset(self._selection(), positive_class=0)
+        for name in FAIRNESS_METRICS_WITH_POSITIVE_CLASS:
+            assert preset[name]["positive_class"] == 0
+        # A non-fairness metric's params must be untouched.
+        assert preset["dwm"] == {}
+
+    def test_override_does_not_mutate_shared_preset_constant(self):
+        # SYNTHEVAL_PRESET's nested dicts are shared module-level objects --
+        # build_preset must shallow-copy before overriding, or this would
+        # corrupt the global constant for every subsequent call in-process.
+        build_preset(self._selection(), positive_class=0)
+        for name in FAIRNESS_METRICS_WITH_POSITIVE_CLASS:
+            assert SYNTHEVAL_PRESET[name]["positive_class"] == 1
+
+    def test_disabled_selection_returns_empty(self):
+        preset = build_preset(self._selection(enabled=False))
+        assert preset == {}
 
 
 class TestBuildBinaryPreset:
@@ -127,3 +164,121 @@ class TestMergeBinaryTargetResults:
         assert results["rank"].tolist() == [0.9]
         assert ranks["auroc_diff"].tolist() == [0.7]
         assert ranks["rank"].tolist() == [0.9]
+
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_results(index=("m1", "m2")) -> pd.DataFrame:
+    """Minimal benchmark_results DataFrame with a MultiIndex column level."""
+    df = pd.DataFrame(index=list(index))
+    df[("dwm", "value")] = [0.8, 0.7]
+    df[("dwm", "error")] = [0.01, 0.02]
+    df.columns = pd.MultiIndex.from_tuples(df.columns)
+    df["rank"] = [0.9, 0.8]
+    return df
+
+
+def _make_ranks(index=("m1", "m2")) -> pd.DataFrame:
+    return pd.DataFrame({"dwm": [0.8, 0.7], "rank": [0.9, 0.8]}, index=list(index))
+
+
+class TestComputeCacheKey:
+    def test_same_inputs_produce_same_key(self):
+        preset = {"dwm": {}, "cls_acc": {}}
+        k1 = _compute_cache_key(preset, ["m1", "m2"], "linear")
+        k2 = _compute_cache_key(preset, ["m1", "m2"], "linear")
+        assert k1 == k2
+
+    def test_different_model_order_same_key(self):
+        # Model names are sorted before hashing -- order must not matter.
+        preset = {"dwm": {}}
+        k1 = _compute_cache_key(preset, ["m1", "m2"], "linear")
+        k2 = _compute_cache_key(preset, ["m2", "m1"], "linear")
+        assert k1 == k2
+
+    def test_different_models_different_key(self):
+        preset = {"dwm": {}}
+        k1 = _compute_cache_key(preset, ["m1"], "linear")
+        k2 = _compute_cache_key(preset, ["m1", "m2"], "linear")
+        assert k1 != k2
+
+    def test_different_preset_different_key(self):
+        k1 = _compute_cache_key({"dwm": {}}, ["m1"], "linear")
+        k2 = _compute_cache_key({"cls_acc": {}}, ["m1"], "linear")
+        assert k1 != k2
+
+    def test_different_ranking_strategy_different_key(self):
+        preset = {"dwm": {}}
+        k1 = _compute_cache_key(preset, ["m1"], "linear")
+        k2 = _compute_cache_key(preset, ["m1"], "summation")
+        assert k1 != k2
+
+    def test_returns_hex_string(self):
+        key = _compute_cache_key({"dwm": {}}, ["m1"], "linear")
+        assert isinstance(key, str)
+        int(key, 16)  # raises ValueError if not valid hex
+
+
+class TestSaveLoadSynthevalCache:
+    def test_roundtrip_results_and_ranks(self, tmp_path):
+        results = _make_results()
+        ranks = _make_ranks()
+        key = _compute_cache_key({"dwm": {}}, ["m1", "m2"], "linear")
+        _save_syntheval_cache(results, ranks, tmp_path, "main", key)
+
+        loaded = _load_syntheval_cache(tmp_path, "main", key)
+        assert loaded is not None
+        loaded_results, loaded_ranks = loaded
+        pd.testing.assert_frame_equal(loaded_results, results)
+        pd.testing.assert_frame_equal(loaded_ranks, ranks)
+
+    def test_cache_miss_when_no_files(self, tmp_path):
+        key = _compute_cache_key({"dwm": {}}, ["m1"], "linear")
+        assert _load_syntheval_cache(tmp_path, "main", key) is None
+
+    def test_cache_miss_when_key_changed(self, tmp_path):
+        results, ranks = _make_results(), _make_ranks()
+        old_key = _compute_cache_key({"dwm": {}}, ["m1", "m2"], "linear")
+        new_key = _compute_cache_key({"dwm": {}}, ["m1", "m2", "m3"], "linear")
+        _save_syntheval_cache(results, ranks, tmp_path, "main", old_key)
+        assert _load_syntheval_cache(tmp_path, "main", new_key) is None
+
+    def test_cache_miss_when_meta_corrupted(self, tmp_path):
+        results, ranks = _make_results(), _make_ranks()
+        key = _compute_cache_key({"dwm": {}}, ["m1", "m2"], "linear")
+        _save_syntheval_cache(results, ranks, tmp_path, "main", key)
+        (tmp_path / "main_cache_meta.json").write_text("not json")
+        assert _load_syntheval_cache(tmp_path, "main", key) is None
+
+    def test_cache_miss_when_results_parquet_missing(self, tmp_path):
+        results, ranks = _make_results(), _make_ranks()
+        key = _compute_cache_key({"dwm": {}}, ["m1", "m2"], "linear")
+        _save_syntheval_cache(results, ranks, tmp_path, "main", key)
+        (tmp_path / "main_results.parquet").unlink()
+        assert _load_syntheval_cache(tmp_path, "main", key) is None
+
+    def test_separate_prefixes_do_not_collide(self, tmp_path):
+        results_a = _make_results(index=["a1", "a2"])
+        ranks_a = _make_ranks(index=["a1", "a2"])
+        results_b = _make_results(index=["b1", "b2"])
+        ranks_b = _make_ranks(index=["b1", "b2"])
+        key = _compute_cache_key({"dwm": {}}, ["m1", "m2"], "linear")
+
+        _save_syntheval_cache(results_a, ranks_a, tmp_path, "main", key)
+        _save_syntheval_cache(results_b, ranks_b, tmp_path, "binary_target", key)
+
+        loaded_a = _load_syntheval_cache(tmp_path, "main", key)
+        loaded_b = _load_syntheval_cache(tmp_path, "binary_target", key)
+        assert loaded_a is not None and loaded_b is not None
+        assert list(loaded_a[0].index) == ["a1", "a2"]
+        assert list(loaded_b[0].index) == ["b1", "b2"]
+
+    def test_meta_json_contains_cache_key(self, tmp_path):
+        results, ranks = _make_results(), _make_ranks()
+        key = _compute_cache_key({"dwm": {}}, ["m1", "m2"], "linear")
+        _save_syntheval_cache(results, ranks, tmp_path, "main", key)
+        meta = json.loads((tmp_path / "main_cache_meta.json").read_text())
+        assert meta["cache_key"] == key

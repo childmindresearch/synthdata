@@ -15,6 +15,7 @@ from synthdata.evaluation.catalog import (
     SYNTHCITY_CATEGORY_TO_TYPE,
     classify_syntheval_metric,
     is_custom_syntheval_metric,
+    is_redundant_synthcity_submetric,
 )
 from synthdata.evaluation.custom_eval import build_log_disparity_summary_table
 from synthdata.evaluation.syntheval_eval import extract_oriented_values, extract_raw_values
@@ -51,6 +52,15 @@ def _synthcity_frames(
         return empty, empty
 
     raw = pd.DataFrame({name: res["mean"] for name, res in ok_results.items()}).T
+
+    redundant_cols = [c for c in raw.columns if is_redundant_synthcity_submetric(c)]
+    if redundant_cols:
+        logger.info(
+            "[synthcity] excluding known-redundant duplicate sub-metric(s) from combined "
+            "table: %s (see catalog.SYNTHCITY_REDUNDANT_SUBMETRIC_SUFFIXES)",
+            redundant_cols,
+        )
+        raw = raw.drop(columns=redundant_cols)
 
     directions = {}
     for res in ok_results.values():
@@ -133,27 +143,46 @@ def _minmax_scale(col: pd.Series) -> pd.Series:
     return (col - lo) / (hi - lo)
 
 
+#: Types rolled up in the combined table. Order matters for iteration below
+#: but not for correctness (weighted sum is order-independent).
+_TYPES = ("utility", "privacy", "fairness")
+
+#: Equal weighting used when the caller doesn't pass ``rank_weights`` (e.g.
+#: existing direct callers/tests predating evaluation.rank_weights) --
+#: mirrors the pre-existing implicit behavior before per-type weights existed.
+DEFAULT_RANK_WEIGHTS = {"utility": 1.0, "privacy": 1.0, "fairness": 1.0}
+
+
 def build_combined_table(
     synthcity_results: dict[str, pd.DataFrame],
     syntheval_benchmark_results: pd.DataFrame | None,
     syntheval_benchmark_ranks: pd.DataFrame | None,
     log_disparity_reports: dict[str, dict],
     model_names: list,
+    rank_weights: dict | None = None,
 ) -> pd.DataFrame:
     """Build the single combined, ranked, multi-index evaluation table.
 
-    Ranking scheme (see repo docs for rationale):
+    Ranking scheme -- a hierarchical *mean-of-means*, not a flat sum, so a
+    framework/type with many metric columns (e.g. synthcity's ~7-column
+    "performance" category) can't silently outweigh one with few (e.g.
+    syntheval's single-column ``cls_acc``) purely by virtue of column count:
+
       1. Every metric is oriented so "higher = better", then min-max scaled
          across models (independently per metric).
-      2. A sub-rank is computed per ``(framework, type)`` group by summing its
-         scaled metrics -- column ``(framework, type, "rank")``.
-      3. A rolled-up rank per ``type`` (utility/privacy/fairness) sums the
-         scaled metrics of that type across *all* frameworks -- column
+      2. A sub-rank is computed per ``(framework, type)`` group as the MEAN
+         of that group's scaled metrics -- column ``(framework, type, "rank")``.
+      3. A rolled-up rank per ``type`` (utility/privacy/fairness) is the MEAN
+         of the *group ranks* from step 2 across frameworks (not a flat mean/
+         sum of every individual metric of that type) -- column
          ``("__all__", type, "rank")``.
-      4. One overall rank sums every scaled metric -- column
-         ``("__all__", "overall", "rank")``.
+      4. One overall rank is the WEIGHTED SUM of the 3 type-level rollups from
+         step 3, using ``rank_weights`` (default: equal weight 1.0 each, see
+         ``DEFAULT_RANK_WEIGHTS``) -- column ``("__all__", "overall", "rank")``.
     Models are sorted descending by the overall rank.
     """
+    rank_weights = rank_weights or DEFAULT_RANK_WEIGHTS
+
     sc_raw, sc_oriented = _synthcity_frames(synthcity_results, model_names)
     se_raw, se_oriented = _syntheval_frames(
         syntheval_benchmark_results, syntheval_benchmark_ranks, model_names
@@ -173,7 +202,7 @@ def build_combined_table(
 
     combined = raw_df.copy()
 
-    # Per (framework, type) sub-rank.
+    # Step 2: per (framework, type) sub-rank -- MEAN of that group's scaled metrics.
     groups = sorted(
         set(
             zip(
@@ -185,16 +214,24 @@ def build_combined_table(
     )
     for framework, type_ in groups:
         cols = [c for c in scaled_df.columns if c[0] == framework and c[1] == type_]
-        combined[(framework, type_, _RANK)] = scaled_df[cols].sum(axis=1, skipna=True)
+        combined[(framework, type_, _RANK)] = scaled_df[cols].mean(axis=1, skipna=True)
 
-    # Rolled-up rank per type, across frameworks.
-    for type_ in ("utility", "privacy", "fairness"):
-        cols = [c for c in scaled_df.columns if c[1] == type_]
-        if cols:
-            combined[(_ALL, type_, _RANK)] = scaled_df[cols].sum(axis=1, skipna=True)
+    # Step 3: rolled-up rank per type -- MEAN of the group ranks just computed
+    # for that type (across frameworks), NOT a flat mean/sum of every
+    # individual metric of that type.
+    for type_ in _TYPES:
+        group_rank_cols = [(fw, t, _RANK) for fw, t in groups if t == type_]
+        if group_rank_cols:
+            combined[(_ALL, type_, _RANK)] = combined[group_rank_cols].mean(axis=1, skipna=True)
 
-    # Overall rank.
-    combined[(_ALL, "overall", _RANK)] = scaled_df.sum(axis=1, skipna=True)
+    # Step 4: overall rank -- WEIGHTED SUM of the type-level rollups.
+    overall = pd.Series(0.0, index=combined.index)
+    for type_ in _TYPES:
+        key = (_ALL, type_, _RANK)
+        if key in combined.columns:
+            weight = rank_weights.get(type_, 1.0)
+            overall = overall.add(combined[key].fillna(0.0) * weight, fill_value=0.0)
+    combined[(_ALL, "overall", _RANK)] = overall
 
     combined.columns = pd.MultiIndex.from_tuples(
         combined.columns, names=["framework", "type", "metric"]

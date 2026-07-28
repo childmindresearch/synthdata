@@ -66,6 +66,29 @@ SYNTHCITY_CATEGORY_TO_TYPE = {
     "attacks": "privacy",
 }
 
+#: ``stats.alpha_precision``'s "_naive" sub-metrics (delta_precision_alpha_naive,
+#: delta_coverage_beta_naive, authenticity_naive) duplicate the "_OC"
+#: (OneClass-embedding) sub-metrics' exact same 3 quantities computed in a
+#: different (raw min-max normalized) feature space -- confirmed via
+#: ``synthcity.metrics.eval_statistical.AlphaPrecision._normalize_covariates``'s
+#: own docstring ("This is an internal method to replicate the old, naive
+#: method for evaluating AlphaPrecision"). Left uncorrected this metric alone
+#: silently contributes 6 utility columns instead of 3 genuinely distinct ones,
+#: so the "_naive" duplicates are excluded from the combined table (see
+#: combine.py's ``_synthcity_frames``) -- the OC variants are kept since they're
+#: the currently-preferred/default computation.
+SYNTHCITY_REDUNDANT_SUBMETRIC_SUFFIXES = ("_naive",)
+
+
+def is_redundant_synthcity_submetric(metric_key: str) -> bool:
+    """Whether a synthcity result column (e.g.
+    ``"stats.alpha_precision.authenticity_naive"``) is a known-redundant
+    duplicate sub-metric that should be excluded from the combined evaluation
+    table -- see ``SYNTHCITY_REDUNDANT_SUBMETRIC_SUFFIXES``.
+    """
+    return metric_key.endswith(SYNTHCITY_REDUNDANT_SUBMETRIC_SUFFIXES)
+
+
 # ---------------------------------------------------------------------------
 # syntheval
 # ---------------------------------------------------------------------------
@@ -102,6 +125,14 @@ SYNTHEVAL_PRESET = {
     "equalized_odds": {"positive_class": 1, "folds": 5, "full_output": True},
     "equal_opportunity": {"positive_class": 1, "folds": 5, "full_output": True},
 }
+
+#: The 3 fairness metrics above whose "positive_class" preset param is
+#: config-driven (see synthdata.evaluation.syntheval_eval.build_preset) --
+#: NOT applied to the separate binary_target pass, whose collapsed target is
+#: already normalized to 1=positive/0=negative by construction.
+FAIRNESS_METRICS_WITH_POSITIVE_CLASS = frozenset(
+    {"statistical_parity", "equalized_odds", "equal_opportunity"}
+)
 
 SYNTHEVAL_METRIC_TYPE = {
     "dwm": "utility",
@@ -184,9 +215,17 @@ SYNTHEVAL_CUSTOM_FAIRNESS_KEYS = {"equalized_odds", "equal_opportunity"}
 
 #: log-disparity's own summary metrics, and whether lower values are "better"
 #: (used to orient them for ranking: True => minimize, False => maximize).
+#:
+#: NOTE: ``log_disparity_median_abs`` is deliberately NOT listed here (unlike
+#: ``build_log_disparity_summary_table``'s raw output, which still includes
+#: it) -- it's computed from the exact same per-subgroup value array as
+#: ``log_disparity_mean_abs`` (see metric_log_disparity.py's ``summary_stats``
+#: construction), so counting both as independent ranked metrics would double-
+#: count one underlying signal. It still shows up in the combined table's raw
+#: columns (informational) via ``_log_disparity_frames``, just excluded from
+#: the fairness rank sum via this dict's key set.
 LOG_DISPARITY_METRICS = {
     "log_disparity_mean_abs": True,
-    "log_disparity_median_abs": True,
     "log_disparity_share_significant": True,
 }
 

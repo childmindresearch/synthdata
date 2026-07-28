@@ -155,6 +155,11 @@ generation:
 evaluation:
   output_dir: output/hepatitis/evaluation # nested under <output_dir>/<experiment_id>/ per run
   models: null # null = evaluate every generated model; or list specific names
+  # Which class counts as "positive" for statistical_parity/equalized_odds/
+  # equal_opportunity (fairness metrics). Only takes effect when data.target_column
+  # is already exactly 2 classes (true for hepatitis) -- for a 3+ class target,
+  # these metrics only run via the separate binary_target pass below instead,
+  # which fixes its own positive class via binary_target.positive_classes.
   positive_class: 1
 
   synthcity:
@@ -172,7 +177,6 @@ evaluation:
     categories: null # fairness is the only custom type today
     metrics: null # e.g. ["log_disparity"] to skip equalized_odds/equal_opportunity
 
-  syntheval_preset: complete_eval
   ranking_strategy: linear # linear | summation
 
   log_disparity:
@@ -194,6 +198,44 @@ evaluation:
     column: null # defaults to data.target_column
     positive_classes: [] # e.g. [0, 1] -- original class values -> binary 1
     negative_classes: [] # e.g. [2] -- original class values -> binary 0
+
+  # Weight applied to each type's rollup rank when computing the overall rank
+  # (see synthdata/evaluation/combine.py's mean-of-means aggregation). Default
+  # is equal weight; the privacy_gate below (pass/fail) is this project's
+  # primary safeguard for sensitive data, not this weight -- raise "privacy"
+  # here too if it should also influence relative ranking among gate-passing
+  # models, not just gate them.
+  rank_weights:
+    utility: 1.0
+    privacy: 1.0
+    fairness: 1.0
+
+  # Absolute (not merely relative-to-other-models) privacy safety floor: checks
+  # each model's RAW metric value against a fixed threshold, so a model can't
+  # look "best on privacy" by comparison alone while still leaking an
+  # unacceptable absolute amount. Failures are surfaced (a
+  # ("__all__", "privacy_gate", "pass"/"violations") column pair in
+  # combined_evaluation.csv, plus a WARNING log line) but never silently
+  # remove a model from the ranked table.
+  # CAUTION: these default thresholds are reasonable starting points, NOT
+  # validated against any specific regulatory standard (e.g. HIPAA Safe
+  # Harbor/Expert Determination) -- get a domain/compliance sign-off before
+  # treating this as a real go/no-go gate for an actual data release.
+  privacy_gate:
+    enabled: true
+    thresholds:
+      mia_recall: { bound: max, value: 0.6 } # chance level ~0.5
+      mia_precision: { bound: max, value: 0.6 } # chance level ~0.5
+      hit_rate: { bound: max, value: 0.05 } # >5% near-duplicate rate
+      att_discl_risk: { bound: max, value: 0.6 }
+      privacy.identifiability_score.score_OC: { bound: max, value: 0.3 }
+      privacy.k-anonymization.syn: { bound: min, value: 5.0 }
+      privacy.k-map.score: { bound: min, value: 5.0 }
+
+  # Whether to write a human-readable report.md (run metadata, ranked summary,
+  # privacy gate results, recommended model, fairness highlights, plot links)
+  # alongside combined_evaluation.csv.
+  generate_report: true
 
 plots:
   output_dir: output/hepatitis/plots # "data"/"imputation" sections write here directly;

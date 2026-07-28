@@ -3,6 +3,8 @@ synthetic datasets using a custom preset (built from
 :mod:`synthdata.evaluation.catalog`, filtered by the configured selection).
 """
 
+import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +12,7 @@ import pandas as pd
 
 from synthdata.data import Dataset
 from synthdata.evaluation.catalog import (
+    FAIRNESS_METRICS_WITH_POSITIVE_CLASS,
     SYNTHEVAL_METRIC_TYPE,
     SYNTHEVAL_PRESET,
     resolve_selection,
@@ -19,6 +22,109 @@ from synthdata.utils import ensure_dir, get_logger, save_json
 logger = get_logger(__name__)
 
 _RANK_COLUMNS = {"rank", "u_rank", "p_rank", "f_rank"}
+
+# ---------------------------------------------------------------------------
+# Benchmark result caching
+# ---------------------------------------------------------------------------
+# SynthEval's benchmark() is expensive (tens of minutes for large datasets).
+# After a successful run we persist the results and ranks as Parquet files
+# alongside a small metadata sidecar that captures the cache key (SHA-256 of
+# the preset JSON + sorted model names).  On the next run we load from cache
+# if the key matches, skipping the full benchmark pass.
+#
+# Parquet is used (not CSV) because benchmark_results has a MultiIndex column
+# level that CSV cannot round-trip without bespoke reconstruction logic.
+# ---------------------------------------------------------------------------
+
+
+def _compute_cache_key(preset: dict, model_names: list[str], ranking_strategy: str) -> str:
+    """Stable SHA-256 hex digest of the preset dict + sorted model names + ranking strategy.
+
+    ``ranking_strategy`` is included because it affects the ranks DataFrame
+    returned by ``se.benchmark()`` (not just the metric values).
+    """
+    payload = json.dumps(
+        {"preset": preset, "models": sorted(model_names), "ranking_strategy": ranking_strategy},
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _save_syntheval_cache(
+    results: pd.DataFrame,
+    ranks: pd.DataFrame,
+    cache_dir: Path,
+    prefix: str,
+    cache_key: str,
+) -> None:
+    """Persist benchmark results + ranks to Parquet and write the cache-key sidecar.
+
+    Files written:
+    - ``<cache_dir>/<prefix>_results.parquet``  -- MultiIndex-column results
+    - ``<cache_dir>/<prefix>_ranks.parquet``    -- ranks DataFrame
+    - ``<cache_dir>/<prefix>_cache_meta.json``  -- {"cache_key": <sha256>}
+    """
+    ensure_dir(cache_dir)
+    results.to_parquet(cache_dir / f"{prefix}_results.parquet")
+    ranks.to_parquet(cache_dir / f"{prefix}_ranks.parquet")
+    meta_path = cache_dir / f"{prefix}_cache_meta.json"
+    save_json(meta_path, {"cache_key": cache_key})
+    logger.info(
+        "[syntheval] cached %s benchmark results to %s (key=%s…)",
+        prefix,
+        cache_dir,
+        cache_key[:12],
+    )
+
+
+def _load_syntheval_cache(
+    cache_dir: Path,
+    prefix: str,
+    cache_key: str,
+) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+    """Return (results, ranks) from cache if the key matches, else None.
+
+    Returns None (cache miss) if any of the three expected files are absent or
+    if the stored cache key doesn't match the current one.
+    """
+    results_path = cache_dir / f"{prefix}_results.parquet"
+    ranks_path = cache_dir / f"{prefix}_ranks.parquet"
+    meta_path = cache_dir / f"{prefix}_cache_meta.json"
+
+    if not (results_path.exists() and ranks_path.exists() and meta_path.exists()):
+        return None
+
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("[syntheval] %s cache meta unreadable (%s); treating as miss", prefix, exc)
+        return None
+
+    if meta.get("cache_key") != cache_key:
+        logger.info(
+            "[syntheval] %s cache key mismatch (stored=%s…, current=%s…); recomputing",
+            prefix,
+            str(meta.get("cache_key", ""))[:12],
+            cache_key[:12],
+        )
+        return None
+
+    try:
+        results = pd.read_parquet(results_path)
+        ranks = pd.read_parquet(ranks_path)
+    except Exception as exc:  # noqa: BLE001 -- any parquet read error → cache miss
+        logger.warning("[syntheval] %s cache files unreadable (%s); recomputing", prefix, exc)
+        return None
+
+    logger.info(
+        "[syntheval] loaded %s benchmark results from cache (key=%s…, %d models, %d metrics)",
+        prefix,
+        cache_key[:12],
+        len(results),
+        len([c for c in results.columns.get_level_values(0).unique() if c not in _RANK_COLUMNS]),
+    )
+    return results, ranks
+
 
 #: Metrics that syntheval refuses to run unless the target has EXACTLY 2
 #: classes (see e.g. metric_auroc_difference.py / metric_statistical_parity.py
@@ -33,8 +139,17 @@ BINARY_ONLY_METRICS = frozenset(
 )
 
 
-def build_preset(selection_cfg) -> dict:
-    """Filter the full SynthEval preset down to the configured selection."""
+def build_preset(selection_cfg, positive_class=1) -> dict:
+    """Filter the full SynthEval preset down to the configured selection.
+
+    ``positive_class`` overrides the "positive_class" preset param (default
+    ``1`` in SYNTHEVAL_PRESET) for the 3 fairness metrics in
+    FAIRNESS_METRICS_WITH_POSITIVE_CLASS -- wired from
+    ``cfg.evaluation.positive_class``, so it only makes sense when the real
+    target column is already exactly 2 classes (e.g. hepatitis). It does NOT
+    apply to the separate binary_target pass (see build_binary_preset), whose
+    collapsed target is always 1=positive/0=negative by construction.
+    """
     all_names = list(SYNTHEVAL_PRESET.keys())
     selected = resolve_selection(
         selection_cfg.enabled,
@@ -43,7 +158,13 @@ def build_preset(selection_cfg) -> dict:
         all_names,
         SYNTHEVAL_METRIC_TYPE,
     )
-    return {k: v for k, v in SYNTHEVAL_PRESET.items() if k in selected}
+    preset = {k: v for k, v in SYNTHEVAL_PRESET.items() if k in selected}
+    for name in FAIRNESS_METRICS_WITH_POSITIVE_CLASS & preset.keys():
+        # Shallow-copy before overriding -- SYNTHEVAL_PRESET's nested dicts are
+        # shared module-level objects reused on every call; mutating in place
+        # would corrupt the global constant for subsequent calls in-process.
+        preset[name] = {**preset[name], "positive_class": positive_class}
+    return preset
 
 
 def run_syntheval_evaluation(
@@ -54,6 +175,7 @@ def run_syntheval_evaluation(
     ranking_strategy: str = "linear",
     output_folder: str | Path | None = None,
     plots_output_dir: str | Path | None = None,
+    positive_class=1,
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
     """Run SynthEval's benchmark() across all datasets. Returns (benchmark_results, benchmark_ranks).
 
@@ -63,8 +185,11 @@ def run_syntheval_evaluation(
     are produced as a side effect of this same benchmark pass (one subfolder per model
     under ``plots_output_dir``), instead of requiring a separate, fully redundant
     benchmark/evaluate pass just to regenerate them.
+
+    ``positive_class`` (from ``cfg.evaluation.positive_class``) is forwarded to
+    :func:`build_preset` for the 3 fairness metrics -- see its docstring.
     """
-    preset = build_preset(selection_cfg)
+    preset = build_preset(selection_cfg, positive_class)
     if not preset:
         logger.info("[syntheval] no metrics selected; skipping")
         return None, None
@@ -92,6 +217,14 @@ def run_syntheval_evaluation(
         show_warnings=False,
     )
 
+    cache_dir = Path(output_folder) if output_folder else None
+    cache_key = _compute_cache_key(preset, list(synthetic_datasets.keys()), ranking_strategy)
+
+    if cache_dir is not None:
+        cached = _load_syntheval_cache(cache_dir, "main", cache_key)
+        if cached is not None:
+            return cached
+
     logger.info(
         "[syntheval] benchmarking %d datasets across %d metrics%s",
         len(synthetic_datasets),
@@ -106,6 +239,10 @@ def run_syntheval_evaluation(
         output_folder=str(output_folder) if output_folder else None,
         plot_output_dir=str(plots_output_dir) if plots_output_dir else None,
     )
+
+    if cache_dir is not None:
+        _save_syntheval_cache(benchmark_results, benchmark_ranks, cache_dir, "main", cache_key)
+
     return benchmark_results, benchmark_ranks
 
 
@@ -158,6 +295,13 @@ def build_binary_preset(selection_cfg) -> dict:
     the main preset -- e.g. disabling the 'fairness' category or explicitly
     excluding 'auroc_diff' via evaluation.syntheval.metrics also excludes it
     from this binary-target pass.
+
+    Deliberately does NOT take a ``positive_class`` override (unlike
+    build_preset): build_binary_target_series always normalizes the collapsed
+    target to 1=positive_classes/0=negative_classes, so "positive_class" must
+    stay SYNTHEVAL_PRESET's default of 1 here regardless of
+    ``cfg.evaluation.positive_class`` -- threading it through would
+    double-remap an already-fixed convention.
     """
     all_names = list(SYNTHEVAL_PRESET.keys())
     selected = resolve_selection(
@@ -235,6 +379,14 @@ def run_binary_target_syntheval_evaluation(
         show_warnings=False,
     )
 
+    cache_dir = Path(output_folder) if output_folder else None
+    cache_key = _compute_cache_key(preset, list(binary_synthetic_datasets.keys()), ranking_strategy)
+
+    if cache_dir is not None:
+        cached = _load_syntheval_cache(cache_dir, "binary_target", cache_key)
+        if cached is not None:
+            return cached
+
     logger.info(
         "[syntheval] binary-target pass: benchmarking %d datasets across %d metric(s) "
         "(column %r collapsed to binary: positive=%s, negative=%s)",
@@ -251,6 +403,12 @@ def run_binary_target_syntheval_evaluation(
         rank_strategy=ranking_strategy,
         output_folder=str(output_folder) if output_folder else None,
     )
+
+    if cache_dir is not None:
+        _save_syntheval_cache(
+            benchmark_results, benchmark_ranks, cache_dir, "binary_target", cache_key
+        )
+
     return benchmark_results, benchmark_ranks
 
 
