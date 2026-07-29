@@ -13,6 +13,7 @@ Two backends are available via ``imputation.method`` in the config:
   datasets where tabimpute's one-hot encoding causes out-of-memory errors.
 """
 
+from synthdata.imputation.benchmark import run_refidiff_benchmark
 from synthdata.imputation.pipeline import (
     apply_rounding,
     build_validation_report,
@@ -24,5 +25,6 @@ __all__ = [
     "apply_rounding",
     "build_validation_report",
     "run_imputation",
+    "run_refidiff_benchmark",
     "validate_imputed_column",
 ]

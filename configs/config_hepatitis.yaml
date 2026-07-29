@@ -1,0 +1,139 @@
+# Hepatitis example. All paths are relative to the repository root.
+
+name: hepatitis
+seed: 42
+device: auto
+
+experiment:
+  tag: null
+  id: null # Set to resume or extend a specific experiment.
+
+data:
+  # Source and schema
+  source: uci
+  uci_id: 46
+  path: null # Required for csv/parquet sources.
+  version: null # Use a new value when the source data changes.
+  variable_schema_path: data/hepatitis/hepatitis_variable_schema.csv
+
+  # Modeling columns
+  target_column: target
+  raw_target_column: CLASS
+  sensitive_columns: [AGE, SEX]
+  drop_columns: []
+  drop_rows_missing_target: false
+
+  # Source normalization and split
+  uppercase_columns: true
+  remap_binary_one_two: true
+  outlier_zscore_threshold: null
+  outlier_columns: []
+  train_size: 0.6667
+  stratify: true
+
+  # Local derived-data storage
+  data_dir: data/hepatitis
+  raw_cache_subdir: raw
+
+imputation:
+  enabled: true
+  method: tabimpute
+  device: auto
+  cache: true
+  validation_margin: 0.2
+  round_to_int_default: true
+  round_rules: { BILIRUBIN: 2, ALBUMIN: 1 }
+
+  # Used only by method: refidiff.
+  refidiff:
+    hidden_dim: 32
+    epochs: 10001
+    early_stopping_patience: 500
+    batch_size: 8192
+    num_steps: 50
+    num_trials: 10
+    denoiser: auto
+    checkpoint_every: 1000
+
+generation:
+  output_dir: output/hepatitis/synthetic_data
+  n_samples: 200
+  force_retrain: false
+
+  synthcity:
+    enabled: true
+    names: [ctgan, tvae, adsgan, bayesian_network, pategan, rtvae, ddpm]
+
+  tabpfn:
+    enabled: true
+    variants: [standard, custom]
+    data_variants: [raw, imputed]
+
+  tabpfgen:
+    enabled: true
+    variants: [standard, custom]
+    standard_params: {}
+    custom_params: { n_sgld_steps: 1000, sgld_noise_scale: 0.1 }
+
+  hpo:
+    enabled: true
+    n_trials: 10
+    timeout_seconds: 300
+    n_iter_cap: 300
+    model_iter_caps: { pategan: 50 }
+    sgld_step_cap: 500
+    metric_config:
+      stats: [prdc, alpha_precision, wasserstein_dist, inv_kl_divergence]
+      sanity: [nearest_syn_neighbor_distance]
+      performance: [xgb]
+      privacy: [identifiability_score, DomiasMIA_prior]
+    storage: null
+    best_params_path: null
+    final_n_iter_override: null
+
+evaluation:
+  output_dir: output/hepatitis/evaluation
+  models: null # Null evaluates every generated model.
+  positive_class: 1
+  ranking_strategy: linear
+  generate_report: true
+  save_per_model_syntheval_plots: true
+
+  synthcity: { enabled: true, categories: null, metrics: null }
+  syntheval: { enabled: true, categories: null, metrics: null }
+  custom: { enabled: true, categories: null, metrics: null }
+
+  log_disparity:
+    protected_columns: [SEX, AGE]
+    target_map: { 0: died, 1: survived }
+    protected_map: [{ 0: male, 1: female }, null]
+    protected_bins: [null, [7, 18, 30, 45, 60, 78]]
+
+  # Used only for targets with more than two classes.
+  binary_target: { enabled: false, column: null, positive_classes: [], negative_classes: [] }
+
+  syntheval_execution:
+    model_workers: auto
+    max_model_workers: 8
+    cores_per_model: 4
+    memory_reserve_gib: 16
+    memory_per_model_gib: null
+
+  rank_weights: { utility: 1.0, privacy: 1.0, fairness: 1.0 }
+  # Starting thresholds only; obtain privacy/compliance review before release.
+  privacy_gate:
+    enabled: true
+    thresholds:
+      mia_recall: { bound: max, value: 0.6 }
+      mia_precision: { bound: max, value: 0.6 }
+      hit_rate: { bound: max, value: 0.05 }
+      att_discl_risk: { bound: max, value: 0.6 }
+      privacy.identifiability_score.score_OC: { bound: max, value: 0.3 }
+      privacy.k-anonymization.syn: { bound: min, value: 5.0 }
+      privacy.k-map.score: { bound: min, value: 5.0 }
+
+plots:
+  output_dir: output/hepatitis/plots
+  sections: [data, imputation, generation, hpo, evaluation]
+  dpi: 150
+  formats: [png]

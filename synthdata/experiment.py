@@ -3,14 +3,16 @@
 `synthdata-generate` starts a new :class:`Experiment` each time it runs (a
 timestamped id, optionally suffixed with a user-supplied ``--tag``, or an
 explicit ``--experiment-id`` to resume/extend a previous one), and nests its
-synthetic-data output under ``generation.output_dir/<experiment_id>/``. That
-experiment id is recorded as the "latest" experiment for this dataset, so
+synthetic-data output under
+``generation.output_dir/<dataset-version>/<experiment_id>/``. That experiment
+id is recorded as the "latest" experiment for this dataset *version*, so
 `synthdata-evaluate` and `synthdata-plot` automatically pick it up (nesting
 their own artifacts the same way) without the user needing to pass it again --
 unless they explicitly want to target a different, earlier experiment via
 ``--experiment-id``.
 
-A JSON manifest at ``<generation.output_dir>/../experiments/<experiment_id>/manifest.json``
+A JSON manifest at
+``<generation.output_dir>/../experiments/<dataset-version>/<experiment_id>/manifest.json``
 records what each stage produced (dataset version, git commit, artifact paths),
 so any artifact can be traced back to exactly the run that produced it.
 """
@@ -27,6 +29,7 @@ from synthdata.utils import ensure_dir, get_logger, git_commit
 logger = get_logger(__name__)
 
 _LATEST_FILENAME = "latest.json"
+_UNVERSIONED_ARTIFACT_SCOPE = "unversioned"
 
 
 def _timestamp_id(tag: str | None = None) -> str:
@@ -34,8 +37,37 @@ def _timestamp_id(tag: str | None = None) -> str:
     return f"{ts}_{tag}" if tag else ts
 
 
+def dataset_version_scope(cfg: Config) -> str:
+    """Return a path-safe, stable scope for artifacts derived from this dataset.
+
+    The configured version is deliberately a directory component: changing it
+    must create a new artifact lineage rather than reuse cached outputs from a
+    prior dataset revision. ``None`` remains supported but is explicitly
+    segregated under ``unversioned`` so it cannot collide with versioned runs.
+    """
+    version = cfg.data.version
+    if version is None:
+        return _UNVERSIONED_ARTIFACT_SCOPE
+    if (
+        not isinstance(version, str)
+        or not version
+        or Path(version).name != version
+        or version in {".", ".."}
+    ):
+        raise ValueError(
+            "data.version must be a non-empty, path-safe label without path separators; "
+            f"got {version!r}."
+        )
+    return version
+
+
+def dataset_plots_dir(cfg: Config) -> Path:
+    """Return the version-scoped destination for dataset-level QA figures."""
+    return ensure_dir(Path(cfg.plots.output_dir) / dataset_version_scope(cfg) / "dataset")
+
+
 def _experiments_root(cfg: Config) -> Path:
-    return Path(cfg.generation.output_dir).parent / "experiments"
+    return Path(cfg.generation.output_dir).parent / "experiments" / dataset_version_scope(cfg)
 
 
 @dataclasses.dataclass
@@ -92,12 +124,25 @@ class Experiment:
 
 
 def _build_experiment(experiment_id: str, cfg: Config) -> Experiment:
-    generation_dir = ensure_dir(Path(cfg.generation.output_dir) / experiment_id)
-    evaluation_dir = ensure_dir(Path(cfg.evaluation.output_dir) / experiment_id)
-    plots_dir = ensure_dir(Path(cfg.plots.output_dir) / experiment_id)
-
-    experiment_root = ensure_dir(_experiments_root(cfg) / experiment_id)
+    scope = dataset_version_scope(cfg)
+    experiment_root = _experiments_root(cfg) / experiment_id
     manifest_path = experiment_root / "manifest.json"
+    if manifest_path.exists():
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        actual_identity = (manifest.get("dataset_name"), manifest.get("dataset_version"))
+        expected_identity = (cfg.name, cfg.data.version)
+        if actual_identity != expected_identity:
+            raise ValueError(
+                f"Refusing to resume experiment '{experiment_id}' at {manifest_path}: "
+                f"manifest belongs to dataset {actual_identity[0]!r}@{actual_identity[1]!r}, "
+                f"not {expected_identity[0]!r}@{expected_identity[1]!r}."
+            )
+
+    generation_dir = ensure_dir(Path(cfg.generation.output_dir) / scope / experiment_id)
+    evaluation_dir = ensure_dir(Path(cfg.evaluation.output_dir) / scope / experiment_id)
+    plots_dir = ensure_dir(Path(cfg.plots.output_dir) / scope / experiment_id)
+    ensure_dir(experiment_root)
 
     experiment = Experiment(
         id=experiment_id,

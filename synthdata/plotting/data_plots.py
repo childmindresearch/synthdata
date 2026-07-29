@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from synthdata.data import Dataset
-from synthdata.plotting import save_matplotlib_figure
+from synthdata.plotting import add_histogram_with_kde, save_matplotlib_figure
 
 
 def plot_column_distributions(
@@ -15,7 +15,7 @@ def plot_column_distributions(
     categorical_columns: list,
     ncols: int = 5,
 ):
-    """Grid of bar charts (categorical) / histograms (continuous) for each column."""
+    """Grid of categorical bars and continuous density histograms with KDEs."""
     import matplotlib.pyplot as plt
 
     n = len(columns)
@@ -30,7 +30,8 @@ def plot_column_distributions(
             counts = series.value_counts().sort_index()
             ax.bar(counts.index.astype(str), counts.values, zorder=3)
         else:
-            ax.hist(series, bins=20, zorder=3)
+            add_histogram_with_kde(ax, series, bins=20, label="data")
+            ax.set_ylabel("density")
         ax.set_title(col, fontsize=9)
         ax.grid(True, linestyle="--", alpha=0.4, zorder=0)
 

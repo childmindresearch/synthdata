@@ -6,18 +6,19 @@ stages. Controlled by ``plots.sections`` in the config (``data``, ``imputation``
 ``generation``, ``hpo``, ``evaluation``).
 
 The ``data``/``imputation`` sections describe the dataset itself and are saved
-directly under ``plots.output_dir`` (shared across experiments). The
-``generation``/``hpo``/``evaluation`` sections are experiment-specific and are
-nested under ``plots.output_dir/<experiment_id>/``, resolved the same way as
+under ``plots.output_dir/<dataset-version>/dataset/`` (shared across
+experiments for that version only). The ``generation``/``hpo``/``evaluation``
+sections are experiment-specific and are nested under
+``plots.output_dir/<dataset-version>/<experiment_id>/``, resolved the same way as
 `synthdata-evaluate` (most recent experiment, or ``--experiment-id``).
 
-Note: the "evaluation" section recomputes evaluation metrics from the cached
-synthetic-data CSVs (fast -- no model retraining) since the figures need the
-full in-memory results (including per-model log-disparity Plotly reports),
-which aren't losslessly cached to disk.
+The "evaluation" section is artifact-only: rank plots are redrawn from the
+combined evaluation CSV and log-disparity reports are rebuilt from the
+evaluation artifact bundle. Native SynthEval diagnostics are created during
+evaluation and verified here; this command never reruns evaluation metrics.
 
 Usage:
-    synthdata-plot --config configs/config.yaml [--experiment-id ID]
+    synthdata-plot --config configs/config.yaml [--experiment-id ID] [--dataset-version v2]
 """
 
 import argparse
@@ -27,7 +28,7 @@ import pandas as pd
 
 from synthdata.config import load_config
 from synthdata.data import load_dataset, load_imputed_splits
-from synthdata.experiment import load_experiment
+from synthdata.experiment import dataset_plots_dir, load_experiment
 from synthdata.utils import get_logger, set_global_seed
 
 logger = get_logger("run_plots")
@@ -54,11 +55,18 @@ def main() -> None:
         "instead of the most recent one (overrides experiment.id). Ignored if "
         "plots.sections has no experiment-specific sections.",
     )
+    parser.add_argument(
+        "--dataset-version",
+        default=None,
+        help="Override data.version and select that version's artifact lineage.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     if args.experiment_id:
         cfg.experiment.id = args.experiment_id
+    if args.dataset_version:
+        cfg.data.version = args.dataset_version
     set_global_seed(cfg.seed)
     sections = set(cfg.plots.sections)
     logger.info("Plotting sections: %s", sorted(sections))
@@ -69,14 +77,14 @@ def main() -> None:
     if "data" in sections:
         from synthdata.plotting.data_plots import save_data_plots
 
-        save_data_plots(dataset, cfg.plots.output_dir, cfg.plots.dpi, cfg.plots.formats)
+        save_data_plots(dataset, dataset_plots_dir(cfg), cfg.plots.dpi, cfg.plots.formats)
 
     if "imputation" in sections and dataset.full_imputed_df is not None:
         from synthdata.imputation import build_validation_report
         from synthdata.plotting.imputation_plots import save_imputation_plots
 
         validation_df = build_validation_report(cfg, dataset)
-        save_imputation_plots(cfg, dataset, validation_df, cfg.plots.output_dir)
+        save_imputation_plots(cfg, dataset, validation_df, dataset_plots_dir(cfg))
 
     experiment = None
     if sections & _EXPERIMENT_SECTIONS:
@@ -97,21 +105,42 @@ def main() -> None:
 
         save_hpo_plots(cfg, cfg.plots.output_dir)
 
-    if "evaluation" in sections and synthetic_datasets and dataset.train_imputed_df is not None:
-        from synthdata.evaluation import run_evaluation
+    if "evaluation" in sections:
+        from synthdata.evaluation.artifacts import (
+            load_log_disparity_reports,
+            verify_native_syntheval_artifacts,
+        )
+        from synthdata.evaluation.combine import load_combined_table
         from synthdata.plotting.evaluation_plots import (
             save_log_disparity_plots,
             save_rank_tradeoff_plots,
         )
 
-        combined, extras = run_evaluation(
-            cfg, dataset, synthetic_datasets, enable_syntheval_plots=True
-        )
+        combined_path = Path(cfg.evaluation.output_dir) / "combined_evaluation.csv"
+        if not combined_path.exists():
+            raise FileNotFoundError(
+                f"Evaluation table not found at {combined_path}. "
+                "Run `synthdata-evaluate --config <path>` first."
+            )
+        combined = load_combined_table(str(combined_path))
+        log_disparity_reports = load_log_disparity_reports(cfg.evaluation.output_dir)
         save_rank_tradeoff_plots(cfg, combined, cfg.plots.output_dir)
-        save_log_disparity_plots(extras["log_disparity_reports"], cfg.plots.output_dir)
-        # Native per-model SynthEval plots (SE_*.png) are produced as a side effect of
-        # run_evaluation()'s syntheval benchmark pass above (via enable_syntheval_plots),
-        # so no separate/redundant recomputation pass is needed here.
+        save_log_disparity_plots(log_disparity_reports, cfg.plots.output_dir)
+        verify_native_syntheval_artifacts(cfg.evaluation.output_dir)
+
+        if cfg.evaluation.generate_report:
+            from synthdata.evaluation.report import save_evaluation_report
+
+            save_evaluation_report(
+                cfg,
+                dataset,
+                combined,
+                {
+                    "selected_datasets": synthetic_datasets,
+                    "log_disparity_reports": log_disparity_reports,
+                },
+                experiment,
+            )
 
     if experiment is not None:
         experiment.record(

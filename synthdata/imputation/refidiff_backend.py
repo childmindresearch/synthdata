@@ -39,6 +39,7 @@ Deliberate deviations from the upstream reference implementation:
   return values in the original feature's units.
 """
 
+import dataclasses
 import hashlib
 import json
 import math
@@ -66,11 +67,6 @@ _S_MIN = 0
 _S_MAX = float("inf")
 _S_NOISE = 1
 _N_LANGEVIN = 10  # inner correction steps per outer diffusion step (impute_mask's N)
-
-# CatBoostClassifier's own default (1000) is ~10x the cost this warm-up fill
-# needs; see _warmup_refine's docstring for the empirical timing behind this.
-_CATBOOST_WARMUP_ITERATIONS = 100
-
 
 # ---------------------------------------------------------------------------
 # Binary categorical encoding (memory-efficient alternative to one-hot: each
@@ -134,14 +130,21 @@ def _encode_categorical_to_bits(series: pd.Series, encoder: dict) -> tuple:
     return bits, missing
 
 
-def _decode_bits_to_categorical(bits: np.ndarray, encoder: dict, column_name: str) -> np.ndarray:
+def _decode_bits_to_categorical(
+    bits: np.ndarray,
+    encoder: dict,
+    column_name: str,
+    policy: str = "clip",
+    diagnostics: list[dict] | None = None,
+) -> np.ndarray:
     """Decode a (n_rows, n_bits) matrix back to original category values.
 
     A bit pattern is read as a single binary integer (matching the upstream
     encoding), so it can decode to an index >= n_categories (e.g. 2 bits
-    encoding 3 categories can decode to index 3). Unlike the upstream repo,
-    we clip such out-of-range indices to the nearest valid one and log how
-    often this happened, rather than silently emitting an invalid category.
+    encoding 3 categories can decode to index 3). Upstream RefiDiff does not
+    repair those unused codewords because it evaluates integer indices only.
+    This DataFrame implementation must return a valid original category, so
+    it records every repair and applies the configured policy.
     """
     idx_to_cat = encoder["idx_to_cat"]
     n_categories = encoder["n_categories"]
@@ -153,15 +156,47 @@ def _decode_bits_to_categorical(bits: np.ndarray, encoder: dict, column_name: st
     out_of_range = idx >= n_categories
     n_out_of_range = int(out_of_range.sum())
     if n_out_of_range:
+        diagnostic = {
+            "column": column_name,
+            "n_rows": len(idx),
+            "n_categories": n_categories,
+            "n_invalid": n_out_of_range,
+            "invalid_rate": n_out_of_range / len(idx),
+            "policy": policy,
+        }
+        if diagnostics is not None:
+            diagnostics.append(diagnostic)
+        if policy == "error":
+            raise ValueError(
+                "refidiff: column "
+                f"{column_name!r} decoded {n_out_of_range}/{len(idx)} invalid binary category "
+                "codes under categorical_decode_policy='error'"
+            )
+        if policy == "nearest_valid":
+            valid_bits = np.array(
+                [
+                    [int(bit) for bit in format(category_idx, f"0{encoder['n_bits']}b")]
+                    for category_idx in range(n_categories)
+                ],
+                dtype=int,
+            )
+            invalid_bits = thresholded[out_of_range]
+            hamming_distances = (invalid_bits[:, None, :] != valid_bits[None, :, :]).sum(axis=2)
+            idx[out_of_range] = hamming_distances.argmin(axis=1)
+            repair_description = "projecting to the nearest valid binary code"
+        else:
+            idx = np.clip(idx, 0, n_categories - 1)
+            repair_description = "clipping to the nearest valid index"
         logger.warning(
             "refidiff: column %r decoded %d/%d out-of-range binary category indices "
-            "(valid range [0, %d]); clipping to the nearest valid index",
+            "(valid range [0, %d]); %s (policy=%s)",
             column_name,
             n_out_of_range,
             len(idx),
             n_categories - 1,
+            repair_description,
+            policy,
         )
-        idx = np.clip(idx, 0, n_categories - 1)
     return np.array([idx_to_cat[i] for i in idx])
 
 
@@ -190,7 +225,12 @@ def _mean_std(data: np.ndarray, missing_mask: np.ndarray) -> tuple:
 
 
 def _warmup_refine(
-    X: np.ndarray, missing_mask: np.ndarray, len_num: int, device: str = "cpu"
+    X: np.ndarray,
+    missing_mask: np.ndarray,
+    len_num: int,
+    catboost_warmup_iterations: int,
+    device: str = "cpu",
+    refine_indices: list[int] | None = None,
 ) -> np.ndarray:
     """Single-pass per-column imputation: XGBRegressor (numeric) / CatBoostClassifier (bit).
 
@@ -212,7 +252,7 @@ def _warmup_refine(
     this row count). So: XGBRegressor uses GPU when available,
     CatBoostClassifier always runs on CPU regardless of ``device``.
 
-    CatBoostClassifier is also capped at ``_CATBOOST_WARMUP_ITERATIONS``
+    CatBoostClassifier is also capped at ``catboost_warmup_iterations``
     boosting rounds (its own default is 1000, ~10x more): on the same
     profiling shape, fit+predict time scaled ~linearly with iterations
     (1000 -> 28.9s, 200 -> 5.8s, 100 -> 2.9s, 50 -> 1.4s), dwarfing every
@@ -230,7 +270,20 @@ def _warmup_refine(
     use_xgb_gpu = device == "cuda"
     X = X.copy()
     _, n_features = X.shape
-    for col in tqdm(range(n_features), desc="refidiff warm-up refinement", unit="col"):
+    columns = range(n_features) if refine_indices is None else refine_indices
+    if refine_indices is not None:
+        invalid_indices = sorted(set(refine_indices) - set(range(n_features)))
+        if invalid_indices:
+            raise ValueError(
+                "refidiff: refinement indices must refer to encoded feature columns; "
+                f"invalid indices: {invalid_indices}"
+            )
+        logger.info(
+            "refidiff: limiting per-column refinement to %d/%d encoded columns",
+            len(refine_indices),
+            n_features,
+        )
+    for col in tqdm(columns, desc="refidiff warm-up refinement", unit="col"):
         missing_idx = np.where(missing_mask[:, col])[0]
         if len(missing_idx) == 0:
             continue
@@ -257,7 +310,7 @@ def _warmup_refine(
             y_obs_mapped = np.array([val_to_label[v] for v in y_obs])
             model = CatBoostClassifier(
                 logging_level="Silent",
-                iterations=_CATBOOST_WARMUP_ITERATIONS,
+                iterations=catboost_warmup_iterations,
                 # Without this, CatBoost writes training-log files (learn_error.tsv,
                 # time_left.tsv, etc.) under ./catboost_info/ on every fit -- this
                 # runs once per categorical column (hundreds of times per impute
@@ -599,16 +652,46 @@ def _impute_mask(
 # ---------------------------------------------------------------------------
 
 
-def _config_hash(in_dim: int, cfg: RefiDiffConfig, denoiser_name: str) -> str:
-    payload = json.dumps(
-        {"in_dim": in_dim, "hidden_dim": cfg.hidden_dim, "denoiser": denoiser_name},
-        sort_keys=True,
-    )
+def _checkpoint_identity(
+    df: pd.DataFrame,
+    feature_columns: list,
+    categorical_columns: list,
+    in_dim: int,
+    cfg: RefiDiffConfig,
+    denoiser_name: str,
+    seed: int,
+    refinement_columns: list | None,
+) -> dict:
+    """Return immutable provenance for a RefiDiff training checkpoint.
+
+    Checkpoints can only be reused when the complete training configuration,
+    source values/missingness, feature roles, and resolved denoiser match.
+    This deliberately fingerprints the input frame rather than trusting a
+    dataset directory, which can be shared by multiple benchmark candidates.
+    """
+    source_hash = hashlib.sha256(
+        pd.util.hash_pandas_object(df[feature_columns], index=True).values.tobytes()
+    ).hexdigest()
+    return {
+        "algorithm": "refidiff-checkpoint-v2",
+        "encoded_input_dim": in_dim,
+        "refidiff_config": dataclasses.asdict(cfg),
+        "resolved_denoiser": denoiser_name,
+        "seed": seed,
+        "feature_columns": feature_columns,
+        "categorical_columns": categorical_columns,
+        "source_frame_sha256": source_hash,
+        "refinement_columns": refinement_columns,
+    }
+
+
+def _config_hash(identity: dict) -> str:
+    payload = json.dumps(identity, sort_keys=True, default=str, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-def _checkpoint_dir(data_dir: Path, in_dim: int, cfg: RefiDiffConfig, denoiser_name: str) -> Path:
-    return Path(data_dir) / ".refidiff_checkpoints" / _config_hash(in_dim, cfg, denoiser_name)
+def _checkpoint_dir(data_dir: Path, identity: dict) -> Path:
+    return Path(data_dir) / ".refidiff_checkpoints" / _config_hash(identity)
 
 
 def _train(
@@ -617,6 +700,7 @@ def _train(
     device: str,
     cfg: RefiDiffConfig,
     checkpoint_dir: Path,
+    checkpoint_identity: dict,
 ) -> Model:
     """Train ``model`` with Adam + ReduceLROnPlateau + early stopping.
 
@@ -629,6 +713,20 @@ def _train(
     ensure_dir(checkpoint_dir)
     best_model_path = checkpoint_dir / "best_model.pt"
     checkpoint_path = checkpoint_dir / "checkpoint.pt"
+    identity_path = checkpoint_dir / "identity.json"
+    serialized_identity = json.dumps(checkpoint_identity, indent=2, sort_keys=True, default=str)
+    if identity_path.exists():
+        with open(identity_path) as f:
+            recorded_identity = json.load(f)
+        if recorded_identity != checkpoint_identity:
+            raise RuntimeError(
+                "refidiff: refusing to resume checkpoint with incompatible identity at "
+                f"{checkpoint_dir}; remove the stale checkpoint only after preserving its "
+                "artifacts and start a new candidate."
+            )
+    else:
+        with open(identity_path, "w") as f:
+            f.write(serialized_identity)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=0)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -741,6 +839,9 @@ def impute_dataframe(
     device: str,
     refidiff_cfg: RefiDiffConfig,
     data_dir: Path,
+    seed: int = 0,
+    refinement_columns: list | None = None,
+    decode_diagnostics_path: Path | None = None,
 ) -> pd.DataFrame:
     """Impute missing values in ``feature_columns`` of ``df`` via RefiDiff.
 
@@ -750,6 +851,13 @@ def impute_dataframe(
     ``data_dir/.refidiff_checkpoints/<config-hash>/``.
     """
     cfg = refidiff_cfg
+    if refinement_columns is not None:
+        unknown_refinement_columns = sorted(set(refinement_columns) - set(feature_columns))
+        if unknown_refinement_columns:
+            raise ValueError(
+                "refidiff: refinement_columns must be feature columns; invalid entries: "
+                f"{unknown_refinement_columns}"
+            )
     numeric_columns = [c for c in feature_columns if c not in categorical_columns]
     n_samples = len(df)
 
@@ -809,6 +917,20 @@ def impute_dataframe(
     x_raw = np.concatenate([numeric_values, cat_values], axis=1)
     missing_mask = np.concatenate([numeric_missing, cat_missing], axis=1)
 
+    refine_indices = None
+    if refinement_columns is not None:
+        refine_indices = []
+        numeric_index = {column: index for index, column in enumerate(numeric_columns)}
+        offset = len_num
+        for column, width in zip(categorical_columns, cat_bin_widths, strict=True):
+            if column in refinement_columns:
+                refine_indices.extend(range(offset, offset + width))
+            offset += width
+        refine_indices.extend(
+            numeric_index[column] for column in refinement_columns if column in numeric_index
+        )
+        refine_indices.sort()
+
     logger.info(
         "refidiff: encoded feature matrix shape=%s (%d numeric + %d binary-encoded categorical "
         "bit columns), %d/%d missing entries",
@@ -828,7 +950,14 @@ def impute_dataframe(
     logger.info("refidiff: running warm-up refinement pass")
     x_warm = x.copy()
     x_warm[missing_mask] = 0.0
-    x_warm = _warmup_refine(x_warm, missing_mask, len_num, device=device)
+    x_warm = _warmup_refine(
+        x_warm,
+        missing_mask,
+        len_num,
+        catboost_warmup_iterations=cfg.catboost_warmup_iterations,
+        device=device,
+        refine_indices=refine_indices,
+    )
 
     # --- Train the EDM diffusion model on the warm-up-filled data. ---
     in_dim = x_warm.shape[1]
@@ -846,10 +975,26 @@ def impute_dataframe(
         cfg.epochs,
         cfg.early_stopping_patience,
     )
+    logger.info(
+        "refidiff: refinement settings numeric=XGBRegressor(defaults), "
+        "categorical=CatBoostClassifier(iterations=%d)",
+        cfg.catboost_warmup_iterations,
+    )
 
     train_data = torch.tensor(x_warm, dtype=torch.float32)
-    checkpoint_dir = _checkpoint_dir(data_dir, in_dim, cfg, denoiser_name)
-    model = _train(model, train_data, device, cfg, checkpoint_dir)
+    checkpoint_identity = _checkpoint_identity(
+        df,
+        feature_columns,
+        categorical_columns,
+        in_dim,
+        cfg,
+        denoiser_name,
+        seed,
+        refinement_columns,
+    )
+    checkpoint_dir = _checkpoint_dir(data_dir, checkpoint_identity)
+    logger.info("refidiff: checkpoint namespace=%s", checkpoint_dir)
+    model = _train(model, train_data, device, cfg, checkpoint_dir, checkpoint_identity)
 
     # --- Reverse-diffusion sampling: average num_trials trajectories. ---
     model.eval()
@@ -871,7 +1016,14 @@ def impute_dataframe(
 
     # --- Polishing pass: re-run warm-up refinement on the diffusion output. ---
     logger.info("refidiff: running polishing refinement pass")
-    rec_x = _warmup_refine(rec_x, missing_mask, len_num, device=device)
+    rec_x = _warmup_refine(
+        rec_x,
+        missing_mask,
+        len_num,
+        catboost_warmup_iterations=cfg.catboost_warmup_iterations,
+        device=device,
+        refine_indices=refine_indices,
+    )
 
     # --- De-standardize back to raw feature units. ---
     rec_x = rec_x * 2.0 * std + mean
@@ -888,11 +1040,37 @@ def impute_dataframe(
     numeric_result = decode_label_encoded_columns(numeric_result, numeric_category_maps)
 
     categorical_data = {}
+    decode_diagnostics: list[dict] = []
     offset = len_num
     for col, width in zip(categorical_columns, cat_bin_widths, strict=True):
         bits = rec_x[:, offset : offset + width]
-        categorical_data[col] = _decode_bits_to_categorical(bits, cat_encoders[col], col)
+        categorical_data[col] = _decode_bits_to_categorical(
+            bits,
+            cat_encoders[col],
+            col,
+            policy=cfg.categorical_decode_policy,
+            diagnostics=decode_diagnostics,
+        )
         offset += width
+
+    if decode_diagnostics_path is not None:
+        ensure_dir(Path(decode_diagnostics_path).parent)
+        diagnostics_payload = {
+            "policy": cfg.categorical_decode_policy,
+            "n_categorical_columns": len(categorical_columns),
+            "n_columns_with_invalid_codes": len(decode_diagnostics),
+            "n_invalid_codes": sum(entry["n_invalid"] for entry in decode_diagnostics),
+            "columns": decode_diagnostics,
+        }
+        with open(decode_diagnostics_path, "w") as f:
+            json.dump(diagnostics_payload, f, indent=2, sort_keys=True)
+        logger.info(
+            "refidiff: wrote categorical decode diagnostics (%d invalid codes across %d columns) "
+            "to %s",
+            diagnostics_payload["n_invalid_codes"],
+            diagnostics_payload["n_columns_with_invalid_codes"],
+            decode_diagnostics_path,
+        )
     categorical_result = pd.DataFrame(categorical_data, index=df.index)
 
     result = pd.concat([numeric_result, categorical_result], axis=1)

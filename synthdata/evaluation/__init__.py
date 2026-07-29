@@ -9,6 +9,7 @@ import pandas as pd
 from synthdata.config import Config
 from synthdata.data import Dataset
 from synthdata.evaluation import (
+    artifacts,
     combine,
     custom_eval,
     privacy_gate,
@@ -39,7 +40,6 @@ def run_evaluation(
     cfg: Config,
     dataset: Dataset,
     synthetic_datasets: dict[str, pd.DataFrame],
-    enable_syntheval_plots: bool = False,
     experiment=None,
 ) -> tuple[pd.DataFrame, dict]:
     """Run the full evaluation stage.
@@ -48,12 +48,10 @@ def run_evaluation(
     ranked, multi-index DataFrame (see :mod:`synthdata.evaluation.combine`) and
     ``extras`` holds the raw per-framework results (useful for plotting).
 
-    If ``enable_syntheval_plots`` is True (and ``cfg.evaluation.save_per_model_syntheval_plots``
-    is enabled), SynthEval's native per-metric plots are produced as a side effect of the
-    single syntheval benchmark pass below -- callers must NOT also call the old
-    ``save_per_model_syntheval_plots`` helper afterwards, as that would redundantly
-    recompute every metric (including the expensive ``corr_diff``/``mi_diff`` ones) a
-    second time just to get plots that this call already produced.
+    When ``cfg.evaluation.save_per_model_syntheval_plots`` is enabled,
+    SynthEval's native per-metric plots are always produced as a side effect
+    of the single benchmark pass below. Callers must NOT run a second
+    evaluation merely to obtain those diagnostics.
 
     ``experiment`` (optional :class:`synthdata.experiment.Experiment`) is only used to
     include the experiment id in the generated Markdown report (see
@@ -78,7 +76,12 @@ def run_evaluation(
         workspace=output_dir / "synthcity_workspace",
     )
 
-    want_syntheval_plots = enable_syntheval_plots and eval_cfg.save_per_model_syntheval_plots
+    # Native SynthEval diagnostics can only be created during SynthEval's
+    # metric pass. Always produce them when this evaluation config enables
+    # them, independent of the CLI's broader --plot switch, so a later
+    # synthdata-plot run never needs to rerun evaluation merely to obtain
+    # these diagnostics.
+    want_syntheval_plots = eval_cfg.syntheval.enabled and eval_cfg.save_per_model_syntheval_plots
     plots_output_dir = (
         Path(cfg.plots.output_dir) / "evaluation" / "syntheval_plots"
         if want_syntheval_plots
@@ -93,6 +96,7 @@ def run_evaluation(
         output_folder=output_dir / "syntheval_benchmark",
         plots_output_dir=plots_output_dir,
         positive_class=eval_cfg.positive_class,
+        execution_cfg=eval_cfg.syntheval_execution,
     )
 
     if eval_cfg.binary_target.enabled:
@@ -104,6 +108,7 @@ def run_evaluation(
             preset_dir=output_dir,
             ranking_strategy=eval_cfg.ranking_strategy,
             output_folder=output_dir / "syntheval_benchmark",
+            execution_cfg=eval_cfg.syntheval_execution,
         )
         benchmark_results, benchmark_ranks = syntheval_eval.merge_binary_target_results(
             benchmark_results, benchmark_ranks, binary_results, binary_ranks
@@ -127,6 +132,13 @@ def run_evaluation(
 
     combined.to_csv(output_dir / "combined_evaluation.csv")
 
+    artifact_manifest = artifacts.persist_evaluation_artifacts(
+        output_dir,
+        combined,
+        log_disparity_reports,
+        native_syntheval_plot_dir=plots_output_dir,
+    )
+
     extras = {
         "selected_datasets": selected_datasets,
         "synthcity_results": synthcity_results,
@@ -134,6 +146,7 @@ def run_evaluation(
         "syntheval_benchmark_ranks": benchmark_ranks,
         "log_disparity_reports": log_disparity_reports,
         "privacy_gate_result": gate_result,
+        "artifact_manifest": str(artifact_manifest),
     }
 
     if eval_cfg.generate_report:

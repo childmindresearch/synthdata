@@ -3,8 +3,15 @@ synthetic datasets using a custom preset (built from
 :mod:`synthdata.evaluation.catalog`, filtered by the configured selection).
 """
 
+import dataclasses
 import hashlib
 import json
+import multiprocessing
+import os
+import socket
+import time
+import traceback
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +29,251 @@ from synthdata.utils import ensure_dir, get_logger, save_json
 logger = get_logger(__name__)
 
 _RANK_COLUMNS = {"rank", "u_rank", "p_rank", "f_rank"}
+_CHECKPOINT_SCHEMA_VERSION = 1
+
+
+def _atomic_json(path: Path, payload: dict) -> None:
+    """Atomically replace a JSON sidecar in its destination directory."""
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    os.replace(temporary, path)
+
+
+def _atomic_parquet(path: Path, frame: pd.DataFrame) -> None:
+    """Atomically replace a Parquet result checkpoint."""
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    frame.to_parquet(temporary)
+    os.replace(temporary, path)
+
+
+def _frame_fingerprint(frame: pd.DataFrame) -> str:
+    """Content hash including column order and dtypes for cache validity."""
+    digest = hashlib.sha256()
+    digest.update(
+        repr([(str(column), str(dtype)) for column, dtype in frame.dtypes.items()]).encode()
+    )
+    digest.update(pd.util.hash_pandas_object(frame, index=True).values.tobytes())
+    return digest.hexdigest()
+
+
+def _checkpoint_model_id(model_name: str) -> str:
+    """Stable path-safe model id while retaining the original name in metadata."""
+    return hashlib.sha256(model_name.encode()).hexdigest()[:16]
+
+
+def _available_memory_gib() -> float | None:
+    """Return Linux MemAvailable in GiB, or None where it cannot be observed."""
+    try:
+        lines = Path("/proc/meminfo").read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) / 1024**2
+    return None
+
+
+def resolve_model_workers(execution_cfg, *, n_models: int, n_columns: int) -> int:
+    """Resolve a memory- and CPU-bounded number of concurrent model processes."""
+    if not n_models:
+        return 0
+    requested = execution_cfg.model_workers
+    if requested != "auto":
+        return min(requested, execution_cfg.max_model_workers, n_models)
+
+    cpu_count = os.cpu_count() or 1
+    cpu_bound = max(1, cpu_count // execution_cfg.cores_per_model)
+    per_model_gib = execution_cfg.memory_per_model_gib or max(6.0, 0.0135 * n_columns)
+    available_gib = _available_memory_gib()
+    if available_gib is None:
+        memory_bound = 1
+    else:
+        total_gib = available_gib
+        try:
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                if line.startswith("MemTotal:"):
+                    total_gib = int(line.split()[1]) / 1024**2
+                    break
+        except OSError:
+            pass
+        budget_gib = min(
+            total_gib * 0.75, max(0.0, available_gib - execution_cfg.memory_reserve_gib)
+        )
+        memory_bound = max(1, int(budget_gib // per_model_gib))
+    return max(1, min(n_models, execution_cfg.max_model_workers, cpu_bound, memory_bound))
+
+
+def _checkpoint_paths(
+    checkpoint_root: Path, pass_name: str, model_name: str
+) -> tuple[Path, Path, Path]:
+    model_dir = (
+        checkpoint_root
+        / f"checkpoints-v{_CHECKPOINT_SCHEMA_VERSION}"
+        / pass_name
+        / _checkpoint_model_id(model_name)
+    )
+    return model_dir, model_dir / "status.json", model_dir / "result.parquet"
+
+
+def _valid_checkpoint(
+    checkpoint_root: Path,
+    pass_name: str,
+    model_name: str,
+    context_fingerprint: str,
+    model_fingerprint: str,
+    require_plots: bool,
+) -> pd.DataFrame | None:
+    model_dir, status_path, result_path = _checkpoint_paths(checkpoint_root, pass_name, model_name)
+    if not (status_path.exists() and result_path.exists()):
+        return None
+    try:
+        status = json.loads(status_path.read_text())
+        if (
+            status.get("state") != "succeeded"
+            or status.get("schema_version") != _CHECKPOINT_SCHEMA_VERSION
+            or status.get("model_name") != model_name
+            or status.get("context_fingerprint") != context_fingerprint
+            or status.get("model_fingerprint") != model_fingerprint
+            or (require_plots and not status.get("plots_completed"))
+        ):
+            return None
+        return pd.read_parquet(result_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        logger.warning(
+            "[syntheval] invalid checkpoint for %s at %s; recomputing", model_name, model_dir
+        )
+        return None
+
+
+def _model_worker(
+    model_name: str,
+    synthetic_frame: pd.DataFrame,
+    real_frame: pd.DataFrame,
+    holdout_frame: pd.DataFrame | None,
+    cat_cols: list,
+    target_column: str,
+    sensitive_columns: list,
+    preset_path: str,
+    checkpoint_root: str,
+    pass_name: str,
+    context_fingerprint: str,
+    model_fingerprint: str,
+    plots_output_dir: str | None,
+    cores_per_model: int,
+) -> None:
+    """Run exactly one model in a disposable child process and checkpoint it."""
+    os.environ["LOKY_MAX_CPU_COUNT"] = str(cores_per_model)
+    os.environ["OMP_NUM_THREADS"] = str(cores_per_model)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(cores_per_model)
+    # Workers change into their model-specific native-plot directory before
+    # checkpointing. Keep checkpoint paths absolute so a successful evaluation
+    # cannot fail merely because its current working directory changed.
+    checkpoint_root_path = Path(checkpoint_root).resolve()
+    model_dir, status_path, result_path = _checkpoint_paths(
+        checkpoint_root_path, pass_name, model_name
+    )
+    ensure_dir(model_dir)
+    start = time.time()
+    _atomic_json(
+        status_path,
+        {
+            "schema_version": _CHECKPOINT_SCHEMA_VERSION,
+            "state": "running",
+            "model_name": model_name,
+            "context_fingerprint": context_fingerprint,
+            "model_fingerprint": model_fingerprint,
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "started_at": start,
+            "shape": list(synthetic_frame.shape),
+            "plots_completed": False,
+        },
+    )
+    original_dir = Path.cwd()
+    try:
+        from syntheval import AnalysisConfig, SynthEval
+
+        analysis_config = AnalysisConfig(
+            dataset=real_frame,
+            target_vars=target_column,
+            confounder_vars=None,
+            sensitive_vars=sensitive_columns,
+        )
+        plot_dir = None
+        if plots_output_dir is not None:
+            # Resolve before changing the worker's directory. SynthEval writes
+            # native diagnostics relative to CWD; retaining an absolute path
+            # lets us accurately inventory the files after evaluation.
+            plot_dir = ensure_dir(Path(plots_output_dir).resolve() / model_name)
+            os.chdir(plot_dir)
+        se = SynthEval(
+            real_frame,
+            holdout_dataframe=holdout_frame,
+            cat_cols=cat_cols,
+            verbose=False,
+            enable_plots=plot_dir is not None,
+            console="off",
+            show_warnings=False,
+        )
+        result = se.evaluate(
+            synthetic_frame,
+            analysis_target=analysis_config,
+            presets_file=preset_path,
+            _dataset_name=model_name,
+        )
+        if result is None:
+            raise RuntimeError("SynthEval returned no normalized metric results")
+        _atomic_parquet(result_path, result)
+        plot_files = (
+            sorted(
+                str(path.relative_to(plot_dir)) for path in plot_dir.rglob("*") if path.is_file()
+            )
+            if plot_dir
+            else []
+        )
+        _atomic_json(
+            status_path,
+            {
+                "schema_version": _CHECKPOINT_SCHEMA_VERSION,
+                "state": "succeeded",
+                "model_name": model_name,
+                "context_fingerprint": context_fingerprint,
+                "model_fingerprint": model_fingerprint,
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "started_at": start,
+                "completed_at": time.time(),
+                "elapsed_seconds": time.time() - start,
+                "shape": list(synthetic_frame.shape),
+                "plots_completed": plot_dir is not None,
+                "plot_files": plot_files,
+            },
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        _atomic_json(
+            status_path,
+            {
+                "schema_version": _CHECKPOINT_SCHEMA_VERSION,
+                "state": "failed",
+                "model_name": model_name,
+                "context_fingerprint": context_fingerprint,
+                "model_fingerprint": model_fingerprint,
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "started_at": start,
+                "failed_at": time.time(),
+                "elapsed_seconds": time.time() - start,
+                "exception_type": type(exc).__name__,
+                "exception": str(exc),
+                "traceback": traceback.format_exc(),
+                "shape": list(synthetic_frame.shape),
+                "plots_completed": False,
+            },
+        )
+        raise
+    finally:
+        os.chdir(original_dir)
+
 
 # ---------------------------------------------------------------------------
 # Benchmark result caching
@@ -37,14 +289,24 @@ _RANK_COLUMNS = {"rank", "u_rank", "p_rank", "f_rank"}
 # ---------------------------------------------------------------------------
 
 
-def _compute_cache_key(preset: dict, model_names: list[str], ranking_strategy: str) -> str:
-    """Stable SHA-256 hex digest of the preset dict + sorted model names + ranking strategy.
+def _compute_cache_key(
+    preset: dict,
+    model_names: list[str],
+    ranking_strategy: str,
+    evaluation_fingerprint: str | None = None,
+) -> str:
+    """Stable SHA-256 digest of the benchmark configuration and input fingerprint.
 
     ``ranking_strategy`` is included because it affects the ranks DataFrame
     returned by ``se.benchmark()`` (not just the metric values).
     """
     payload = json.dumps(
-        {"preset": preset, "models": sorted(model_names), "ranking_strategy": ranking_strategy},
+        {
+            "preset": preset,
+            "models": sorted(model_names),
+            "ranking_strategy": ranking_strategy,
+            "evaluation_fingerprint": evaluation_fingerprint,
+        },
         sort_keys=True,
     ).encode()
     return hashlib.sha256(payload).hexdigest()
@@ -65,10 +327,10 @@ def _save_syntheval_cache(
     - ``<cache_dir>/<prefix>_cache_meta.json``  -- {"cache_key": <sha256>}
     """
     ensure_dir(cache_dir)
-    results.to_parquet(cache_dir / f"{prefix}_results.parquet")
-    ranks.to_parquet(cache_dir / f"{prefix}_ranks.parquet")
+    _atomic_parquet(cache_dir / f"{prefix}_results.parquet", results)
+    _atomic_parquet(cache_dir / f"{prefix}_ranks.parquet", ranks)
     meta_path = cache_dir / f"{prefix}_cache_meta.json"
-    save_json(meta_path, {"cache_key": cache_key})
+    _atomic_json(meta_path, {"cache_key": cache_key})
     logger.info(
         "[syntheval] cached %s benchmark results to %s (key=%s…)",
         prefix,
@@ -167,6 +429,183 @@ def build_preset(selection_cfg, positive_class=1) -> dict:
     return preset
 
 
+def _evaluation_context_fingerprint(
+    dataset: Dataset,
+    preset: dict,
+    pass_name: str,
+    plots_enabled: bool,
+) -> str:
+    """Fingerprint inputs shared by every model in one evaluation pass."""
+    payload = {
+        "schema_version": _CHECKPOINT_SCHEMA_VERSION,
+        "pass_name": pass_name,
+        "preset": preset,
+        "dataset_name": dataset.name,
+        "dataset_version": dataset.version,
+        "target_column": dataset.target_column,
+        "sensitive_columns": dataset.sensitive_columns,
+        "categorical_columns": dataset.all_categorical_columns,
+        "train": _frame_fingerprint(dataset.train_imputed_df),
+        "holdout": _frame_fingerprint(dataset.test_imputed_df),
+        "plots_enabled": plots_enabled,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _run_resumable_syntheval(
+    synthetic_datasets: dict[str, pd.DataFrame],
+    dataset: Dataset,
+    preset: dict,
+    preset_path: Path,
+    output_folder: str | Path,
+    ranking_strategy: str,
+    execution_cfg,
+    pass_name: str,
+    plots_output_dir: str | Path | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Evaluate models in disposable bounded processes and resume checkpoints.
+
+    Each child handles exactly one model. Its process exit releases all native
+    and allocator high-water memory before the parent admits another model.
+    """
+    from syntheval.syntheval import aggregate_benchmark_results
+
+    checkpoint_root = ensure_dir(output_folder).resolve()
+    plots_enabled = plots_output_dir is not None
+    context_fingerprint = _evaluation_context_fingerprint(dataset, preset, pass_name, plots_enabled)
+    results: dict[str, pd.DataFrame] = {}
+    pending: list[tuple[str, pd.DataFrame, str]] = []
+    for model_name, frame in synthetic_datasets.items():
+        model_fingerprint = _frame_fingerprint(frame)
+        cached = _valid_checkpoint(
+            checkpoint_root,
+            pass_name,
+            model_name,
+            context_fingerprint,
+            model_fingerprint,
+            plots_enabled,
+        )
+        if cached is None:
+            pending.append((model_name, frame, model_fingerprint))
+        else:
+            logger.info("[syntheval] %s checkpoint hit for model %s", pass_name, model_name)
+            results[model_name] = cached
+
+    if pending:
+        workers = resolve_model_workers(
+            execution_cfg,
+            n_models=len(pending),
+            n_columns=dataset.train_imputed_df.shape[1],
+        )
+        logger.info(
+            "[syntheval] %s scheduling %d missing model(s) with %d disposable worker(s) "
+            "(train=%s, holdout=%s, features=%d, plots=%s)",
+            pass_name,
+            len(pending),
+            workers,
+            dataset.train_imputed_df.shape,
+            dataset.test_imputed_df.shape if dataset.test_imputed_df is not None else None,
+            dataset.train_imputed_df.shape[1],
+            plots_enabled,
+        )
+        context = multiprocessing.get_context("spawn")
+        active: dict[str, multiprocessing.Process] = {}
+        pending_iter = iter(pending)
+
+        def start_next() -> bool:
+            try:
+                model_name, frame, model_fingerprint = next(pending_iter)
+            except StopIteration:
+                return False
+            process = context.Process(
+                target=_model_worker,
+                args=(
+                    model_name,
+                    frame,
+                    dataset.train_imputed_df,
+                    dataset.test_imputed_df,
+                    dataset.all_categorical_columns,
+                    dataset.target_column,
+                    dataset.sensitive_columns,
+                    str(preset_path.resolve()),
+                    str(checkpoint_root),
+                    pass_name,
+                    context_fingerprint,
+                    model_fingerprint,
+                    str(plots_output_dir) if plots_output_dir else None,
+                    execution_cfg.cores_per_model,
+                ),
+                name=f"syntheval-{pass_name}-{model_name}",
+            )
+            process.start()
+            active[model_name] = process
+            logger.info(
+                "[syntheval] %s started model=%s pid=%s", pass_name, model_name, process.pid
+            )
+            return True
+
+        for _ in range(workers):
+            if not start_next():
+                break
+
+        failures = []
+        while active:
+            completed = []
+            for model_name, process in active.items():
+                if process.is_alive():
+                    continue
+                process.join()
+                completed.append((model_name, process.exitcode))
+            if not completed:
+                time.sleep(0.1)
+                continue
+            for model_name, exitcode in completed:
+                del active[model_name]
+                model_fingerprint = _frame_fingerprint(synthetic_datasets[model_name])
+                cached = _valid_checkpoint(
+                    checkpoint_root,
+                    pass_name,
+                    model_name,
+                    context_fingerprint,
+                    model_fingerprint,
+                    plots_enabled,
+                )
+                if exitcode == 0 and cached is not None:
+                    results[model_name] = cached
+                    logger.info("[syntheval] %s completed model=%s", pass_name, model_name)
+                else:
+                    _, status_path, _ = _checkpoint_paths(checkpoint_root, pass_name, model_name)
+                    _atomic_json(
+                        status_path,
+                        {
+                            "schema_version": _CHECKPOINT_SCHEMA_VERSION,
+                            "state": "failed",
+                            "model_name": model_name,
+                            "context_fingerprint": context_fingerprint,
+                            "model_fingerprint": model_fingerprint,
+                            "exit_code": exitcode,
+                            "failed_at": time.time(),
+                            "failure_reason": "worker exited without a valid succeeded checkpoint",
+                        },
+                    )
+                    failures.append(f"{model_name} (exit={exitcode}, status={status_path})")
+                    logger.error(
+                        "[syntheval] %s model=%s exited %s without a valid checkpoint",
+                        pass_name,
+                        model_name,
+                        exitcode,
+                    )
+                start_next()
+        if failures:
+            raise RuntimeError(
+                f"SynthEval {pass_name} failed for {len(failures)} model(s): {', '.join(failures)}. "
+                f"Completed model checkpoints remain resumable under {checkpoint_root}."
+            )
+
+    ordered_results = {name: results[name] for name in synthetic_datasets}
+    return aggregate_benchmark_results(ordered_results, ranking_strategy)
+
+
 def run_syntheval_evaluation(
     synthetic_datasets: dict[str, pd.DataFrame],
     dataset: Dataset,
@@ -176,6 +615,7 @@ def run_syntheval_evaluation(
     output_folder: str | Path | None = None,
     plots_output_dir: str | Path | None = None,
     positive_class=1,
+    execution_cfg=None,
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
     """Run SynthEval's benchmark() across all datasets. Returns (benchmark_results, benchmark_ranks).
 
@@ -194,54 +634,49 @@ def run_syntheval_evaluation(
         logger.info("[syntheval] no metrics selected; skipping")
         return None, None
 
-    from syntheval import AnalysisConfig, SynthEval
-
     preset_dir = ensure_dir(preset_dir)
     preset_path = preset_dir / "syntheval_preset.json"
     save_json(preset_path, preset)
 
-    analysis_config = AnalysisConfig(
-        dataset=dataset.train_imputed_df,
-        target_vars=dataset.target_column,
-        confounder_vars=None,
-        sensitive_vars=dataset.sensitive_columns,
+    cache_dir = Path(output_folder) if output_folder else preset_dir / "syntheval_benchmark"
+    context_fingerprint = _evaluation_context_fingerprint(
+        dataset, preset, "main", plots_output_dir is not None
+    )
+    model_fingerprints = {
+        name: _frame_fingerprint(frame) for name, frame in synthetic_datasets.items()
+    }
+    cache_key = _compute_cache_key(
+        preset,
+        list(synthetic_datasets.keys()),
+        ranking_strategy,
+        hashlib.sha256(
+            json.dumps(
+                {"context": context_fingerprint, "models": model_fingerprints}, sort_keys=True
+            ).encode()
+        ).hexdigest(),
     )
 
-    se = SynthEval(
-        dataset.train_imputed_df,
-        holdout_dataframe=dataset.test_imputed_df,
-        cat_cols=dataset.all_categorical_columns,
-        verbose=False,
-        enable_plots=plots_output_dir is not None,
-        console="off",
-        show_warnings=False,
-    )
+    cached = _load_syntheval_cache(cache_dir, "main", cache_key)
+    if cached is not None:
+        return cached
 
-    cache_dir = Path(output_folder) if output_folder else None
-    cache_key = _compute_cache_key(preset, list(synthetic_datasets.keys()), ranking_strategy)
+    if execution_cfg is None:
+        from synthdata.config import SynthEvalExecutionConfig
 
-    if cache_dir is not None:
-        cached = _load_syntheval_cache(cache_dir, "main", cache_key)
-        if cached is not None:
-            return cached
-
-    logger.info(
-        "[syntheval] benchmarking %d datasets across %d metrics%s",
-        len(synthetic_datasets),
-        len(preset),
-        " (with native plots)" if plots_output_dir else "",
-    )
-    benchmark_results, benchmark_ranks = se.benchmark(
+        execution_cfg = SynthEvalExecutionConfig()
+    benchmark_results, benchmark_ranks = _run_resumable_syntheval(
         synthetic_datasets,
-        analysis_target=analysis_config,
-        presets_file=str(preset_path),
-        rank_strategy=ranking_strategy,
-        output_folder=str(output_folder) if output_folder else None,
-        plot_output_dir=str(plots_output_dir) if plots_output_dir else None,
+        dataset,
+        preset,
+        preset_path,
+        cache_dir,
+        ranking_strategy,
+        execution_cfg,
+        "main",
+        plots_output_dir,
     )
 
-    if cache_dir is not None:
-        _save_syntheval_cache(benchmark_results, benchmark_ranks, cache_dir, "main", cache_key)
+    _save_syntheval_cache(benchmark_results, benchmark_ranks, cache_dir, "main", cache_key)
 
     return benchmark_results, benchmark_ranks
 
@@ -322,6 +757,7 @@ def run_binary_target_syntheval_evaluation(
     preset_dir: str | Path,
     ranking_strategy: str = "linear",
     output_folder: str | Path | None = None,
+    execution_cfg=None,
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
     """Run a second, separate SynthEval benchmark() pass against a binary-
     collapsed copy of the target column, for the metrics that require exactly
@@ -356,39 +792,42 @@ def run_binary_target_syntheval_evaluation(
     hout_df = _binarize(dataset.test_imputed_df) if dataset.test_imputed_df is not None else None
     binary_synthetic_datasets = {name: _binarize(df) for name, df in synthetic_datasets.items()}
 
-    from syntheval import AnalysisConfig, SynthEval
-
     preset_dir = ensure_dir(preset_dir)
     preset_path = preset_dir / "syntheval_binary_target_preset.json"
     save_json(preset_path, preset)
-
-    analysis_config = AnalysisConfig(
-        dataset=train_df,
-        target_vars=column,
-        confounder_vars=None,
-        sensitive_vars=dataset.sensitive_columns,
+    binary_dataset = dataclasses.replace(
+        dataset,
+        target_column=column,
+        train_imputed_df=train_df,
+        test_imputed_df=hout_df,
     )
-
-    se = SynthEval(
-        train_df,
-        holdout_dataframe=hout_df,
-        cat_cols=dataset.all_categorical_columns,
-        verbose=False,
-        enable_plots=False,
-        console="off",
-        show_warnings=False,
+    cache_dir = Path(output_folder) if output_folder else preset_dir / "syntheval_benchmark"
+    context_fingerprint = _evaluation_context_fingerprint(
+        binary_dataset, preset, "binary_target", False
     )
+    model_fingerprints = {
+        name: _frame_fingerprint(frame) for name, frame in binary_synthetic_datasets.items()
+    }
+    cache_key = _compute_cache_key(
+        preset,
+        list(binary_synthetic_datasets.keys()),
+        ranking_strategy,
+        hashlib.sha256(
+            json.dumps(
+                {"context": context_fingerprint, "models": model_fingerprints}, sort_keys=True
+            ).encode()
+        ).hexdigest(),
+    )
+    cached = _load_syntheval_cache(cache_dir, "binary_target", cache_key)
+    if cached is not None:
+        return cached
 
-    cache_dir = Path(output_folder) if output_folder else None
-    cache_key = _compute_cache_key(preset, list(binary_synthetic_datasets.keys()), ranking_strategy)
+    if execution_cfg is None:
+        from synthdata.config import SynthEvalExecutionConfig
 
-    if cache_dir is not None:
-        cached = _load_syntheval_cache(cache_dir, "binary_target", cache_key)
-        if cached is not None:
-            return cached
-
+        execution_cfg = SynthEvalExecutionConfig()
     logger.info(
-        "[syntheval] binary-target pass: benchmarking %d datasets across %d metric(s) "
+        "[syntheval] binary-target pass: scheduling %d datasets across %d metric(s) "
         "(column %r collapsed to binary: positive=%s, negative=%s)",
         len(binary_synthetic_datasets),
         len(preset),
@@ -396,18 +835,17 @@ def run_binary_target_syntheval_evaluation(
         positive_classes,
         negative_classes,
     )
-    benchmark_results, benchmark_ranks = se.benchmark(
+    benchmark_results, benchmark_ranks = _run_resumable_syntheval(
         binary_synthetic_datasets,
-        analysis_target=analysis_config,
-        presets_file=str(preset_path),
-        rank_strategy=ranking_strategy,
-        output_folder=str(output_folder) if output_folder else None,
+        binary_dataset,
+        preset,
+        preset_path,
+        cache_dir,
+        ranking_strategy,
+        execution_cfg,
+        "binary_target",
     )
-
-    if cache_dir is not None:
-        _save_syntheval_cache(
-            benchmark_results, benchmark_ranks, cache_dir, "binary_target", cache_key
-        )
+    _save_syntheval_cache(benchmark_results, benchmark_ranks, cache_dir, "binary_target", cache_key)
 
     return benchmark_results, benchmark_ranks
 

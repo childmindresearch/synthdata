@@ -54,6 +54,7 @@ def make_config(tmp_path):
         name: str = "testds",
         tag: str | None = None,
         experiment_id: str | None = None,
+        data_version: str | None = None,
     ) -> Config:
         output_root = tmp_path / "output" / name
         return Config(
@@ -62,6 +63,7 @@ def make_config(tmp_path):
                 source="csv",
                 path=str(tmp_path / "raw.csv"),
                 target_column="target",
+                version=data_version,
             ),
             generation=GenerationConfig(output_dir=str(output_root / "synthetic_data")),
             evaluation=EvaluationConfig(output_dir=str(output_root / "evaluation")),

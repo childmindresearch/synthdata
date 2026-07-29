@@ -761,8 +761,34 @@ def compute_log_disparity_report(
         "leaf_equity_table": leaf_equity_table,
         "legend_table": legend_table,
         "label_counts": label_counts,
+        # Retain the rendering inputs as first-class report data.  The
+        # evaluation artifact bundle serializes these values plus the tables
+        # above, allowing synthdata-plot to rebuild this figure without
+        # recomputing any fairness statistics.
+        "protected_group_cols": protected_group_cols,
+        "protected_order_map": protected_order_map,
+        "target_order": target_order,
         "report_figure": report_figure,
     }
+
+
+def build_log_disparity_report_figure(report: dict[str, Any]) -> go.Figure:
+    """Rebuild a report figure from persisted ``compute_log_disparity_report`` data.
+
+    This deliberately consumes only the report's serializable tables and
+    rendering metadata, so callers can render a saved evaluation without
+    rerunning any statistical calculation.
+    """
+    return _build_model_report_figure(
+        report["summary_stats"]["model"],
+        report["hierarchy_results"],
+        report["subgroup_table"],
+        report["leaf_equity_table"],
+        report["legend_table"],
+        report["protected_group_cols"],
+        report["protected_order_map"],
+        report["target_order"],
+    )
 
 
 # ============================================================================

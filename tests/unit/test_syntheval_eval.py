@@ -5,15 +5,19 @@ and the syntheval benchmark result caching helpers.
 """
 
 import json
+import os
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from synthdata.config import FrameworkSelectionConfig
+from synthdata.config import FrameworkSelectionConfig, SynthEvalExecutionConfig
 from synthdata.evaluation.catalog import FAIRNESS_METRICS_WITH_POSITIVE_CLASS, SYNTHEVAL_PRESET
 from synthdata.evaluation.syntheval_eval import (
     BINARY_ONLY_METRICS,
+    _atomic_parquet,
+    _checkpoint_paths,
     _compute_cache_key,
     _load_syntheval_cache,
     _save_syntheval_cache,
@@ -21,6 +25,7 @@ from synthdata.evaluation.syntheval_eval import (
     build_binary_target_series,
     build_preset,
     merge_binary_target_results,
+    resolve_model_workers,
 )
 
 pytestmark = pytest.mark.unit
@@ -216,6 +221,11 @@ class TestComputeCacheKey:
         k2 = _compute_cache_key(preset, ["m1"], "summation")
         assert k1 != k2
 
+    def test_different_evaluation_fingerprint_different_key(self):
+        k1 = _compute_cache_key({"dwm": {}}, ["m1"], "linear", "real-data-a")
+        k2 = _compute_cache_key({"dwm": {}}, ["m1"], "linear", "real-data-b")
+        assert k1 != k2
+
     def test_returns_hex_string(self):
         key = _compute_cache_key({"dwm": {}}, ["m1"], "linear")
         assert isinstance(key, str)
@@ -282,3 +292,38 @@ class TestSaveLoadSynthevalCache:
         _save_syntheval_cache(results, ranks, tmp_path, "main", key)
         meta = json.loads((tmp_path / "main_cache_meta.json").read_text())
         assert meta["cache_key"] == key
+
+
+class TestResolveModelWorkers:
+    def test_explicit_limit_obeys_model_and_max_bounds(self):
+        cfg = SynthEvalExecutionConfig(model_workers=10, max_model_workers=4)
+        assert resolve_model_workers(cfg, n_models=3, n_columns=10) == 3
+
+    def test_auto_uses_memory_and_cpu_bounds(self, monkeypatch):
+        cfg = SynthEvalExecutionConfig(
+            model_workers="auto",
+            max_model_workers=8,
+            cores_per_model=4,
+            memory_reserve_gib=16,
+        )
+        monkeypatch.setattr("synthdata.evaluation.syntheval_eval.os.cpu_count", lambda: 24)
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval._available_memory_gib", lambda: 118.0
+        )
+        assert resolve_model_workers(cfg, n_models=18, n_columns=1038) == 6
+
+
+class TestCheckpointPaths:
+    def test_absolute_checkpoint_path_survives_plot_directory_change(self, tmp_path):
+        checkpoint_root = tmp_path / "evaluation" / "syntheval_benchmark"
+        model_dir, _, result_path = _checkpoint_paths(checkpoint_root.resolve(), "main", "model_a")
+        model_dir.mkdir(parents=True)
+        plot_dir = tmp_path / "plots" / "model_a"
+        plot_dir.mkdir(parents=True)
+        previous_dir = Path.cwd()
+        try:
+            os.chdir(plot_dir)
+            _atomic_parquet(result_path, pd.DataFrame({"metric": ["dwm"], "val": [0.5]}))
+        finally:
+            os.chdir(previous_dir)
+        assert result_path.exists()

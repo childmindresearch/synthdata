@@ -1,0 +1,65 @@
+# Narrow RefiDiff HPO screening profile for LORIS.
+# A final study should use a new --study-id and the reference profile's full
+# MCAR/MAR/MNAR audit; never promote this screening configuration directly.
+name: loris
+seed: 42
+device: auto
+
+data:
+  source: csv
+  path: data/loris/loris_combined.csv
+  version: "1.2"
+  variable_schema_path: data/loris/variable_schema.csv
+  target_column: CGAS_class
+  sensitive_columns: [Sex, Age, PreInt_Demos_Fam__Child_Race]
+  drop_rows_missing_target: true
+  drop_columns:
+    - subject_id
+    - CGAS__CGAS_Score
+    - Diagnosis_ClinicianConsensus__DX_01
+    - Diagnosis_ClinicianConsensus__DX_01_Code
+    - Diagnosis_ClinicianConsensus__DX_01_Cat
+    - Diagnosis_ClinicianConsensus__DX_01_ByHx
+    - Diagnosis_ClinicianConsensus__DX_02
+    - Diagnosis_ClinicianConsensus__DX_02_Code
+    - Diagnosis_ClinicianConsensus__DX_02_Cat
+    - Diagnosis_ClinicianConsensus__DX_02_ByHx
+    - Diagnosis_ClinicianConsensus__DX_03
+    - Diagnosis_ClinicianConsensus__DX_03_Code
+    - Diagnosis_ClinicianConsensus__DX_03_Cat
+    - DailyMeds__med_type_01
+    - DailyMeds__med_type_02
+    - DailyMeds__med_type_03
+  train_size: 0.6667
+  stratify: true
+  data_dir: data/loris
+  raw_cache_subdir: raw
+
+imputation:
+  method: refidiff
+  device: auto
+  refidiff:
+    hidden_dim: 32
+    epochs: 1000
+    early_stopping_patience: 100
+    batch_size: 8192
+    num_steps: 25
+    num_trials: 3
+    denoiser: mamba
+    checkpoint_every: 1000
+    catboost_warmup_iterations: 1000
+  benchmark:
+    enabled: true
+    output_dir: output/loris/imputation
+    mask_fraction: 0.3
+    n_masks: 3
+    mechanisms: [mcar]
+    hpo:
+      enabled: true
+      n_trials: 12
+      timeout_seconds: null
+      hidden_dims: [16, 32, 64]
+      num_steps: [10, 25, 50]
+      num_trials: [1, 3, 5]
+      epochs: [1000, 3000]
+      early_stopping_patience: [100, 250]

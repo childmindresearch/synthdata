@@ -57,42 +57,23 @@ class DataConfig:
     #: this set to True -- otherwise stratified train_test_split raises on NaN.
     drop_rows_missing_target: bool = False
 
-    #: "auto" to infer nominal (unordered categorical) columns (nunique <=
-    #: auto_nominal_unique_threshold, or dtype object/category/bool), or an
-    #: explicit list of column names. Columns listed in ``ordinal_columns`` are
-    #: always excluded here (they're a separate, ordered role -- see below),
-    #: even under "auto".
-    nominal_columns: str | list = "auto"
-    auto_nominal_unique_threshold: int = 10
+    #: Path to a CSV that explicitly defines how every retained feature and the
+    #: target are modeled. It must contain ``column`` and ``kind`` columns;
+    #: ``kind`` is ``categorical`` or ``continuous``. An optional
+    #: ``ordinal_order`` uses square brackets to give the lowest-to-highest
+    #: order for an ordinal categorical variable; a blank value means nominal.
+    #:
+    #: The schema is intentionally mandatory for new datasets. The loader validates exact
+    #: coverage after source cleanup and fails on missing, duplicate, or stale declarations.
+    variable_schema_path: str | None = None
 
-    #: Explicit list of ordinal (ordered, discrete) feature columns -- e.g.
-    #: Likert-scale/severity-band columns. Unlike ``nominal_columns`` there is no
-    #: "auto" inference (a generic cardinality heuristic can't tell an ordered
-    #: category set from an unordered one), so every ordinal column must be
-    #: listed here explicitly. Encoded/decoded through the exact same
-    #: categorical backend machinery as ``nominal_columns`` (see
-    #: ``Dataset.categorical_columns`` = ``nominal_columns + ordinal_columns``),
-    #: so every ordinal column is guaranteed to come back as one of its observed
-    #: valid category values -- it can no longer silently fall through to being
-    #: imputed/generated as a plain continuous column just because someone forgot
-    #: to also add it to the (formerly single) categorical column list. Must not
-    #: overlap ``nominal_columns``.
+    #: Transitional compatibility for existing configurations. New configs must
+    #: use ``variable_schema_path``; these fields are only used if no schema path
+    #: is supplied. ``"auto"`` is no longer accepted, so heuristics are never a
+    #: default data-typing policy. Legacy support will be removed in the next
+    #: breaking schema release.
+    nominal_columns: list | None = None
     ordinal_columns: list = dataclasses.field(default_factory=list)
-
-    #: Explicit natural-order encoding for ``ordinal_columns`` entries stored as
-    #: text (e.g. ``{"activity_level": ["Very Light", "Light", "Moderate",
-    #: "Heavy", "Exceptional"]}``, lowest to highest). Applied before
-    #: ``nominal_columns``/``ordinal_columns`` are resolved into
-    #: ``Dataset.categorical_columns``, so these columns are encoded to integers
-    #: preserving their true order first. Every key here must also appear in
-    #: ``ordinal_columns`` (raises otherwise -- this is exactly the mistake that
-    #: caused a real bug: a column had its category order configured here but
-    #: was never actually routed through the categorical encode/decode path, so
-    #: it silently came back as a continuous value instead of one of its 5 valid
-    #: codes). Every value observed in the column must appear in its configured
-    #: list (raises otherwise). ``ordinal_columns`` entries not listed here are
-    #: assumed to already be numeric-coded in their true order (e.g. a 0-4
-    #: Likert code).
     ordinal_column_categories: dict = dataclasses.field(default_factory=dict)
 
     #: Uppercase all column names on load (matches the hepatitis notebook convention).
@@ -160,6 +141,54 @@ class RefiDiffConfig:
     #: (shared-GPU preemption/OOM) can resume instead of retraining from
     #: scratch.
     checkpoint_every: int = 1000
+    #: Number of CatBoost boosting rounds used during each categorical
+    #: warm-up/polishing refinement fit. ``100`` is the established practical
+    #: LORIS default; the upstream RefiDiff reference uses CatBoost's default
+    #: budget (normally 1000), which should be selected explicitly for a
+    #: reproduction profile.
+    catboost_warmup_iterations: int = 100
+    #: How binary categorical codes that do not map to an observed category
+    #: are repaired. ``clip`` preserves the historical local port behavior;
+    #: ``nearest_valid`` projects to the valid binary code with minimum Hamming
+    #: distance (ties resolve to the lower category index); ``error`` aborts
+    #: rather than silently repairing, for strict diagnostic comparisons.
+    categorical_decode_policy: str = "clip"
+
+
+@dataclasses.dataclass
+class RefiDiffBenchmarkHPOConfig:
+    """Narrow, staged search space for masked-cell RefiDiff validation."""
+
+    enabled: bool = False
+    n_trials: int = 12
+    timeout_seconds: int | None = None
+    hidden_dims: list = dataclasses.field(default_factory=lambda: [16, 32, 64])
+    num_steps: list = dataclasses.field(default_factory=lambda: [10, 25, 50])
+    num_trials: list = dataclasses.field(default_factory=lambda: [1, 3, 5])
+    epochs: list = dataclasses.field(default_factory=lambda: [1000, 3000])
+    early_stopping_patience: list = dataclasses.field(default_factory=lambda: [100, 250])
+
+
+@dataclasses.dataclass
+class RefiDiffBenchmarkConfig:
+    """Append-only masked-cell validation for RefiDiff candidates.
+
+    Benchmarking is deliberately separate from ordinary imputation caching:
+    it creates artificial masks only in the training split and writes studies
+    beneath ``output/<dataset>/imputation/<version>/<study-id>/``.
+    """
+
+    enabled: bool = False
+    output_dir: str = "output/dataset/imputation"
+    mask_fraction: float = 0.3
+    n_masks: int = 3
+    mechanisms: list = dataclasses.field(default_factory=lambda: ["mcar"])
+    #: Optional feature columns eligible for artificial masking/scoring. All
+    #: feature columns remain visible to the imputer as context. ``None`` uses
+    #: every non-sensitive feature; a small explicit panel is appropriate for
+    #: an affordable screening study on a very wide dataset.
+    score_columns: list | None = None
+    hpo: RefiDiffBenchmarkHPOConfig = dataclasses.field(default_factory=RefiDiffBenchmarkHPOConfig)
 
 
 @dataclasses.dataclass
@@ -178,8 +207,8 @@ class ImputationConfig:
     #: datasets with genuinely continuous features that shouldn't be integer-snapped.
     round_to_int_default: bool = True
     #: Reuse previously cached imputed CSVs if present *and* still valid: validity
-    #: is determined by comparing a hash of the imputation-relevant config fields
-    #: (nominal_columns, ordinal_columns, ordinal_column_categories, method,
+    #: is determined by comparing a hash of the resolved schema/config fields
+    #: (categorical roles, ordinal orders, method,
     #: round_rules, round_to_int_default, refidiff params) against the sidecar
     #: ``.imputation_cache_key.json`` written alongside the cached CSVs, so
     #: editing e.g. ``data.nominal_columns``/``data.ordinal_columns`` and
@@ -190,6 +219,8 @@ class ImputationConfig:
     validation_margin: float = 0.2
     #: Only used when method == "refidiff".
     refidiff: RefiDiffConfig = dataclasses.field(default_factory=RefiDiffConfig)
+    #: Optional train-only artificial-masking benchmark/HPO for RefiDiff.
+    benchmark: RefiDiffBenchmarkConfig = dataclasses.field(default_factory=RefiDiffBenchmarkConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +308,8 @@ class HPOConfig:
 @dataclasses.dataclass
 class GenerationConfig:
     n_samples: int = 200
+    #: Base artifact root. Runtime stage paths are versioned under
+    #: ``<output_dir>/<data.version or 'unversioned'>/<experiment-id>/``.
     output_dir: str = "output/dataset/synthetic_data"
     force_retrain: bool = False
     synthcity: SynthcityModelsConfig = dataclasses.field(default_factory=SynthcityModelsConfig)
@@ -388,7 +421,26 @@ class PrivacyGateConfig:
 
 
 @dataclasses.dataclass
+class SynthEvalExecutionConfig:
+    """Resource policy for resumable per-model SynthEval evaluation.
+
+    ``model_workers`` may be ``"auto"`` or an explicit positive integer.
+    Automatic mode derives a safe bound from CPU count, available memory, and
+    dataset width; the remaining fields constrain that estimate.
+    """
+
+    model_workers: str | int = "auto"
+    max_model_workers: int = 8
+    cores_per_model: int = 4
+    memory_reserve_gib: float = 16.0
+    #: Optional fixed estimate; automatic mode derives one from feature width when None.
+    memory_per_model_gib: float | None = None
+
+
+@dataclasses.dataclass
 class EvaluationConfig:
+    #: Base artifact root. Runtime stage paths are versioned under
+    #: ``<output_dir>/<data.version or 'unversioned'>/<experiment-id>/``.
     output_dir: str = "output/dataset/evaluation"
     #: Restrict evaluation to a subset of generated model names (None = all found on disk).
     models: list | None = None
@@ -407,6 +459,9 @@ class EvaluationConfig:
     log_disparity: LogDisparityConfig = dataclasses.field(default_factory=LogDisparityConfig)
     save_per_model_syntheval_plots: bool = True
     binary_target: BinaryTargetConfig = dataclasses.field(default_factory=BinaryTargetConfig)
+    syntheval_execution: SynthEvalExecutionConfig = dataclasses.field(
+        default_factory=SynthEvalExecutionConfig
+    )
 
     #: Per-"type" (utility/privacy/fairness) weight applied when rolling up
     #: type-level ranks into the overall rank (see
@@ -433,6 +488,9 @@ class EvaluationConfig:
 
 @dataclasses.dataclass
 class PlotsConfig:
+    #: Base artifact root. Dataset QA figures use
+    #: ``<output_dir>/<data.version or 'unversioned'>/dataset/``; experiment
+    #: figures add ``<experiment-id>/`` beneath the version scope.
     output_dir: str = "output/dataset/plots"
     #: Which figure groups to (re)generate: "data", "imputation", "generation", "hpo", "evaluation".
     sections: list = dataclasses.field(
@@ -459,8 +517,8 @@ class ExperimentConfig:
 
     Every invocation of the CLI scripts is treated as an "experiment": its
     generation/evaluation/plot artifacts are nested under
-    `<stage_output_dir>/<experiment_id>/`, and a manifest.json log at
-    `<generation_output_dir>/../experiments/<experiment_id>/manifest.json`
+    `<stage_output_dir>/<data.version>/<experiment_id>/`, and a manifest.json log at
+    `<generation_output_dir>/../experiments/<data.version>/<experiment_id>/manifest.json`
     records what each stage produced (see :mod:`synthdata.experiment`).
     """
 
@@ -529,6 +587,8 @@ _NESTED_DATACLASSES = {
     (Config, "plots"): PlotsConfig,
     (Config, "experiment"): ExperimentConfig,
     (ImputationConfig, "refidiff"): RefiDiffConfig,
+    (ImputationConfig, "benchmark"): RefiDiffBenchmarkConfig,
+    (RefiDiffBenchmarkConfig, "hpo"): RefiDiffBenchmarkHPOConfig,
     (GenerationConfig, "synthcity"): SynthcityModelsConfig,
     (GenerationConfig, "tabpfn"): TabPFNConfig,
     (GenerationConfig, "tabpfgen"): TabPFGenConfig,
@@ -538,6 +598,7 @@ _NESTED_DATACLASSES = {
     (EvaluationConfig, "custom"): FrameworkSelectionConfig,
     (EvaluationConfig, "log_disparity"): LogDisparityConfig,
     (EvaluationConfig, "binary_target"): BinaryTargetConfig,
+    (EvaluationConfig, "syntheval_execution"): SynthEvalExecutionConfig,
     (EvaluationConfig, "privacy_gate"): PrivacyGateConfig,
 }
 
@@ -577,16 +638,118 @@ def _validate(cfg: Config) -> None:
             "imputation.refidiff.denoiser must be 'auto', 'mamba', or 'mlp', "
             f"got {cfg.imputation.refidiff.denoiser!r}"
         )
+    if cfg.imputation.refidiff.categorical_decode_policy not in {
+        "clip",
+        "nearest_valid",
+        "error",
+    }:
+        raise ValueError(
+            "imputation.refidiff.categorical_decode_policy must be 'clip', 'nearest_valid', "
+            f"or 'error', got {cfg.imputation.refidiff.categorical_decode_policy!r}"
+        )
+    refidiff = cfg.imputation.refidiff
+    positive_refidiff_fields = (
+        "hidden_dim",
+        "epochs",
+        "early_stopping_patience",
+        "batch_size",
+        "num_trials",
+        "checkpoint_every",
+        "catboost_warmup_iterations",
+    )
+    for field_name in positive_refidiff_fields:
+        value = getattr(refidiff, field_name)
+        if not isinstance(value, int) or value < 1:
+            raise ValueError(
+                f"imputation.refidiff.{field_name} must be a positive integer, got {value!r}"
+            )
+    if not isinstance(refidiff.num_steps, int) or refidiff.num_steps < 2:
+        raise ValueError(
+            f"imputation.refidiff.num_steps must be an integer >= 2, got {refidiff.num_steps!r}"
+        )
+    benchmark = cfg.imputation.benchmark
+    if not isinstance(benchmark.mask_fraction, (int, float)) or not 0 < benchmark.mask_fraction < 1:
+        raise ValueError(
+            "imputation.benchmark.mask_fraction must be a number strictly between 0 and 1, "
+            f"got {benchmark.mask_fraction!r}"
+        )
+    if not isinstance(benchmark.n_masks, int) or benchmark.n_masks < 1:
+        raise ValueError(
+            f"imputation.benchmark.n_masks must be a positive integer, got {benchmark.n_masks!r}"
+        )
+    bad_mechanisms = set(benchmark.mechanisms) - {"mcar", "mar", "mnar"}
+    if not benchmark.mechanisms or bad_mechanisms:
+        raise ValueError(
+            "imputation.benchmark.mechanisms must contain one or more of 'mcar', 'mar', or "
+            f"'mnar', got {benchmark.mechanisms!r}"
+        )
+    if benchmark.score_columns is not None and (
+        not isinstance(benchmark.score_columns, list) or not benchmark.score_columns
+    ):
+        raise ValueError(
+            "imputation.benchmark.score_columns must be a non-empty list or null, "
+            f"got {benchmark.score_columns!r}"
+        )
+    benchmark_hpo = benchmark.hpo
+    if not isinstance(benchmark_hpo.n_trials, int) or benchmark_hpo.n_trials < 1:
+        raise ValueError(
+            "imputation.benchmark.hpo.n_trials must be a positive integer, "
+            f"got {benchmark_hpo.n_trials!r}"
+        )
+    for field_name in (
+        "hidden_dims",
+        "num_steps",
+        "num_trials",
+        "epochs",
+        "early_stopping_patience",
+    ):
+        values = getattr(benchmark_hpo, field_name)
+        if not isinstance(values, list) or not values:
+            raise ValueError(
+                f"imputation.benchmark.hpo.{field_name} must be a non-empty list, got {values!r}"
+            )
     if cfg.evaluation.ranking_strategy not in ("linear", "summation"):
         raise ValueError(
             "evaluation.ranking_strategy must be 'linear' or 'summation', "
             f"got {cfg.evaluation.ranking_strategy!r}"
         )
+    execution = cfg.evaluation.syntheval_execution
+    if execution.model_workers != "auto" and (
+        not isinstance(execution.model_workers, int) or execution.model_workers < 1
+    ):
+        raise ValueError(
+            "evaluation.syntheval_execution.model_workers must be 'auto' or a positive integer, "
+            f"got {execution.model_workers!r}"
+        )
+    for field_name in ("max_model_workers", "cores_per_model"):
+        value = getattr(execution, field_name)
+        if not isinstance(value, int) or value < 1:
+            raise ValueError(
+                f"evaluation.syntheval_execution.{field_name} must be a positive integer, "
+                f"got {value!r}"
+            )
+    for field_name in ("memory_reserve_gib", "memory_per_model_gib"):
+        value = getattr(execution, field_name)
+        if value is not None and (not isinstance(value, (int, float)) or value <= 0):
+            raise ValueError(
+                f"evaluation.syntheval_execution.{field_name} must be a positive number or None, "
+                f"got {value!r}"
+            )
     bad_data_variants = set(cfg.generation.tabpfn.data_variants) - {"raw", "imputed"}
     if bad_data_variants:
         raise ValueError(
             "generation.tabpfn.data_variants entries must be 'raw' and/or 'imputed', "
             f"got {sorted(bad_data_variants)}"
+        )
+    if cfg.data.nominal_columns == "auto":
+        raise ValueError(
+            "data.nominal_columns: 'auto' is no longer supported. Define every retained column "
+            "in data.variable_schema_path instead."
+        )
+    if cfg.data.nominal_columns is not None and not isinstance(cfg.data.nominal_columns, list):
+        raise ValueError(
+            "data.nominal_columns must be a list or null; use data.variable_schema_path for new "
+            "datasets."
         )
     if isinstance(cfg.data.nominal_columns, list):
         overlap = set(cfg.data.nominal_columns) & set(cfg.data.ordinal_columns)

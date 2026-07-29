@@ -9,6 +9,7 @@ import argparse
 
 from synthdata.config import load_config
 from synthdata.data import load_dataset
+from synthdata.experiment import dataset_plots_dir
 from synthdata.imputation import build_validation_report, run_imputation
 from synthdata.utils import get_logger, set_global_seed
 
@@ -48,9 +49,10 @@ def main() -> None:
         from synthdata.plotting.data_plots import save_data_plots
         from synthdata.plotting.imputation_plots import save_imputation_plots
 
-        save_data_plots(dataset, cfg.plots.output_dir, cfg.plots.dpi, cfg.plots.formats)
+        plots_dir = dataset_plots_dir(cfg)
+        save_data_plots(dataset, plots_dir, cfg.plots.dpi, cfg.plots.formats)
         if cfg.imputation.enabled and validation_df is not None:
-            save_imputation_plots(cfg, dataset, validation_df, cfg.plots.output_dir)
+            save_imputation_plots(cfg, dataset, validation_df, plots_dir)
 
     logger.info(
         "Done. Imputed data cached under %s (dataset version=%s)",

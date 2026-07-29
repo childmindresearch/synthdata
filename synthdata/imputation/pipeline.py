@@ -51,6 +51,7 @@ def _impute_dataframe(cfg: Config, df: pd.DataFrame, dataset: Dataset, device: s
             device=device,
             refidiff_cfg=cfg.imputation.refidiff,
             data_dir=dataset.data_dir,
+            seed=cfg.seed,
         )
     # Unreachable in practice: Config._validate() already restricts
     # imputation.method to {"tabimpute", "refidiff"} before this runs.
@@ -120,10 +121,9 @@ def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
     which only affects the post-hoc report, not the imputed values themselves)
     doesn't force an unnecessary retrain. Uses ``dataset.feature_columns``/
     ``dataset.nominal_columns``/``dataset.ordinal_columns`` (the already-resolved
-    lists) rather than ``cfg.data.nominal_columns``/``cfg.data.ordinal_columns``
-    directly, so two differently-*written* configs (e.g. an explicit list vs.
-    an ``"auto"`` heuristic that resolves to the same columns) correctly hash
-    identically.
+    lists) rather than the written schema/config directly, so equivalent
+    declarations correctly hash identically. The exact ordinal orders are
+    included because RefiDiff's categorical encoding preserves that order.
     """
     imp_cfg = cfg.imputation
     payload = {
@@ -132,7 +132,11 @@ def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
         "feature_columns": sorted(dataset.feature_columns),
         "nominal_columns": sorted(dataset.nominal_columns),
         "ordinal_columns": sorted(dataset.ordinal_columns),
-        "ordinal_column_categories": cfg.data.ordinal_column_categories,
+        "ordinal_orders": {
+            column: entry["ordinal_order"]
+            for column, entry in dataset.variable_schema.items()
+            if entry["ordinal_order"] is not None
+        },
         "imputation_enabled": imp_cfg.enabled,
         "imputation_method": imp_cfg.method,
         "round_rules": imp_cfg.round_rules,

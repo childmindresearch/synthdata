@@ -16,6 +16,8 @@ import pytest
 from synthdata.config import RefiDiffConfig
 from synthdata.imputation.pipeline import _impute_dataframe
 from synthdata.imputation.refidiff_backend import (
+    _checkpoint_dir,
+    _checkpoint_identity,
     _decode_bits_to_categorical,
     _encode_categorical_to_bits,
     _fit_categorical_binary_encoders,
@@ -65,6 +67,36 @@ class TestBinaryCategoricalEncoding:
         assert "out-of-range" in caplog.text
         assert "mycol" in caplog.text
 
+    def test_out_of_range_decode_projects_to_nearest_valid_binary_code(self):
+        # 3 categories -> 2 bits. Invalid 11 has Hamming distance 1 to 01 and
+        # 10; the deterministic tie rule selects the lower category index (1).
+        encoder = {"idx_to_cat": {0: "a", 1: "b", 2: "c"}, "n_categories": 3, "n_bits": 2}
+        bits = np.array([[1, 1]], dtype=float)
+        diagnostics = []
+
+        decoded = _decode_bits_to_categorical(
+            bits, encoder, "mycol", policy="nearest_valid", diagnostics=diagnostics
+        )
+
+        assert decoded.tolist() == ["b"]
+        assert diagnostics == [
+            {
+                "column": "mycol",
+                "n_rows": 1,
+                "n_categories": 3,
+                "n_invalid": 1,
+                "invalid_rate": 1.0,
+                "policy": "nearest_valid",
+            }
+        ]
+
+    def test_out_of_range_decode_can_fail_loudly(self):
+        encoder = {"idx_to_cat": {0: "a", 1: "b", 2: "c"}, "n_categories": 3, "n_bits": 2}
+        with pytest.raises(ValueError, match="categorical_decode_policy='error'"):
+            _decode_bits_to_categorical(
+                np.array([[1, 1]], dtype=float), encoder, "mycol", policy="error"
+            )
+
 
 class TestMeanStd:
     def test_uses_observed_entries_only(self):
@@ -108,6 +140,37 @@ class TestPipelineDispatch:
         _, kwargs = mock_impute.call_args
         assert kwargs["data_dir"] == dataset.data_dir
         assert kwargs["refidiff_cfg"] is cfg.imputation.refidiff
+        assert kwargs["seed"] == cfg.seed
+
+
+class TestCheckpointIdentity:
+    def test_checkpoint_identity_changes_with_training_parameters_and_data(self, tmp_path):
+        cfg = RefiDiffConfig(epochs=10, catboost_warmup_iterations=100)
+        frame = pd.DataFrame({"value": [1.0, np.nan], "category": ["a", "b"]})
+        identity = _checkpoint_identity(
+            frame,
+            ["value", "category"],
+            ["category"],
+            2,
+            cfg,
+            "mlp",
+            seed=42,
+            refinement_columns=None,
+        )
+        changed_cfg = RefiDiffConfig(epochs=11, catboost_warmup_iterations=100)
+        changed_identity = _checkpoint_identity(
+            frame,
+            ["value", "category"],
+            ["category"],
+            2,
+            changed_cfg,
+            "mlp",
+            seed=42,
+            refinement_columns=None,
+        )
+
+        assert identity != changed_identity
+        assert _checkpoint_dir(tmp_path, identity) != _checkpoint_dir(tmp_path, changed_identity)
 
 
 @pytest.mark.slow

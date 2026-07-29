@@ -1,5 +1,7 @@
 """Unit tests for synthdata.config: dataclass composition, validation, YAML loading."""
 
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -12,6 +14,7 @@ from synthdata.config import (
     ImputationConfig,
     PrivacyGateConfig,
     RefiDiffConfig,
+    SynthEvalExecutionConfig,
     _from_dict,
     _validate,
     load_config,
@@ -76,6 +79,18 @@ class TestFromDict:
         # Sibling RefiDiffConfig defaults are preserved.
         assert cfg.imputation.refidiff.denoiser == "auto"
 
+    @pytest.mark.parametrize(
+        "config_name",
+        ["config_loris_refidiff_reference.yaml", "config_loris_refidiff_hpo.yaml"],
+    )
+    def test_refidiff_benchmark_profiles_load(self, config_name):
+        root = Path(__file__).parents[2]
+        cfg = load_config(root / "configs" / config_name)
+        assert cfg.imputation.method == "refidiff"
+        assert cfg.imputation.refidiff.denoiser == "mamba"
+        assert cfg.imputation.refidiff.catboost_warmup_iterations == 1000
+        assert cfg.imputation.benchmark.enabled
+
     def test_evaluation_binary_target_nested_dict_builds_nested_dataclass(self):
         cfg = _from_dict(
             Config,
@@ -111,6 +126,14 @@ class TestFromDict:
         assert cfg.evaluation.privacy_gate.thresholds == {
             "mia_recall": {"bound": "max", "value": 0.7}
         }
+
+    def test_syntheval_execution_nested_dict_builds_nested_dataclass(self):
+        cfg = _from_dict(
+            Config,
+            {"evaluation": {"syntheval_execution": {"model_workers": 3}}},
+        )
+        assert isinstance(cfg.evaluation.syntheval_execution, SynthEvalExecutionConfig)
+        assert cfg.evaluation.syntheval_execution.model_workers == 3
 
 
 class TestValidate:
@@ -177,6 +200,32 @@ class TestValidate:
         with pytest.raises(ValueError, match="ranking_strategy"):
             _validate(cfg)
 
+    @pytest.mark.parametrize("workers", [0, -1, "many", 1.5])
+    def test_invalid_syntheval_model_workers_raise(self, workers):
+        cfg = self._base_valid()
+        cfg.evaluation.syntheval_execution.model_workers = workers
+        with pytest.raises(ValueError, match="syntheval_execution.model_workers"):
+            _validate(cfg)
+
+    def test_valid_explicit_syntheval_model_workers_pass(self):
+        cfg = self._base_valid()
+        cfg.evaluation.syntheval_execution.model_workers = 3
+        _validate(cfg)
+
+    @pytest.mark.parametrize("field", ["max_model_workers", "cores_per_model"])
+    def test_non_positive_syntheval_integer_bounds_raise(self, field):
+        cfg = self._base_valid()
+        setattr(cfg.evaluation.syntheval_execution, field, 0)
+        with pytest.raises(ValueError, match=field):
+            _validate(cfg)
+
+    @pytest.mark.parametrize("field", ["memory_reserve_gib", "memory_per_model_gib"])
+    def test_non_positive_syntheval_memory_bounds_raise(self, field):
+        cfg = self._base_valid()
+        setattr(cfg.evaluation.syntheval_execution, field, 0)
+        with pytest.raises(ValueError, match=field):
+            _validate(cfg)
+
     def test_bad_tabpfn_data_variant_raises(self):
         cfg = self._base_valid()
         cfg.generation.tabpfn.data_variants = ["raw", "bogus"]
@@ -211,6 +260,49 @@ class TestValidate:
         cfg = self._base_valid()
         cfg.imputation.refidiff.denoiser = denoiser
         _validate(cfg)  # should not raise
+
+    def test_bad_refidiff_categorical_decode_policy_raises(self):
+        cfg = self._base_valid()
+        cfg.imputation.refidiff.categorical_decode_policy = "unknown"
+        with pytest.raises(ValueError, match="categorical_decode_policy"):
+            _validate(cfg)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("hidden_dim", 0),
+            ("epochs", 0),
+            ("early_stopping_patience", 0),
+            ("batch_size", 0),
+            ("num_trials", 0),
+            ("checkpoint_every", 0),
+            ("catboost_warmup_iterations", 0),
+        ],
+    )
+    def test_non_positive_refidiff_integer_raises(self, field, value):
+        cfg = self._base_valid()
+        setattr(cfg.imputation.refidiff, field, value)
+        with pytest.raises(ValueError, match=field):
+            _validate(cfg)
+
+    @pytest.mark.parametrize("num_steps", [0, 1])
+    def test_refidiff_requires_at_least_two_sampling_steps(self, num_steps):
+        cfg = self._base_valid()
+        cfg.imputation.refidiff.num_steps = num_steps
+        with pytest.raises(ValueError, match="num_steps"):
+            _validate(cfg)
+
+    def test_invalid_refidiff_benchmark_mask_fraction_raises(self):
+        cfg = self._base_valid()
+        cfg.imputation.benchmark.mask_fraction = 1.0
+        with pytest.raises(ValueError, match="benchmark.mask_fraction"):
+            _validate(cfg)
+
+    def test_invalid_refidiff_benchmark_mechanism_raises(self):
+        cfg = self._base_valid()
+        cfg.imputation.benchmark.mechanisms = ["unknown"]
+        with pytest.raises(ValueError, match="benchmark.mechanisms"):
+            _validate(cfg)
 
     def test_ordinal_column_not_in_ordinal_columns_raises(self):
         cfg = self._base_valid()
@@ -248,6 +340,18 @@ class TestValidate:
         cfg = self._base_valid()
         cfg.data.ordinal_column_categories = {"activity": ["Light", "Light"]}
         with pytest.raises(ValueError, match="ordinal_column_categories"):
+            _validate(cfg)
+
+    def test_schema_takes_precedence_over_legacy_column_typing(self):
+        cfg = self._base_valid()
+        cfg.data.variable_schema_path = "schema.csv"
+        cfg.data.nominal_columns = ["category"]
+        _validate(cfg)
+
+    def test_auto_nominal_typing_is_rejected(self):
+        cfg = self._base_valid()
+        cfg.data.nominal_columns = "auto"
+        with pytest.raises(ValueError, match="no longer supported"):
             _validate(cfg)
 
     def test_binary_target_disabled_by_default_passes(self):

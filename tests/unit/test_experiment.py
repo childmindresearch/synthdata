@@ -6,6 +6,8 @@ import pytest
 
 from synthdata.experiment import (
     _timestamp_id,
+    dataset_plots_dir,
+    dataset_version_scope,
     load_experiment,
     start_experiment,
 )
@@ -68,6 +70,36 @@ class TestStartExperiment:
         experiment = start_experiment(cfg)
         assert experiment.id.endswith("_baseline")
         assert experiment.tag == "baseline"
+
+    def test_dataset_version_isolates_all_artifact_directories(self, make_config):
+        v1 = start_experiment(make_config(experiment_id="baseline", data_version="v1"))
+        v2 = start_experiment(make_config(experiment_id="baseline", data_version="v2"))
+
+        assert v1.generation_dir != v2.generation_dir
+        assert v1.evaluation_dir != v2.evaluation_dir
+        assert v1.plots_dir != v2.plots_dir
+        assert v1.manifest_path != v2.manifest_path
+        assert "v1" in v1.generation_dir.parts
+        assert "v2" in v2.generation_dir.parts
+
+    def test_dataset_level_plots_are_version_scoped(self, make_config):
+        v1_dir = dataset_plots_dir(make_config(data_version="v1"))
+        v2_dir = dataset_plots_dir(make_config(data_version="v2"))
+
+        assert v1_dir != v2_dir
+        assert v1_dir.parts[-2:] == ("v1", "dataset")
+        assert v2_dir.parts[-2:] == ("v2", "dataset")
+
+    def test_unversioned_artifacts_have_dedicated_scope(self, make_config):
+        cfg = make_config()
+
+        assert dataset_version_scope(cfg) == "unversioned"
+        assert dataset_plots_dir(cfg).parts[-2:] == ("unversioned", "dataset")
+
+    @pytest.mark.parametrize("version", ["", ".", "..", "v1/v2"])
+    def test_rejects_unsafe_dataset_version_for_artifact_path(self, make_config, version):
+        with pytest.raises(ValueError, match="path-safe"):
+            start_experiment(make_config(data_version=version))
 
 
 class TestRecordAppendOnly:
@@ -154,3 +186,14 @@ class TestLoadExperimentResumability:
         cfg.experiment.id = None
         loaded = load_experiment(cfg)
         assert loaded.id == "exp-2"
+
+    def test_latest_pointer_is_scoped_to_dataset_version(self, make_config):
+        v1_cfg = make_config(experiment_id="v1-exp", data_version="v1")
+        v2_cfg = make_config(experiment_id="v2-exp", data_version="v2")
+        start_experiment(v1_cfg)
+        start_experiment(v2_cfg)
+
+        v1_cfg.experiment.id = None
+        v2_cfg.experiment.id = None
+        assert load_experiment(v1_cfg).id == "v1-exp"
+        assert load_experiment(v2_cfg).id == "v2-exp"

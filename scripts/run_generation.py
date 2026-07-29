@@ -8,7 +8,7 @@ to resume/extend a specific past one. `synthdata-evaluate`/`synthdata-plot`
 automatically pick up the most recent experiment unless told otherwise.
 
 Usage:
-    synthdata-generate --config configs/config.yaml [--plot] [--tag baseline]
+    synthdata-generate --config configs/config.yaml [--plot] [--tag baseline] [--dataset-version v2]
 
 Requires imputed data (run `synthdata-impute` first).
 """
@@ -44,6 +44,11 @@ def main() -> None:
         help="Resume/extend a specific past experiment instead of starting a new one "
         "(overrides experiment.id).",
     )
+    parser.add_argument(
+        "--dataset-version",
+        default=None,
+        help="Override data.version for this artifact lineage (e.g. 'v2', '2024-06-01').",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -51,6 +56,8 @@ def main() -> None:
         cfg.experiment.tag = args.tag
     if args.experiment_id:
         cfg.experiment.id = args.experiment_id
+    if args.dataset_version:
+        cfg.data.version = args.dataset_version
     set_global_seed(cfg.seed)
 
     dataset = load_dataset(cfg)

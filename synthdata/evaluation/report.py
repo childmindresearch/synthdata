@@ -258,7 +258,7 @@ def _plot_links_section(report_dir: Path, cfg: Config, log_disparity_reports: di
         lines.append(
             "No plots were found under `"
             + str(plots_dir)
-            + "` (run with `--plot` to generate them)."
+            + "` (run `synthdata-plot` to render recorded plot artifacts)."
         )
     return "\n".join(lines)
 

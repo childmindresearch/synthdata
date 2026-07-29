@@ -12,6 +12,7 @@ downstream stage (imputation, generation, evaluation, plotting).
 """
 
 import dataclasses
+import hashlib
 import json
 import types
 from datetime import UTC, datetime
@@ -48,6 +49,13 @@ class Dataset:
     #: Freeform dataset version label (see DataConfig.version), recorded in
     #: experiment manifests for traceability. None if not set by the user.
     version: str | None = None
+
+    #: Explicit, resolved variable schema used to derive the categorical roles.
+    #: Each entry is ``{"kind": "categorical"|"continuous",
+    #: "ordinal_order": list|None}`` and includes the target column.
+    variable_schema: dict = dataclasses.field(default_factory=dict)
+    #: SHA-256 fingerprint of the exact source schema CSV, if one was used.
+    variable_schema_fingerprint: str | None = None
 
     #: Populated once imputation has run (see synthdata.imputation).
     full_imputed_df: pd.DataFrame | None = None
@@ -174,6 +182,148 @@ def _load_local_file(cfg: Config) -> tuple:
 # ---------------------------------------------------------------------------
 # Column typing helpers
 # ---------------------------------------------------------------------------
+
+
+def _schema_fingerprint(path: Path) -> str:
+    """Return a SHA-256 fingerprint of a variable-schema source file."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_variable_schema(path: str | Path, modeling_columns: list) -> tuple[dict, str]:
+    """Read and strictly validate the explicit variable schema CSV.
+
+    The CSV requires ``column`` and ``kind`` fields. ``kind`` is exactly
+    ``categorical`` or ``continuous``. ``ordinal_order`` is optional; when it
+    is present it must be a non-empty square-bracketed list on a categorical row, ordered
+    from low to high. A blank order denotes a nominal categorical. Every
+    retained feature *and* the target must appear exactly once, and no stale
+    declarations are accepted.
+    """
+    schema_path = Path(path)
+    if not schema_path.exists():
+        raise FileNotFoundError(f"Variable schema file not found: {schema_path}")
+
+    try:
+        schema_df = pd.read_csv(schema_path, dtype=str, keep_default_na=False)
+    except (OSError, pd.errors.ParserError) as exc:
+        raise ValueError(f"Failed to read variable schema CSV {schema_path}: {exc}") from exc
+
+    required_columns = {"column", "kind"}
+    missing_columns = required_columns - set(schema_df.columns)
+    if missing_columns:
+        raise ValueError(
+            f"Variable schema {schema_path} is missing required column(s) "
+            f"{sorted(missing_columns)}; required columns are 'column' and 'kind'."
+        )
+
+    if schema_df["column"].str.strip().eq("").any():
+        bad_rows = (schema_df.index[schema_df["column"].str.strip().eq("")] + 2).tolist()
+        raise ValueError(
+            f"Variable schema {schema_path} has blank column name(s) at CSV row(s) {bad_rows}."
+        )
+    schema_df["column"] = schema_df["column"].str.strip()
+    duplicate_columns = schema_df.loc[schema_df["column"].duplicated(), "column"].tolist()
+    if duplicate_columns:
+        raise ValueError(
+            f"Variable schema {schema_path} declares column(s) more than once: "
+            f"{sorted(set(duplicate_columns))}."
+        )
+
+    expected_columns = set(modeling_columns)
+    declared_columns = set(schema_df["column"])
+    missing_declarations = sorted(expected_columns - declared_columns)
+    stale_declarations = sorted(declared_columns - expected_columns)
+    if missing_declarations or stale_declarations:
+        details = []
+        if missing_declarations:
+            details.append(f"missing declaration(s): {missing_declarations}")
+        if stale_declarations:
+            details.append(f"stale/non-modeling declaration(s): {stale_declarations}")
+        raise ValueError(
+            f"Variable schema {schema_path} must declare every retained feature and target exactly "
+            f"once after source cleanup; {'; '.join(details)}."
+        )
+
+    schema_columns = ["column", "kind"]
+    if "ordinal_order" in schema_df.columns:
+        schema_columns.append("ordinal_order")
+    schema = {}
+    for row_number, values in enumerate(
+        schema_df[schema_columns].itertuples(index=False, name=None), start=2
+    ):
+        column, raw_kind, *order_values = values
+        kind = raw_kind.strip().lower()
+        if kind not in {"categorical", "continuous"}:
+            raise ValueError(
+                f"Variable schema {schema_path} row {row_number} column {column!r} has invalid "
+                f"kind {kind!r}; expected 'categorical' or 'continuous'."
+            )
+
+        raw_order = order_values[0] if order_values else ""
+        raw_order = raw_order.strip()
+        ordinal_order = None
+        if raw_order:
+            if kind != "categorical":
+                raise ValueError(
+                    f"Variable schema {schema_path} row {row_number} column {column!r} supplies "
+                    "ordinal_order but is declared continuous."
+                )
+            try:
+                ordinal_order = json.loads(raw_order)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Variable schema {schema_path} row {row_number} column {column!r} has invalid "
+                    f"ordinal_order value; expected a square-bracketed list: {exc.msg}."
+                ) from exc
+            if not isinstance(ordinal_order, list) or not ordinal_order:
+                raise ValueError(
+                    f"Variable schema {schema_path} row {row_number} column {column!r} must use a "
+                    "non-empty square-bracketed list for ordinal_order."
+                )
+            try:
+                unique_order_values = {json.dumps(value, sort_keys=True) for value in ordinal_order}
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Variable schema {schema_path} row {row_number} column {column!r} has an "
+                    f"ordinal_order value that cannot be represented in JSON: {exc}."
+                ) from exc
+            if len(unique_order_values) != len(ordinal_order):
+                raise ValueError(
+                    f"Variable schema {schema_path} row {row_number} column {column!r} has duplicate "
+                    "ordinal_order values."
+                )
+        schema[column] = {"kind": kind, "ordinal_order": ordinal_order}
+
+    logger.info(
+        "Loaded strict variable schema from %s: %d columns (%d categorical, %d ordinal)",
+        schema_path,
+        len(schema),
+        sum(entry["kind"] == "categorical" for entry in schema.values()),
+        sum(entry["ordinal_order"] is not None for entry in schema.values()),
+    )
+    return schema, _schema_fingerprint(schema_path)
+
+
+def schema_column_roles(schema: dict, target_column: str) -> tuple[list, list, dict]:
+    """Derive nominal/ordinal compatibility lists and ordinal orders from a schema."""
+    nominal_columns = [
+        column
+        for column, entry in schema.items()
+        if column != target_column
+        and entry["kind"] == "categorical"
+        and entry["ordinal_order"] is None
+    ]
+    ordinal_columns = [
+        column
+        for column, entry in schema.items()
+        if column != target_column and entry["ordinal_order"] is not None
+    ]
+    ordinal_orders = {
+        column: entry["ordinal_order"]
+        for column, entry in schema.items()
+        if column != target_column and entry["ordinal_order"] is not None
+    }
+    return nominal_columns, ordinal_columns, ordinal_orders
 
 
 def infer_nominal_columns(
@@ -467,6 +617,8 @@ def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
         "feature_columns": dataset.feature_columns,
         "nominal_columns": dataset.nominal_columns,
         "ordinal_columns": dataset.ordinal_columns,
+        "variable_schema": dataset.variable_schema,
+        "variable_schema_fingerprint": dataset.variable_schema_fingerprint,
         "sensitive_columns": dataset.sensitive_columns,
         "n_rows": int(len(dataset.full_df)),
         "n_train": int(len(dataset.train_df)),
@@ -530,19 +682,46 @@ def load_dataset(cfg: Config) -> Dataset:
             )
 
     feature_columns = [c for c in df.columns if c != target_column]
+    modeling_columns = feature_columns + [target_column]
+    variable_schema = {}
+    variable_schema_fingerprint = None
 
-    if cfg.data.ordinal_column_categories:
-        df = encode_ordinal_columns(df, cfg.data.ordinal_column_categories)
-
-    ordinal_columns = [c for c in cfg.data.ordinal_columns if c in feature_columns]
-    nominal_columns = infer_nominal_columns(
-        df,
-        feature_columns,
-        cfg.data.nominal_columns,
-        ordinal_columns=ordinal_columns,
-        unique_threshold=cfg.data.auto_nominal_unique_threshold,
-        uci_variable_types=variable_types,
-    )
+    if cfg.data.variable_schema_path:
+        variable_schema, variable_schema_fingerprint = load_variable_schema(
+            cfg.data.variable_schema_path, modeling_columns
+        )
+        nominal_columns, ordinal_columns, ordinal_orders = schema_column_roles(
+            variable_schema, target_column
+        )
+        if ordinal_orders:
+            df = encode_ordinal_columns(df, ordinal_orders)
+    else:
+        # Legacy explicit lists remain readable so existing recorded experiments
+        # can be reproduced. New datasets must use variable_schema_path; no
+        # dtype/cardinality inference is permitted here.
+        if cfg.data.nominal_columns is None:
+            raise ValueError(
+                "data.variable_schema_path is required for new datasets. Existing configurations "
+                "may temporarily provide an explicit data.nominal_columns list together with "
+                "data.ordinal_columns, but automatic type inference is not supported."
+            )
+        if cfg.data.ordinal_column_categories:
+            df = encode_ordinal_columns(df, cfg.data.ordinal_column_categories)
+        ordinal_columns = [c for c in cfg.data.ordinal_columns if c in feature_columns]
+        nominal_columns = [
+            c
+            for c in cfg.data.nominal_columns
+            if c in feature_columns and c not in set(ordinal_columns)
+        ]
+        variable_schema = {
+            column: {
+                "kind": "categorical"
+                if column in nominal_columns + ordinal_columns
+                else "continuous",
+                "ordinal_order": cfg.data.ordinal_column_categories.get(column),
+            }
+            for column in modeling_columns
+        }
     categorical_columns = nominal_columns + ordinal_columns
     warn_non_numeric_feature_columns(df, feature_columns, categorical_columns)
 
@@ -583,6 +762,8 @@ def load_dataset(cfg: Config) -> Dataset:
         train_df=train_df,
         test_df=test_df,
         version=cfg.data.version,
+        variable_schema=variable_schema,
+        variable_schema_fingerprint=variable_schema_fingerprint,
     )
 
     paths = dataset.paths()

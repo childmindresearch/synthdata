@@ -1,0 +1,72 @@
+# Upstream-faithful RefiDiff reference for the LORIS masked-cell benchmark.
+# This profile deliberately uses CatBoost's 1000-round default described in
+# RefiDiff Appendix G. It writes benchmark artifacts only under output/.
+name: loris
+seed: 42
+device: auto
+
+data:
+  source: csv
+  path: data/loris/loris_combined.csv
+  version: "1.2"
+  variable_schema_path: data/loris/variable_schema.csv
+  target_column: CGAS_class
+  sensitive_columns: [Sex, Age, PreInt_Demos_Fam__Child_Race]
+  drop_rows_missing_target: true
+  drop_columns:
+    - subject_id
+    - CGAS__CGAS_Score
+    - Diagnosis_ClinicianConsensus__DX_01
+    - Diagnosis_ClinicianConsensus__DX_01_Code
+    - Diagnosis_ClinicianConsensus__DX_01_Cat
+    - Diagnosis_ClinicianConsensus__DX_01_ByHx
+    - Diagnosis_ClinicianConsensus__DX_02
+    - Diagnosis_ClinicianConsensus__DX_02_Code
+    - Diagnosis_ClinicianConsensus__DX_02_Cat
+    - Diagnosis_ClinicianConsensus__DX_02_ByHx
+    - Diagnosis_ClinicianConsensus__DX_03
+    - Diagnosis_ClinicianConsensus__DX_03_Code
+    - Diagnosis_ClinicianConsensus__DX_03_Cat
+    - DailyMeds__med_type_01
+    - DailyMeds__med_type_02
+    - DailyMeds__med_type_03
+  train_size: 0.6667
+  stratify: true
+  data_dir: data/loris
+  raw_cache_subdir: raw
+
+imputation:
+  method: refidiff
+  device: auto
+  refidiff:
+    hidden_dim: 32
+    epochs: 10001
+    early_stopping_patience: 500
+    batch_size: 8192
+    num_steps: 50
+    num_trials: 10
+    denoiser: mamba
+    checkpoint_every: 1000
+    catboost_warmup_iterations: 1000
+    # Compare with `clip` using a fresh study ID; diagnostics are persisted
+    # per mask under each candidate artifact directory.
+    categorical_decode_policy: nearest_valid
+  benchmark:
+    enabled: true
+    output_dir: output/loris/imputation
+    mask_fraction: 0.3
+    # First smoke benchmark: all 1,038 features remain imputation context,
+    # while this representative, non-sensitive panel bounds per-column
+    # warm-up/polishing cost. Use a fresh all-column audit study after this.
+    n_masks: 1
+    mechanisms: [mcar]
+    score_columns:
+      - DailyMeds__hours_sleep
+      - BIA__BIA_BMI
+      - BIA__BIA_Height
+      - Physical__Diastolic_BP
+      - PreInt_Demos_Fam__Child_Ethnicity
+      - PreInt_Demos_Fam__guardian_maritalstatus
+      - DailyMeds__alcohol
+      - BIA__BIA_Activity_Level
+    hpo: { enabled: false }

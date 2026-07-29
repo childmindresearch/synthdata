@@ -85,13 +85,13 @@ def build_synthetic_eval_fn(
 
 
 def default_storage_url(output_dir: str | Path) -> str:
-    db_path = Path(output_dir).parent / "optuna_studies.db"
+    db_path = Path(output_dir) / "optuna_studies.db"
     ensure_dir(db_path.parent)
     return f"sqlite:///{db_path}"
 
 
 def default_best_params_path(output_dir: str | Path) -> Path:
-    return Path(output_dir).parent / "hpo_best_params.json"
+    return Path(output_dir) / "hpo_best_params.json"
 
 
 def create_study(

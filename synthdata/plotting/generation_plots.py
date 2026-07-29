@@ -11,7 +11,7 @@ import pandas as pd
 from synthdata.config import Config
 from synthdata.data import Dataset
 from synthdata.generation.hpo import default_storage_url
-from synthdata.plotting import save_matplotlib_figure, save_plotly_figure
+from synthdata.plotting import add_histogram_with_kde, save_matplotlib_figure, save_plotly_figure
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -41,7 +41,7 @@ def plot_real_vs_synthetic(
     categorical_columns: list,
     ncols: int = 4,
 ):
-    """Per-column comparison: bar charts for categorical columns, histograms otherwise."""
+    """Per-column comparison with categorical bars and continuous KDEs."""
     import matplotlib.pyplot as plt
 
     n = len(feature_columns)
@@ -82,8 +82,10 @@ def plot_real_vs_synthetic(
             ax.set_xticklabels(categories)
             ax.set_ylabel("frequency")
         else:
-            ax.hist(real_df[col].dropna(), bins=20, density=True, alpha=0.5, label="real")
-            ax.hist(synth_df[col].dropna(), bins=20, density=True, alpha=0.5, label="synthetic")
+            add_histogram_with_kde(ax, real_df[col], bins=20, label="real", alpha=0.4, color="C0")
+            add_histogram_with_kde(
+                ax, synth_df[col], bins=20, label="synthetic", alpha=0.4, color="C1"
+            )
             ax.set_ylabel("density")
         ax.set_title(col, fontsize=9)
         ax.legend(fontsize=7)

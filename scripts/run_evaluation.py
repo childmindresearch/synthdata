@@ -7,7 +7,7 @@ Evaluates the most recent experiment started by `synthdata-generate` unless
 :mod:`synthdata.experiment`).
 
 Usage:
-    synthdata-evaluate --config configs/config.yaml [--plot] [--experiment-id ID]
+    synthdata-evaluate --config configs/config.yaml [--plot] [--experiment-id ID] [--dataset-version v2]
 
 Requires generated synthetic data (run `synthdata-generate` first).
 """
@@ -41,7 +41,9 @@ def main() -> None:
     )
     parser.add_argument("--config", required=True, help="Path to the YAML config file.")
     parser.add_argument(
-        "--plot", action="store_true", help="Save rank trade-off + log-disparity + SynthEval plots."
+        "--plot",
+        action="store_true",
+        help="Save rank trade-off + log-disparity plots after evaluation.",
     )
     parser.add_argument(
         "--experiment-id",
@@ -49,11 +51,18 @@ def main() -> None:
         help="Evaluate a specific past experiment instead of the most recent one "
         "(overrides experiment.id).",
     )
+    parser.add_argument(
+        "--dataset-version",
+        default=None,
+        help="Override data.version and select that version's artifact lineage.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     if args.experiment_id:
         cfg.experiment.id = args.experiment_id
+    if args.dataset_version:
+        cfg.data.version = args.dataset_version
     set_global_seed(cfg.seed)
 
     dataset = load_dataset(cfg)
@@ -73,9 +82,7 @@ def main() -> None:
             "Run `synthdata-generate --config <path>` first."
         )
 
-    combined, extras = run_evaluation(
-        cfg, dataset, synthetic_datasets, enable_syntheval_plots=args.plot, experiment=experiment
-    )
+    combined, extras = run_evaluation(cfg, dataset, synthetic_datasets, experiment=experiment)
     logger.info(
         "Combined evaluation summary (ranked, higher=better):\n%s",
         simple_rank_summary(combined).to_string(),
@@ -112,6 +119,7 @@ def main() -> None:
         artifacts={
             "evaluation_dir": str(experiment.evaluation_dir),
             "combined_table": str(Path(cfg.evaluation.output_dir) / "combined_evaluation.csv"),
+            "artifact_manifest": extras["artifact_manifest"],
             **({"report": extras["report_path"]} if "report_path" in extras else {}),
         },
         n_models=len(synthetic_datasets),

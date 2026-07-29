@@ -1,5 +1,6 @@
 """Unit tests for the pure column-typing/transform helpers in synthdata.data."""
 
+import json
 import logging
 
 import numpy as np
@@ -14,8 +15,11 @@ from synthdata.data import (
     encode_ordinal_columns,
     infer_nominal_columns,
     label_encode_non_numeric_columns,
+    load_dataset,
+    load_variable_schema,
     mask_outliers_as_missing,
     remap_binary_one_two,
+    schema_column_roles,
     warn_non_numeric_feature_columns,
 )
 
@@ -93,6 +97,113 @@ class TestInferNominalColumns:
             df, feature_columns=["x"], explicit="auto", unique_threshold=2
         )
         assert result == []
+
+
+class TestVariableSchema:
+    def _write_schema(self, tmp_path, text: str):
+        path = tmp_path / "variable_schema.csv"
+        path.write_text(text)
+        return path
+
+    def test_valid_schema_derives_nominal_and_ordinal_roles(self, tmp_path):
+        path = self._write_schema(
+            tmp_path,
+            "column,kind,ordinal_order\n"
+            "age,continuous,\n"
+            'severity,categorical,"[0, 1, 2]"\n'
+            "site,categorical,\n"
+            "target,categorical,\n",
+        )
+        schema, fingerprint = load_variable_schema(path, ["age", "severity", "site", "target"])
+        nominal, ordinal, orders = schema_column_roles(schema, "target")
+        assert nominal == ["site"]
+        assert ordinal == ["severity"]
+        assert orders == {"severity": [0, 1, 2]}
+        assert len(fingerprint) == 64
+
+    def test_schema_requires_exact_modeling_column_coverage(self, tmp_path):
+        path = self._write_schema(
+            tmp_path,
+            "column,kind\nage,continuous\nstale,categorical\n",
+        )
+        with pytest.raises(ValueError, match="missing declaration.*target.*stale"):
+            load_variable_schema(path, ["age", "target"])
+
+    def test_schema_rejects_duplicate_columns(self, tmp_path):
+        path = self._write_schema(
+            tmp_path,
+            "column,kind\nage,continuous\nage,categorical\ntarget,categorical\n",
+        )
+        with pytest.raises(ValueError, match="more than once"):
+            load_variable_schema(path, ["age", "target"])
+
+    def test_schema_rejects_invalid_kind(self, tmp_path):
+        path = self._write_schema(
+            tmp_path,
+            "column,kind\nage,ratio\ntarget,categorical\n",
+        )
+        with pytest.raises(ValueError, match="invalid kind"):
+            load_variable_schema(path, ["age", "target"])
+
+    def test_schema_rejects_order_for_continuous_column(self, tmp_path):
+        path = self._write_schema(
+            tmp_path,
+            'column,kind,ordinal_order\nage,continuous,"[1, 2]"\ntarget,categorical,\n',
+        )
+        with pytest.raises(ValueError, match="declared continuous"):
+            load_variable_schema(path, ["age", "target"])
+
+    def test_schema_rejects_duplicate_ordinal_order_values(self, tmp_path):
+        path = self._write_schema(
+            tmp_path,
+            'column,kind,ordinal_order\nseverity,categorical,"[0, 1, 1]"\ntarget,categorical,\n',
+        )
+        with pytest.raises(ValueError, match="duplicate ordinal_order"):
+            load_variable_schema(path, ["severity", "target"])
+
+    def test_load_dataset_uses_schema_roles_and_ordinal_encoding(self, tmp_path):
+        raw_path = tmp_path / "raw.csv"
+        pd.DataFrame(
+            {
+                "age": [10, 11, 12, 13],
+                "severity": ["Low", "High", "Medium", "Low"],
+                "site": ["A", "B", "A", "B"],
+                "target": [0, 1, 0, 1],
+            }
+        ).to_csv(raw_path, index=False)
+        schema_path = self._write_schema(
+            tmp_path,
+            "column,kind,ordinal_order\n"
+            "age,continuous,\n"
+            'severity,categorical,"[""Low"", ""Medium"", ""High""]"\n'
+            "site,categorical,\n"
+            "target,categorical,\n",
+        )
+        cfg = Config(
+            name="schema_test",
+            data=DataConfig(
+                source="csv",
+                path=str(raw_path),
+                target_column="target",
+                variable_schema_path=str(schema_path),
+                data_dir=str(tmp_path / "derived"),
+                train_size=0.5,
+                stratify=True,
+            ),
+        )
+
+        dataset = load_dataset(cfg)
+
+        assert dataset.nominal_columns == ["site"]
+        assert dataset.ordinal_columns == ["severity"]
+        assert dataset.full_df["severity"].tolist() == [0.0, 2.0, 1.0, 0.0]
+        assert dataset.variable_schema_fingerprint
+        manifest = json.loads((dataset.data_dir / "dataset_manifest.json").read_text())
+        assert manifest["variable_schema"]["severity"]["ordinal_order"] == [
+            "Low",
+            "Medium",
+            "High",
+        ]
 
 
 class TestRemapBinaryOneTwo:

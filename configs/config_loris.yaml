@@ -1,58 +1,29 @@
-# =============================================================================
-# synthdata pipeline configuration -- LORIS (HBN) mock dataset
-# =============================================================================
-# This single file drives all four pipeline stages:
-#   synthdata-impute   --config configs/config_loris.yaml
-#   synthdata-generate --config configs/config_loris.yaml
-#   synthdata-evaluate --config configs/config_loris.yaml
-#   synthdata-plot     --config configs/config_loris.yaml
-#
-# Source data: data/loris/loris_combined.csv (see notebooks/eda_loris.ipynb for
-# the exploratory analysis behind every decision below). This dataset is
-# considerably larger than the bundled hepatitis example in BOTH dimensions:
-# ~4867 rows (vs 155) and ~1050 raw columns (vs 19) drawn from many HBN
-# assessments. A few practical consequences of that scale are called out
-# inline below.
-# =============================================================================
+# LORIS/HBN dataset configuration. Paths are relative to the repository root.
+# Copy this file and update the data section for a new dataset.
 
 name: loris
 seed: 42
-device: auto # auto | cpu | cuda | mps
+device: auto
 
 experiment:
-  tag: try_all_models_hpo
-  id: "0.3"
+  tag: retry_all_models_hpo_30m
+  id: "0.4"
 
 data:
+  # Source and schema
   source: csv
   path: data/loris/loris_combined.csv
+  version: "1.2"
+  variable_schema_path: data/loris/variable_schema.csv
 
-  version: "1.0"
-
-  target_column: CGAS_class # 3-class reduction of CGAS__CGAS_Score: 0 (<=44, severe),
-  # 1 (45-50, moderate), 2 (>=51, typical) -- confirmed as a clean/deterministic
-  # bucketing in notebooks/eda_loris.ipynb section 2.
-
-  # ~27% of rows have no CGAS_class (the assessment wasn't administered/completed
-  # for every subject). Every pipeline stage assumes a fully-observed target
-  # (imputation only fills feature_columns; stratified train_test_split raises
-  # on NaN), so unlabeled rows are dropped rather than having their label
-  # imputed -- fabricating ground-truth labels for a supervised generation task
-  # would be a fundamentally different (and much riskier) operation than
-  # imputing predictor missingness. See synthdata/config.py DataConfig and
-  # synthdata/data.py load_dataset for the implementation.
-  drop_rows_missing_target: true
-
+  # Modeling columns
+  target_column: CGAS_class # 0 severe, 1 moderate, 2 typical
   sensitive_columns: [Sex, Age, PreInt_Demos_Fam__Child_Race]
-
+  drop_rows_missing_target: true
   drop_columns:
-    - subject_id # row identifier
-    - CGAS__CGAS_Score # target leakage: CGAS_class is a deterministic bucketing of this column
-    # Raw per-diagnosis-slot fields (free text / ICD codes, 15-93 unique values,
-    # up to 65% missing across the 2nd/3rd diagnosis slots): high-cardinality
-    # categorical columns like these are hard for tabular GANs/one-hot encoders
-    # to model well, and their information is already captured at DSM-category
-    # granularity by the derived Diagnosis_Cat__* binary flags (kept below).
+    - subject_id
+    - CGAS__CGAS_Score # Deterministically defines CGAS_class.
+    # High-cardinality diagnosis fields; DSM-category flags are retained instead.
     - Diagnosis_ClinicianConsensus__DX_01
     - Diagnosis_ClinicianConsensus__DX_01_Code
     - Diagnosis_ClinicianConsensus__DX_01_Cat
@@ -63,1018 +34,70 @@ data:
     - Diagnosis_ClinicianConsensus__DX_03
     - Diagnosis_ClinicianConsensus__DX_03_Code
     - Diagnosis_ClinicianConsensus__DX_03_Cat
-    # Raw medication-category text (>99% missing, 6-7 categories): redundant
-    # with the derived MedType__* binary flags (also kept below, despite being
-    # equally sparse -- that's a missingness problem, not a reformulation one).
+    # Sparse raw medication text; derived medication flags are retained instead.
     - DailyMeds__med_type_01
     - DailyMeds__med_type_02
     - DailyMeds__med_type_03
 
-  # Explicit split of feature columns into nominal (unordered categorical, 293
-  # columns) and ordinal (ordered categorical, 529 columns) roles, derived from
-  # data/loris/loris_variable_types.csv's measurement_level (confirmed via
-  # notebooks/eda_loris.ipynb section 5b). Both roles are encoded/decoded the
-  # same way by every backend (see Dataset.categorical_columns = nominal_columns
-  # + ordinal_columns) -- the split exists so that (a) every ordinal column is
-  # guaranteed to be routed through that encode/decode path (no more silently
-  # falling through to plain continuous numeric treatment just because someone
-  # forgot to add it to a single combined list -- exactly the bug that bit
-  # BIA__BIA_Activity_Level, now correctly included in ordinal_columns below
-  # instead of relying solely on ordinal_column_categories), and (b)
-  # refidiff's bit-encoding preserves each ordinal column's true value order
-  # (see refidiff_backend._fit_categorical_binary_encoders) rather than an
-  # arbitrary one, which only matters for the ordinal role.
-  #
-  # ordinal_columns excludes 6 high-cardinality ordinal columns (the WISC
-  # `*_Percentile` scores, 31-65 unique values) and includes only the 528
-  # (of 536 total ordinal columns) with low cardinality (n_unique <= 10) plus
-  # BIA__BIA_Activity_Level (n_unique=5, stored as text -- see
-  # ordinal_column_categories below) -- the WISC percentiles are better modeled
-  # as continuous; forcing them categorical buys nothing since there's no small
-  # fixed category set.
-  #
-  # This combined list drives different encodings per backend: refidiff (this
-  # config's active imputation.method) binary/bit-encodes categoricals
-  # (ceil(log2(k)) columns/feature) -- cheap even with the ordinal columns
-  # added, and fixes a real bug where refidiff silently imputed non-listed (but
-  # integer-coded) ordinal columns as continuous. tabimpute one-hot-encodes (k
-  # columns/feature) -- an earlier `nominal_columns: auto` pass (nominal+ordinal
-  # via a cardinality heuristic) CUDA-OOM'd tabimpute at this dataset's width,
-  # so re-verify the estimated one-hot width (notebooks/eda_loris.ipynb section
-  # 5b) before ever switching imputation.method back to tabimpute or enabling
-  # generation.synthcity for this dataset with this same list.
-  nominal_columns:
-    - ACE_P__ACE_01
-    - ACE_P__ACE_02
-    - ACE_P__ACE_03
-    - ACE_P__ACE_04
-    - ACE_P__ACE_05
-    - ACE_P__ACE_06
-    - ACE_P__ACE_07
-    - ACE_P__ACE_08
-    - ACE_P__ACE_09
-    - ACE_P__ACE_10
-    - ACE_P__ACE_11
-    - ACE_P__ACE_12
-    - ACE_P__ACE_13
-    - ACE_P__ACE_14
-    - ACE_P__ACE_15
-    - ACE_P__ACE_16
-    - ACE_P__ACE_17
-    - CSSRS__CSSRS_01
-    - CSSRS__CSSRS_02
-    - CSSRS__CSSRS_aborted
-    - CSSRS__CSSRS_actual
-    - CSSRS__CSSRS_actual_selfinjury
-    - CSSRS__CSSRS_behavior
-    - CSSRS__CSSRS_interrupted
-    - CSSRS__CSSRS_prep
-    - DailyMeds__alcohol
-    - DailyMeds__medications
-    - DailyMeds__nicotine
-    - Diagnosis_Cat__Anxiety_Disorders
-    - Diagnosis_Cat__Depressive_Disorders
-    - Diagnosis_Cat__Disruptive_Impulse_Control_and_Conduct_Disorders
-    - Diagnosis_Cat__Elimination_Disorders
-    - Diagnosis_Cat__Feeding_and_Eating_Disorders
-    - Diagnosis_Cat__Neurodevelopmental_Disorders
-    - Diagnosis_Cat__Obsessive_Compulsive_and_Related_Disorders
-    - Diagnosis_Cat__Other_Conditions_That_May_Be_a_Focus_of_Clinical_Attention
-    - Diagnosis_Cat__Substance_Related_and_Addictive_Disorders
-    - Diagnosis_Cat__Trauma_and_Stressor_Related_Disorders
-    - DrugScreen__AMP500
-    - DrugScreen__BAR300
-    - DrugScreen__BUP10
-    - DrugScreen__BZO300
-    - DrugScreen__COC150
-    - DrugScreen__MAMP500
-    - DrugScreen__MDMA500
-    - DrugScreen__MTD300
-    - DrugScreen__OXY100
-    - DrugScreen__PCP25
-    - DrugScreen__THC50
-    - MedType__ADHD-Non_Stimulant
-    - MedType__ADHD-Stimulant
-    - MedType__Antipsychotics
-    - MedType__Mood_Stabilizers
-    - MedType__Non-Psychiatric_Drug
-    - MedType__SSRI
-    - NLES_P__NLES_P_02a
-    - NLES_P__NLES_P_03a
-    - NLES_P__NLES_P_03b
-    - NLES_P__NLES_P_05b
-    - NLES_P__NLES_P_06a
-    - NLES_P__NLES_P_07a
-    - NLES_P__NLES_P_07b
-    - NLES_P__NLES_P_08a
-    - NLES_P__NLES_P_08b
-    - NLES_P__NLES_P_09a
-    - NLES_P__NLES_P_10a
-    - NLES_P__NLES_P_10b
-    - NLES_P__NLES_P_11a
-    - NLES_P__NLES_P_12a
-    - NLES_P__NLES_P_13a
-    - NLES_P__NLES_P_14a
-    - NLES_P__NLES_P_15a
-    - NLES_P__NLES_P_15b
-    - NLES_P__NLES_P_16a
-    - NLES_P__NLES_P_16b
-    - NLES_P__NLES_P_17a
-    - NLES_P__NLES_P_18a
-    - NLES_P__NLES_P_18b
-    - NLES_P__NLES_P_19a
-    - NLES_P__NLES_P_19b
-    - NLES_P__NLES_P_20a
-    - NLES_P__NLES_P_20b
-    - NLES_P__NLES_P_21a
-    - NLES_P__NLES_P_21b
-    - NLES_SR__NLES_SR_01a
-    - NLES_SR__NLES_SR_02a
-    - NLES_SR__NLES_SR_03a
-    - NLES_SR__NLES_SR_04a
-    - NLES_SR__NLES_SR_05a
-    - NLES_SR__NLES_SR_06a
-    - NLES_SR__NLES_SR_07a
-    - NLES_SR__NLES_SR_08a
-    - NLES_SR__NLES_SR_09a
-    - NLES_SR__NLES_SR_10a
-    - NLES_SR__NLES_SR_11a
-    - NLES_SR__NLES_SR_12a
-    - NLES_SR__NLES_SR_13a
-    - NLES_SR__NLES_SR_14a
-    - NLES_SR__NLES_SR_15a
-    - NLES_SR__NLES_SR_16a
-    - NLES_SR__NLES_SR_17a
-    - NLES_SR__NLES_SR_18a
-    - NLES_SR__NLES_SR_19a
-    - NLES_SR__NLES_SR_20a
-    - NLES_SR__NLES_SR_21a
-    - NLES_SR__NLES_SR_22a
-    - PMHS__PMHS_12
-    - Pegboard__peg_dom_hand
-    - Pegboard__peg_valid
-    - PreInt_Demos_Fam__Child_Ethnicity
-    - PreInt_Demos_Fam__Child_Race
-    - PreInt_Demos_Fam__guardian_maritalstatus
-    - PreInt_TxHx__ACS
-    - PreInt_TxHx__Past_DX
-    - PreInt_TxHx__emergency_room
-    - PreInt_TxHx__firearms
-    - PreInt_TxHx__health_problems
-    - PreInt_TxHx__homicide
-    - PreInt_TxHx__hospitalized
-    - PreInt_TxHx__other_med_cur
-    - PreInt_TxHx__other_med_past
-    - PreInt_TxHx__psych_meds_cur
-    - PreInt_TxHx__psych_meds_past
-    - PreInt_TxHx__suicide
-    - PreInt_TxHx__trauma
-    - SCQ__SCQ_01
-    - SCQ__SCQ_02
-    - SCQ__SCQ_03
-    - SCQ__SCQ_04
-    - SCQ__SCQ_05
-    - SCQ__SCQ_06
-    - SCQ__SCQ_07
-    - SCQ__SCQ_08
-    - SCQ__SCQ_09
-    - SCQ__SCQ_10
-    - SCQ__SCQ_11
-    - SCQ__SCQ_12
-    - SCQ__SCQ_13
-    - SCQ__SCQ_14
-    - SCQ__SCQ_15
-    - SCQ__SCQ_16
-    - SCQ__SCQ_17
-    - SCQ__SCQ_18
-    - SCQ__SCQ_19
-    - SCQ__SCQ_20
-    - SCQ__SCQ_21
-    - SCQ__SCQ_22
-    - SCQ__SCQ_23
-    - SCQ__SCQ_24
-    - SCQ__SCQ_25
-    - SCQ__SCQ_26
-    - SCQ__SCQ_27
-    - SCQ__SCQ_28
-    - SCQ__SCQ_29
-    - SCQ__SCQ_30
-    - SCQ__SCQ_31
-    - SCQ__SCQ_32
-    - SCQ__SCQ_33
-    - SCQ__SCQ_34
-    - SCQ__SCQ_35
-    - SCQ__SCQ_36
-    - SCQ__SCQ_37
-    - SCQ__SCQ_38
-    - SCQ__SCQ_39
-    - SCQ__SCQ_40
-    - Sex
-    - SympChck__CSC_01C
-    - SympChck__CSC_01P
-    - SympChck__CSC_02C
-    - SympChck__CSC_02P
-    - SympChck__CSC_03C
-    - SympChck__CSC_03P
-    - SympChck__CSC_04C
-    - SympChck__CSC_04P
-    - SympChck__CSC_05C
-    - SympChck__CSC_05P
-    - SympChck__CSC_06C
-    - SympChck__CSC_06P
-    - SympChck__CSC_07C
-    - SympChck__CSC_07P
-    - SympChck__CSC_08C
-    - SympChck__CSC_08P
-    - SympChck__CSC_09C
-    - SympChck__CSC_09P
-    - SympChck__CSC_10C
-    - SympChck__CSC_10P
-    - SympChck__CSC_11C
-    - SympChck__CSC_11P
-    - SympChck__CSC_12C
-    - SympChck__CSC_12P
-    - SympChck__CSC_13C
-    - SympChck__CSC_13P
-    - SympChck__CSC_14C
-    - SympChck__CSC_14P
-    - SympChck__CSC_15C
-    - SympChck__CSC_15P
-    - SympChck__CSC_16C
-    - SympChck__CSC_16P
-    - SympChck__CSC_17C
-    - SympChck__CSC_17P
-    - SympChck__CSC_18C
-    - SympChck__CSC_18P
-    - SympChck__CSC_19C
-    - SympChck__CSC_19P
-    - SympChck__CSC_20C
-    - SympChck__CSC_20P
-    - SympChck__CSC_21C
-    - SympChck__CSC_21P
-    - SympChck__CSC_22C
-    - SympChck__CSC_22P
-    - SympChck__CSC_23C
-    - SympChck__CSC_23P
-    - SympChck__CSC_24C
-    - SympChck__CSC_24P
-    - SympChck__CSC_25C
-    - SympChck__CSC_25P
-    - SympChck__CSC_26C
-    - SympChck__CSC_26P
-    - SympChck__CSC_27C
-    - SympChck__CSC_27P
-    - SympChck__CSC_28C
-    - SympChck__CSC_28P
-    - SympChck__CSC_29C
-    - SympChck__CSC_29P
-    - SympChck__CSC_30C
-    - SympChck__CSC_30P
-    - SympChck__CSC_31C
-    - SympChck__CSC_31P
-    - SympChck__CSC_32C
-    - SympChck__CSC_32P
-    - SympChck__CSC_33C
-    - SympChck__CSC_33P
-    - SympChck__CSC_34C
-    - SympChck__CSC_34P
-    - SympChck__CSC_35C
-    - SympChck__CSC_35P
-    - SympChck__CSC_36C
-    - SympChck__CSC_36P
-    - SympChck__CSC_37C
-    - SympChck__CSC_37P
-    - SympChck__CSC_38C
-    - SympChck__CSC_38P
-    - SympChck__CSC_39C
-    - SympChck__CSC_39P
-    - SympChck__CSC_40C
-    - SympChck__CSC_40P
-    - SympChck__CSC_41C
-    - SympChck__CSC_41P
-    - SympChck__CSC_42C
-    - SympChck__CSC_42P
-    - SympChck__CSC_43C
-    - SympChck__CSC_43P
-    - SympChck__CSC_44C
-    - SympChck__CSC_44P
-    - SympChck__CSC_45C
-    - SympChck__CSC_45P
-    - SympChck__CSC_46C
-    - SympChck__CSC_46P
-    - SympChck__CSC_47C
-    - SympChck__CSC_47P
-    - SympChck__CSC_48C
-    - SympChck__CSC_48P
-    - SympChck__CSC_49C
-    - SympChck__CSC_49P
-    - SympChck__CSC_50C
-    - SympChck__CSC_50P
-    - SympChck__CSC_51C
-    - SympChck__CSC_51P
-    - SympChck__CSC_52C
-    - SympChck__CSC_52P
-    - SympChck__CSC_53C
-    - SympChck__CSC_53P
-    - SympChck__CSC_54C
-    - SympChck__CSC_54P
-    - SympChck__CSC_55aC
-    - SympChck__CSC_55aP
-    - SympChck__CSC_55bC
-    - SympChck__CSC_55bP
-    - SympChck__CSC_55cC
-    - SympChck__CSC_55cP
-    - SympChck__CSC_55dC
-    - SympChck__CSC_55dP
-    - SympChck__CSC_55eC
-    - SympChck__CSC_55eP
-    - SympChck__CSC_55fC
-    - SympChck__CSC_55gC
-    - SympChck__CSC_55gP
-    - SympChck__CSC_55hC
-    - SympChck__CSC_55hP
-    - SympChck__CSC_55iC
-    - SympChck__CSC_55iP
-    - TBI__TBI_01
-
-  ordinal_columns:
-    - ARI_SR__ARI_S_01
-    - ARI_SR__ARI_S_02
-    - ARI_SR__ARI_S_03
-    - ARI_SR__ARI_S_04
-    - ARI_SR__ARI_S_05
-    - ARI_SR__ARI_S_06
-    - ARI_SR__ARI_S_07
-    - BIA__BIA_Activity_Level
-    - BIA__BIA_Frame
-    - CBCL__CBCL_01
-    - CBCL__CBCL_02
-    - CBCL__CBCL_03
-    - CBCL__CBCL_04
-    - CBCL__CBCL_05
-    - CBCL__CBCL_06
-    - CBCL__CBCL_07
-    - CBCL__CBCL_08
-    - CBCL__CBCL_09
-    - CBCL__CBCL_10
-    - CBCL__CBCL_100
-    - CBCL__CBCL_101
-    - CBCL__CBCL_102
-    - CBCL__CBCL_103
-    - CBCL__CBCL_104
-    - CBCL__CBCL_105
-    - CBCL__CBCL_106
-    - CBCL__CBCL_107
-    - CBCL__CBCL_108
-    - CBCL__CBCL_109
-    - CBCL__CBCL_11
-    - CBCL__CBCL_110
-    - CBCL__CBCL_111
-    - CBCL__CBCL_112
-    - CBCL__CBCL_113A
-    - CBCL__CBCL_113B
-    - CBCL__CBCL_113C
-    - CBCL__CBCL_12
-    - CBCL__CBCL_13
-    - CBCL__CBCL_14
-    - CBCL__CBCL_15
-    - CBCL__CBCL_16
-    - CBCL__CBCL_17
-    - CBCL__CBCL_18
-    - CBCL__CBCL_19
-    - CBCL__CBCL_20
-    - CBCL__CBCL_21
-    - CBCL__CBCL_22
-    - CBCL__CBCL_23
-    - CBCL__CBCL_24
-    - CBCL__CBCL_25
-    - CBCL__CBCL_26
-    - CBCL__CBCL_27
-    - CBCL__CBCL_28
-    - CBCL__CBCL_29
-    - CBCL__CBCL_30
-    - CBCL__CBCL_31
-    - CBCL__CBCL_32
-    - CBCL__CBCL_33
-    - CBCL__CBCL_34
-    - CBCL__CBCL_35
-    - CBCL__CBCL_36
-    - CBCL__CBCL_37
-    - CBCL__CBCL_38
-    - CBCL__CBCL_39
-    - CBCL__CBCL_40
-    - CBCL__CBCL_41
-    - CBCL__CBCL_42
-    - CBCL__CBCL_43
-    - CBCL__CBCL_44
-    - CBCL__CBCL_45
-    - CBCL__CBCL_46
-    - CBCL__CBCL_47
-    - CBCL__CBCL_48
-    - CBCL__CBCL_49
-    - CBCL__CBCL_50
-    - CBCL__CBCL_51
-    - CBCL__CBCL_52
-    - CBCL__CBCL_53
-    - CBCL__CBCL_54
-    - CBCL__CBCL_55
-    - CBCL__CBCL_56A
-    - CBCL__CBCL_56B
-    - CBCL__CBCL_56C
-    - CBCL__CBCL_56D
-    - CBCL__CBCL_56E
-    - CBCL__CBCL_56F
-    - CBCL__CBCL_56G
-    - CBCL__CBCL_56H
-    - CBCL__CBCL_57
-    - CBCL__CBCL_58
-    - CBCL__CBCL_59
-    - CBCL__CBCL_60
-    - CBCL__CBCL_61
-    - CBCL__CBCL_62
-    - CBCL__CBCL_63
-    - CBCL__CBCL_64
-    - CBCL__CBCL_65
-    - CBCL__CBCL_66
-    - CBCL__CBCL_67
-    - CBCL__CBCL_68
-    - CBCL__CBCL_69
-    - CBCL__CBCL_70
-    - CBCL__CBCL_71
-    - CBCL__CBCL_72
-    - CBCL__CBCL_73
-    - CBCL__CBCL_74
-    - CBCL__CBCL_75
-    - CBCL__CBCL_76
-    - CBCL__CBCL_77
-    - CBCL__CBCL_78
-    - CBCL__CBCL_79
-    - CBCL__CBCL_80
-    - CBCL__CBCL_81
-    - CBCL__CBCL_82
-    - CBCL__CBCL_83
-    - CBCL__CBCL_84
-    - CBCL__CBCL_85
-    - CBCL__CBCL_86
-    - CBCL__CBCL_87
-    - CBCL__CBCL_88
-    - CBCL__CBCL_89
-    - CBCL__CBCL_90
-    - CBCL__CBCL_91
-    - CBCL__CBCL_92
-    - CBCL__CBCL_93
-    - CBCL__CBCL_94
-    - CBCL__CBCL_95
-    - CBCL__CBCL_96
-    - CBCL__CBCL_97
-    - CBCL__CBCL_98
-    - CBCL__CBCL_99
-    - DTS__DTS_01
-    - DTS__DTS_02
-    - DTS__DTS_03
-    - DTS__DTS_04
-    - DTS__DTS_05
-    - DTS__DTS_06
-    - DTS__DTS_07
-    - DTS__DTS_08
-    - DTS__DTS_09
-    - DTS__DTS_10
-    - DTS__DTS_11
-    - DTS__DTS_12
-    - DTS__DTS_13
-    - DTS__DTS_14
-    - DTS__DTS_15
-    - ICU_P__ICU_P_01
-    - ICU_P__ICU_P_02
-    - ICU_P__ICU_P_03
-    - ICU_P__ICU_P_04
-    - ICU_P__ICU_P_05
-    - ICU_P__ICU_P_06
-    - ICU_P__ICU_P_07
-    - ICU_P__ICU_P_08
-    - ICU_P__ICU_P_09
-    - ICU_P__ICU_P_10
-    - ICU_P__ICU_P_11
-    - ICU_P__ICU_P_12
-    - ICU_P__ICU_P_13
-    - ICU_P__ICU_P_14
-    - ICU_P__ICU_P_15
-    - ICU_P__ICU_P_16
-    - ICU_P__ICU_P_17
-    - ICU_P__ICU_P_18
-    - ICU_P__ICU_P_19
-    - ICU_P__ICU_P_20
-    - ICU_P__ICU_P_21
-    - ICU_P__ICU_P_22
-    - ICU_P__ICU_P_23
-    - ICU_P__ICU_P_24
-    - ICU_SR__ICU_SR_01
-    - ICU_SR__ICU_SR_02
-    - ICU_SR__ICU_SR_03
-    - ICU_SR__ICU_SR_04
-    - ICU_SR__ICU_SR_05
-    - ICU_SR__ICU_SR_06
-    - ICU_SR__ICU_SR_07
-    - ICU_SR__ICU_SR_08
-    - ICU_SR__ICU_SR_09
-    - ICU_SR__ICU_SR_10
-    - ICU_SR__ICU_SR_11
-    - ICU_SR__ICU_SR_12
-    - ICU_SR__ICU_SR_13
-    - ICU_SR__ICU_SR_14
-    - ICU_SR__ICU_SR_15
-    - ICU_SR__ICU_SR_16
-    - ICU_SR__ICU_SR_17
-    - ICU_SR__ICU_SR_18
-    - ICU_SR__ICU_SR_19
-    - ICU_SR__ICU_SR_20
-    - ICU_SR__ICU_SR_21
-    - ICU_SR__ICU_SR_22
-    - ICU_SR__ICU_SR_23
-    - ICU_SR__ICU_SR_24
-    - MFQ_P__MFQ_P_01
-    - MFQ_P__MFQ_P_02
-    - MFQ_P__MFQ_P_03
-    - MFQ_P__MFQ_P_04
-    - MFQ_P__MFQ_P_05
-    - MFQ_P__MFQ_P_06
-    - MFQ_P__MFQ_P_07
-    - MFQ_P__MFQ_P_08
-    - MFQ_P__MFQ_P_09
-    - MFQ_P__MFQ_P_10
-    - MFQ_P__MFQ_P_11
-    - MFQ_P__MFQ_P_12
-    - MFQ_P__MFQ_P_13
-    - MFQ_P__MFQ_P_14
-    - MFQ_P__MFQ_P_15
-    - MFQ_P__MFQ_P_16
-    - MFQ_P__MFQ_P_17
-    - MFQ_P__MFQ_P_18
-    - MFQ_P__MFQ_P_19
-    - MFQ_P__MFQ_P_20
-    - MFQ_P__MFQ_P_21
-    - MFQ_P__MFQ_P_22
-    - MFQ_P__MFQ_P_23
-    - MFQ_P__MFQ_P_24
-    - MFQ_P__MFQ_P_25
-    - MFQ_P__MFQ_P_26
-    - MFQ_P__MFQ_P_27
-    - MFQ_P__MFQ_P_28
-    - MFQ_P__MFQ_P_29
-    - MFQ_P__MFQ_P_30
-    - MFQ_P__MFQ_P_31
-    - MFQ_P__MFQ_P_32
-    - MFQ_P__MFQ_P_33
-    - MFQ_P__MFQ_P_34
-    - MFQ_SR__MFQ_SR_01
-    - MFQ_SR__MFQ_SR_02
-    - MFQ_SR__MFQ_SR_03
-    - MFQ_SR__MFQ_SR_04
-    - MFQ_SR__MFQ_SR_05
-    - MFQ_SR__MFQ_SR_06
-    - MFQ_SR__MFQ_SR_07
-    - MFQ_SR__MFQ_SR_08
-    - MFQ_SR__MFQ_SR_09
-    - MFQ_SR__MFQ_SR_10
-    - MFQ_SR__MFQ_SR_11
-    - MFQ_SR__MFQ_SR_12
-    - MFQ_SR__MFQ_SR_13
-    - MFQ_SR__MFQ_SR_14
-    - MFQ_SR__MFQ_SR_15
-    - MFQ_SR__MFQ_SR_16
-    - MFQ_SR__MFQ_SR_17
-    - MFQ_SR__MFQ_SR_18
-    - MFQ_SR__MFQ_SR_19
-    - MFQ_SR__MFQ_SR_20
-    - MFQ_SR__MFQ_SR_21
-    - MFQ_SR__MFQ_SR_22
-    - MFQ_SR__MFQ_SR_23
-    - MFQ_SR__MFQ_SR_24
-    - MFQ_SR__MFQ_SR_25
-    - MFQ_SR__MFQ_SR_26
-    - MFQ_SR__MFQ_SR_27
-    - MFQ_SR__MFQ_SR_28
-    - MFQ_SR__MFQ_SR_29
-    - MFQ_SR__MFQ_SR_30
-    - MFQ_SR__MFQ_SR_31
-    - MFQ_SR__MFQ_SR_32
-    - MFQ_SR__MFQ_SR_33
-    - NIH_final__NIH_Flanker_Itm_Cnt
-    - NLES_P__NLES_P_01a
-    - NLES_P__NLES_P_03c
-    - NLES_P__NLES_P_04a
-    - NLES_P__NLES_P_05a
-    - NLES_P__NLES_P_05c
-    - NLES_P__NLES_P_07c
-    - NLES_P__NLES_P_10c
-    - NLES_P__NLES_P_16c
-    - NLES_P__NLES_P_18c
-    - NLES_P__NLES_P_19c
-    - NLES_P__NLES_P_20c
-    - NLES_P__NLES_P_21c
-    - PANAS__PANAS_01
-    - PANAS__PANAS_02
-    - PANAS__PANAS_03
-    - PANAS__PANAS_04
-    - PANAS__PANAS_05
-    - PANAS__PANAS_06
-    - PANAS__PANAS_07
-    - PANAS__PANAS_08
-    - PANAS__PANAS_09
-    - PANAS__PANAS_10
-    - PANAS__PANAS_11
-    - PANAS__PANAS_12
-    - PANAS__PANAS_13
-    - PANAS__PANAS_14
-    - PANAS__PANAS_15
-    - PANAS__PANAS_16
-    - PANAS__PANAS_17
-    - PANAS__PANAS_18
-    - PANAS__PANAS_19
-    - PANAS__PANAS_20
-    - PMHS__PMHS_01
-    - PMHS__PMHS_02
-    - PMHS__PMHS_03
-    - PMHS__PMHS_04
-    - PMHS__PMHS_05
-    - PMHS__PMHS_06
-    - PMHS__PMHS_07
-    - PMHS__PMHS_08
-    - PMHS__PMHS_09
-    - PMHS__PMHS_10
-    - PMHS__PMHS_11
-    - PMHS__PMHS_13
-    - PMHS__PMHS_14
-    - PMHS__PMHS_15
-    - PMHS__PMHS_16
-    - PMHS__PMHS_17
-    - PMHS__PMHS_18
-    - PMHS__PMHS_19
-    - PMHS__PMHS_20
-    - PMHS__PMHS_21
-    - PMHS__PMHS_22
-    - PMHS__PMHS_23
-    - RBS__RBS_01
-    - RBS__RBS_02
-    - RBS__RBS_03
-    - RBS__RBS_04
-    - RBS__RBS_05
-    - RBS__RBS_06
-    - RBS__RBS_07
-    - RBS__RBS_08
-    - RBS__RBS_09
-    - RBS__RBS_10
-    - RBS__RBS_11
-    - RBS__RBS_12
-    - RBS__RBS_13
-    - RBS__RBS_14
-    - RBS__RBS_15
-    - RBS__RBS_16
-    - RBS__RBS_17
-    - RBS__RBS_18
-    - RBS__RBS_19
-    - RBS__RBS_20
-    - RBS__RBS_21
-    - RBS__RBS_22
-    - RBS__RBS_23
-    - RBS__RBS_24
-    - RBS__RBS_25
-    - RBS__RBS_26
-    - RBS__RBS_27
-    - RBS__RBS_28
-    - RBS__RBS_29
-    - RBS__RBS_30
-    - RBS__RBS_31
-    - RBS__RBS_32
-    - RBS__RBS_33
-    - RBS__RBS_34
-    - RBS__RBS_35
-    - RBS__RBS_36
-    - RBS__RBS_37
-    - RBS__RBS_38
-    - RBS__RBS_39
-    - RBS__RBS_40
-    - RBS__RBS_41
-    - RBS__RBS_42
-    - RBS__RBS_43
-    - SCARED_P__SCARED_P_01
-    - SCARED_P__SCARED_P_02
-    - SCARED_P__SCARED_P_03
-    - SCARED_P__SCARED_P_04
-    - SCARED_P__SCARED_P_05
-    - SCARED_P__SCARED_P_06
-    - SCARED_P__SCARED_P_07
-    - SCARED_P__SCARED_P_08
-    - SCARED_P__SCARED_P_09
-    - SCARED_P__SCARED_P_10
-    - SCARED_P__SCARED_P_11
-    - SCARED_P__SCARED_P_12
-    - SCARED_P__SCARED_P_13
-    - SCARED_P__SCARED_P_14
-    - SCARED_P__SCARED_P_15
-    - SCARED_P__SCARED_P_16
-    - SCARED_P__SCARED_P_17
-    - SCARED_P__SCARED_P_18
-    - SCARED_P__SCARED_P_19
-    - SCARED_P__SCARED_P_20
-    - SCARED_P__SCARED_P_21
-    - SCARED_P__SCARED_P_22
-    - SCARED_P__SCARED_P_23
-    - SCARED_P__SCARED_P_24
-    - SCARED_P__SCARED_P_25
-    - SCARED_P__SCARED_P_26
-    - SCARED_P__SCARED_P_27
-    - SCARED_P__SCARED_P_28
-    - SCARED_P__SCARED_P_29
-    - SCARED_P__SCARED_P_30
-    - SCARED_P__SCARED_P_31
-    - SCARED_P__SCARED_P_32
-    - SCARED_P__SCARED_P_33
-    - SCARED_P__SCARED_P_34
-    - SCARED_P__SCARED_P_35
-    - SCARED_P__SCARED_P_36
-    - SCARED_P__SCARED_P_37
-    - SCARED_P__SCARED_P_38
-    - SCARED_P__SCARED_P_39
-    - SCARED_P__SCARED_P_40
-    - SCARED_P__SCARED_P_41
-    - SCARED_SR__SCARED_SR_01
-    - SCARED_SR__SCARED_SR_02
-    - SCARED_SR__SCARED_SR_03
-    - SCARED_SR__SCARED_SR_04
-    - SCARED_SR__SCARED_SR_05
-    - SCARED_SR__SCARED_SR_06
-    - SCARED_SR__SCARED_SR_07
-    - SCARED_SR__SCARED_SR_08
-    - SCARED_SR__SCARED_SR_09
-    - SCARED_SR__SCARED_SR_10
-    - SCARED_SR__SCARED_SR_11
-    - SCARED_SR__SCARED_SR_12
-    - SCARED_SR__SCARED_SR_13
-    - SCARED_SR__SCARED_SR_14
-    - SCARED_SR__SCARED_SR_15
-    - SCARED_SR__SCARED_SR_16
-    - SCARED_SR__SCARED_SR_17
-    - SCARED_SR__SCARED_SR_18
-    - SCARED_SR__SCARED_SR_19
-    - SCARED_SR__SCARED_SR_20
-    - SCARED_SR__SCARED_SR_21
-    - SCARED_SR__SCARED_SR_22
-    - SCARED_SR__SCARED_SR_23
-    - SCARED_SR__SCARED_SR_24
-    - SCARED_SR__SCARED_SR_25
-    - SCARED_SR__SCARED_SR_26
-    - SCARED_SR__SCARED_SR_27
-    - SCARED_SR__SCARED_SR_28
-    - SCARED_SR__SCARED_SR_29
-    - SCARED_SR__SCARED_SR_30
-    - SCARED_SR__SCARED_SR_31
-    - SCARED_SR__SCARED_SR_32
-    - SCARED_SR__SCARED_SR_33
-    - SCARED_SR__SCARED_SR_34
-    - SCARED_SR__SCARED_SR_35
-    - SCARED_SR__SCARED_SR_36
-    - SCARED_SR__SCARED_SR_37
-    - SCARED_SR__SCARED_SR_38
-    - SCARED_SR__SCARED_SR_39
-    - SCARED_SR__SCARED_SR_40
-    - SCARED_SR__SCARED_SR_41
-    - SRS__SRS_01
-    - SRS__SRS_02
-    - SRS__SRS_03
-    - SRS__SRS_04
-    - SRS__SRS_05
-    - SRS__SRS_06
-    - SRS__SRS_07
-    - SRS__SRS_08
-    - SRS__SRS_09
-    - SRS__SRS_10
-    - SRS__SRS_11
-    - SRS__SRS_12
-    - SRS__SRS_13
-    - SRS__SRS_14
-    - SRS__SRS_15
-    - SRS__SRS_16
-    - SRS__SRS_17
-    - SRS__SRS_18
-    - SRS__SRS_19
-    - SRS__SRS_20
-    - SRS__SRS_21
-    - SRS__SRS_22
-    - SRS__SRS_23
-    - SRS__SRS_24
-    - SRS__SRS_25
-    - SRS__SRS_26
-    - SRS__SRS_27
-    - SRS__SRS_28
-    - SRS__SRS_29
-    - SRS__SRS_30
-    - SRS__SRS_31
-    - SRS__SRS_32
-    - SRS__SRS_33
-    - SRS__SRS_34
-    - SRS__SRS_35
-    - SRS__SRS_36
-    - SRS__SRS_37
-    - SRS__SRS_38
-    - SRS__SRS_39
-    - SRS__SRS_40
-    - SRS__SRS_41
-    - SRS__SRS_42
-    - SRS__SRS_43
-    - SRS__SRS_44
-    - SRS__SRS_45
-    - SRS__SRS_46
-    - SRS__SRS_47
-    - SRS__SRS_48
-    - SRS__SRS_49
-    - SRS__SRS_50
-    - SRS__SRS_51
-    - SRS__SRS_52
-    - SRS__SRS_53
-    - SRS__SRS_54
-    - SRS__SRS_55
-    - SRS__SRS_56
-    - SRS__SRS_57
-    - SRS__SRS_58
-    - SRS__SRS_59
-    - SRS__SRS_60
-    - SRS__SRS_61
-    - SRS__SRS_62
-    - SRS__SRS_63
-    - SRS__SRS_64
-    - SRS__SRS_65
-    - WHODAS_P__WHODAS_P_01
-    - WHODAS_P__WHODAS_P_02
-    - WHODAS_P__WHODAS_P_03
-    - WHODAS_P__WHODAS_P_04
-    - WHODAS_P__WHODAS_P_05
-    - WHODAS_P__WHODAS_P_06
-    - WHODAS_P__WHODAS_P_07
-    - WHODAS_P__WHODAS_P_08
-    - WHODAS_P__WHODAS_P_09
-    - WHODAS_P__WHODAS_P_10
-    - WHODAS_P__WHODAS_P_11
-    - WHODAS_P__WHODAS_P_12
-    - WHODAS_SR__WHODAS_SR_01
-    - WHODAS_SR__WHODAS_SR_02
-    - WHODAS_SR__WHODAS_SR_03
-    - WHODAS_SR__WHODAS_SR_04
-    - WHODAS_SR__WHODAS_SR_05
-    - WHODAS_SR__WHODAS_SR_06
-    - WHODAS_SR__WHODAS_SR_07
-    - WHODAS_SR__WHODAS_SR_08
-    - WHODAS_SR__WHODAS_SR_09
-    - WHODAS_SR__WHODAS_SR_10
-    - WHODAS_SR__WHODAS_SR_11
-    - WHODAS_SR__WHODAS_SR_12
-
-  # Explicit natural-order encoding for the one ordinal column stored as text
-  # rather than an already-numeric Likert code (loris_variable_types.csv
-  # classifies BIA__BIA_Activity_Level as `ordinal, known ordered category
-  # (override)` -- now correctly included in ordinal_columns above, in addition
-  # to being mapped here). Without this mapping, BIA__BIA_Activity_Level's raw
-  # text values would crash refidiff's numeric-matrix conversion with
-  # `ValueError: could not convert string to float: 'Exceptional'`; with it,
-  # the column is encoded to integers 0-4 in its true order *before*
-  # nominal_columns/ordinal_columns are resolved, then bit-encoded/decoded
-  # like every other ordinal column (see refidiff_backend's
-  # _fit_categorical_binary_encoders, which sorts by natural value -- i.e. this
-  # true order -- rather than alphabetically).
-  ordinal_column_categories:
-    BIA__BIA_Activity_Level: [Very Light, Light, Moderate, Heavy, Exceptional]
-    BIA__BIA_Frame: [Small, Medium, Large]
-
+  # Source normalization and split
   uppercase_columns: false
-  remap_binary_one_two: false # not needed: binary columns here are already coded {0, 1}
-
-  # A handful of raw numeric columns carry implausible outlier values -- either
-  # "not administered" sentinel codes (e.g. a lone 999 among otherwise 0-30
-  # day-count values in WHODAS_SR__WHODAS_SR_Days01-03 and the Pegboard
-  # peg_time_* columns) or corrupted derived values (e.g. a single-row
-  # BIA__BIA_DEE of 124728 among otherwise ~1500-3000 values -- confirmed to
-  # cascade across every BIA__* derived metric for the same handful of rows,
-  # presumably from a bad denominator upstream). Left as-is, these overflow
-  # TabPFN's/TabImpute's internal float32 computations (confirmed empirically --
-  # "Input X contains infinity" partway through a TabPFN raw-data fit).
-  #
-  # Deliberately an explicit column list, not "check every numeric column":
-  # z-score outlier checks false-positive heavily on this dataset's many
-  # zero-/mode-inflated ordinal/Likert survey items (e.g. RBS__RBS_13 is a
-  # legitimate 0-3 severity scale where 0 is >98% of responses -- a blanket
-  # check flagged its real 2s/3s as "outliers" with z-scores >10, confirmed
-  # empirically). Only list columns confirmed to have genuine sentinel/corrupt
-  # values here, not just a skewed distribution. 8 standard deviations is
-  # generous enough to keep genuine heavy-tailed clinical values on these
-  # specific columns while catching the confirmed outliers.
-  outlier_zscore_threshold: null
-  outlier_columns:
-    - BIA__BIA_DEE
-    - BIA__BIA_BMR
-    - BIA__BIA_FFM
-    - BIA__BIA_Fat
-    - BIA__BIA_TBW
-    - BIA__BIA_LST
-    - BIA__BIA_BMC
-    - BIA__BIA_SMM
-    - BIA__BIA_ECW
-    - BIA__BIA_LDM
-    - BIA__BIA_ICW
-    - BIA__BIA_Height
-    - BIA__BIA_Weight
-    - BIA__BIA_FFMI
-    - BIA__BIA_FMI
-    - BIA__BIA_BMI
-    - Pegboard__peg_time_d
-    - Pegboard__peg_time_nd
-    - WHODAS_SR__WHODAS_SR_Days01
-    - WHODAS_SR__WHODAS_SR_Days02
-    - WHODAS_SR__WHODAS_SR_Days03
-    - NLES_P__NLES_P_Upset_Avg
-    - NLES_SR__NLES_SR_Upset_Avg
-
+  remap_binary_one_two: false
+  outlier_zscore_threshold: null # Set only with confirmed corrupt/sentinel columns.
+  outlier_columns: null
   train_size: 0.6667
   stratify: true
 
+  # Local derived-data storage
   data_dir: data/loris
   raw_cache_subdir: raw
 
 imputation:
   enabled: true
-  # tabimpute (TabPFN-based) one-hot-encodes every nominal_columns/
-  # ordinal_columns entry before imputing, which CUDA-OOMs at this dataset's
-  # width (see the nominal_columns/ordinal_columns comment above). refidiff
-  # uses a per-column predictive warm-up (XGBoost/CatBoost) + Mamba-based EDM
-  # diffusion refinement instead, with binary (log2(k)-bit) categorical
-  # encoding rather than one-hot -- confirmed to scale to this dataset's width
-  # where tabimpute does not. Requires the `refidiff` optional dependency
-  # group (`uv sync --extra refidiff`); see /memories/repo/refidiff-notes.md
-  # for the exact mamba-ssm/causal-conv1d version pins verified to build/run.
-  method: refidiff
+  method: refidiff # Avoids TabImpute one-hot expansion on this wide dataset.
   device: auto
-  round_rules: {}
-  # false (unlike the hepatitis example): ~1000 of this dataset's feature
-  # columns are genuine assessment measures (ages with fractional years, BIA/
-  # physical measurements, raw/standardized/percentile test scores) where
-  # snapping to the nearest integer would destroy real precision. Ordinal
-  # columns (including BIA__BIA_Activity_Level, see ordinal_columns above)
-  # don't need this either -- every backend already recovers clean, correctly-
-  # ordered category values for columns listed in nominal_columns/
-  # ordinal_columns, so the blanket post-hoc rounding step is unnecessary here.
-  round_to_int_default: false
   cache: true
   validation_margin: 0.2
-
+  round_to_int_default: false
+  round_rules: {}
   refidiff:
-    # Defaults mirror the RefiDiff paper's own hyperparameters. Not yet
-    # tuned against this dataset's actual runtime/memory footprint -- revisit
-    # once Phase 7 (a real end-to-end run) reports observed numbers.
     hidden_dim: 32
     epochs: 10001
     early_stopping_patience: 500
     batch_size: 8192
     num_steps: 50
     num_trials: 10
-    denoiser: auto # auto | mamba | mlp -- "auto" uses mamba-ssm if importable, else falls back to an MLP denoiser
+    denoiser: auto
     checkpoint_every: 1000
+    catboost_warmup_iterations: 1000
+  benchmark:
+    enabled: false
+    output_dir: output/loris/imputation
+    mask_fraction: 0.3
+    n_masks: 3
+    mechanisms: [mcar]
+    hpo:
+      enabled: false
+      n_trials: 12
+      timeout_seconds: null
+      hidden_dims: [16, 32, 64]
+      num_steps: [10, 25, 50]
+      num_trials: [1, 3, 5]
+      epochs: [1000, 3000]
+      early_stopping_patience: [100, 250]
 
 generation:
-  n_samples: 1000
   output_dir: output/loris/synthetic_data
+  n_samples: 1000
   force_retrain: false
 
   synthcity:
     enabled: true
-    # bayesian_network excluded: structure learning does not scale to ~1000
-    # variables (feasible for hepatitis's 19 columns, not here). privbayes/decaf
-    # excluded for the same reason they were excluded from the hepatitis
-    # example (unstable training). Re-test the rest of the list at this scale
-    # before assuming timings from the hepatitis notebook transfer directly --
-    # expect meaningfully longer per-model fit times than a 19-column dataset.
-    #
-    # ddpm excluded: its training loss (mloss, the multinomial/categorical
-    # term) reliably goes inf -> NaN within the first couple of optimizer
-    # steps on this dataset (reproduced on a fresh CPU-only run with as few as
-    # 1-5 epochs, independent of lr/batch_size, and independent of the 14
-    # literally-constant declared-categorical columns e.g. DrugScreen__*).
-    # Traced step-by-step (log_x_cat/model_out/compute_Lt/kl_prior all finite
-    # on step 1; mloss is already NaN by step 2) without finding the exact
-    # internal culprit -- plausibly the ~822-categorical-column multinomial
-    # diffusion term itself being numerically unstable at this width/dtype
-    # mix, upstream in synthcity's plugin_ddpm/gaussian_multinomial_diffsuion.
-    # Not investigated further since ddpm is one of six synthcity backends
-    # here; revisit (or file upstream against vanderschaarlab/synthcity) if
-    # ddpm output specifically becomes needed.
+    # Bayesian network and DDPM do not scale reliably to this dataset width.
     names: [ctgan, tvae, adsgan, pategan, rtvae]
 
   tabpfn:
     enabled: true
     variants: [standard, custom]
-    # TabPFN officially supports up to 2000 features but only ensembles over
-    # random 500-feature subsets beyond that (tabpfn/inference_config.py:
-    # MAX_NUMBER_OF_FEATURES). This dataset has ~1000 feature columns after the
-    # drops above -- under the hard cap, but well past the full-attention
-    # regime, so expect slower fits than the hepatitis example.
     data_variants: [raw, imputed]
 
   tabpfgen:
@@ -1086,7 +109,7 @@ generation:
   hpo:
     enabled: true
     n_trials: 100
-    timeout_seconds: 300
+    timeout_seconds: 1800
     n_iter_cap: 300
     model_iter_caps: { pategan: 50 }
     sgld_step_cap: 500
@@ -1102,30 +125,14 @@ generation:
 evaluation:
   output_dir: output/loris/evaluation
   models: null
-  # Which class counts as "positive" for statistical_parity/equalized_odds/
-  # equal_opportunity (fairness metrics) -- only takes effect if data.target_column
-  # is exactly 2 classes. CGAS_class has 3+ classes here, so these metrics only
-  # ever run via the binary_target pass below (which fixes its own positive class
-  # via binary_target.positive_classes) -- this field is currently a no-op for
-  # loris specifically; kept set for if/when the target is ever naturally binary.
-  positive_class: 0
-
-  synthcity:
-    enabled: true
-    categories: null
-    metrics: null
-
-  syntheval:
-    enabled: true
-    categories: null
-    metrics: null
-
-  custom:
-    enabled: true
-    categories: null
-    metrics: null
-
+  positive_class: 0 # Used only if the target is naturally binary.
   ranking_strategy: linear
+  generate_report: true
+  save_per_model_syntheval_plots: true
+
+  synthcity: { enabled: true, categories: null, metrics: null }
+  syntheval: { enabled: true, categories: null, metrics: null }
+  custom: { enabled: true, categories: null, metrics: null }
 
   log_disparity:
     protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Race]
@@ -1133,40 +140,22 @@ evaluation:
     protected_map: [{ 0: male, 1: female }, null, null]
     protected_bins: [null, [5, 8, 11, 14, 17, 22], null]
 
-  save_per_model_syntheval_plots: true
-
-  # auroc_diff/statistical_parity/equalized_odds/equal_opportunity all refuse to
-  # run against CGAS_class as-is (SynthEval requires an exactly-2-class target
-  # for these; CGAS_class has 3: 0=severe, 1=moderate, 2=typical -- see
-  # data.target_column above). This runs a second, separate SynthEval pass
-  # against a disposable binary collapse of CGAS_class -- 1 (positive/"clinically
-  # significant impairment") = severe+moderate, 0 (negative/reference) = typical
-  # -- so those 4 metrics can run too, without affecting any other metric's
-  # results (which keep using the real 3-class CGAS_class) or the generated
-  # data (this never touches data.target_column/imputation/generation). See
-  # synthdata/evaluation/syntheval_eval.py's build_binary_target_series/
-  # run_binary_target_syntheval_evaluation.
+  # Separate binary SynthEval pass: severe/moderate versus typical.
   binary_target:
     enabled: true
-    column: null # defaults to data.target_column (CGAS_class)
-    positive_classes: [0, 1] # severe + moderate -> "clinically significant impairment"
-    negative_classes: [2] # typical -> reference/negative outcome
+    column: null
+    positive_classes: [0, 1]
+    negative_classes: [2]
 
-  # Weight applied to each type's rollup rank when computing the overall rank
-  # (see synthdata/evaluation/combine.py's mean-of-means aggregation). Default
-  # is equal weight; the privacy_gate below (pass/fail) is this project's
-  # primary safeguard for sensitive data, not this weight -- raise "privacy"
-  # here too if it should also influence relative ranking among gate-passing
-  # models, not just gate them.
-  rank_weights:
-    utility: 1.0
-    privacy: 1.0
-    fairness: 1.0
+  # Resource cap for resumable per-model SynthEval processes.
+  syntheval_execution:
+    model_workers: 6
+    max_model_workers: 6
+    cores_per_model: 4
+    memory_reserve_gib: 16
+    memory_per_model_gib: 14
 
-  # Absolute (not merely relative-to-other-models) privacy safety floor -- see
-  # configs/config.yaml's evaluation.privacy_gate comment for the full
-  # rationale/caveats. Same defaults reused here; adjust if loris-specific
-  # domain/compliance guidance differs from hepatitis's.
+  rank_weights: { utility: 1.0, privacy: 1.0, fairness: 1.0 }
   privacy_gate:
     enabled: true
     thresholds:
@@ -1177,11 +166,6 @@ evaluation:
       privacy.identifiability_score.score_OC: { bound: max, value: 0.3 }
       privacy.k-anonymization.syn: { bound: min, value: 5.0 }
       privacy.k-map.score: { bound: min, value: 5.0 }
-
-  # Whether to write a human-readable report.md (run metadata, ranked summary,
-  # privacy gate results, recommended model, fairness highlights, plot links)
-  # alongside combined_evaluation.csv.
-  generate_report: true
 
 plots:
   output_dir: output/loris/plots
