@@ -312,6 +312,24 @@ class TestResolveModelWorkers:
         )
         assert resolve_model_workers(cfg, n_models=18, n_columns=1038) == 6
 
+    def test_auto_does_not_read_total_memory_after_available_memory(self, monkeypatch):
+        cfg = SynthEvalExecutionConfig(
+            model_workers="auto",
+            max_model_workers=8,
+            cores_per_model=4,
+            memory_reserve_gib=16,
+        )
+        monkeypatch.setattr("synthdata.evaluation.syntheval_eval.os.cpu_count", lambda: 24)
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval._available_memory_gib", lambda: 118.0
+        )
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval.Path.read_text",
+            lambda _path: pytest.fail("worker resolution must not read MemTotal"),
+        )
+
+        assert resolve_model_workers(cfg, n_models=18, n_columns=1038) == 6
+
 
 class TestCheckpointPaths:
     def test_absolute_checkpoint_path_survives_plot_directory_change(self, tmp_path):

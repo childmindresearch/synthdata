@@ -74,7 +74,14 @@ def _available_memory_gib() -> float | None:
 
 
 def resolve_model_workers(execution_cfg, *, n_models: int, n_columns: int) -> int:
-    """Resolve a memory- and CPU-bounded number of concurrent model processes."""
+    """Resolve a memory- and CPU-bounded number of concurrent model processes.
+
+    The Linux ``MemAvailable`` value is already the kernel's estimate of
+    immediately allocatable memory. It is therefore the only host-memory
+    value used for auto-sizing: ``MemTotal`` can describe a smaller container
+    or runner limit than the available-memory probe supplied by callers/tests,
+    making worker selection depend on an unrelated second system read.
+    """
     if not n_models:
         return 0
     requested = execution_cfg.model_workers
@@ -88,17 +95,7 @@ def resolve_model_workers(execution_cfg, *, n_models: int, n_columns: int) -> in
     if available_gib is None:
         memory_bound = 1
     else:
-        total_gib = available_gib
-        try:
-            for line in Path("/proc/meminfo").read_text().splitlines():
-                if line.startswith("MemTotal:"):
-                    total_gib = int(line.split()[1]) / 1024**2
-                    break
-        except OSError:
-            pass
-        budget_gib = min(
-            total_gib * 0.75, max(0.0, available_gib - execution_cfg.memory_reserve_gib)
-        )
+        budget_gib = max(0.0, available_gib - execution_cfg.memory_reserve_gib)
         memory_bound = max(1, int(budget_gib // per_model_gib))
     return max(1, min(n_models, execution_cfg.max_model_workers, cpu_bound, memory_bound))
 
