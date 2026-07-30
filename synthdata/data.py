@@ -634,13 +634,14 @@ def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
 def load_dataset(cfg: Config) -> Dataset:
     """Load, type, and split the dataset described by ``cfg.data``.
 
-    Produces (and caches to ``cfg.data.data_dir`` [nested under ``cfg.data.version``
-    if set]) ``full.csv``, ``train.csv``, and ``test.csv``. These are the
+    Produces (and caches to ``cfg.data.data_dir/data_v_<cfg.data.version>``)
+    ``full.csv``, ``train.csv``, and ``test.csv``. These are the
     pre-imputation splits; :mod:`synthdata.imputation` later fills in
     ``*_imputed.csv`` variants aligned to the same row indices.
     """
     data_dir_base = Path(cfg.data.data_dir)
-    data_dir = ensure_dir(data_dir_base / cfg.data.version if cfg.data.version else data_dir_base)
+    data_version_scope = f"data_v_{cfg.data.version}" if cfg.data.version else "data_v_unversioned"
+    data_dir = ensure_dir(data_dir_base / data_version_scope)
 
     if cfg.data.source == "uci":
         df, variable_types = _load_uci(cfg, data_dir)

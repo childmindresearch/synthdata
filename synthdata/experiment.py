@@ -4,7 +4,7 @@
 timestamped id, optionally suffixed with a user-supplied ``--tag``, or an
 explicit ``--experiment-id`` to resume/extend a previous one), and nests its
 synthetic-data output under
-``generation.output_dir/<dataset-version>/<experiment_id>/``. That experiment
+``generation.output_dir/data_v_<dataset-version>/exp_v_<experiment_id>/``. That experiment
 id is recorded as the "latest" experiment for this dataset *version*, so
 `synthdata-evaluate` and `synthdata-plot` automatically pick it up (nesting
 their own artifacts the same way) without the user needing to pass it again --
@@ -12,7 +12,7 @@ unless they explicitly want to target a different, earlier experiment via
 ``--experiment-id``.
 
 A JSON manifest at
-``<generation.output_dir>/../experiments/<dataset-version>/<experiment_id>/manifest.json``
+``<generation.output_dir>/../experiments/data_v_<dataset-version>/exp_v_<experiment_id>/manifest.json``
 records what each stage produced (dataset version, git commit, artifact paths),
 so any artifact can be traced back to exactly the run that produced it.
 """
@@ -29,7 +29,12 @@ from synthdata.utils import ensure_dir, get_logger, git_commit
 logger = get_logger(__name__)
 
 _LATEST_FILENAME = "latest.json"
-_UNVERSIONED_ARTIFACT_SCOPE = "unversioned"
+_UNVERSIONED_ARTIFACT_SCOPE = "data_v_unversioned"
+
+
+def _data_version_scope_label(version: str | None) -> str:
+    """Return the human-readable directory label for a dataset version."""
+    return f"data_v_{version or 'unversioned'}"
 
 
 def _timestamp_id(tag: str | None = None) -> str:
@@ -58,7 +63,7 @@ def dataset_version_scope(cfg: Config) -> str:
             "data.version must be a non-empty, path-safe label without path separators; "
             f"got {version!r}."
         )
-    return version
+    return _data_version_scope_label(version)
 
 
 def dataset_plots_dir(cfg: Config) -> Path:
@@ -125,7 +130,8 @@ class Experiment:
 
 def _build_experiment(experiment_id: str, cfg: Config) -> Experiment:
     scope = dataset_version_scope(cfg)
-    experiment_root = _experiments_root(cfg) / experiment_id
+    experiment_scope = f"exp_v_{experiment_id}"
+    experiment_root = _experiments_root(cfg) / experiment_scope
     manifest_path = experiment_root / "manifest.json"
     if manifest_path.exists():
         with open(manifest_path) as f:
@@ -139,9 +145,9 @@ def _build_experiment(experiment_id: str, cfg: Config) -> Experiment:
                 f"not {expected_identity[0]!r}@{expected_identity[1]!r}."
             )
 
-    generation_dir = ensure_dir(Path(cfg.generation.output_dir) / scope / experiment_id)
-    evaluation_dir = ensure_dir(Path(cfg.evaluation.output_dir) / scope / experiment_id)
-    plots_dir = ensure_dir(Path(cfg.plots.output_dir) / scope / experiment_id)
+    generation_dir = ensure_dir(Path(cfg.generation.output_dir) / scope / experiment_scope)
+    evaluation_dir = ensure_dir(Path(cfg.evaluation.output_dir) / scope / experiment_scope)
+    plots_dir = ensure_dir(Path(cfg.plots.output_dir) / scope / experiment_scope)
     ensure_dir(experiment_root)
 
     experiment = Experiment(

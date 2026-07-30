@@ -231,6 +231,7 @@ def _warmup_refine(
     catboost_warmup_iterations: int,
     device: str = "cpu",
     refine_indices: list[int] | None = None,
+    refinement_pass: str = "warm-up",
 ) -> np.ndarray:
     """Single-pass per-column imputation: XGBRegressor (numeric) / CatBoostClassifier (bit).
 
@@ -283,7 +284,7 @@ def _warmup_refine(
             len(refine_indices),
             n_features,
         )
-    for col in tqdm(columns, desc="refidiff warm-up refinement", unit="col"):
+    for col in tqdm(columns, desc=f"refidiff {refinement_pass} refinement", unit="col"):
         missing_idx = np.where(missing_mask[:, col])[0]
         if len(missing_idx) == 0:
             continue
@@ -957,6 +958,7 @@ def impute_dataframe(
         catboost_warmup_iterations=cfg.catboost_warmup_iterations,
         device=device,
         refine_indices=refine_indices,
+        refinement_pass="warm-up",
     )
 
     # --- Train the EDM diffusion model on the warm-up-filled data. ---
@@ -1023,6 +1025,7 @@ def impute_dataframe(
         catboost_warmup_iterations=cfg.catboost_warmup_iterations,
         device=device,
         refine_indices=refine_indices,
+        refinement_pass="polishing",
     )
 
     # --- De-standardize back to raw feature units. ---

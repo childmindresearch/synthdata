@@ -36,7 +36,7 @@ class DataConfig:
     path: str | None = None
 
     #: Freeform dataset version label (e.g. "v1", "2024-06-01"). If set, cached
-    #: raw/imputed/split CSVs are nested under `data_dir/<version>/` and every
+    #: raw/imputed/split CSVs are nested under `data_dir/data_v_<version>/` and every
     #: experiment manifest records which version was used, so results stay
     #: traceable when the underlying dataset changes over time.
     version: str | None = None
@@ -175,7 +175,7 @@ class RefiDiffBenchmarkConfig:
 
     Benchmarking is deliberately separate from ordinary imputation caching:
     it creates artificial masks only in the training split and writes studies
-    beneath ``output/<dataset>/imputation/<version>/<study-id>/``.
+    beneath ``output/<dataset>/imputation/data_v_<version>/benchmark_<study-id>/``.
     """
 
     enabled: bool = False
@@ -517,8 +517,9 @@ class ExperimentConfig:
 
     Every invocation of the CLI scripts is treated as an "experiment": its
     generation/evaluation/plot artifacts are nested under
-    `<stage_output_dir>/<data.version>/<experiment_id>/`, and a manifest.json log at
-    `<generation_output_dir>/../experiments/<data.version>/<experiment_id>/manifest.json`
+    `<stage_output_dir>/data_v_<data.version>/exp_v_<experiment_id>/`,
+    and a manifest.json log at
+    `<generation_output_dir>/../experiments/data_v_<data.version>/exp_v_<experiment_id>/manifest.json`
     records what each stage produced (see :mod:`synthdata.experiment`).
     """
 

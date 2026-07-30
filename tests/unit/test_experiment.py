@@ -36,7 +36,7 @@ class TestStartExperiment:
         assert experiment.generation_dir.exists()
         assert experiment.evaluation_dir.exists()
         assert experiment.plots_dir.exists()
-        assert experiment.generation_dir.name == experiment.id
+        assert experiment.generation_dir.name == f"exp_v_{experiment.id}"
         # No manifest file yet -- only created on first record().
         assert not experiment.manifest_path.exists()
 
@@ -79,22 +79,23 @@ class TestStartExperiment:
         assert v1.evaluation_dir != v2.evaluation_dir
         assert v1.plots_dir != v2.plots_dir
         assert v1.manifest_path != v2.manifest_path
-        assert "v1" in v1.generation_dir.parts
-        assert "v2" in v2.generation_dir.parts
+        assert "data_v_v1" in v1.generation_dir.parts
+        assert "data_v_v2" in v2.generation_dir.parts
+        assert "exp_v_baseline" in v1.generation_dir.parts
 
     def test_dataset_level_plots_are_version_scoped(self, make_config):
         v1_dir = dataset_plots_dir(make_config(data_version="v1"))
         v2_dir = dataset_plots_dir(make_config(data_version="v2"))
 
         assert v1_dir != v2_dir
-        assert v1_dir.parts[-2:] == ("v1", "dataset")
-        assert v2_dir.parts[-2:] == ("v2", "dataset")
+        assert v1_dir.parts[-2:] == ("data_v_v1", "dataset")
+        assert v2_dir.parts[-2:] == ("data_v_v2", "dataset")
 
     def test_unversioned_artifacts_have_dedicated_scope(self, make_config):
         cfg = make_config()
 
-        assert dataset_version_scope(cfg) == "unversioned"
-        assert dataset_plots_dir(cfg).parts[-2:] == ("unversioned", "dataset")
+        assert dataset_version_scope(cfg) == "data_v_unversioned"
+        assert dataset_plots_dir(cfg).parts[-2:] == ("data_v_unversioned", "dataset")
 
     @pytest.mark.parametrize("version", ["", ".", "..", "v1/v2"])
     def test_rejects_unsafe_dataset_version_for_artifact_path(self, make_config, version):

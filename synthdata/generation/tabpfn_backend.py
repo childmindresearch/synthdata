@@ -17,6 +17,39 @@ from synthdata.utils import get_logger
 logger = get_logger(__name__)
 
 
+def _patch_explicit_categorical_feature_inference():
+    """Make TabPFN extensions honor the caller's categorical column list.
+
+    ``TabPFNUnsupervisedModel.fit`` calls ``infer_categorical_features`` again,
+    and that helper adds low-cardinality numeric columns to the list even when
+    the caller supplied an explicit list. This is incorrect for this pipeline:
+    the variable schema is the source of truth, so a continuous column remains
+    continuous regardless of its observed cardinality.
+
+    The patch replaces only the inference step. The explicit indices are still
+    supplied through ``set_categorical_features`` by the extension's experiment
+    API, and the separate TabPFN class-count limit is retained by
+    :func:`_patch_use_classifier_nan_bug` because it is a model capability
+    constraint, not a type inference decision.
+
+    Tracking: this works around ``infer_categorical_features`` in the pinned
+    ``tabpfn-extensions`` git-main dependency. Re-check the upstream behavior
+    before removing it if the dependency starts documenting an opt-out for
+    cardinality inference.
+    """
+    from tabpfn_extensions import unsupervised
+
+    if getattr(unsupervised, "_synthdata_explicit_types_patched", False):
+        return
+
+    def infer_categorical_features(X, categorical_features=None):
+        del X
+        return list(categorical_features or [])
+
+    unsupervised.infer_categorical_features = infer_categorical_features
+    unsupervised._synthdata_explicit_types_patched = True
+
+
 def _patch_use_classifier_nan_bug():
     """Work around a tabpfn_extensions bug where a column's classifier-vs-
     regressor decision is inconsistent between ``density_`` (which picks the
@@ -148,6 +181,7 @@ def _make_experiment():
     from tabpfn_extensions import unsupervised
     from tabpfn_extensions.unsupervised import experiments
 
+    _patch_explicit_categorical_feature_inference()
     _patch_use_classifier_nan_bug()
     _patch_regression_sample_inf_bug()
 

@@ -49,7 +49,7 @@ The four commands form an ordered pipeline:
 3. **Evaluate** candidates for utility, privacy, and fairness. Evaluation can process models in parallel within configured resource limits and writes a ranked table, report, and diagnostics.
 4. **Plot** recorded data-quality, generation, HPO, and evaluation artifacts without rerunning earlier stages.
 
-Artifacts are namespaced by dataset name, dataset version, and experiment ID. Generation creates a new experiment by default; evaluation and plotting use the latest one or accept `--experiment-id` to revisit a prior run. This preserves cached inputs, model outputs, HPO state, metrics, and figures across dataset revisions.
+Artifacts are namespaced by dataset name, dataset version, and experiment ID. Their folder names make both levels explicit: for example, `data_v_1.2/exp_v_0.4/`. Generation creates a new experiment by default; evaluation and plotting use the latest one or accept `--experiment-id` to revisit a prior run. This preserves cached inputs, model outputs, HPO state, metrics, and figures across dataset revisions.
 
 > [!TIP]
 > See [`synthdata/config.py`](synthdata/config.py) for cache, device, model, HPO, parallel evaluation, artifact, experiment, metric, ranking, privacy-gate, and plot options.
@@ -92,43 +92,25 @@ Tests are under [`tests/`](tests/). See `pyproject.toml` for available test mark
 
 ## Legacy and exploratory code
 
-The pipeline above is the supported path for new work. The following areas are
-older or exploratory tracks retained for reference and targeted experimentation:
+The pipeline above is the supported path for new work. The following areas are older or exploratory tracks retained for reference and targeted experimentation:
 
 ### Apps
 
-- [`apps/presidio/presidio_streamlit.py`](apps/presidio/presidio_streamlit.py):
-  an offline-focused Presidio Streamlit app for PHI/PII processing. Install its
-  dependencies with `uv sync --extra presidio`; see the
-  [Presidio app guide](apps/presidio/PRESIDIO_APP_GUIDE.md) for setup and
-  security guidance.
+- [`apps/presidio/presidio_streamlit.py`](apps/presidio/presidio_streamlit.py): an offline-focused Presidio Streamlit app for PHI/PII processing. Install its dependencies with `uv sync --extra presidio`; see the [Presidio app guide](apps/presidio/PRESIDIO_APP_GUIDE.md) for setup and security guidance.
 
 ### Notebooks
 
-- [`notebooks/ydata-test.py`](notebooks/ydata-test.py): ydata-synthetic
-  experimentation; requires `uv sync --extra ydata`.
-- [`notebooks/ctgan_hpo_hepatitis.ipynb`](notebooks/ctgan_hpo_hepatitis.ipynb)
-  and [`notebooks/test_hepatitis_data.ipynb`](notebooks/test_hepatitis_data.ipynb):
-  earlier Hepatitis-focused synthesis, imputation, HPO, and evaluation work.
-- [`notebooks/tabpfn_demo.ipynb`](notebooks/tabpfn_demo.ipynb): TabPFN
-  classification and synthesis exploration. Configure `TABPFN_TOKEN` (and,
-  optionally, `HF_TOKEN`) in `.env` when the API is required.
+- [`notebooks/ydata-test.py`](notebooks/ydata-test.py): ydata-synthetic experimentation; requires `uv sync --extra ydata`.
+- [`notebooks/ctgan_hpo_hepatitis.ipynb`](notebooks/ctgan_hpo_hepatitis.ipynb) and [`notebooks/test_hepatitis_data.ipynb`](notebooks/test_hepatitis_data.ipynb): earlier Hepatitis-focused synthesis, imputation, HPO, and evaluation work.
+- [`notebooks/tabpfn_demo.ipynb`](notebooks/tabpfn_demo.ipynb): TabPFN classification and synthesis exploration. Configure `TABPFN_TOKEN` (and, optionally, `HF_TOKEN`) in `.env` when the API is required.
 
 ### Scripts
 
-- [`scripts/run_imputation.py`](scripts/run_imputation.py),
-  [`scripts/run_generation.py`](scripts/run_generation.py),
-  [`scripts/run_evaluation.py`](scripts/run_evaluation.py), and
-  [`scripts/run_plots.py`](scripts/run_plots.py): the installed pipeline CLI
-  entry points.
-- [`scripts/document_pipeline/`](scripts/document_pipeline): early
-  PII-anonymization and Markdown-parsing work unrelated to the synthetic-data
-  pipeline.
+- [`scripts/document_pipeline/`](scripts/document_pipeline): early PII-anonymization and Markdown-parsing work unrelated to the synthetic-data pipeline.
 
 ## Repository layout
 
 - [`synthdata/`](synthdata/): pipeline implementation.
 - [`configs/`](configs/): example configurations.
 - [`scripts/`](scripts/): installed CLI entry points.
-- [`docs/internal/`](docs/internal/): local, auditable experiment notes.
 - [`apps/`](apps/) and [`notebooks/`](notebooks/): optional exploratory work.

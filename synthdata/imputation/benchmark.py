@@ -20,6 +20,7 @@ from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 
 from synthdata.config import Config, RefiDiffConfig
 from synthdata.data import Dataset
+from synthdata.experiment import dataset_version_scope
 from synthdata.generation.hpo import create_study
 from synthdata.imputation.refidiff_backend import impute_dataframe
 from synthdata.utils import ensure_dir, get_logger, git_commit, resolve_device
@@ -37,8 +38,11 @@ def benchmark_study_dir(cfg: Config, study_id: str) -> Path:
         raise ValueError(
             f"Benchmark study id must be a non-empty path-safe label, got {study_id!r}."
         )
-    version = cfg.data.version or "unversioned"
-    return Path(cfg.imputation.benchmark.output_dir) / version / study_id
+    return (
+        Path(cfg.imputation.benchmark.output_dir)
+        / dataset_version_scope(cfg)
+        / f"benchmark_{study_id}"
+    )
 
 
 def _source_fingerprint(dataset: Dataset) -> str:
