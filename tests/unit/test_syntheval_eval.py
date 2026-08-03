@@ -21,6 +21,7 @@ from synthdata.evaluation.syntheval_eval import (
     _compute_cache_key,
     _load_syntheval_cache,
     _save_syntheval_cache,
+    _shutdown_nested_joblib_executor,
     build_binary_preset,
     build_binary_target_series,
     build_preset,
@@ -51,6 +52,21 @@ class TestBuildBinaryTargetSeries:
         series = pd.Series([0, np.nan, 2], name="t")
         with pytest.raises(ValueError, match="missing value"):
             build_binary_target_series(series, positive_classes=[0], negative_classes=[2])
+
+
+class TestJoblibCleanup:
+    def test_shutdown_nested_executor_terminates_reusable_pool(self, monkeypatch):
+        shutdown_calls = []
+
+        class Executor:
+            def shutdown(self, *, wait, kill_workers):
+                shutdown_calls.append((wait, kill_workers))
+
+        monkeypatch.setattr("joblib.externals.loky.reusable_executor._executor", Executor())
+
+        _shutdown_nested_joblib_executor()
+
+        assert shutdown_calls == [(True, True)]
 
     def test_unmapped_value_raises(self):
         series = pd.Series([0, 1, 2], name="CGAS_class")

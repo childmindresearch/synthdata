@@ -142,6 +142,20 @@ def _valid_checkpoint(
         return None
 
 
+def _shutdown_nested_joblib_executor() -> None:
+    """Stop SynthEval's reusable loky pool before a disposable worker exits.
+
+    SynthEval's metric-level joblib calls intentionally keep the reusable pool
+    alive. In a one-model subprocess that leaves interpreter shutdown waiting
+    for loky's 300-second idle timeout, so terminate the pool explicitly here.
+    """
+    from joblib.externals.loky import reusable_executor
+
+    executor = getattr(reusable_executor, "_executor", None)
+    if executor is not None:
+        executor.shutdown(wait=True, kill_workers=True)
+
+
 def _model_worker(
     model_name: str,
     synthetic_frame: pd.DataFrame,
@@ -269,7 +283,10 @@ def _model_worker(
         )
         raise
     finally:
-        os.chdir(original_dir)
+        try:
+            _shutdown_nested_joblib_executor()
+        finally:
+            os.chdir(original_dir)
 
 
 # ---------------------------------------------------------------------------

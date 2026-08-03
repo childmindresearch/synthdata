@@ -3,7 +3,8 @@ revision = 3
 requires-python = "==3.11.*"
 resolution-markers = [
     "platform_machine == 'x86_64' and sys_platform == 'linux'",
-    "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux')",
+    "platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux'",
+    "platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux'",
     "sys_platform != 'linux'",
     "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
 ]
@@ -14,8 +15,10 @@ conflicts = [[
 
 [manifest]
 overrides = [
+    { name = "nvidia-nccl-cu12", marker = "platform_machine != 'aarch64' and sys_platform == 'linux'" },
     { name = "scikit-learn", specifier = "==1.9.0" },
     { name = "tabpfn", specifier = "==8.0.8" },
+    { name = "xgboost", specifier = ">=3.1.3,<3.2.0" },
 ]
 
 [[package]]
@@ -1025,17 +1028,17 @@ name = "decaf-synthetic-data"
 version = "0.1.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "loguru", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "networkx", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "numpy", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "pandas", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "pytorch-lightning", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "scikit-learn", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "scipy", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "loguru", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "networkx", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "numpy", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "pandas", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "pytorch-lightning", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "scikit-learn", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "scipy", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
     { name = "torch", version = "2.7.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or (platform_machine == 'aarch64' and platform_python_implementation != 'CPython') or (platform_machine == 'aarch64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (platform_machine == 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or sys_platform != 'linux'" },
-    { name = "torchtext", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "xgboost", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or (platform_machine == 'aarch64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (platform_machine == 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or sys_platform != 'linux'" },
+    { name = "torchtext", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "xgboost", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ae/70/f6f6217dc9c238ff0acd00db3d7f25ee68f9185cae45b6227e29bd63fe59/decaf_synthetic_data-0.1.7-py3-none-any.whl", hash = "sha256:3433f810c12ffa5b6554b5c60ffe1ac456e7a99a1447aab69e9964f238ac0da5", size = 9322, upload-time = "2025-06-16T13:51:36.812Z" },
@@ -1249,7 +1252,8 @@ name = "fastcore"
 version = "2.1.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux')",
+    "platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux'",
+    "platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux'",
     "sys_platform != 'linux'",
     "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
 ]
@@ -2540,8 +2544,8 @@ name = "lightning-utilities"
 version = "0.15.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "packaging", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "typing-extensions", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "packaging", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "typing-extensions", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/f1/45/7fa8f56b17dc0f0a41ec70dd307ecd6787254483549843bef4c30ab5adce/lightning_utilities-0.15.3.tar.gz", hash = "sha256:792ae0204c79f6859721ac7f386c237a33b0ed06ba775009cb894e010a842033", size = 33553, upload-time = "2026-02-22T14:48:53.348Z" }
 wheels = [
@@ -3293,7 +3297,7 @@ name = "nvidia-cufft"
 version = "12.0.0.61"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink", marker = "(platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine != 'aarch64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8b/ae/f417a75c0259e85c1d2f83ca4e960289a5f814ed0cea74d18c353d3e989d/nvidia_cufft-12.0.0.61-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:2708c852ef8cd89d1d2068bdbece0aa188813a0c934db3779b9b1faa8442e5f5", size = 214053554, upload-time = "2025-09-04T08:31:38.196Z" },
@@ -3357,9 +3361,9 @@ name = "nvidia-cusolver"
 version = "12.0.4.66"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas", marker = "(platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "nvidia-cusparse", marker = "(platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "nvidia-nvjitlink", marker = "(platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "nvidia-cublas", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine != 'aarch64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "nvidia-cusparse", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine != 'aarch64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine != 'aarch64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c8/c3/b30c9e935fc01e3da443ec0116ed1b2a009bb867f5324d3f2d7e533e776b/nvidia_cusolver-12.0.4.66-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:02c2457eaa9e39de20f880f4bd8820e6a1cfb9f9a34f820eb12a155aa5bc92d2", size = 223467760, upload-time = "2025-09-04T08:33:04.222Z" },
@@ -3387,7 +3391,7 @@ name = "nvidia-cusparse"
 version = "12.6.3.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink", marker = "(platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine != 'aarch64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f8/94/5c26f33738ae35276672f12615a64bd008ed5be6d1ebcb23579285d960a9/nvidia_cusparse-12.6.3.3-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:80bcc4662f23f1054ee334a15c72b8940402975e0eab63178fc7e670aa59472c", size = 162155568, upload-time = "2025-09-04T08:33:42.864Z" },
@@ -4431,15 +4435,15 @@ name = "pytorch-lightning"
 version = "2.6.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "fsspec", extra = ["http"], marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "lightning-utilities", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "packaging", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "pyyaml", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "fsspec", extra = ["http"], marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "lightning-utilities", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "packaging", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "pyyaml", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
     { name = "torch", version = "2.7.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or (platform_machine == 'aarch64' and platform_python_implementation != 'CPython') or (platform_machine == 'aarch64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (platform_machine == 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or sys_platform != 'linux'" },
-    { name = "torchmetrics", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "tqdm", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "typing-extensions", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or (platform_machine == 'aarch64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (platform_machine == 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or sys_platform != 'linux'" },
+    { name = "torchmetrics", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "tqdm", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "typing-extensions", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/8b/ac/ebd5f6f58691cbd4f73836e43e1727f3814311b960c41f88e259606ca2b2/pytorch_lightning-2.6.1.tar.gz", hash = "sha256:ba08f8901cf226fcca473046ad9346f414e99117762dc869c76e650d5b3d7bdc", size = 665563, upload-time = "2026-01-30T14:59:11.636Z" }
 wheels = [
@@ -4621,7 +4625,8 @@ version = "2.30.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "platform_machine == 'x86_64' and sys_platform == 'linux'",
-    "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux')",
+    "platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux'",
+    "platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux'",
     "sys_platform != 'linux'",
     "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
 ]
@@ -4647,7 +4652,8 @@ version = "2.34.2"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "platform_machine == 'x86_64' and sys_platform == 'linux'",
-    "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux')",
+    "platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux'",
+    "platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux'",
     "sys_platform != 'linux'",
     "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
 ]
@@ -5481,7 +5487,7 @@ provides-extras = ["testing", "goggle", "all"]
 
 [[package]]
 name = "synthdata"
-version = "0.7.0"
+version = "0.7.1"
 source = { editable = "." }
 dependencies = [
     { name = "altair" },
@@ -6062,7 +6068,8 @@ name = "torch"
 version = "2.13.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux')",
+    "platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux'",
+    "platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux'",
     "sys_platform != 'linux'",
     "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
 ]
@@ -6094,11 +6101,11 @@ name = "torchmetrics"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "lightning-utilities", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "numpy", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "packaging", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "lightning-utilities", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "numpy", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "packaging", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
     { name = "torch", version = "2.7.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or (platform_machine == 'aarch64' and platform_python_implementation != 'CPython') or (platform_machine == 'aarch64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (platform_machine == 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or sys_platform != 'linux'" },
+    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or (platform_machine == 'aarch64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (platform_machine == 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or sys_platform != 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/81/34/39b8b749333db56c0585d7a11fa62a283c087bb1dfc897d69fb8cedbefb1/torchmetrics-1.9.0.tar.gz", hash = "sha256:a488609948600df52d3db4fcdab02e62aab2a85ef34da67037dc3e65b8512faa", size = 581765, upload-time = "2026-03-09T17:41:22.443Z" }
 wheels = [
@@ -6110,12 +6117,12 @@ name = "torchtext"
 version = "0.18.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "requests", version = "2.30.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and extra == 'extra-9-synthdata-ydata') or (platform_python_implementation != 'CPython' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-ydata') or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "requests", version = "2.34.2", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and extra == 'extra-9-synthdata-tabpfn') or (platform_machine != 'aarch64' and extra != 'extra-9-synthdata-ydata') or (platform_python_implementation != 'CPython' and extra == 'extra-9-synthdata-tabpfn') or (platform_python_implementation != 'CPython' and extra != 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn') or (sys_platform != 'linux' and extra != 'extra-9-synthdata-ydata') or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "numpy", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "requests", version = "2.30.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-ydata') or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "requests", version = "2.34.2", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and extra == 'extra-9-synthdata-tabpfn') or (platform_machine != 'aarch64' and extra != 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn') or (sys_platform != 'linux' and extra != 'extra-9-synthdata-ydata') or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
     { name = "torch", version = "2.7.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
-    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or (platform_machine == 'aarch64' and platform_python_implementation != 'CPython') or (platform_machine == 'aarch64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (platform_machine == 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or sys_platform != 'linux'" },
-    { name = "tqdm", marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or (platform_machine == 'aarch64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (platform_machine == 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or sys_platform != 'linux'" },
+    { name = "tqdm", marker = "platform_machine != 'aarch64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/61/22/38bba8f6255f3e58b7f9d66cc988e044ee8cfb4edf0c57f4a7918e7c4aa6/torchtext-0.18.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:0f3855b2ada84f02298e72ad19c1a86f940df2f4ce62d89098955f3ae575d174", size = 2139004, upload-time = "2024-04-24T15:49:37.052Z" },
@@ -6159,7 +6166,8 @@ name = "torchvision"
 version = "0.28.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux')",
+    "platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux'",
+    "platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux'",
     "sys_platform != 'linux'",
     "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
 ]
@@ -6279,7 +6287,8 @@ name = "triton"
 version = "3.7.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux')",
+    "platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux'",
+    "platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux'",
     "sys_platform != 'linux'",
     "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
 ]
@@ -6315,7 +6324,8 @@ name = "tsai"
 version = "1.0.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux')",
+    "platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux'",
+    "platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux'",
     "sys_platform != 'linux'",
     "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
 ]
@@ -6733,22 +6743,20 @@ wheels = [
 
 [[package]]
 name = "xgboost"
-version = "2.1.4"
+version = "3.1.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "nvidia-nccl-cu12", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
     { name = "scipy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e2/5e/860a1ef13ce38db8c257c83e138be64bcffde8f401e84bf1e2e91838afa3/xgboost-2.1.4.tar.gz", hash = "sha256:ab84c4bbedd7fae1a26f61e9dd7897421d5b08454b51c6eb072abc1d346d08d7", size = 1091127, upload-time = "2025-02-06T18:18:20.192Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/42/db/ff3eb8ff8cdf87a57cbb0f484234b4353178587236c4c84c1d307165c1f8/xgboost-3.1.3.tar.gz", hash = "sha256:0aeaa59d7ba09221a6fa75f70406751cfafdf3f149d0a91b197a1360404a28f3", size = 1237662, upload-time = "2026-01-10T00:20:13.458Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b6/fe/7a1d2342c2e93f22b41515e02b73504c7809247b16ae395bd2ee7ef11e19/xgboost-2.1.4-py3-none-macosx_10_15_x86_64.macosx_11_0_x86_64.macosx_12_0_x86_64.whl", hash = "sha256:78d88da184562deff25c820d943420342014dd55e0f4c017cc4563c2148df5ee", size = 2140692, upload-time = "2025-02-06T18:16:59.23Z" },
-    { url = "https://files.pythonhosted.org/packages/f5/b6/653a70910739f127adffbefb688ebc22b51139292757de7c22b1e04ce792/xgboost-2.1.4-py3-none-macosx_12_0_arm64.whl", hash = "sha256:523db01d4e74b05c61a985028bde88a4dd380eadc97209310621996d7d5d14a7", size = 1939418, upload-time = "2025-02-06T18:17:02.494Z" },
-    { url = "https://files.pythonhosted.org/packages/43/06/905fee34c10fb0d0c3baa15106413b76f360d8e958765ec57c9eddf762fa/xgboost-2.1.4-py3-none-manylinux2014_aarch64.whl", hash = "sha256:57c7e98111aceef4b689d7d2ce738564a1f7fe44237136837a47847b8b33bade", size = 4442052, upload-time = "2025-02-06T18:17:04.029Z" },
-    { url = "https://files.pythonhosted.org/packages/f8/6a/41956f91ab984f2fa44529b2551d825a20d33807eba051a60d06ede2a87c/xgboost-2.1.4-py3-none-manylinux2014_x86_64.whl", hash = "sha256:f1343a512e634822eab30d300bfc00bf777dc869d881cc74854b42173cfcdb14", size = 4533170, upload-time = "2025-02-06T18:17:05.753Z" },
-    { url = "https://files.pythonhosted.org/packages/b1/53/37032dca20dae7a88ad1907f817a81f232ca6e935f0c28c98db3c0a0bd22/xgboost-2.1.4-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:d366097d0db047315736f46af852feaa907f6d7371716af741cdce488ae36d20", size = 4206715, upload-time = "2025-02-06T18:17:08.448Z" },
-    { url = "https://files.pythonhosted.org/packages/e4/3c/e3a93bfa7e8693c825df5ec02a40f7ff5f0950e02198b1e85da9315a8d47/xgboost-2.1.4-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:8df6da72963969ab2bf49a520c3e147b1e15cbeddd3aa0e3e039b3532c739339", size = 223642416, upload-time = "2025-02-06T18:17:25.08Z" },
-    { url = "https://files.pythonhosted.org/packages/43/80/0b5a2dfcf5b4da27b0b68d2833f05d77e1a374d43db951fca200a1f12a52/xgboost-2.1.4-py3-none-win_amd64.whl", hash = "sha256:8bbfe4fedc151b83a52edbf0de945fd94358b09a81998f2945ad330fd5f20cd6", size = 124910381, upload-time = "2025-02-06T18:17:43.202Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/a9/8668a5662c497c32ab127b7ca57d91153f499b31c725969a1e4147782e64/xgboost-3.1.3-py3-none-macosx_10_15_x86_64.whl", hash = "sha256:e16a6c352ee1a4c19372a7b2bb75129e10e63adeeabd3d11f21b7787378e5a50", size = 2378032, upload-time = "2026-01-10T00:18:14.103Z" },
+    { url = "https://files.pythonhosted.org/packages/52/39/ec5c53228b091387e934d3d419e8e3a5ce98c1650d458987d6e254a15304/xgboost-3.1.3-py3-none-macosx_12_0_arm64.whl", hash = "sha256:a7a1d59f3529de0ad9089c59b6cc595cd7b4424feabcc06463c4bde41f202f74", size = 2211477, upload-time = "2026-01-10T00:18:34.409Z" },
+    { url = "https://files.pythonhosted.org/packages/99/f7/ceb06e6b959e5a8b303883482ecad346495641947679e3f735ae8ac1caa7/xgboost-3.1.3-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:2e31482633883b2e95fda6055db654bbfac82e10d91ad3d9929086ebd28eb1c4", size = 115346575, upload-time = "2026-01-10T00:19:11.44Z" },
+    { url = "https://files.pythonhosted.org/packages/6c/9c/9d4ad7f586698bad52a570d2bf81138e500a5d9f32723c2b4ed1dd9252d8/xgboost-3.1.3-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:687504d1d76dc797df08b0dbe8b83d58629cdc06df52378f617164d16142bf2c", size = 115926894, upload-time = "2026-01-10T00:19:49.123Z" },
+    { url = "https://files.pythonhosted.org/packages/3a/d8/4d4ae25452577f2dfabc66b60e712e7c01f9fe6c389fa88c546c2f427c4d/xgboost-3.1.3-py3-none-win_amd64.whl", hash = "sha256:3fe349b4c6030f0d66e166a3a6b7d470e776d530ea240d77335e36144cbe132a", size = 72011993, upload-time = "2026-01-10T00:17:42.98Z" },
 ]
 
 [[package]]

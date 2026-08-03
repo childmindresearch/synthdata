@@ -1,6 +1,6 @@
 [project]
 name = "synthdata"
-version = "0.7.0"
+version = "0.7.1"
 description = "Sandbox for synthetic data generation and evaluation"
 authors = [
     {name = "Alp Erkent", email = "alp.erkent@childmind.org"},
@@ -93,6 +93,10 @@ dev = [
 override-dependencies = [
     "scikit-learn==1.9.0",
     "tabpfn==8.0.8",
+    # The ARM XGBoost CUDA wheel declares cu12 NCCL, which conflicts with the
+    # repo's CUDA 13 Torch wheel; use Torch's NCCL on ARM and keep cu12 on x86.
+    "nvidia-nccl-cu12; sys_platform == 'linux' and platform_machine != 'aarch64'",
+    "xgboost>=3.1.3,<3.2.0",
 ]
 
 conflicts = [
