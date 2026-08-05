@@ -26,7 +26,7 @@ def plot_rank_tradeoff(
 ):
     """Build a two-dimensional rank trade-off scatter plot.
 
-    HPO-tuned variants are larger diamond markers; regular variants are circles.
+    HPO-tuned variants are diamond markers; regular variants are circles.
     All variants of the same base model share a color.
     """
     from matplotlib.lines import Line2D
@@ -44,7 +44,7 @@ def plot_rank_tradeoff(
         ax.scatter(
             x_value,
             y_value,
-            s=260 if is_hpo else 130,
+            s=130,
             marker="D" if is_hpo else "o",
             color=palette[base],
             alpha=0.85,
@@ -94,7 +94,7 @@ def plot_rank_tradeoff(
             marker="D",
             linestyle="none",
             color="grey",
-            markersize=10,
+            markersize=9,
             markeredgecolor="black",
             label="HPO-tuned model",
         ),
@@ -107,8 +107,9 @@ def plot_rank_tradeoff(
 def plot_rank_tradeoff_3d(combined: pd.DataFrame):
     """Build an interactive utility/privacy/fairness rank scatter plot.
 
-    HPO-tuned variants are larger diamonds; regular variants are circles. Each
-    base model's variants share a color.
+    HPO-tuned variants are diamonds; regular variants are circles. All
+    variants use the same marker size, and each base model's variants share a
+    color.
     """
     import plotly.graph_objects as go
 
@@ -145,7 +146,7 @@ def plot_rank_tradeoff_3d(combined: pd.DataFrame):
                 text=[str(model)],
                 textposition="top center",
                 marker={
-                    "size": 11 if is_hpo else 8,
+                    "size": 8,
                     "symbol": "diamond" if is_hpo else "circle",
                     "color": palette[base],
                     "line": {"color": "black" if is_hpo else palette[base], "width": 1},
@@ -187,7 +188,7 @@ def plot_rank_tradeoff_3d(combined: pd.DataFrame):
             z=[None],
             mode="markers",
             name="HPO-tuned model",
-            marker={"size": 11, "color": "grey", "symbol": "diamond"},
+            marker={"size": 8, "color": "grey", "symbol": "diamond"},
             hoverinfo="skip",
         )
     )

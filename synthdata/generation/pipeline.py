@@ -142,7 +142,13 @@ def run_generation(
                         device=device,
                     )
                     params = hpo_mod.run_study(
-                        f"hpo_{name}", objective, gen_cfg.hpo, output_dir, seed
+                        f"hpo_{name}",
+                        objective,
+                        gen_cfg.hpo,
+                        output_dir,
+                        seed,
+                        checkpoint_workspace=output_dir / "synthcity_workspace",
+                        checkpoint_plugin=name,
                     )
                     best_params.set("synthcity", name, params)
                 params = dict(best_params.get("synthcity", name))

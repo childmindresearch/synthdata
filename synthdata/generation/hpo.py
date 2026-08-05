@@ -13,6 +13,7 @@ Provides:
   ``output/hepatitis/hpo_best_params.json`` from the notebooks.
 """
 
+import re
 from collections.abc import Callable
 from pathlib import Path
 
@@ -94,6 +95,115 @@ def default_best_params_path(output_dir: str | Path) -> Path:
     return Path(output_dir) / "hpo_best_params.json"
 
 
+def cleanup_hpo_generator_checkpoints(
+    workspace: str | Path,
+    study: optuna.Study,
+    plugin_name: str,
+    target_trials: int,
+) -> int:
+    """Compact completed synthcity HPO generator caches.
+
+    Synthcity stores a fully serialized generator for every benchmark trial.
+    Keep the best trial and the highest-numbered trial with a saved generator
+    as conservative recovery artifacts; remove the other generator caches only
+    after the study reaches its configured completed-trial target. Metric and
+    synthetic-data caches are intentionally left untouched.
+    """
+    if not plugin_name:
+        raise ValueError("plugin_name must not be empty")
+    if target_trials < 1:
+        raise ValueError(f"target_trials must be positive, got {target_trials}")
+
+    completed = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
+    if len(completed) < target_trials:
+        logger.info(
+            "[%s] HPO incomplete (%d/%d completed); retaining generator checkpoints in %s",
+            study.study_name,
+            len(completed),
+            target_trials,
+            workspace,
+        )
+        return 0
+
+    workspace_path = Path(workspace)
+    if not workspace_path.is_dir():
+        logger.info(
+            "[%s] no synthcity checkpoint workspace found at %s",
+            study.study_name,
+            workspace_path,
+        )
+        return 0
+
+    trial_numbers = {trial.number for trial in study.trials}
+    pattern = re.compile(rf"_trial_(?P<trial>\d+)_{re.escape(plugin_name)}_.*_generator_\d+\.bkp$")
+    checkpoints_by_trial: dict[int, list[Path]] = {}
+    for path in workspace_path.iterdir():
+        if not path.is_file():
+            continue
+        match = pattern.search(path.name)
+        if match is None:
+            continue
+        trial_number = int(match.group("trial"))
+        if trial_number not in trial_numbers:
+            continue
+        checkpoints_by_trial.setdefault(trial_number, []).append(path)
+
+    if not checkpoints_by_trial:
+        logger.info(
+            "[%s] no generator checkpoints found for plugin=%s in %s",
+            study.study_name,
+            plugin_name,
+            workspace_path,
+        )
+        return 0
+
+    keep_trial_numbers = {study.best_trial.number, max(checkpoints_by_trial)}
+    to_delete = [
+        path
+        for trial_number, paths in checkpoints_by_trial.items()
+        if trial_number not in keep_trial_numbers
+        for path in paths
+    ]
+
+    failures: list[tuple[Path, OSError]] = []
+    for path in to_delete:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            failures.append((path, exc))
+
+    if failures:
+        details = "; ".join(f"{path}: {exc}" for path, exc in failures)
+        logger.error(
+            "[%s] failed to delete %d HPO generator checkpoint(s): %s",
+            study.study_name,
+            len(failures),
+            details,
+        )
+        raise RuntimeError(
+            f"Failed to delete {len(failures)} HPO generator checkpoint(s)"
+        ) from failures[0][1]
+
+    kept_count = sum(
+        len(paths)
+        for trial_number, paths in checkpoints_by_trial.items()
+        if trial_number in keep_trial_numbers
+    )
+    logger.info(
+        "[%s] HPO checkpoint cleanup complete for plugin=%s: kept %d checkpoint(s) "
+        "for trial(s) %s; deleted %d from %s",
+        study.study_name,
+        plugin_name,
+        kept_count,
+        sorted(keep_trial_numbers),
+        len(to_delete),
+        workspace_path,
+    )
+    return len(to_delete)
+
+
 def create_study(
     study_name: str, hpo_cfg: HPOConfig, output_dir: str | Path, seed: int
 ) -> optuna.Study:
@@ -114,13 +224,22 @@ def run_study(
     output_dir: str | Path,
     seed: int,
     drop_keys: tuple = ("n_iter",),
+    checkpoint_workspace: str | Path | None = None,
+    checkpoint_plugin: str | None = None,
 ) -> dict:
     """Run (or resume, via SQLite storage) an Optuna study; return best params.
 
     ``drop_keys`` are removed from the returned best-params dict: e.g. ``n_iter``
     is capped during search for speed, so the searched value is unreliable and
     generation should fall back to the plugin's own default instead.
+
+    When both checkpoint arguments are provided, completed synthcity HPO
+    studies retain only their best and latest generator caches. Incomplete
+    studies retain every cache so an interrupted run remains recoverable.
     """
+    if (checkpoint_workspace is None) != (checkpoint_plugin is None):
+        raise ValueError("checkpoint_workspace and checkpoint_plugin must be provided together")
+
     study = create_study(study_name, hpo_cfg, output_dir, seed)
     n_done = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     n_remaining = max(hpo_cfg.n_trials - n_done, 0)
@@ -153,6 +272,13 @@ def run_study(
         len(completed),
         best,
     )
+    if checkpoint_workspace is not None and checkpoint_plugin is not None:
+        cleanup_hpo_generator_checkpoints(
+            checkpoint_workspace,
+            study,
+            checkpoint_plugin,
+            len(completed),
+        )
     return best
 
 

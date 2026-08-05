@@ -75,7 +75,7 @@ def _privacy_gate_section(combined: pd.DataFrame) -> str:
             "threshold metrics were computed -- see logs). No absolute privacy safety floor "
             "was checked; treat any 'recommended model' below with that caveat."
         )
-    lines = ["## Privacy gate (absolute privacy safety floor, not a relative rank)", ""]
+    lines = ["## Privacy gate", ""]
     passing = combined.index[combined[_GATE_PASS_COL]].tolist()
     failing = combined.index[~combined[_GATE_PASS_COL]].tolist()
     lines.append(f"- Passing ({len(passing)}): " + (", ".join(f"`{m}`" for m in passing) or "none"))
