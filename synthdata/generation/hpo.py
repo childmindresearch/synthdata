@@ -166,9 +166,10 @@ def cleanup_hpo_generator_checkpoints(
     ]
 
     failures: list[tuple[Path, OSError]] = []
-    for path in sorted(to_delete):
         try:
             path.unlink()
+        except FileNotFoundError:
+            continue
         except OSError as exc:
             failures.append((path, exc))
 
@@ -275,7 +276,7 @@ def run_study(
             checkpoint_workspace,
             study,
             checkpoint_plugin,
-            hpo_cfg.n_trials,
+            len(completed),
         )
     return best
 

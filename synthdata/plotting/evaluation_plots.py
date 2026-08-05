@@ -26,7 +26,7 @@ def plot_rank_tradeoff(
 ):
     """Build a two-dimensional rank trade-off scatter plot.
 
-    HPO-tuned variants are larger diamond markers; regular variants are circles.
+    HPO-tuned variants are diamond markers; regular variants are circles.
     All variants of the same base model share a color.
     """
     from matplotlib.lines import Line2D
