@@ -6,8 +6,8 @@ seed: 42
 device: auto
 
 experiment:
-  tag: retry_all_models_hpo_30m
-  id: "0.4"
+  tag: retry_all_models_hpo_4h_nitro
+  id: "0.5"
 
 data:
   # Source and schema
@@ -108,8 +108,8 @@ generation:
 
   hpo:
     enabled: true
-    n_trials: 20
-    timeout_seconds: 7200
+    n_trials: 50
+    timeout_seconds: 14400
     n_iter_cap: 100
     model_iter_caps: { pategan: 30 }
     sgld_step_cap: 2000
