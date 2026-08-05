@@ -166,6 +166,7 @@ def cleanup_hpo_generator_checkpoints(
     ]
 
     failures: list[tuple[Path, OSError]] = []
+    for path in to_delete:
         try:
             path.unlink()
         except FileNotFoundError:
