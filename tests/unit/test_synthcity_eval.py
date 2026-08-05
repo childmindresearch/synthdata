@@ -16,6 +16,9 @@ class TestResolveMetricConfig:
         assert result["attack"] == SYNTHCITY_METRIC_CONFIG["attack"]
         assert "attacks" not in result
 
+    def test_final_evaluation_catalog_retains_domias(self):
+        assert "DomiasMIA_prior" in SYNTHCITY_METRIC_CONFIG["privacy"]
+
     def test_privacy_category_includes_attack_metrics(self):
         result = resolve_metric_config(FrameworkSelectionConfig(categories=["privacy"]))
 

@@ -86,7 +86,7 @@ generation:
       stats: [prdc, alpha_precision, wasserstein_dist, inv_kl_divergence]
       sanity: [nearest_syn_neighbor_distance]
       performance: [xgb]
-      privacy: [identifiability_score, DomiasMIA_prior]
+      privacy: [identifiability_score]
     storage: null
     best_params_path: null
     final_n_iter_override: null
