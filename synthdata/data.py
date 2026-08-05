@@ -78,9 +78,24 @@ class Dataset:
         return list(self.nominal_columns) + list(self.ordinal_columns)
 
     @property
+    def target_is_categorical(self) -> bool:
+        """Whether the resolved schema declares the target as categorical.
+
+        Datasets created through the legacy explicit-list configuration have no
+        reliable target-kind declaration, so retain the historical assumption
+        that their target is categorical.
+        """
+        target_entry = self.variable_schema.get(self.target_column)
+        if target_entry is None:
+            return True
+        return target_entry.get("kind") == "categorical"
+
+    @property
     def all_categorical_columns(self) -> list:
-        """Categorical feature columns plus the target column."""
-        return self.categorical_columns + [self.target_column]
+        """Categorical feature columns plus the target when declared categorical."""
+        if self.target_is_categorical:
+            return self.categorical_columns + [self.target_column]
+        return self.categorical_columns
 
     def paths(self) -> dict:
         d = self.data_dir
@@ -717,7 +732,7 @@ def load_dataset(cfg: Config) -> Dataset:
         variable_schema = {
             column: {
                 "kind": "categorical"
-                if column in nominal_columns + ordinal_columns
+                if column == target_column or column in nominal_columns + ordinal_columns
                 else "continuous",
                 "ordinal_order": cfg.data.ordinal_column_categories.get(column),
             }
@@ -726,11 +741,16 @@ def load_dataset(cfg: Config) -> Dataset:
     categorical_columns = nominal_columns + ordinal_columns
     warn_non_numeric_feature_columns(df, feature_columns, categorical_columns)
 
-    # Cast whole-numbered categorical columns (incl. target) to a proper int dtype.
+    target_is_categorical = (
+        variable_schema.get(target_column, {}).get("kind", "categorical") == "categorical"
+    )
+
+    # Cast whole-numbered categorical columns to a proper int dtype.
     # Some downstream tooling (e.g. SynthEval's AnalysisConfig) infers "categorical"
     # from dtype (object/int) rather than cardinality, so a float-typed {0.0, 1.0}
-    # target/categorical column would otherwise silently be treated as continuous.
-    df = cast_integer_like_columns(df, categorical_columns + [target_column])
+    # categorical column would otherwise silently be treated as continuous.
+    columns_to_cast = categorical_columns + ([target_column] if target_is_categorical else [])
+    df = cast_integer_like_columns(df, columns_to_cast)
 
     if cfg.data.outlier_zscore_threshold is not None and cfg.data.outlier_columns:
         outlier_columns = [
