@@ -211,7 +211,7 @@ def _make_experiment():
     # Disable the internal auto-plot: should_plot=False is not respected by this
     # version and self.data has duplicate indices after pd.concat, which breaks
     # seaborn reindex.
-    experiment.__dict__["plot"] = lambda **kwargs: None
+    experiment.plot = lambda **kwargs: None
     return experiment, model_unsupervised
 
 

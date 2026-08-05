@@ -22,10 +22,10 @@ def _set_schema(dataset, *, target_kind):
     dataset.variable_schema = {
         column: {
             "kind": (
-                "categorical"
-                if column in {"smoker", "target"} and column != "target"
-                else target_kind
+                target_kind
                 if column == "target"
+                else "categorical"
+                if column == "smoker"
                 else "continuous"
             ),
             "ordinal_order": None,
