@@ -46,18 +46,26 @@ class TestSynthcityFrames:
 
     def test_builds_multiindex_columns_oriented_by_direction(self):
         result = pd.DataFrame(
-            {"mean": [0.5, 0.3], "direction": ["maximize", "minimize"]},
-            index=["stats.ks_test", "privacy.identifiability_score"],
+            {"mean": [0.5, 0.3, 0.2], "direction": ["maximize", "minimize", "minimize"]},
+            index=[
+                "stats.ks_test",
+                "privacy.identifiability_score",
+                "attack.data_leakage_linear",
+            ],
         )
         raw, oriented = _synthcity_frames({"model_a": result}, model_names=["model_a"])
 
         assert raw.loc["model_a", ("synthcity", "utility", "stats.ks_test")] == 0.5
         assert raw.loc["model_a", ("synthcity", "privacy", "privacy.identifiability_score")] == 0.3
+        assert raw.loc["model_a", ("synthcity", "privacy", "attack.data_leakage_linear")] == 0.2
         # maximize -> unchanged sign; minimize -> flipped sign.
         assert oriented.loc["model_a", ("synthcity", "utility", "stats.ks_test")] == 0.5
         assert (
             oriented.loc["model_a", ("synthcity", "privacy", "privacy.identifiability_score")]
             == -0.3
+        )
+        assert (
+            oriented.loc["model_a", ("synthcity", "privacy", "attack.data_leakage_linear")] == -0.2
         )
 
     def test_failed_model_excluded_not_raising(self):

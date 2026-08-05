@@ -49,21 +49,21 @@ SYNTHCITY_METRIC_CONFIG = {
         "identifiability_score",
         "DomiasMIA_prior",
     ],
-    "attacks": [
+    "attack": [
         "data_leakage_mlp",
         "data_leakage_xgb",
         "data_leakage_linear",
     ],
 }
 
-#: synthcity's own "category" (sanity/stats/.../attacks) rolled up to utility/privacy.
+#: synthcity's own "category" (sanity/stats/.../attack) rolled up to utility/privacy.
 SYNTHCITY_CATEGORY_TO_TYPE = {
     "sanity": "utility",
     "stats": "utility",
     "performance": "utility",
     "detection": "privacy",
     "privacy": "privacy",
-    "attacks": "privacy",
+    "attack": "privacy",
 }
 
 #: ``stats.alpha_precision``'s "_naive" sub-metrics (delta_precision_alpha_naive,
