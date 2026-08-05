@@ -196,6 +196,8 @@ class TestVariableSchema:
 
         assert dataset.nominal_columns == ["site"]
         assert dataset.ordinal_columns == ["severity"]
+        assert dataset.target_is_categorical is True
+        assert dataset.all_categorical_columns == ["site", "severity", "target"]
         assert dataset.full_df["severity"].tolist() == [0.0, 2.0, 1.0, 0.0]
         assert dataset.variable_schema_fingerprint
         manifest = json.loads((dataset.data_dir / "dataset_manifest.json").read_text())
@@ -204,6 +206,44 @@ class TestVariableSchema:
             "Medium",
             "High",
         ]
+
+    def test_continuous_target_remains_continuous_in_dataset_metadata(self, tmp_path):
+        raw_path = tmp_path / "raw.csv"
+        pd.DataFrame(
+            {
+                "score": [0, 1, 0, 1],
+                "target": [0.0, 1.5, 2.0, 3.5],
+            }
+        ).to_csv(raw_path, index=False)
+        schema_path = self._write_schema(
+            tmp_path,
+            "column,kind\nscore,continuous\ntarget,continuous\n",
+        )
+        cfg = Config(
+            name="continuous_target_schema_test",
+            data=DataConfig(
+                source="csv",
+                path=str(raw_path),
+                target_column="target",
+                variable_schema_path=str(schema_path),
+                data_dir=str(tmp_path / "derived"),
+                train_size=0.5,
+                stratify=False,
+            ),
+        )
+
+        dataset = load_dataset(cfg)
+
+        assert dataset.target_is_categorical is False
+        assert dataset.all_categorical_columns == []
+        assert pd.api.types.is_float_dtype(dataset.full_df["target"])
+
+
+def test_legacy_dataset_assumes_categorical_target(make_dataset):
+    dataset = make_dataset()
+
+    assert dataset.target_is_categorical is True
+    assert dataset.all_categorical_columns == ["target"]
 
 
 class TestRemapBinaryOneTwo:

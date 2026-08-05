@@ -175,6 +175,7 @@ def run_generation(
     # split and/or the imputed one -- see gen_cfg.tabpfn.data_variants)
     # ------------------------------------------------------------------
     if gen_cfg.tabpfn.enabled:
+        tpfn.validate_tabpfn_target(dataset.target_column, dataset.target_is_categorical)
         for data_variant in gen_cfg.tabpfn.data_variants:
             if data_variant == "imputed":
                 train_df_variant = dataset.train_imputed_df
@@ -192,6 +193,8 @@ def run_generation(
                         dataset.categorical_columns,
                         dataset.target_column,
                         n_samples,
+                        target_is_categorical=dataset.target_is_categorical,
+                        variable_schema_fingerprint=dataset.variable_schema_fingerprint,
                     ),
                 )
             if "custom" in gen_cfg.tabpfn.variants:
@@ -202,6 +205,8 @@ def run_generation(
                         dataset.categorical_columns,
                         dataset.target_column,
                         n_samples,
+                        target_is_categorical=dataset.target_is_categorical,
+                        variable_schema_fingerprint=dataset.variable_schema_fingerprint,
                     ),
                 )
 
