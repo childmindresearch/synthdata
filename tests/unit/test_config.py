@@ -32,6 +32,11 @@ class TestFromDict:
         cfg = _from_dict(Config, {})
         assert cfg == Config()
 
+    def test_default_hpo_privacy_objective_excludes_domias(self):
+        cfg = _from_dict(Config, {})
+
+        assert cfg.generation.hpo.metric_config["privacy"] == ["identifiability_score"]
+
     def test_flat_fields_applied(self):
         cfg = _from_dict(Config, {"name": "mydata", "seed": 7})
         assert cfg.name == "mydata"
@@ -90,6 +95,13 @@ class TestFromDict:
         assert cfg.imputation.refidiff.denoiser == "mamba"
         assert cfg.imputation.refidiff.catboost_warmup_iterations == 1000
         assert cfg.imputation.benchmark.enabled
+
+    @pytest.mark.parametrize("config_name", ["config_hepatitis.yaml", "config_loris.yaml"])
+    def test_shipped_hpo_profiles_exclude_domias(self, config_name):
+        root = Path(__file__).parents[2]
+        cfg = load_config(root / "configs" / config_name)
+
+        assert cfg.generation.hpo.metric_config["privacy"] == ["identifiability_score"]
 
     def test_evaluation_binary_target_nested_dict_builds_nested_dataclass(self):
         cfg = _from_dict(

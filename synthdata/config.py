@@ -293,7 +293,9 @@ class HPOConfig:
             ],
             "sanity": ["nearest_syn_neighbor_distance"],
             "performance": ["xgb"],
-            "privacy": ["identifiability_score", "DomiasMIA_prior"],
+            # DOMIAS is deferred from HPO until its high-dimensional KDE
+            # failure modes have a separately validated treatment.
+            "privacy": ["identifiability_score"],
         }
     )
     #: Optuna storage URL, e.g. "sqlite:///output/dataset/optuna_studies.db".
