@@ -99,28 +99,33 @@ def cleanup_hpo_generator_checkpoints(
     workspace: str | Path,
     study: optuna.Study,
     plugin_name: str,
-    target_trials: int,
 ) -> int:
     """Compact completed synthcity HPO generator caches.
 
     Synthcity stores a fully serialized generator for every benchmark trial.
     Keep the best trial and the highest-numbered trial with a saved generator
-    as conservative recovery artifacts; remove the other generator caches only
-    after the study reaches its configured completed-trial target. Metric and
-    synthetic-data caches are intentionally left untouched.
+    as conservative recovery artifacts once no trial is running; remove the
+    other generator caches even when a time-limited study finished below its
+    configured target. Metric and synthetic-data caches are intentionally left
+    untouched.
     """
     if not plugin_name:
         raise ValueError("plugin_name must not be empty")
-    if target_trials < 1:
-        raise ValueError(f"target_trials must be positive, got {target_trials}")
 
+    running = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.RUNNING]
     completed = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
-    if len(completed) < target_trials:
+    if running:
         logger.info(
-            "[%s] HPO incomplete (%d/%d completed); retaining generator checkpoints in %s",
+            "[%s] HPO still has %d running trial(s); retaining generator checkpoints in %s",
             study.study_name,
-            len(completed),
-            target_trials,
+            len(running),
+            workspace,
+        )
+        return 0
+    if not completed:
+        logger.info(
+            "[%s] HPO has no completed trials; retaining generator checkpoints in %s",
+            study.study_name,
             workspace,
         )
         return 0
@@ -233,9 +238,10 @@ def run_study(
     is capped during search for speed, so the searched value is unreliable and
     generation should fall back to the plugin's own default instead.
 
-    When both checkpoint arguments are provided, completed synthcity HPO
-    studies retain only their best and latest generator caches. Incomplete
-    studies retain every cache so an interrupted run remains recoverable.
+    When both checkpoint arguments are provided, synthcity HPO studies with no
+    running trial retain only their best and latest generator caches. Studies
+    with a running trial or no completed trial retain every cache so an active
+    or unsuccessful run remains recoverable.
     """
     if (checkpoint_workspace is None) != (checkpoint_plugin is None):
         raise ValueError("checkpoint_workspace and checkpoint_plugin must be provided together")
@@ -277,7 +283,6 @@ def run_study(
             checkpoint_workspace,
             study,
             checkpoint_plugin,
-            len(completed),
         )
     return best
 

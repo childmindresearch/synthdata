@@ -52,13 +52,15 @@ def test_completed_hpo_keeps_best_and_latest_generator_checkpoints(tmp_path):
     assert not (workspace / "data_trial_0_tvae_augmentation_cache_3.11.15_generator_0.bkp").exists()
 
 
-def test_incomplete_hpo_retains_all_generator_checkpoints(tmp_path):
+def test_partial_hpo_keeps_best_and_latest_generator_checkpoints(tmp_path):
     workspace = tmp_path / "synthcity_workspace"
 
     def objective(trial):
         path = workspace / f"data_trial_{trial.number}_tvae_cache_3.11.15_generator_0.bkp"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"checkpoint")
+        if trial.number == 0:
+            return 1.0
         raise optuna.TrialPruned()
 
     run_study(
@@ -72,4 +74,6 @@ def test_incomplete_hpo_retains_all_generator_checkpoints(tmp_path):
         checkpoint_plugin="tvae",
     )
 
-    assert len(list(workspace.glob("*_generator_0.bkp"))) == 3
+    assert (workspace / "data_trial_0_tvae_cache_3.11.15_generator_0.bkp").exists()
+    assert (workspace / "data_trial_2_tvae_cache_3.11.15_generator_0.bkp").exists()
+    assert not (workspace / "data_trial_1_tvae_cache_3.11.15_generator_0.bkp").exists()
