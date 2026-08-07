@@ -84,11 +84,14 @@ def main() -> None:
                 if dataset.train_imputed_df is not None
                 else dataset.train_df
             )
+            real_df = dataset.decode_ordinal_frame(real_df)
+            df = dataset.decode_ordinal_frame(df)
             fig = plot_real_vs_synthetic(
                 real_df,
                 df,
                 dataset.feature_columns + [dataset.target_column],
                 dataset.all_categorical_columns,
+                category_orders=dataset.ordinal_category_orders,
             )
             save_matplotlib_figure(
                 fig,

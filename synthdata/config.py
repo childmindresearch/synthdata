@@ -208,12 +208,13 @@ class ImputationConfig:
     round_to_int_default: bool = True
     #: Reuse previously cached imputed CSVs if present *and* still valid: validity
     #: is determined by comparing a hash of the resolved schema/config fields
-    #: (categorical roles, ordinal orders, method,
-    #: round_rules, round_to_int_default, refidiff params) against the sidecar
-    #: ``.imputation_cache_key.json`` written alongside the cached CSVs, so
-    #: editing e.g. ``data.nominal_columns``/``data.ordinal_columns`` and
-    #: rerunning correctly retrains instead of silently reusing stale imputed
-    #: data (see synthdata.imputation.pipeline.run_imputation).
+    #: (categorical roles, ordinal orders, method, round_rules,
+    #: round_to_int_default, refidiff params) and exact source/full/train/test
+    #: fingerprints against the sidecar ``.imputation_cache_key.json`` written
+    #: alongside the cached CSVs. Editing e.g. ``data.nominal_columns``/
+    #: ``data.ordinal_columns`` or refreshing source/split membership therefore
+    #: retrains instead of silently reusing stale imputed data (see
+    #: synthdata.imputation.pipeline.run_imputation).
     cache: bool = True
     #: Fractional margin used when validating imputed continuous values fall within range.
     validation_margin: float = 0.2

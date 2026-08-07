@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from synthdata.data import Dataset
-from synthdata.plotting import add_histogram_with_kde, save_matplotlib_figure
+from synthdata.plotting import add_histogram_with_kde, ordered_categories, save_matplotlib_figure
 
 
 def plot_column_distributions(
@@ -14,6 +14,7 @@ def plot_column_distributions(
     columns: list,
     categorical_columns: list,
     ncols: int = 5,
+    category_orders: dict | None = None,
 ):
     """Grid of categorical bars and continuous density histograms with KDEs."""
     import matplotlib.pyplot as plt
@@ -27,8 +28,12 @@ def plot_column_distributions(
     for ax, col in zip(axes_flat, columns, strict=False):
         series = df[col].dropna()
         if col in categorical_columns:
-            counts = series.value_counts().sort_index()
-            ax.bar(counts.index.astype(str), counts.values, zorder=3)
+            counts = series.value_counts()
+            categories = ordered_categories(
+                set(counts.index), category_orders.get(col) if category_orders else None
+            )
+            counts = counts.reindex(categories, fill_value=0)
+            ax.bar([str(category) for category in categories], counts.values, zorder=3)
         else:
             add_histogram_with_kde(ax, series, bins=20, label="data")
             ax.set_ylabel("density")
@@ -65,8 +70,12 @@ def save_data_plots(
     dataset: Dataset, output_dir: str | Path, dpi: int = 150, formats=("png",)
 ) -> None:
     output_dir = Path(output_dir)
+    full_df = dataset.decode_ordinal_frame(dataset.full_df)
     fig1 = plot_column_distributions(
-        dataset.full_df, dataset.feature_columns, dataset.categorical_columns
+        full_df,
+        dataset.feature_columns,
+        dataset.categorical_columns,
+        category_orders=dataset.ordinal_category_orders,
     )
     save_matplotlib_figure(fig1, output_dir / "data" / "column_distributions", dpi, formats)
 

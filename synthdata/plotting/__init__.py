@@ -11,6 +11,17 @@ from synthdata.utils import ensure_dir, get_logger
 logger = get_logger(__name__)
 
 
+def ordered_categories(values: set, configured_order: list | None = None) -> list:
+    """Return category labels in configured order with a safe fallback for extras."""
+    present = set(values)
+    ordered = [value for value in configured_order or [] if value in present]
+    extras = present - set(ordered)
+    try:
+        return ordered + sorted(extras)
+    except TypeError:
+        return ordered + sorted(extras, key=str)
+
+
 def add_histogram_with_kde(
     ax,
     values: pd.Series,

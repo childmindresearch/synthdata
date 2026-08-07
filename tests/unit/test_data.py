@@ -12,6 +12,7 @@ from synthdata.data import (
     _load_local_file,
     cast_integer_like_columns,
     decode_label_encoded_columns,
+    decode_ordinal_columns,
     encode_ordinal_columns,
     infer_nominal_columns,
     label_encode_non_numeric_columns,
@@ -206,6 +207,10 @@ class TestVariableSchema:
             "Medium",
             "High",
         ]
+        assert manifest["source_fingerprint"] == dataset.source_fingerprint
+        assert manifest["full_fingerprint"] == dataset.full_fingerprint
+        assert manifest["train_split_fingerprint"] == dataset.train_split_fingerprint
+        assert manifest["test_split_fingerprint"] == dataset.test_split_fingerprint
 
     def test_continuous_target_remains_continuous_in_dataset_metadata(self, tmp_path):
         raw_path = tmp_path / "raw.csv"
@@ -367,6 +372,26 @@ class TestEncodeOrdinalColumns:
         )
         assert out["activity"].tolist()[:3] == [3.0, 1.0, 0.0]
         assert np.isnan(out["activity"].iloc[3])
+
+    def test_decodes_back_to_configured_string_labels(self):
+        df = pd.DataFrame({"activity": ["Heavy", "Light", "Very Light", None]})
+        encoded = encode_ordinal_columns(
+            df, {"activity": ["Very Light", "Light", "Moderate", "Heavy"]}
+        )
+
+        decoded = decode_ordinal_columns(
+            encoded, {"activity": ["Very Light", "Light", "Moderate", "Heavy"]}
+        )
+
+        assert decoded["activity"].tolist()[:3] == ["Heavy", "Light", "Very Light"]
+        assert pd.isna(decoded["activity"].iloc[3])
+
+    def test_rejects_invalid_model_space_code(self):
+        with pytest.raises(ValueError, match="activity"):
+            decode_ordinal_columns(
+                pd.DataFrame({"activity": [0.5]}),
+                {"activity": ["Low", "High"]},
+            )
 
     def test_raises_on_unknown_observed_category(self):
         df = pd.DataFrame({"activity": ["Light", "Unheard Of"]})

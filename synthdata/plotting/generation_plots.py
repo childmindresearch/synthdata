@@ -11,7 +11,12 @@ import pandas as pd
 from synthdata.config import Config
 from synthdata.data import Dataset
 from synthdata.generation.hpo import default_storage_url
-from synthdata.plotting import add_histogram_with_kde, save_matplotlib_figure, save_plotly_figure
+from synthdata.plotting import (
+    add_histogram_with_kde,
+    ordered_categories,
+    save_matplotlib_figure,
+    save_plotly_figure,
+)
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -40,6 +45,7 @@ def plot_real_vs_synthetic(
     feature_columns: list,
     categorical_columns: list,
     ncols: int = 4,
+    category_orders: dict | None = None,
 ):
     """Per-column comparison with categorical bars and continuous KDEs."""
     import matplotlib.pyplot as plt
@@ -58,12 +64,9 @@ def plot_real_vs_synthetic(
             real_freq = _category_value_counts(real_df[col])
             synth_freq = _category_value_counts(synth_df[col])
             all_categories = set(real_freq.index) | set(synth_freq.index)
-            try:
-                categories = sorted(all_categories)
-            except TypeError:
-                # Mixed types (e.g. real is text-valued but synthesis produced a
-                # stray numeric code) -- fall back to a stable, comparable order.
-                categories = sorted(all_categories, key=str)
+            categories = ordered_categories(
+                all_categories, category_orders.get(col) if category_orders else None
+            )
             positions = np.arange(len(categories))
             width = 0.4
             ax.bar(
@@ -112,13 +115,23 @@ def save_generation_plots(
     import matplotlib.pyplot as plt
 
     output_dir = Path(output_dir) / "generation"
-    real_df = dataset.train_imputed_df
+    real_model_df = dataset.train_imputed_df
+    if real_model_df is None:
+        raise RuntimeError("save_generation_plots() requires imputed training data")
+    real_df = dataset.decode_ordinal_frame(real_model_df)
     all_columns = dataset.feature_columns + [dataset.target_column]
     categorical = dataset.all_categorical_columns
 
     for name, synth_df in synthetic_datasets.items():
         try:
-            fig = plot_real_vs_synthetic(real_df, synth_df, all_columns, categorical)
+            decoded_synth_df = dataset.decode_ordinal_frame(synth_df)
+            fig = plot_real_vs_synthetic(
+                real_df,
+                decoded_synth_df,
+                all_columns,
+                categorical,
+                category_orders=dataset.ordinal_category_orders,
+            )
             save_matplotlib_figure(fig, output_dir / name, cfg.plots.dpi, cfg.plots.formats)
         except (ValueError, TypeError, OSError, RuntimeError) as exc:
             logger.warning("real-vs-synthetic plot failed for %s: %s", name, exc)

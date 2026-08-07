@@ -17,14 +17,42 @@ import numpy as np
 import pandas as pd
 
 from synthdata.config import Config
-from synthdata.data import Dataset
+from synthdata.data import (
+    IMPUTATION_CACHE_KEY_FILENAME,
+    Dataset,
+    dataframe_fingerprint,
+    load_imputed_splits,
+)
 from synthdata.utils import ensure_dir, get_logger, resolve_device
 
 logger = get_logger(__name__)
 
 #: Sidecar filename (under ``dataset.data_dir``) recording the config fields that
 #: determined the currently-cached imputed CSVs -- see :func:`_cache_key_record`.
-_CACHE_KEY_FILENAME = ".imputation_cache_key.json"
+_CACHE_KEY_FILENAME = IMPUTATION_CACHE_KEY_FILENAME
+
+
+def _persist_decoded_imputed_splits(dataset: Dataset) -> None:
+    """Persist label-preserving views alongside numeric model-space caches."""
+    dataset.attach_decoded_imputed_splits()
+    decoded_frames = {
+        "full_imputed_decoded": dataset.full_imputed_decoded_df,
+        "train_imputed_decoded": dataset.train_imputed_decoded_df,
+        "test_imputed_decoded": dataset.test_imputed_decoded_df,
+    }
+    missing = [name for name, frame in decoded_frames.items() if frame is None]
+    if missing:
+        raise RuntimeError(
+            f"Cannot persist decoded imputed data because split(s) are missing: {missing}"
+        )
+    paths = dataset.paths()
+    for name, frame in decoded_frames.items():
+        frame.to_csv(paths[name], index=False)
+    logger.info(
+        "Wrote ordinal-decoded imputed splits under %s (model-space caches remain in "
+        "full_imputed.csv/train_imputed.csv/test_imputed.csv)",
+        dataset.data_dir,
+    )
 
 
 def _impute_dataframe(cfg: Config, df: pd.DataFrame, dataset: Dataset, device: str) -> pd.DataFrame:
@@ -123,7 +151,10 @@ def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
     ``dataset.nominal_columns``/``dataset.ordinal_columns`` (the already-resolved
     lists) rather than the written schema/config directly, so equivalent
     declarations correctly hash identically. The exact ordinal orders are
-    included because RefiDiff's categorical encoding preserves that order.
+    included because RefiDiff's categorical encoding preserves that order. Exact
+    fingerprints of the full source and deterministic train/test splits are also
+    included so a refreshed source export cannot reuse an imputation cache merely
+    because its columns and resolved schema happen to be unchanged.
     """
     imp_cfg = cfg.imputation
     payload = {
@@ -141,6 +172,12 @@ def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
         "imputation_method": imp_cfg.method,
         "round_rules": imp_cfg.round_rules,
         "round_to_int_default": imp_cfg.round_to_int_default,
+        "dataset_version": dataset.version,
+        "variable_schema_fingerprint": dataset.variable_schema_fingerprint,
+        "source_fingerprint": dataset.source_fingerprint,
+        "full_fingerprint": dataframe_fingerprint(dataset.full_df),
+        "train_split_fingerprint": dataframe_fingerprint(dataset.train_df),
+        "test_split_fingerprint": dataframe_fingerprint(dataset.test_df),
     }
     if imp_cfg.method == "refidiff":
         payload["refidiff"] = dataclasses.asdict(imp_cfg.refidiff)
@@ -187,12 +224,12 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
     Caches to ``full_imputed.csv``/``train_imputed.csv``/``test_imputed.csv`` under
     ``cfg.data.data_dir``; reused on subsequent runs unless ``cfg.imputation.cache``
     is False. Reuse also requires the cache-key sidecar file
-    (``.imputation_cache_key.json``, also under ``data_dir``) to match a fresh
-    hash of the current config's imputation-relevant fields (see
-    :func:`_cache_key_payload`) -- so editing e.g. ``nominal_columns``/
-    ``ordinal_columns`` or ``imputation.method`` and rerunning correctly
-    retrains instead of silently reusing stale imputed CSVs from before the
-    change.
+    ``.imputation_cache_key.json``, also under ``data_dir``) to match a fresh
+    hash of the current config's imputation-relevant fields and exact
+    source/split fingerprints (see :func:`_cache_key_payload`) -- so editing
+    e.g. ``nominal_columns``/``ordinal_columns`` or refreshing the source and
+    rerunning correctly retrains instead of silently reusing stale imputed
+    CSVs from before the change.
     """
     paths = dataset.paths()
     cache_key_path = dataset.data_dir / _CACHE_KEY_FILENAME
@@ -207,13 +244,20 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
     )
 
     if cfg.imputation.cache and cached_csvs_exist and cached_key == current_key:
-        logger.info(
-            "Using cached imputed data at %s (cache_key=%s)", dataset.data_dir, current_key[:16]
+        dataset = load_imputed_splits(dataset)
+        if dataset.full_imputed_df is not None:
+            _persist_decoded_imputed_splits(dataset)
+            logger.info(
+                "Using cached imputed data at %s (cache_key=%s)",
+                dataset.data_dir,
+                current_key[:16],
+            )
+            return dataset
+        logger.warning(
+            "Imputation cache key matched at %s, but cached frames failed provenance/shape "
+            "validation; retraining",
+            dataset.data_dir,
         )
-        dataset.full_imputed_df = pd.read_csv(paths["full_imputed"])
-        dataset.train_imputed_df = pd.read_csv(paths["train_imputed"])
-        dataset.test_imputed_df = pd.read_csv(paths["test_imputed"])
-        return dataset
 
     if cfg.imputation.cache and cached_csvs_exist and cached_key != current_key:
         logger.info(
@@ -273,6 +317,11 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
         )
     train_imputed.to_csv(paths["train_imputed"], index=False)
     test_imputed.to_csv(paths["test_imputed"], index=False)
+    cache_record["imputed_row_counts"] = {
+        "full": len(full_imputed),
+        "train": len(train_imputed),
+        "test": len(test_imputed),
+    }
     with open(cache_key_path, "w") as f:
         json.dump(cache_record, f, indent=2, sort_keys=True, default=str)
     logger.info("Wrote imputation cache-key %s to %s", current_key[:16], cache_key_path)
@@ -280,6 +329,7 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
     dataset.full_imputed_df = full_imputed
     dataset.train_imputed_df = train_imputed
     dataset.test_imputed_df = test_imputed
+    _persist_decoded_imputed_splits(dataset)
     return dataset
 
 

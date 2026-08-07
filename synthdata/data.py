@@ -27,6 +27,32 @@ from synthdata.utils import ensure_dir, get_logger, git_commit
 
 logger = get_logger(__name__)
 
+IMPUTATION_CACHE_KEY_FILENAME = ".imputation_cache_key.json"
+
+
+def dataframe_fingerprint(df: pd.DataFrame) -> str:
+    """Return a stable fingerprint for a DataFrame's values and structure."""
+    metadata = {
+        "columns": [str(column) for column in df.columns],
+        "dtypes": [str(dtype) for dtype in df.dtypes],
+        "index_dtype": str(df.index.dtype),
+        "index_name": df.index.name,
+        "shape": list(df.shape),
+    }
+    digest = hashlib.sha256(json.dumps(metadata, sort_keys=True, default=str).encode())
+    values = pd.util.hash_pandas_object(df, index=True).to_numpy(dtype=np.uint64, copy=False)
+    digest.update(values.tobytes())
+    return digest.hexdigest()
+
+
+def file_fingerprint(path: str | Path) -> str:
+    """Return the SHA-256 fingerprint of a source file's exact bytes."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source_file:
+        for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 
 @dataclasses.dataclass
 class Dataset:
@@ -56,11 +82,32 @@ class Dataset:
     variable_schema: dict = dataclasses.field(default_factory=dict)
     #: SHA-256 fingerprint of the exact source schema CSV, if one was used.
     variable_schema_fingerprint: str | None = None
+    #: SHA-256 fingerprint of the exact local source file, or of the raw loaded
+    #: source frame for sources without a local file.
+    source_fingerprint: str | None = None
+    #: Fingerprints of the cleaned source frame and deterministic split frames.
+    full_fingerprint: str | None = None
+    train_split_fingerprint: str | None = None
+    test_split_fingerprint: str | None = None
 
-    #: Populated once imputation has run (see synthdata.imputation).
+    #: Numeric model-space frames populated once imputation has run
+    #: (see synthdata.imputation).
     full_imputed_df: pd.DataFrame | None = None
     train_imputed_df: pd.DataFrame | None = None
     test_imputed_df: pd.DataFrame | None = None
+    #: User-facing copies with configured ordinal labels restored.
+    full_imputed_decoded_df: pd.DataFrame | None = None
+    train_imputed_decoded_df: pd.DataFrame | None = None
+    test_imputed_decoded_df: pd.DataFrame | None = None
+
+    def __post_init__(self) -> None:
+        """Capture fingerprints for the exact frames held by this dataset."""
+        if self.full_fingerprint is None:
+            self.full_fingerprint = dataframe_fingerprint(self.full_df)
+        if self.train_split_fingerprint is None:
+            self.train_split_fingerprint = dataframe_fingerprint(self.train_df)
+        if self.test_split_fingerprint is None:
+            self.test_split_fingerprint = dataframe_fingerprint(self.test_df)
 
     @property
     def categorical_columns(self) -> list:
@@ -76,6 +123,20 @@ class Dataset:
         ``ordinal_columns`` directly only when the distinction actually matters.
         """
         return list(self.nominal_columns) + list(self.ordinal_columns)
+
+    @property
+    def ordinal_category_orders(self) -> dict:
+        """Return configured ordinal labels in their low-to-high order."""
+        return {
+            column: list(self.variable_schema[column]["ordinal_order"])
+            for column in self.ordinal_columns
+            if column in self.variable_schema
+            and self.variable_schema[column].get("ordinal_order") is not None
+        }
+
+    def decode_ordinal_frame(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Restore configured ordinal labels in a model-space DataFrame."""
+        return decode_ordinal_columns(df, self.ordinal_category_orders)
 
     @property
     def target_is_categorical(self) -> bool:
@@ -106,7 +167,28 @@ class Dataset:
             "full_imputed": d / "full_imputed.csv",
             "train_imputed": d / "train_imputed.csv",
             "test_imputed": d / "test_imputed.csv",
+            "full_imputed_decoded": d / "full_imputed_decoded.csv",
+            "train_imputed_decoded": d / "train_imputed_decoded.csv",
+            "test_imputed_decoded": d / "test_imputed_decoded.csv",
         }
+
+    def attach_decoded_imputed_splits(self) -> None:
+        """Attach decoded user-facing views for any loaded imputed splits."""
+        self.full_imputed_decoded_df = (
+            self.decode_ordinal_frame(self.full_imputed_df)
+            if self.full_imputed_df is not None
+            else None
+        )
+        self.train_imputed_decoded_df = (
+            self.decode_ordinal_frame(self.train_imputed_df)
+            if self.train_imputed_df is not None
+            else None
+        )
+        self.test_imputed_decoded_df = (
+            self.decode_ordinal_frame(self.test_imputed_df)
+            if self.test_imputed_df is not None
+            else None
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +511,45 @@ def encode_ordinal_columns(df: pd.DataFrame, ordinal_categories: dict) -> pd.Dat
     return out
 
 
+def decode_ordinal_columns(df: pd.DataFrame, ordinal_categories: dict) -> pd.DataFrame:
+    """Restore ordinal labels from their zero-based model-space codes.
+
+    ``ordinal_categories`` maps each column to the labels used by
+    :func:`encode_ordinal_columns`, ordered from low to high. Missing values
+    remain missing. Non-integral or out-of-range codes are rejected instead of
+    silently producing an invalid category label.
+    """
+    out = df.copy()
+    for col, categories in ordinal_categories.items():
+        if col not in out.columns:
+            raise KeyError(
+                f"Ordinal decoder references column {col!r}, which is not present in the "
+                f"DataFrame. Available columns: {list(out.columns)}"
+            )
+        if not categories:
+            raise ValueError(f"Ordinal decoder has no categories configured for column {col!r}")
+
+        try:
+            codes = pd.to_numeric(out[col], errors="raise")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Ordinal column {col!r} contains non-numeric model-space values and cannot "
+                "be decoded"
+            ) from exc
+
+        non_integral = codes.notna() & codes.mod(1).ne(0)
+        out_of_range = codes.notna() & ((codes < 0) | (codes >= len(categories)))
+        if non_integral.any() or out_of_range.any():
+            invalid_codes = codes[non_integral | out_of_range].dropna().tolist()
+            raise ValueError(
+                f"Ordinal column {col!r} contains invalid model-space code(s) "
+                f"{invalid_codes}; expected integral values in [0, {len(categories) - 1}]"
+            )
+
+        out[col] = codes.map(dict(enumerate(categories)))
+    return out
+
+
 def warn_non_numeric_feature_columns(
     df: pd.DataFrame, feature_columns: list, categorical_columns: list
 ) -> list:
@@ -634,6 +755,10 @@ def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
         "ordinal_columns": dataset.ordinal_columns,
         "variable_schema": dataset.variable_schema,
         "variable_schema_fingerprint": dataset.variable_schema_fingerprint,
+        "source_fingerprint": dataset.source_fingerprint,
+        "full_fingerprint": dataframe_fingerprint(dataset.full_df),
+        "train_split_fingerprint": dataframe_fingerprint(dataset.train_df),
+        "test_split_fingerprint": dataframe_fingerprint(dataset.test_df),
         "sensitive_columns": dataset.sensitive_columns,
         "n_rows": int(len(dataset.full_df)),
         "n_train": int(len(dataset.train_df)),
@@ -660,8 +785,10 @@ def load_dataset(cfg: Config) -> Dataset:
 
     if cfg.data.source == "uci":
         df, variable_types = _load_uci(cfg, data_dir)
+        source_fingerprint = dataframe_fingerprint(df)
     elif cfg.data.source in ("csv", "parquet"):
         df, variable_types = _load_local_file(cfg)
+        source_fingerprint = file_fingerprint(cfg.data.path)
     else:
         raise ValueError(f"Unknown data.source: {cfg.data.source!r}")
 
@@ -785,6 +912,7 @@ def load_dataset(cfg: Config) -> Dataset:
         version=cfg.data.version,
         variable_schema=variable_schema,
         variable_schema_fingerprint=variable_schema_fingerprint,
+        source_fingerprint=source_fingerprint,
     )
 
     paths = dataset.paths()
@@ -813,12 +941,89 @@ def load_dataset(cfg: Config) -> Dataset:
 
 
 def load_imputed_splits(dataset: Dataset) -> Dataset:
-    """Attach already-imputed CSVs (produced by synthdata.imputation) to a Dataset."""
+    """Attach imputed CSVs only when their source and split provenance still matches."""
     paths = dataset.paths()
-    if paths["full_imputed"].exists():
-        dataset.full_imputed_df = pd.read_csv(paths["full_imputed"])
-    if paths["train_imputed"].exists():
-        dataset.train_imputed_df = pd.read_csv(paths["train_imputed"])
-    if paths["test_imputed"].exists():
-        dataset.test_imputed_df = pd.read_csv(paths["test_imputed"])
+    imputed_paths = {
+        "full": paths["full_imputed"],
+        "train": paths["train_imputed"],
+        "test": paths["test_imputed"],
+    }
+    if not all(path.exists() for path in imputed_paths.values()):
+        return dataset
+
+    provenance_path = dataset.data_dir / IMPUTATION_CACHE_KEY_FILENAME
+    if not provenance_path.exists():
+        logger.warning(
+            "Ignoring imputed CSVs under %s because provenance file %s is missing; "
+            "rerun imputation to create a validated cache",
+            dataset.data_dir,
+            provenance_path,
+        )
+        return dataset
+    try:
+        with provenance_path.open() as provenance_file:
+            provenance = json.load(provenance_file)
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "Ignoring imputed CSVs under %s because provenance file %s is invalid (%s); "
+            "rerun imputation",
+            dataset.data_dir,
+            provenance_path,
+            exc,
+        )
+        return dataset
+
+    expected_provenance = {
+        "source_fingerprint": dataset.source_fingerprint,
+        "full_fingerprint": dataframe_fingerprint(dataset.full_df),
+        "train_split_fingerprint": dataframe_fingerprint(dataset.train_df),
+        "test_split_fingerprint": dataframe_fingerprint(dataset.test_df),
+    }
+    mismatches = {
+        field: (provenance.get(field), expected)
+        for field, expected in expected_provenance.items()
+        if provenance.get(field) != expected
+    }
+    if mismatches:
+        logger.warning(
+            "Ignoring stale imputed CSVs under %s; source/split fingerprints differ: %s",
+            dataset.data_dir,
+            mismatches,
+        )
+        return dataset
+
+    frames = {name: pd.read_csv(path) for name, path in imputed_paths.items()}
+    expected_columns = dataset.full_df.columns.tolist()
+    recorded_row_counts = provenance.get("imputed_row_counts")
+    if isinstance(recorded_row_counts, dict) and all(
+        isinstance(recorded_row_counts.get(name), int) for name in imputed_paths
+    ):
+        expected_rows = {name: recorded_row_counts[name] for name in imputed_paths}
+    else:
+        expected_rows = {
+            "full": len(dataset.full_df),
+            "train": len(dataset.train_df),
+            "test": len(dataset.test_df),
+        }
+    invalid_frames = {
+        name: {
+            "rows": len(frame),
+            "expected_rows": expected_rows[name],
+            "columns_match": frame.columns.tolist() == expected_columns,
+        }
+        for name, frame in frames.items()
+        if len(frame) != expected_rows[name] or frame.columns.tolist() != expected_columns
+    }
+    if invalid_frames:
+        logger.warning(
+            "Ignoring imputed CSVs under %s because cached frame shapes/columns are stale: %s",
+            dataset.data_dir,
+            invalid_frames,
+        )
+        return dataset
+
+    dataset.full_imputed_df = frames["full"]
+    dataset.train_imputed_df = frames["train"]
+    dataset.test_imputed_df = frames["test"]
+    dataset.attach_decoded_imputed_splits()
     return dataset

@@ -3,8 +3,10 @@
 import json
 import logging
 
+import pandas as pd
 import pytest
 
+from synthdata.data import load_imputed_splits
 from synthdata.imputation.pipeline import (
     _CACHE_KEY_FILENAME,
     _cache_key_payload,
@@ -70,6 +72,30 @@ class TestCacheKeyPayload:
             != _cache_key_record(cfg_b, dataset)["cache_key"]
         )
 
+    def test_source_data_change_changes_hash(self, make_config, make_dataset):
+        cfg = make_config()
+        dataset_a = make_dataset()
+        dataset_b = make_dataset()
+        dataset_b.full_df = dataset_b.full_df.copy()
+        dataset_b.full_df.loc[dataset_b.full_df.index[0], "age"] = 99
+
+        assert (
+            _cache_key_record(cfg, dataset_a)["cache_key"]
+            != _cache_key_record(cfg, dataset_b)["cache_key"]
+        )
+
+    def test_split_membership_change_changes_hash(self, make_config, make_dataset):
+        cfg = make_config()
+        dataset_a = make_dataset()
+        dataset_b = make_dataset()
+        dataset_b.train_df = dataset_b.test_df.copy()
+        dataset_b.test_df = dataset_a.train_df.copy()
+
+        assert (
+            _cache_key_record(cfg, dataset_a)["cache_key"]
+            != _cache_key_record(cfg, dataset_b)["cache_key"]
+        )
+
     def test_refidiff_params_included_only_for_refidiff_method(self, make_config, make_dataset):
         cfg = make_config()
         cfg.imputation.method = "tabimpute"
@@ -115,6 +141,64 @@ class TestLoadCachedKey:
 
 
 class TestRunImputationCaching:
+    def test_persists_and_reloads_decoded_ordinal_splits(self, make_config, make_dataset, mocker):
+        cfg = make_config()
+        encoded = pd.DataFrame(
+            {
+                "activity": [0.0, 1.0, None, 0.0],
+                "target": [0, 1, 0, 1],
+            }
+        )
+        dataset = make_dataset(
+            df=encoded,
+            feature_columns=["activity"],
+            ordinal_columns=["activity"],
+        )
+        dataset.variable_schema = {
+            "activity": {
+                "kind": "categorical",
+                "ordinal_order": ["Low", "High"],
+            },
+            "target": {"kind": "categorical", "ordinal_order": None},
+        }
+        mocker.patch(
+            "synthdata.imputation.tabimpute_backend.impute_dataframe",
+            return_value=encoded.fillna({"activity": 1.0}),
+        )
+
+        run_imputation(cfg, dataset)
+
+        assert dataset.full_imputed_decoded_df["activity"].tolist() == [
+            "Low",
+            "High",
+            "High",
+            "Low",
+        ]
+        decoded_path = dataset.paths()["full_imputed_decoded"]
+        assert pd.read_csv(decoded_path)["activity"].tolist() == [
+            "Low",
+            "High",
+            "High",
+            "Low",
+        ]
+
+        reloaded = make_dataset(
+            df=encoded,
+            feature_columns=["activity"],
+            ordinal_columns=["activity"],
+            name=dataset.name,
+        )
+        reloaded.data_dir = dataset.data_dir
+        reloaded.variable_schema = dataset.variable_schema
+        load_imputed_splits(reloaded)
+
+        assert reloaded.full_imputed_decoded_df["activity"].tolist() == [
+            "Low",
+            "High",
+            "High",
+            "Low",
+        ]
+
     def test_first_run_calls_backend_and_writes_cache_key(self, make_config, make_dataset, mocker):
         cfg = make_config()
         dataset = make_dataset()
@@ -153,6 +237,44 @@ class TestRunImputationCaching:
         run_imputation(cfg, dataset_b)
 
         assert mock_impute.call_count == 2  # retrained instead of reusing stale cache
+
+    def test_source_data_change_forces_retrain(self, make_config, make_dataset, mocker):
+        cfg = make_config()
+        dataset = make_dataset()
+        mock_impute = mocker.patch(
+            "synthdata.imputation.tabimpute_backend.impute_dataframe",
+            return_value=dataset.full_df.fillna(0),
+        )
+        run_imputation(cfg, dataset)
+
+        dataset_b = make_dataset(name=dataset.name)
+        dataset_b.data_dir = dataset.data_dir
+        dataset_b.full_df = dataset_b.full_df.copy()
+        dataset_b.full_df.loc[dataset_b.full_df.index[0], "age"] = 99
+        run_imputation(cfg, dataset_b)
+
+        assert mock_impute.call_count == 2
+
+    def test_changed_split_membership_rejects_cached_imputation(
+        self, make_config, make_dataset, mocker
+    ):
+        cfg = make_config()
+        dataset = make_dataset()
+        mock_impute = mocker.patch(
+            "synthdata.imputation.tabimpute_backend.impute_dataframe",
+            return_value=dataset.full_df.fillna(0),
+        )
+        run_imputation(cfg, dataset)
+
+        changed = make_dataset(name=dataset.name)
+        changed.data_dir = dataset.data_dir
+        changed.train_df = changed.test_df.copy()
+        changed.test_df = dataset.train_df.copy()
+        load_imputed_splits(changed)
+
+        assert changed.train_imputed_df is None
+        assert changed.test_imputed_df is None
+        mock_impute.assert_called_once()
 
     def test_cache_disabled_always_retrains(self, make_config, make_dataset, mocker):
         cfg = make_config()

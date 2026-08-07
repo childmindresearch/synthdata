@@ -7,7 +7,7 @@ import pandas as pd
 
 from synthdata.config import Config
 from synthdata.data import Dataset
-from synthdata.plotting import add_histogram_with_kde, save_matplotlib_figure
+from synthdata.plotting import add_histogram_with_kde, ordered_categories, save_matplotlib_figure
 
 
 def plot_observed_vs_imputed(
@@ -16,6 +16,7 @@ def plot_observed_vs_imputed(
     columns_with_missing: list,
     categorical_columns: list,
     ncols: int = 4,
+    category_orders: dict | None = None,
 ):
     """For each column with missing values: observed vs. imputed distribution."""
     import matplotlib.pyplot as plt
@@ -39,20 +40,25 @@ def plot_observed_vs_imputed(
         n_imputed = int(missing_mask.sum())
 
         if col in categorical_columns:
-            obs_counts = observed.value_counts(normalize=True).sort_index()
-            imp_counts = imputed.value_counts(normalize=True).sort_index()
-            categories = sorted(set(obs_counts.index) | set(imp_counts.index))
+            obs_counts = observed.value_counts(normalize=True)
+            imp_counts = imputed.value_counts(normalize=True)
+            all_categories = set(obs_counts.index) | set(imp_counts.index)
+            categories = ordered_categories(
+                all_categories, category_orders.get(col) if category_orders else None
+            )
+            obs_frequencies = obs_counts.to_dict()
+            imp_frequencies = imp_counts.to_dict()
             positions = np.arange(len(categories))
             width = 0.4
             ax.bar(
                 positions - width / 2,
-                [obs_counts.get(c, 0) for c in categories],
+                [obs_frequencies.get(c, 0) for c in categories],
                 width,
                 label="observed",
             )
             ax.bar(
                 positions + width / 2,
-                [imp_counts.get(c, 0) for c in categories],
+                [imp_frequencies.get(c, 0) for c in categories],
                 width,
                 label="imputed",
             )
@@ -92,9 +98,20 @@ def save_imputation_plots(
     cfg: Config, dataset: Dataset, validation_df: pd.DataFrame, output_dir: str | Path
 ) -> None:
     output_dir = Path(output_dir)
-    columns_with_missing = [c for c in dataset.feature_columns if dataset.full_df[c].isna().any()]
+    full_imputed_model_df = dataset.full_imputed_df
+    if full_imputed_model_df is None:
+        raise RuntimeError("save_imputation_plots() requires imputed data")
+    full_df = dataset.decode_ordinal_frame(dataset.full_df)
+    full_imputed_df = dataset.full_imputed_decoded_df
+    if full_imputed_df is None:
+        full_imputed_df = dataset.decode_ordinal_frame(full_imputed_model_df)
+    columns_with_missing = [c for c in dataset.feature_columns if full_df[c].isna().any()]
     fig1 = plot_observed_vs_imputed(
-        dataset.full_df, dataset.full_imputed_df, columns_with_missing, dataset.categorical_columns
+        full_df,
+        full_imputed_df,
+        columns_with_missing,
+        dataset.categorical_columns,
+        category_orders=dataset.ordinal_category_orders,
     )
     save_matplotlib_figure(
         fig1, output_dir / "imputation" / "observed_vs_imputed", cfg.plots.dpi, cfg.plots.formats
