@@ -7,26 +7,49 @@ and the syntheval benchmark result caching helpers.
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
+from syntheval.execution import build_metric_execution
 
 from synthdata.config import FrameworkSelectionConfig, SynthEvalExecutionConfig
-from synthdata.evaluation.catalog import FAIRNESS_METRICS_WITH_POSITIVE_CLASS, SYNTHEVAL_PRESET
+from synthdata.data import dataframe_fingerprint, semantic_context_digest
+from synthdata.evaluation.catalog import (
+    FAIRNESS_METRICS_WITH_POSITIVE_CLASS,
+    SYNTHEVAL_PRESET,
+    syntheval_execution_keys_by_framework,
+    syntheval_execution_manifest,
+)
 from synthdata.evaluation.syntheval_eval import (
     BINARY_ONLY_METRICS,
     _atomic_parquet,
     _checkpoint_paths,
     _compute_cache_key,
+    _evaluation_context_fingerprint,
+    _evaluation_role_frames,
+    _execution_payload_failed,
+    _execution_payload_succeeded,
+    _execution_sidecar_payload,
+    _failed_execution_payload,
+    _frame_fingerprint,
     _load_syntheval_cache,
+    _run_resumable_syntheval,
     _save_syntheval_cache,
     _shutdown_nested_joblib_executor,
+    _structured_observations,
     build_binary_preset,
     build_binary_target_series,
+    build_group_context,
+    build_metric_execution_passes,
     build_preset,
+    build_syntheval_tables_from_executions,
+    extend_syntheval_expected_diagnostics,
     merge_binary_target_results,
     resolve_model_workers,
+    run_syntheval_evaluation,
+    validate_syntheval_results,
 )
 
 pytestmark = pytest.mark.unit
@@ -107,6 +130,156 @@ class TestBuildPreset:
         preset = build_preset(self._selection(enabled=False))
         assert preset == {}
 
+    def test_multiclass_native_preset_excludes_binary_only_metrics(self):
+        preset = build_preset(self._selection(), target_is_binary=False)
+
+        assert not set(BINARY_ONLY_METRICS) & set(preset)
+        assert "dwm" in preset
+
+
+class TestEvaluationRoleContext:
+    def test_final_holdout_has_a_distinct_evidence_context(self, make_canonical_dataset):
+        dataset = make_canonical_dataset()
+        train_for_tuning, tuning = _evaluation_role_frames(dataset, "tuning")
+        train_for_final, final_holdout = _evaluation_role_frames(dataset, "final_holdout")
+
+        candidate_context = _evaluation_context_fingerprint(
+            dataset,
+            {},
+            "main",
+            False,
+            fit_frame=train_for_tuning,
+            tuning_frame=tuning,
+            evaluation_role="tuning",
+        )
+        final_context = _evaluation_context_fingerprint(
+            dataset,
+            {},
+            "main",
+            False,
+            fit_frame=train_for_final,
+            tuning_frame=final_holdout,
+            evaluation_role="final_holdout",
+        )
+
+        assert train_for_tuning is train_for_final
+        assert tuning is not final_holdout
+        assert candidate_context != final_context
+
+    def test_candidate_context_ignores_holdout_assignment_changes(self, make_canonical_dataset):
+        dataset = make_canonical_dataset()
+        train_frame, tuning = _evaluation_role_frames(dataset, "tuning")
+        candidate_before = _evaluation_context_fingerprint(
+            dataset,
+            {},
+            "main",
+            False,
+            fit_frame=train_frame,
+            tuning_frame=tuning,
+            evaluation_role="tuning",
+        )
+
+        dataset.assignment = dataset.assignment.copy()
+        final_rows = dataset.assignment["role"].eq("final_holdout")
+        dataset.assignment.loc[final_rows, "population_group_hash"] = "holdout-only-change"
+        dataset.assignment_fingerprint = dataframe_fingerprint(dataset.assignment)
+
+        candidate_after = _evaluation_context_fingerprint(
+            dataset,
+            {},
+            "main",
+            False,
+            fit_frame=train_frame,
+            tuning_frame=tuning,
+            evaluation_role="tuning",
+        )
+        assert candidate_after == candidate_before
+
+    def test_semantic_context_changes_evaluation_cache_identity(self, make_canonical_dataset):
+        dataset = make_canonical_dataset()
+        train_frame, tuning = _evaluation_role_frames(dataset, "tuning")
+        semantic_context = {
+            "schema_version": "semantic-context-v1",
+            "target_column": "target",
+            "task_type": "classification",
+            "feature_columns": ["feature", "protected"],
+            "protected_columns": ["protected"],
+            "quasi_identifier_columns": ["feature"],
+            "feature_types": {
+                "feature": "continuous",
+                "protected": "categorical",
+                "target": "categorical",
+            },
+            "source_table": {"feature": "measurements"},
+        }
+        first = _evaluation_context_fingerprint(
+            dataset,
+            {},
+            "main",
+            False,
+            fit_frame=train_frame,
+            tuning_frame=tuning,
+            semantic_context=semantic_context,
+        )
+        changed_context = {**semantic_context, "quasi_identifier_columns": ["protected"]}
+
+        assert semantic_context_digest(semantic_context) != semantic_context_digest(changed_context)
+        assert (
+            _evaluation_context_fingerprint(
+                dataset,
+                {},
+                "main",
+                False,
+                fit_frame=train_frame,
+                tuning_frame=tuning,
+                semantic_context=changed_context,
+            )
+            != first
+        )
+
+    def test_main_resumable_evaluation_receives_semantic_context(
+        self, make_canonical_dataset, monkeypatch, tmp_path
+    ):
+        dataset = make_canonical_dataset()
+        semantic_context = {
+            "schema_version": "semantic-context-v1",
+            "task_type": "classification",
+        }
+        captured = {}
+
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval._load_syntheval_cache",
+            lambda *args, **kwargs: None,
+        )
+
+        def fake_run_resumable(*args, **kwargs):
+            captured["semantic_context"] = kwargs["semantic_context"]
+            return pd.DataFrame(), pd.DataFrame(), {}
+
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval._run_resumable_syntheval",
+            fake_run_resumable,
+        )
+
+        run_syntheval_evaluation(
+            {"model_a": dataset.role_frame("train", imputed=True)},
+            dataset,
+            FrameworkSelectionConfig(),
+            preset_dir=tmp_path,
+            output_folder=tmp_path / "syntheval",
+            semantic_context=semantic_context,
+        )
+
+        assert captured["semantic_context"] == semantic_context
+
+    def test_final_holdout_is_rejected_for_legacy_dataset(self, make_dataset):
+        dataset = make_dataset()
+        dataset.train_imputed_df = dataset.train_df.copy()
+        dataset.test_imputed_df = dataset.test_df.copy()
+
+        with pytest.raises(RuntimeError, match="final-holdout evaluation"):
+            _evaluation_role_frames(dataset, "final_holdout")
+
 
 class TestBuildBinaryPreset:
     def _selection(self, **overrides) -> FrameworkSelectionConfig:
@@ -129,6 +302,62 @@ class TestBuildBinaryPreset:
     def test_category_selection_excludes_fairness_excludes_fairness_metrics(self):
         preset = build_binary_preset(self._selection(categories=["utility"]))
         assert set(preset) == {"auroc_diff"}
+
+
+class TestSynthEvalExecutionManifest:
+    def test_repaired_metrics_require_static_v2_rows(self):
+        manifest = syntheval_execution_manifest(
+            {"dwm": {}, "corr_diff": {}, "ks_test": {}},
+            include_holdout_outputs=True,
+        )
+
+        assert manifest["dwm"] == ("avg_dwm_diff",)
+        assert manifest["corr_diff"] == ("corr_mat_diff_v2",)
+        assert manifest["ks_test"] == ("ks_tvd_stat_v2", "frac_ks_sigs_v2")
+
+        assert syntheval_execution_keys_by_framework(manifest) == {
+            "syntheval": [
+                "avg_dwm_diff",
+                "corr_mat_diff_v2",
+                "ks_tvd_stat_v2",
+                "frac_ks_sigs_v2",
+            ],
+            "custom": [],
+        }
+
+    def test_classification_manifest_tracks_resolved_v2_score_policy(self):
+        macro = syntheval_execution_manifest(
+            {"cls_acc": {"F1_type": "micro"}},
+            include_holdout_outputs=True,
+        )
+        balanced = syntheval_execution_manifest(
+            {"cls_acc": {"F1_type": "balanced_accuracy"}},
+            include_holdout_outputs=False,
+        )
+
+        assert macro["cls_acc"] == (
+            "avg_macro_F1_diff_v2",
+            "avg_macro_F1_diff_v2_hout",
+        )
+        assert balanced["cls_acc"] == ("avg_balanced_accuracy_diff_v2",)
+
+    def test_full_output_manifest_requires_declared_target_and_group_rows(self):
+        manifest = syntheval_execution_manifest(
+            {
+                "statistical_parity": {"full_output": True},
+                "equalized_odds": {"full_output": True},
+                "equal_opportunity": {"full_output": True},
+            },
+            include_holdout_outputs=False,
+            target_columns=["Target Label"],
+            protected_columns=["Sex"],
+        )
+
+        assert manifest == {
+            "statistical_parity": ("statistical_parity", "sp_target_label_Sex"),
+            "equalized_odds": ("equalized_odds", "eqo_target_label_Sex"),
+            "equal_opportunity": ("equal_opportunity", "eo_target_label_Sex"),
+        }
 
 
 class TestMergeBinaryTargetResults:
@@ -185,6 +414,643 @@ class TestMergeBinaryTargetResults:
         assert results["rank"].tolist() == [0.9]
         assert ranks["auroc_diff"].tolist() == [0.7]
         assert ranks["rank"].tolist() == [0.9]
+
+    def test_native_metric_wins_when_binary_pass_collides(self):
+        main_results = self._comb_df({"auroc": ([0.1], [0.01])}, rank=[0.9])
+        main_ranks = pd.DataFrame({"auroc": [0.9], "rank": [0.9]}, index=["m1"])
+        binary_results = self._comb_df({"auroc": ([0.6], [0.06])}, rank=[0.2])
+        binary_ranks = pd.DataFrame({"auroc": [0.4], "rank": [0.2]}, index=["m1"])
+
+        results, ranks = merge_binary_target_results(
+            main_results, main_ranks, binary_results, binary_ranks
+        )
+
+        assert results[("auroc", "value")].tolist() == [0.1]
+        assert results[("auroc", "error")].tolist() == [0.01]
+        assert ranks["auroc"].tolist() == [0.9]
+
+
+class TestSynthEvalMetricValidation:
+    def test_failed_execution_payload_retain_expected_keys_as_failure_evidence(self):
+        payload = _failed_execution_payload(
+            model_name="model_a",
+            pass_name="main",
+            target_view="native",
+            expected_manifest_digest="manifest-hash",
+            expected_output_manifest={"metric_method": ("metric_a",)},
+            context_fingerprint="context-hash",
+            role_context={},
+            group_context=None,
+            failure_status={"exit_code": 1, "failure_reason": "worker failed"},
+        )
+
+        assert _execution_payload_failed(
+            payload,
+            expected_manifest={"metric_method": ("metric_a",)},
+            expected_pass_id="main",
+            expected_target_view="native",
+        )
+        assert not _execution_payload_succeeded(payload)
+        status = payload["metric_executions"][0]["status"]
+        assert status["failed_keys"] == ["metric_a"]
+        assert status["missing_keys"] == ["metric_a"]
+
+    def test_known_qualified_diagnostics_remain_successful_at_root_boundary(self):
+        execution = build_metric_execution(
+            "equalized_odds",
+            [
+                {"metric": "equalized_odds", "val": 0.1},
+                {"metric": "eqo_target_group", "val": 0.2},
+            ],
+            expected_keys=["equalized_odds"],
+        )
+
+        assert execution.status.succeeded is True
+
+    def test_structured_tables_prefer_v2_values_over_legacy_rows(self):
+        executions = {
+            "model_a": {
+                "metric_executions": [
+                    {
+                        "method": "corr_diff",
+                        "status": {"expected_keys": ["corr_mat_diff_v2"]},
+                        "normalized_rows": [
+                            {
+                                "metric": "corr_mat_diff",
+                                "dim": "u",
+                                "val": 0.9,
+                                "err": 0.1,
+                                "n_val": 0.1,
+                                "n_err": 0.01,
+                            }
+                        ],
+                        "normalized_rows_v2": [
+                            {
+                                "metric": "corr_mat_diff_v2",
+                                "dim": "u",
+                                "val": 0.2,
+                                "err": 0.02,
+                                "n_val": 0.8,
+                                "n_err": 0.08,
+                                "raw_value": 0.2,
+                                "normalized_value": 0.8,
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+
+        results, ranks = build_syntheval_tables_from_executions(
+            executions,
+            ["model_a"],
+            "summation",
+        )
+
+        assert results.loc["model_a", ("corr_mat_diff_v2", "value")] == 0.2
+        assert ranks.loc["model_a", "corr_mat_diff_v2"] == 0.8
+
+    def test_selected_normalized_metric_missing_is_indeterminate(self):
+        results = pd.DataFrame(index=["model_a"])
+        results[("avg_dwm_diff", "value")] = [0.2]
+        results.columns = pd.MultiIndex.from_tuples(results.columns)
+        ranks = pd.DataFrame({"avg_dwm_diff": [0.8]}, index=["model_a"])
+        expected = {
+            "syntheval": ["avg_dwm_diff", "pca_eigval_diff"],
+            "custom": [],
+        }
+
+        validations = validate_syntheval_results(
+            results,
+            ranks,
+            expected,
+            role_hashes={"train": "train-hash", "test": "test-hash"},
+            model_names=["model_a"],
+            requested_use="audit",
+        )
+
+        validation = validations[("syntheval", "main")]["model_a"]
+        assert validation.expected_keys == ("avg_dwm_diff", "pca_eigval_diff")
+        assert validation.completed_keys == ("avg_dwm_diff",)
+        assert validation.indeterminate_keys == ("pca_eigval_diff",)
+        assert validation.expected_records[1].status == "missing"
+        assert validation.decision_status == "indeterminate"
+
+    def test_observed_qualified_diagnostics_are_contract_checked(self):
+        results = pd.DataFrame(index=["model_a"])
+        results[("statistical_parity", "value")] = [0.1]
+        results[("sp_target_sex", "value")] = [0.2]
+        results.columns = pd.MultiIndex.from_tuples(results.columns)
+        ranks = pd.DataFrame(
+            {"statistical_parity": [0.9], "sp_target_sex": [0.8]}, index=["model_a"]
+        )
+        expected = extend_syntheval_expected_diagnostics(
+            {"syntheval": ["statistical_parity"], "custom": []},
+            results,
+        )
+
+        validations = validate_syntheval_results(
+            results,
+            ranks,
+            expected,
+            role_hashes={"train": "train-hash", "test": "test-hash"},
+            model_names=["model_a"],
+            requested_use="audit",
+        )
+
+        validation = validations[("syntheval", "main")]["model_a"]
+        assert "sp_target_sex" not in validation.expected_keys
+        diagnostic_record = next(
+            record for record in validation.records if record.expected_key == "sp_target_sex"
+        )
+        assert diagnostic_record.is_expected is False
+        assert diagnostic_record.value_role == "diagnostic"
+        assert diagnostic_record.status == "unexpected"
+
+    def test_missing_declared_qualified_diagnostic_is_indeterminate(self):
+        results = pd.DataFrame(index=["model_a"])
+        results[("statistical_parity", "value")] = [0.1]
+        results.columns = pd.MultiIndex.from_tuples(results.columns)
+        ranks = pd.DataFrame({"statistical_parity": [0.9]}, index=["model_a"])
+        expected = syntheval_execution_keys_by_framework(
+            syntheval_execution_manifest(
+                {"statistical_parity": {"full_output": True}},
+                include_holdout_outputs=False,
+                target_columns=["target"],
+                protected_columns=["sex"],
+            )
+        )
+
+        validations = validate_syntheval_results(
+            results,
+            ranks,
+            expected,
+            role_hashes={"train": "train-hash", "tuning": "tuning-hash"},
+            model_names=["model_a"],
+            requested_use="audit",
+        )
+
+        validation = validations[("syntheval", "main")]["model_a"]
+        assert "sp_target_sex" in validation.expected_keys
+        assert (
+            next(
+                record
+                for record in validation.expected_records
+                if record.expected_key == "sp_target_sex"
+            ).status
+            == "missing"
+        )
+        assert validation.complete is False
+
+    def test_missing_qualified_diagnostics_do_not_change_static_expectations(self):
+        expected = extend_syntheval_expected_diagnostics(
+            {"syntheval": ["statistical_parity"], "custom": []},
+            pd.DataFrame(),
+            structured_executions={},
+        )
+
+        assert expected == {"syntheval": ["statistical_parity"], "custom": []}
+
+    def test_structured_execution_rows_select_v2_and_preserve_failures(self):
+        executions = {
+            "model_a": {
+                "model_name": "model_a",
+                "pass_id": "main",
+                "target_view": "native",
+                "metric_executions": [
+                    {
+                        "method": "corr_diff",
+                        "status": {
+                            "state": "succeeded",
+                            "expected_keys": ["corr_mat_diff_v2"],
+                            "failed_keys": [],
+                        },
+                        "normalized_rows": [{"metric": "corr_mat_diff", "val": 0.9, "n_val": 0.1}],
+                        "normalized_rows_v2": [
+                            {
+                                "metric": "corr_mat_diff_v2",
+                                "val": 0.2,
+                                "n_val": 0.8,
+                                "raw_value": 0.2,
+                                "normalized_value": 0.8,
+                                "metric_version": "v2",
+                            }
+                        ],
+                    },
+                    {
+                        "method": "ks_test",
+                        "status": {
+                            "state": "failed",
+                            "expected_keys": ["ks_tvd_stat_v2"],
+                            "failed_keys": ["ks_tvd_stat_v2"],
+                            "exception_message": "invalid support",
+                        },
+                        "normalized_rows": [],
+                        "normalized_rows_v2": [],
+                    },
+                ],
+            }
+        }
+        expected = {"syntheval": ["corr_mat_diff_v2", "ks_tvd_stat_v2"], "custom": []}
+
+        validations = validate_syntheval_results(
+            pd.DataFrame(),
+            None,
+            expected,
+            role_hashes={"train": "train-hash", "test": "test-hash"},
+            model_names=["model_a"],
+            requested_use="audit",
+            structured_executions=executions,
+        )
+
+        validation = validations[("syntheval", "main")]["model_a"]
+        assert validation.expected_records[0].raw_value == 0.2
+        assert validation.expected_records[0].source_metadata["normalized_value"] == 0.8
+        assert validation.expected_records[0].result_metadata == {}
+        assert validation.expected_records[0].status == "succeeded"
+        assert validation.expected_records[1].status == "failed"
+
+    @pytest.mark.parametrize(
+        ("emitted_key", "metadata", "expected_sample_size"),
+        [
+            ("corr_mat_diff_v2", {"valid_pairs": 7, "total_pairs": 8}, 7),
+            ("mutual_inf_diff_v2", {"valid_pairs": 5, "total_pairs": 6}, 5),
+            ("ks_tvd_stat_v2", {"valid_tests": 4, "support_size": 99}, 4),
+            ("frac_ks_sigs_v2", {"valid_tests": 4, "support_size": 99}, 4),
+            ("avg_h_dist_v2", {"valid_columns": 3, "support_size": 99}, 3),
+            ("avg_qMSE_v2", {"valid_columns": 2, "support_size": 99}, 2),
+            ("avg_pMSE_v2", {"oof_n": 12, "support_size": 99}, 12),
+        ],
+    )
+    def test_structured_observations_extract_declared_support_not_normalized_score(
+        self, emitted_key, metadata, expected_sample_size
+    ):
+        observations = _structured_observations(
+            {
+                "model_a": {
+                    "pass_id": "main",
+                    "target_view": "native",
+                    "metric_executions": [
+                        {
+                            "method": "metric_method",
+                            "status": {
+                                "state": "succeeded",
+                                "expected_keys": [emitted_key],
+                                "failed_keys": [],
+                            },
+                            "normalized_rows_v2": [
+                                {
+                                    "metric": emitted_key,
+                                    "val": 0.2,
+                                    "err": 0.01,
+                                    "n_val": 0.8,
+                                    "n_err": 0.02,
+                                    "raw_value": 0.2,
+                                    "normalized_value": 0.8,
+                                    "metric_version": "v2",
+                                    "metadata": metadata,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+            role_hashes={"train": "train-hash", "tuning": "tuning-hash"},
+        )
+
+        observation = observations["model_a"][0]
+        assert observation.sample_size == expected_sample_size
+        assert observation.uncertainty == pytest.approx(0.01)
+        assert observation.source_metadata["normalized_value"] == 0.8
+        assert observation.result_metadata == metadata
+        assert observation.source_metadata["result_metadata"] == metadata
+
+    def test_structured_observations_leave_unsupported_sample_size_missing(self):
+        observations = _structured_observations(
+            {
+                "model_a": {
+                    "pass_id": "main",
+                    "target_view": "native",
+                    "metric_executions": [
+                        {
+                            "method": "metric_method",
+                            "status": {
+                                "state": "succeeded",
+                                "expected_keys": ["auroc_v2"],
+                                "failed_keys": [],
+                            },
+                            "normalized_rows_v2": [
+                                {
+                                    "metric": "auroc_v2",
+                                    "val": 0.2,
+                                    "err": 0.01,
+                                    "n_val": 0.8,
+                                    "metadata": {"support_size": 99},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+            role_hashes={},
+        )
+
+        assert observations["model_a"][0].sample_size is None
+
+    def test_structured_observations_drop_non_finite_uncertainty(self):
+        observations = _structured_observations(
+            {
+                "model_a": {
+                    "pass_id": "main",
+                    "target_view": "native",
+                    "metric_executions": [
+                        {
+                            "method": "metric_method",
+                            "status": {"state": "succeeded", "failed_keys": []},
+                            "normalized_rows": [
+                                {
+                                    "metric": "mia_recall",
+                                    "val": 0.2,
+                                    "err": float("nan"),
+                                    "n_val": 0.8,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+            role_hashes={},
+        )
+
+        assert observations["model_a"][0].uncertainty is None
+
+    def test_main_pass_wins_for_repeated_emitted_key(self):
+        class Validation:
+            def __init__(self, expected_keys, completed_keys=None):
+                self.expected_keys = expected_keys
+                self.completed_keys = expected_keys if completed_keys is None else completed_keys
+
+        execution_passes = build_metric_execution_passes(
+            {
+                ("syntheval", "main"): {"model_a": Validation(("auroc", "avg_dwm_diff"))},
+                ("syntheval", "binary_target"): {"model_a": Validation(("auroc",))},
+            }
+        )
+
+        assert execution_passes[("syntheval", "auroc", "model_a")] == "main"
+        assert execution_passes[("syntheval", "avg_dwm_diff", "model_a")] == "main"
+
+    def test_execution_pass_ownership_is_model_specific(self):
+        class Validation:
+            def __init__(self, expected_keys, completed_keys=()):
+                self.expected_keys = expected_keys
+                self.completed_keys = completed_keys
+
+        execution_passes = build_metric_execution_passes(
+            {
+                ("syntheval", "main"): {
+                    "model_a": Validation(("auroc",), ("auroc",)),
+                    "model_b": Validation(("auroc",)),
+                },
+                ("syntheval", "binary_target"): {
+                    "model_a": Validation(("auroc",), ("auroc",)),
+                    "model_b": Validation(("auroc",), ("auroc",)),
+                },
+            }
+        )
+
+        assert execution_passes[("syntheval", "auroc", "model_a")] == "main"
+        assert execution_passes[("syntheval", "auroc", "model_b")] == "binary_target"
+
+    def test_binary_pass_owns_repeated_key_when_main_is_missing(self):
+        main_results = pd.DataFrame(index=["model_a"])
+        main_validations = validate_syntheval_results(
+            main_results,
+            None,
+            {"syntheval": ["auroc"]},
+            role_hashes={"train": "train-hash", "test": "test-hash"},
+            model_names=["model_a"],
+            requested_use="audit",
+        )
+
+        binary_results = pd.DataFrame(index=["model_a"])
+        binary_results[("auroc", "value")] = [0.6]
+        binary_results.columns = pd.MultiIndex.from_tuples(binary_results.columns)
+        binary_ranks = pd.DataFrame({"auroc": [0.4]}, index=["model_a"])
+        binary_validations = validate_syntheval_results(
+            binary_results,
+            binary_ranks,
+            {"syntheval": ["auroc"]},
+            role_hashes={"train": "train-hash", "test": "test-hash"},
+            model_names=["model_a"],
+            execution_pass="binary_target",
+            target_view="binary_collapsed",
+            requested_use="audit",
+        )
+
+        assert main_validations[("syntheval", "main")]["model_a"].indeterminate_keys == ("auroc",)
+        assert binary_validations[("syntheval", "binary_target")]["model_a"].completed_keys == (
+            "auroc",
+        )
+        execution_passes = build_metric_execution_passes({**main_validations, **binary_validations})
+
+        assert execution_passes[("syntheval", "auroc", "model_a")] == "binary_target"
+
+
+class TestGroupContext:
+    @staticmethod
+    def _dataset(make_dataset):
+        frame = pd.DataFrame(
+            {
+                "patient_id": [1, 1, 2, 2, 3, 3],
+                "feature": [0, 1, 2, 3, 4, 5],
+                "target": [0, 1, 0, 1, 0, 1],
+            }
+        )
+        dataset = make_dataset(
+            df=frame,
+            feature_columns=["patient_id", "feature"],
+        )
+        dataset.train_imputed_df = frame.iloc[:4].copy()
+        dataset.test_imputed_df = frame.iloc[4:].copy()
+        return dataset
+
+    def test_patient_group_context_records_role_fingerprints(self, make_dataset):
+        dataset = self._dataset(make_dataset)
+        synthetic = pd.DataFrame(
+            {
+                "patient_id": [10, 10, 11, 11],
+                "feature": [0, 1, 2, 3],
+                "target": [0, 1, 0, 1],
+            }
+        )
+
+        context = build_group_context(
+            dataset,
+            {"model_a": synthetic},
+            group_mode="patient_group",
+            group_column="patient_id",
+        )
+
+        assert context["population_unit"] == "patient_group"
+        assert context["roles"]["train"]["groups"] == 2
+        assert context["roles"]["holdout"]["groups"] == 1
+        assert len(context["roles"]["train"]["fingerprint"]) == 64
+        assert context["models"]["model_a"]["groups"] == 2
+
+    def test_patient_group_context_rejects_missing_synthetic_identifier(self, make_dataset):
+        dataset = self._dataset(make_dataset)
+        synthetic = dataset.train_imputed_df.drop(columns=["patient_id"])
+
+        with pytest.raises(ValueError, match="missing from synthetic model 'model_a' frame"):
+            build_group_context(
+                dataset,
+                {"model_a": synthetic},
+                group_mode="patient_group",
+                group_column="patient_id",
+            )
+
+    @pytest.mark.parametrize("role, attribute", [("train", "train"), ("holdout", "test")])
+    def test_patient_group_context_rejects_missing_real_identifier(
+        self, make_dataset, role, attribute
+    ):
+        dataset = self._dataset(make_dataset)
+        frame = getattr(dataset, f"{attribute}_imputed_df").drop(columns=["patient_id"])
+        setattr(dataset, f"{attribute}_imputed_df", frame)
+        synthetic = dataset.train_imputed_df.copy()
+        synthetic["patient_id"] = 10
+
+        with pytest.raises(ValueError, match="missing from .* frame"):
+            build_group_context(
+                dataset,
+                {"model_a": synthetic},
+                group_mode="patient_group",
+                group_column="patient_id",
+            )
+
+    def test_patient_group_context_rejects_null_identifier(self, make_dataset):
+        dataset = self._dataset(make_dataset)
+        dataset.train_imputed_df = dataset.train_imputed_df.copy()
+        dataset.train_imputed_df.loc[dataset.train_imputed_df.index[0], "patient_id"] = None
+        synthetic = dataset.train_imputed_df.copy()
+
+        with pytest.raises(ValueError, match="contains missing values in train frame"):
+            build_group_context(
+                dataset,
+                {"model_a": synthetic},
+                group_mode="patient_group",
+                group_column="patient_id",
+            )
+
+    def test_patient_group_context_rejects_train_holdout_overlap(self, make_dataset):
+        dataset = self._dataset(make_dataset)
+        dataset.test_imputed_df = dataset.test_imputed_df.copy()
+        dataset.test_imputed_df.loc[:, "patient_id"] = [2, 3]
+        synthetic = dataset.train_imputed_df.copy()
+
+        with pytest.raises(ValueError, match="overlap between train and holdout"):
+            build_group_context(
+                dataset,
+                {"model_a": synthetic},
+                group_mode="patient_group",
+                group_column="patient_id",
+            )
+
+    def test_patient_group_validation_marks_row_only_metric_unsafe(self):
+        results = pd.DataFrame(index=["model_a"])
+        results[("avg_dwm_diff", "value")] = [0.2]
+        results.columns = pd.MultiIndex.from_tuples(results.columns)
+        ranks = pd.DataFrame({"avg_dwm_diff": [0.8]}, index=["model_a"])
+
+        validations = validate_syntheval_results(
+            results,
+            ranks,
+            {"syntheval": ["avg_dwm_diff"], "custom": []},
+            role_hashes={"train": "train-hash", "test": "test-hash"},
+            model_names=["model_a"],
+            requested_use="audit",
+            population_unit="patient_group",
+            group_mode="patient_group",
+            resolved_configuration={"group_column": "patient_id"},
+        )
+
+        validation = validations[("syntheval", "main")]["model_a"]
+        assert validation.expected_records[0].status == "group_unsafe"
+        assert validation.decision_eligible is False
+        assert validation.evaluation_context.group_mode == "patient_group"
+        assert validation.evaluation_context.resolved_configuration["group_column"] == "patient_id"
+
+    @pytest.mark.parametrize(
+        ("framework", "emitted_key"),
+        [
+            ("syntheval", "avg_dwm_diff"),
+            ("syntheval", "mia_recall"),
+            ("syntheval", "sp_target_sex"),
+            ("custom", "eo_target_sex"),
+        ],
+    )
+    def test_patient_group_validation_blocks_unsupported_metric_families(
+        self, framework, emitted_key
+    ):
+        results = pd.DataFrame({(emitted_key, "value"): [0.2]}, index=["model_a"])
+        results.columns = pd.MultiIndex.from_tuples(results.columns)
+        ranks = pd.DataFrame({emitted_key: [0.2]}, index=["model_a"])
+
+        validations = validate_syntheval_results(
+            results,
+            ranks,
+            {
+                "syntheval": [emitted_key] if framework == "syntheval" else [],
+                "custom": [emitted_key] if framework == "custom" else [],
+            },
+            role_hashes={"train": "train-hash", "tuning": "tuning-hash"},
+            model_names=["model_a"],
+            requested_use="audit",
+            population_unit="patient_group",
+            group_mode="patient_group",
+        )
+
+        validation = validations[(framework, "main")]["model_a"]
+        assert validation.expected_records[0].status == "group_unsafe"
+        assert validation.decision_eligible is False
+
+    def test_execution_sidecar_contains_group_context(self):
+        execution = SimpleNamespace(
+            schema_version="syntheval-execution-v1",
+            pass_id="main",
+            target_view="native",
+            expected_manifest_digest="manifest-hash",
+            execution_complete=True,
+            policy_eligible=False,
+            preprocessing_fingerprint="preprocessing-hash",
+            preprocessing_metadata={"fit_role": "train"},
+            metric_executions=(),
+        )
+        group_context = {"group_mode": "patient_group", "group_column": "patient_id"}
+        semantic_context = {
+            "schema_version": "semantic-context-v1",
+            "target_column": "target",
+            "task_type": "classification",
+            "feature_columns": ["feature"],
+            "protected_columns": [],
+            "quasi_identifier_columns": [],
+            "feature_types": {"feature": "continuous", "target": "categorical"},
+            "source_table": {},
+        }
+
+        payload = _execution_sidecar_payload(
+            execution,
+            "model_a",
+            group_context,
+            semantic_context=semantic_context,
+        )
+
+        assert payload["model_name"] == "model_a"
+        assert payload["group_context"] == group_context
+        assert payload["preprocessing_fingerprint"] == "preprocessing-hash"
+        assert payload["preprocessing_metadata"] == {"fit_role": "train"}
+        assert payload["semantic_context"] == semantic_context
+        assert payload["semantic_context_digest"] == semantic_context_digest(semantic_context)
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +1214,397 @@ class TestResolveModelWorkers:
 
 
 class TestCheckpointPaths:
+    @staticmethod
+    def _execution_payload(state="succeeded"):
+        failed = [] if state == "succeeded" else ["metric_a"]
+        rows = (
+            [
+                {
+                    "metric": "metric_a",
+                    "dim": "u",
+                    "val": 0.5,
+                    "err": None,
+                    "n_val": 0.5,
+                    "n_err": None,
+                }
+            ]
+            if not failed
+            else []
+        )
+        return {
+            "schema_version": "syntheval-execution-v1",
+            "pass_id": "main",
+            "target_view": "native",
+            "execution_complete": True,
+            "execution_succeeded": state == "succeeded",
+            "metric_executions": [
+                {
+                    "method": "metric_method",
+                    "status": {
+                        "method": "metric_method",
+                        "state": state,
+                        "expected_keys": ["metric_a"],
+                        "observed_keys": [] if failed else ["metric_a"],
+                        "completed_keys": [] if failed else ["metric_a"],
+                        "failed_keys": failed,
+                        "missing_keys": [],
+                        "duplicate_keys": [],
+                        "non_finite_keys": [],
+                        "unexpected_keys": [],
+                    },
+                    "normalized_rows": rows,
+                    "normalized_rows_v2": [],
+                }
+            ],
+        }
+
+    def test_execution_payload_requires_all_metrics_to_succeed(self):
+        assert _execution_payload_succeeded(self._execution_payload()) is True
+        assert _execution_payload_succeeded(self._execution_payload("failed")) is False
+
+    def test_execution_payload_requires_structured_rows(self):
+        payload = self._execution_payload()
+        payload["metric_executions"][0]["normalized_rows"] = []
+
+        assert _execution_payload_succeeded(payload) is False
+
+    def test_execution_payload_rejects_non_finite_structured_values(self):
+        payload = self._execution_payload()
+        payload["metric_executions"][0]["normalized_rows"][0]["n_val"] = float("nan")
+
+        assert _execution_payload_succeeded(payload) is False
+
+    def test_execution_payload_binds_expected_manifest(self):
+        payload = self._execution_payload()
+
+        assert (
+            _execution_payload_succeeded(
+                payload,
+                expected_manifest={"metric_method": ("metric_a",)},
+                expected_pass_id="main",
+                expected_target_view="native",
+            )
+            is True
+        )
+        assert (
+            _execution_payload_succeeded(
+                payload,
+                expected_manifest={"metric_method": ("other_metric",)},
+                expected_pass_id="main",
+                expected_target_view="native",
+            )
+            is False
+        )
+
+    def test_resumable_run_returns_failed_model_evidence_with_cached_models(
+        self, tmp_path, make_canonical_dataset, monkeypatch
+    ):
+        dataset = make_canonical_dataset()
+        fit_frame, tuning_frame = _evaluation_role_frames(dataset, "tuning")
+        manifest = {"metric_method": ("metric_a",)}
+        context_fingerprint = _evaluation_context_fingerprint(
+            dataset,
+            {},
+            "main",
+            False,
+            expected_output_manifest=manifest,
+            fit_frame=fit_frame,
+            tuning_frame=tuning_frame,
+        )
+        expected_manifest_digest = "manifest-hash"
+        checkpoint_root = tmp_path / "checkpoints"
+        cached_dir, cached_status_path, cached_result_path = _checkpoint_paths(
+            checkpoint_root, "main", "model_cached"
+        )
+        cached_dir.mkdir(parents=True)
+        cached_frame = pd.DataFrame({"metric": ["metric_a"], "val": [0.5]})
+        _atomic_parquet(cached_result_path, cached_frame)
+        cached_status_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "state": "succeeded",
+                    "model_name": "model_cached",
+                    "context_fingerprint": context_fingerprint,
+                    "model_fingerprint": _frame_fingerprint(pd.DataFrame({"metric": ["cached"]})),
+                    "expected_manifest_digest": expected_manifest_digest,
+                    "plots_completed": False,
+                }
+            )
+        )
+        cached_execution = self._execution_payload()
+        cached_execution.update(
+            {
+                "model_name": "model_cached",
+                "context_fingerprint": context_fingerprint,
+                "expected_manifest_digest": expected_manifest_digest,
+            }
+        )
+        (cached_dir / "execution.json").write_text(json.dumps(cached_execution))
+
+        class FailedProcess:
+            pid = 123
+            exitcode = 1
+
+            def start(self):
+                return None
+
+            def is_alive(self):
+                return False
+
+            def join(self):
+                return None
+
+        class FailedContext:
+            def Process(self, **_kwargs):
+                return FailedProcess()
+
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval.multiprocessing.get_context",
+            lambda _method: FailedContext(),
+        )
+        cfg = SynthEvalExecutionConfig(model_workers=1, max_model_workers=1, cores_per_model=1)
+        synthetic_datasets = {
+            "model_cached": pd.DataFrame({"metric": ["cached"]}),
+            "model_failed": pd.DataFrame({"metric": ["failed"]}),
+        }
+
+        results, _ranks, executions = _run_resumable_syntheval(
+            synthetic_datasets,
+            dataset,
+            {},
+            tmp_path / "preset.json",
+            checkpoint_root,
+            "linear",
+            cfg,
+            "main",
+            expected_output_manifest=manifest,
+            expected_manifest_digest=expected_manifest_digest,
+            fit_frame=fit_frame,
+            tuning_frame=tuning_frame,
+        )
+
+        assert set(executions) == {"model_cached", "model_failed"}
+        assert executions["model_failed"]["execution_succeeded"] is False
+        assert executions["model_failed"]["metric_executions"][0]["status"]["failed_keys"] == [
+            "metric_a"
+        ]
+        assert results.loc["model_cached", ("metric_a", "value")] == 0.5
+        assert pd.isna(results.loc["model_failed", ("metric_a", "value")])
+
+    def test_resumable_run_preserves_partial_child_execution_evidence(
+        self, tmp_path, make_canonical_dataset, monkeypatch
+    ):
+        dataset = make_canonical_dataset()
+        fit_frame, tuning_frame = _evaluation_role_frames(dataset, "tuning")
+        manifest = {
+            "statistics": ("avg_dwm_diff",),
+            "ks_test": ("ks_tvd_stat_v2",),
+        }
+        context_fingerprint = _evaluation_context_fingerprint(
+            dataset,
+            {},
+            "main",
+            False,
+            expected_output_manifest=manifest,
+            fit_frame=fit_frame,
+            tuning_frame=tuning_frame,
+        )
+        expected_manifest_digest = "manifest-hash"
+        checkpoint_root = tmp_path / "checkpoints"
+        model_dir, _status_path, _result_path = _checkpoint_paths(
+            checkpoint_root, "main", "model_partial"
+        )
+        model_dir.mkdir(parents=True)
+
+        successful = build_metric_execution(
+            "statistics",
+            [
+                {
+                    "metric": "avg_dwm_diff",
+                    "dim": "u",
+                    "val": 0.2,
+                    "err": 0.01,
+                    "n_val": 0.8,
+                    "n_err": 0.02,
+                }
+            ],
+            expected_keys=manifest["statistics"],
+        )
+        failed = build_metric_execution(
+            "ks_test",
+            None,
+            expected_keys=manifest["ks_test"],
+            error=RuntimeError("invalid support"),
+        )
+        partial_execution = SimpleNamespace(
+            schema_version="syntheval-execution-v1",
+            pass_id="main",
+            target_view="native",
+            expected_manifest_digest=expected_manifest_digest,
+            execution_complete=True,
+            succeeded=False,
+            policy_eligible=False,
+            preprocessing_fingerprint="preprocessing-hash",
+            preprocessing_metadata={},
+            metric_executions=(successful, failed),
+        )
+        (model_dir / "execution.json").write_text(
+            json.dumps(
+                _execution_sidecar_payload(
+                    partial_execution,
+                    "model_partial",
+                    context_fingerprint=context_fingerprint,
+                    role_context={},
+                )
+            )
+        )
+
+        class FailedProcess:
+            pid = 123
+            exitcode = 1
+
+            def start(self):
+                return None
+
+            def is_alive(self):
+                return False
+
+            def join(self):
+                return None
+
+        class FailedContext:
+            def Process(self, **_kwargs):
+                return FailedProcess()
+
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval.multiprocessing.get_context",
+            lambda _method: FailedContext(),
+        )
+        cfg = SynthEvalExecutionConfig(model_workers=1, max_model_workers=1, cores_per_model=1)
+
+        results, ranks, executions = _run_resumable_syntheval(
+            {"model_partial": pd.DataFrame({"metric": ["partial"]})},
+            dataset,
+            {},
+            tmp_path / "preset.json",
+            checkpoint_root,
+            "summation",
+            cfg,
+            "main",
+            expected_output_manifest=manifest,
+            expected_manifest_digest=expected_manifest_digest,
+            fit_frame=fit_frame,
+            tuning_frame=tuning_frame,
+        )
+
+        payload = executions["model_partial"]
+        assert _execution_payload_failed(
+            payload,
+            expected_manifest=manifest,
+            expected_pass_id="main",
+            expected_target_view="native",
+        )
+        assert not _execution_payload_succeeded(payload)
+        assert payload["worker_exit"]["exit_code"] == 1
+        methods = {item["method"]: item for item in payload["metric_executions"]}
+        assert methods["statistics"]["status"]["state"] == "succeeded"
+        assert methods["ks_test"]["status"]["failed_keys"] == ["ks_tvd_stat_v2"]
+        assert results.loc["model_partial", ("avg_dwm_diff", "value")] == 0.2
+        assert pd.isna(results.loc["model_partial", ("ks_tvd_stat_v2", "value")])
+
+        observations = _structured_observations(executions, role_hashes={})
+        observed = {item.emitted_key: item for item in observations["model_partial"]}
+        assert observed["avg_dwm_diff"].raw_value == 0.2
+        assert observed["ks_tvd_stat_v2"].error == "invalid support"
+
+        validations = validate_syntheval_results(
+            results,
+            ranks,
+            {"syntheval": ["avg_dwm_diff", "ks_tvd_stat_v2"], "custom": []},
+            role_hashes={},
+            model_names=["model_partial"],
+            requested_use="policy_rank",
+            structured_executions=executions,
+        )
+        validation = validations[("syntheval", "main")]["model_partial"]
+        assert validation.complete is False
+        assert validation.decision_eligible is False
+
+    def test_failed_execution_sidecar_invalidates_checkpoint(self, tmp_path):
+        checkpoint_root = tmp_path / "evaluation" / "syntheval_benchmark"
+        model_dir, status_path, result_path = _checkpoint_paths(checkpoint_root, "main", "model_a")
+        model_dir.mkdir(parents=True)
+        context_fingerprint = "context-hash"
+        model_fingerprint = "model-hash"
+        expected_manifest_digest = "manifest-hash"
+        status_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "state": "succeeded",
+                    "model_name": "model_a",
+                    "context_fingerprint": context_fingerprint,
+                    "model_fingerprint": model_fingerprint,
+                    "expected_manifest_digest": expected_manifest_digest,
+                    "plots_completed": False,
+                }
+            )
+        )
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_parquet(result_path, pd.DataFrame({"metric": ["metric_a"], "val": [0.5]}))
+        execution = self._execution_payload("failed")
+        execution.update(
+            {
+                "model_name": "model_a",
+                "context_fingerprint": context_fingerprint,
+                "expected_manifest_digest": expected_manifest_digest,
+            }
+        )
+        (model_dir / "execution.json").write_text(json.dumps(execution))
+
+        from synthdata.evaluation.syntheval_eval import _valid_checkpoint
+
+        assert (
+            _valid_checkpoint(
+                checkpoint_root,
+                "main",
+                "model_a",
+                context_fingerprint,
+                model_fingerprint,
+                False,
+                expected_manifest_digest=expected_manifest_digest,
+            )
+            is None
+        )
+
+    def test_sidecar_loader_rejects_failed_execution(self, tmp_path):
+        model_dir, _status_path, _result_path = _checkpoint_paths(tmp_path, "main", "model_a")
+        model_dir.mkdir(parents=True)
+        payload = self._execution_payload("failed")
+        payload.update(
+            {
+                "model_name": "model_a",
+                "schema_version": "syntheval-execution-v1",
+                "expected_manifest_digest": "manifest-hash",
+                "context_fingerprint": "context-hash",
+            }
+        )
+        (model_dir / "execution.json").write_text(json.dumps(payload))
+
+        from synthdata.evaluation.syntheval_eval import _load_syntheval_execution_sidecars
+
+        assert (
+            _load_syntheval_execution_sidecars(
+                tmp_path,
+                "main",
+                ["model_a"],
+                "manifest-hash",
+                "context-hash",
+            )
+            is None
+        )
+
     def test_absolute_checkpoint_path_survives_plot_directory_change(self, tmp_path):
         checkpoint_root = tmp_path / "evaluation" / "syntheval_benchmark"
         model_dir, _, result_path = _checkpoint_paths(checkpoint_root.resolve(), "main", "model_a")

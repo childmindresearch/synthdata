@@ -7,10 +7,19 @@ import pytest
 
 from synthdata.evaluation.catalog import (
     LOG_DISPARITY_METRICS,
+    SYNTHCITY_METRIC_CONFIG,
     classify_syntheval_metric,
+    emitted_keys_for_synthcity_metrics,
     is_custom_syntheval_metric,
     is_redundant_synthcity_submetric,
     resolve_selection,
+    syntheval_execution_manifest,
+)
+from synthdata.evaluation.metric_contracts import UnknownMetricContractError
+from tests.unit.synthcity_emitted_key_fixtures import (
+    SELECTED_SYNTHCITY_ATTACK_TARGET_TYPES,
+    SELECTED_SYNTHCITY_EMITTED_KEY_FIXTURES,
+    SELECTED_SYNTHCITY_VARIABLE_COLUMNS,
 )
 
 pytestmark = pytest.mark.unit
@@ -55,7 +64,7 @@ class TestResolveSelection:
 class TestClassifySynthevalMetric:
     def test_known_metric_key_matches_dict(self):
         assert classify_syntheval_metric("statistical_parity") == "fairness"
-        assert classify_syntheval_metric("dwm") == "utility"
+        assert classify_syntheval_metric("avg_dwm_diff") == "utility"
         assert classify_syntheval_metric("nnaa") == "privacy"
 
     def test_auroc_diffs_actual_result_column_name_is_utility(self):
@@ -69,8 +78,9 @@ class TestClassifySynthevalMetric:
     def test_fairness_submetrics_are_fairness(self, prefix):
         assert classify_syntheval_metric(f"{prefix}CGAS_class_Sex") == "fairness"
 
-    def test_unknown_metric_defaults_to_utility(self):
-        assert classify_syntheval_metric("some_unrecognised_metric") == "utility"
+    def test_unknown_metric_fails_closed(self):
+        with pytest.raises(UnknownMetricContractError, match="some_unrecognised_metric"):
+            classify_syntheval_metric("some_unrecognised_metric")
 
 
 class TestIsCustomSynthevalMetric:
@@ -116,6 +126,77 @@ class TestIsRedundantSynthcitySubmetric:
     )
     def test_non_naive_submetrics_not_flagged(self, metric_key):
         assert is_redundant_synthcity_submetric(metric_key) is False
+
+
+class TestContextualEmittedKeys:
+    def test_synthcity_manifest_expands_declared_variables_and_attack_targets(self):
+        keys = emitted_keys_for_synthcity_metrics(
+            {
+                "stats": ["jensenshannon_dist"],
+                "attack": ["data_leakage_xgb"],
+            },
+            variable_columns=["age", "target"],
+            attack_target_types={"sex": "categorical", "income": "continuous"},
+        )
+
+        assert "stats.jensenshannon_dist.marginal" in keys
+        assert "stats.jensenshannon_dist.variable_v2.age" in keys
+        assert "stats.jensenshannon_dist.variable_v2.target" in keys
+        assert "stats.jensenshannon_dist.source_table_macro_v2" in keys
+        assert "stats.jensenshannon_dist.max_variable_v2" in keys
+        assert "attack.data_leakage_xgb.raw_accuracy.sex" in keys
+        assert "attack.data_leakage_xgb.baseline_adjusted_advantage_v2.sex" in keys
+        assert "attack.data_leakage_xgb.disclosure_risk_v2.income" in keys
+        assert "attack.data_leakage_xgb.n_eval.income" in keys
+
+    def test_syntheval_manifest_expands_only_explicit_full_output(self):
+        manifest = syntheval_execution_manifest(
+            {
+                "statistical_parity": {"full_output": True},
+                "dwm": {},
+            },
+            include_holdout_outputs=False,
+            target_columns=["Target Label"],
+            protected_columns=["Sex"],
+        )
+
+        assert manifest["statistical_parity"] == (
+            "statistical_parity",
+            "sp_target_label_Sex",
+        )
+        assert manifest["dwm"] == ("avg_dwm_diff",)
+
+
+class TestSynthcityEmittedKeyFixtures:
+    def test_selected_fixture_covers_every_configured_metric(self):
+        configured = {
+            (category, metric_name)
+            for category, metric_names in SYNTHCITY_METRIC_CONFIG.items()
+            for metric_name in metric_names
+        }
+        fixture_keys = {
+            (category, metric_name)
+            for category, metric_name, _expected_keys in SELECTED_SYNTHCITY_EMITTED_KEY_FIXTURES
+        }
+
+        assert fixture_keys == configured
+
+    @pytest.mark.parametrize(
+        ("category", "metric_name", "expected_keys"),
+        SELECTED_SYNTHCITY_EMITTED_KEY_FIXTURES,
+        ids=[
+            f"{category}.{metric_name}"
+            for category, metric_name, _expected_keys in SELECTED_SYNTHCITY_EMITTED_KEY_FIXTURES
+        ],
+    )
+    def test_selected_metric_manifest_matches_literal_fixture(
+        self, category, metric_name, expected_keys
+    ):
+        assert emitted_keys_for_synthcity_metrics(
+            {category: [metric_name]},
+            variable_columns=SELECTED_SYNTHCITY_VARIABLE_COLUMNS,
+            attack_target_types=SELECTED_SYNTHCITY_ATTACK_TARGET_TYPES,
+        ) == list(expected_keys)
 
 
 class TestLogDisparityMetricsExcludesMedian:

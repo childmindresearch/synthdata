@@ -25,6 +25,23 @@ def _combined_table(with_gate: bool = False, all_pass: bool = True):
 
 
 class TestBuildEvaluationReport:
+    def test_rejects_combined_table_without_overall_rank(self, make_config, make_dataset):
+        cfg = make_config()
+        dataset = make_dataset()
+        combined = _combined_table().drop(columns=[("__all__", "overall", "rank")])
+
+        with pytest.raises(ValueError, match="overall rank"):
+            build_evaluation_report(cfg, dataset, combined, {})
+
+    def test_renders_blocked_legacy_report_without_candidates(self, make_config, make_dataset):
+        cfg = make_config()
+        dataset = make_dataset()
+        combined = pd.DataFrame(index=pd.Index([], name="model"))
+
+        text = build_evaluation_report(cfg, dataset, combined, {})
+
+        assert "No overall rank column was produced" in text
+
     def test_contains_expected_section_headers(self, make_config, make_dataset):
         cfg = make_config()
         dataset = make_dataset()

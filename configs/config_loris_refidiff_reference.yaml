@@ -14,7 +14,6 @@ data:
   sensitive_columns: [Sex, Age, PreInt_Demos_Fam__Child_Race]
   drop_rows_missing_target: true
   drop_columns:
-    - subject_id
     - CGAS__CGAS_Score
     - Diagnosis_ClinicianConsensus__DX_01
     - Diagnosis_ClinicianConsensus__DX_01_Code
@@ -30,8 +29,14 @@ data:
     - DailyMeds__med_type_01
     - DailyMeds__med_type_02
     - DailyMeds__med_type_03
-  train_size: 0.6667
-  stratify: true
+  # Keep subject identity only for disjoint population-group assignment.
+  split:
+    mode: patient_group
+    train_fraction: 0.60
+    tuning_fraction: 0.20
+    final_holdout_fraction: 0.20
+    patient_id_column: subject_id
+    candidate_count: 32
   data_dir: data/loris
   raw_cache_subdir: raw
 

@@ -9,11 +9,13 @@ from synthdata.config import (
     BinaryTargetConfig,
     Config,
     DataConfig,
+    DataSplitConfig,
     GenerationConfig,
     HPOConfig,
     ImputationConfig,
     PrivacyGateConfig,
     RefiDiffConfig,
+    StageAScreenConfig,
     SynthEvalExecutionConfig,
     _from_dict,
     _validate,
@@ -32,10 +34,14 @@ class TestFromDict:
         cfg = _from_dict(Config, {})
         assert cfg == Config()
 
-    def test_default_hpo_privacy_objective_excludes_domias(self):
+    def test_default_hpo_objective_uses_approved_utility_metrics(self):
         cfg = _from_dict(Config, {})
 
-        assert cfg.generation.hpo.metric_config["privacy"] == ["identifiability_score"]
+        assert cfg.generation.hpo.metric_config == {
+            "stats": ["wasserstein_dist", "inv_kl_divergence"],
+            "sanity": ["nearest_syn_neighbor_distance"],
+            "performance": ["xgb"],
+        }
 
     def test_flat_fields_applied(self):
         cfg = _from_dict(Config, {"name": "mydata", "seed": 7})
@@ -63,6 +69,27 @@ class TestFromDict:
         assert cfg.generation.n_samples == 50
         # HPOConfig's other defaults are preserved.
         assert cfg.generation.hpo.n_iter_cap == 300
+
+    def test_stage_a_hpo_config_builds_nested_dataclass(self):
+        cfg = _from_dict(
+            Config,
+            {
+                "generation": {
+                    "hpo": {
+                        "stage_a": {
+                            "minimum_class_count": 2,
+                            "dependency_rules": [
+                                {"child": "derived", "parents": ["group", "target"]}
+                            ],
+                        }
+                    }
+                }
+            },
+        )
+
+        assert isinstance(cfg.generation.hpo.stage_a, StageAScreenConfig)
+        assert cfg.generation.hpo.stage_a.minimum_class_count == 2
+        assert cfg.generation.hpo.stage_a.dependency_rules[0]["child"] == "derived"
 
     def test_unknown_top_level_key_raises(self):
         with pytest.raises(ValueError, match="Unknown config key"):
@@ -97,11 +124,15 @@ class TestFromDict:
         assert cfg.imputation.benchmark.enabled
 
     @pytest.mark.parametrize("config_name", ["config_hepatitis.yaml", "config_loris.yaml"])
-    def test_shipped_hpo_profiles_exclude_domias(self, config_name):
+    def test_shipped_hpo_profiles_use_approved_utility_metrics(self, config_name):
         root = Path(__file__).parents[2]
         cfg = load_config(root / "configs" / config_name)
 
-        assert cfg.generation.hpo.metric_config["privacy"] == ["identifiability_score"]
+        assert cfg.generation.hpo.metric_config == {
+            "stats": ["wasserstein_dist", "inv_kl_divergence"],
+            "sanity": ["nearest_syn_neighbor_distance"],
+            "performance": ["xgb"],
+        }
 
     def test_evaluation_binary_target_nested_dict_builds_nested_dataclass(self):
         cfg = _from_dict(
@@ -120,6 +151,22 @@ class TestFromDict:
         assert cfg.evaluation.binary_target.enabled is True
         assert cfg.evaluation.binary_target.positive_classes == [0, 1]
         assert cfg.evaluation.binary_target.negative_classes == [2]
+
+    def test_structural_privacy_settings_load(self):
+        cfg = _from_dict(
+            Config,
+            {
+                "evaluation": {
+                    "synthcity": {
+                        "structural_n_clusters": [2, 7],
+                        "structural_min_rows_per_cluster": 12,
+                    }
+                }
+            },
+        )
+
+        assert cfg.evaluation.synthcity.structural_n_clusters == [2, 7]
+        assert cfg.evaluation.synthcity.structural_min_rows_per_cluster == 12
 
     def test_evaluation_privacy_gate_nested_dict_builds_nested_dataclass(self):
         cfg = _from_dict(
@@ -157,6 +204,22 @@ class TestValidate:
 
     def test_valid_config_passes(self):
         _validate(self._base_valid())  # should not raise
+
+    @pytest.mark.parametrize(
+        "field, value",
+        [
+            ("structural_n_clusters", []),
+            ("structural_n_clusters", [2, 2]),
+            ("structural_n_clusters", [1, 5]),
+            ("structural_min_rows_per_cluster", 0),
+        ],
+    )
+    def test_invalid_structural_privacy_settings_raise(self, field, value):
+        cfg = self._base_valid()
+        setattr(cfg.evaluation.synthcity, field, value)
+
+        with pytest.raises(ValueError, match="structural"):
+            _validate(cfg)
 
     def test_bad_data_source_raises(self):
         cfg = self._base_valid()
@@ -210,6 +273,90 @@ class TestValidate:
         cfg = self._base_valid()
         cfg.evaluation.ranking_strategy = "bogus"
         with pytest.raises(ValueError, match="ranking_strategy"):
+            _validate(cfg)
+
+    def test_group_mode_defaults_to_rows(self):
+        cfg = self._base_valid()
+        _validate(cfg)
+        assert cfg.evaluation.group_mode == "row"
+        assert cfg.evaluation.group_column is None
+
+    def test_bad_group_mode_raises(self):
+        cfg = self._base_valid()
+        cfg.evaluation.group_mode = "encounter"
+        with pytest.raises(ValueError, match="evaluation.group_mode"):
+            _validate(cfg)
+
+    def test_patient_group_requires_group_column(self):
+        cfg = self._base_valid()
+        cfg.evaluation.group_mode = "patient_group"
+        with pytest.raises(ValueError, match="evaluation.group_column"):
+            _validate(cfg)
+
+    def test_patient_group_with_identifier_passes(self):
+        cfg = self._base_valid()
+        cfg.evaluation.group_mode = "patient_group"
+        cfg.evaluation.group_column = "patient_id"
+        _validate(cfg)
+
+    @pytest.mark.parametrize("group_column", ["", "  ", 7])
+    def test_invalid_group_column_raises(self, group_column):
+        cfg = self._base_valid()
+        cfg.evaluation.group_column = group_column
+        with pytest.raises(ValueError, match="evaluation.group_column"):
+            _validate(cfg)
+
+    def test_group_column_cannot_be_dropped(self):
+        cfg = self._base_valid()
+        cfg.evaluation.group_mode = "patient_group"
+        cfg.evaluation.group_column = "patient_id"
+        cfg.data.drop_columns = ["patient_id"]
+        with pytest.raises(ValueError, match="data.drop_columns"):
+            _validate(cfg)
+
+    @pytest.mark.parametrize(
+        "field, value, message",
+        [
+            ("target_column", "patient_id", "target/identity"),
+            ("protected_columns", ["patient_id"], "declared/identity"),
+            ("drop_columns", ["patient_id"], "drop/identity"),
+            ("drop_columns", ["target"], "target/drop"),
+        ],
+    )
+    def test_split_column_declaration_conflicts_raise(self, field, value, message):
+        cfg = self._base_valid()
+        cfg.data.split = DataSplitConfig(
+            mode="patient_group",
+            patient_id_column="patient_id",
+        )
+        setattr(cfg.data, field, value)
+
+        with pytest.raises(ValueError, match=message):
+            _validate(cfg)
+
+    def test_encounter_label_cannot_be_target_or_dropped(self):
+        cfg = self._base_valid()
+        cfg.data.split = DataSplitConfig(
+            mode="patient_group",
+            patient_id_column="patient_id",
+            encounter_label_column="encounter",
+        )
+        cfg.data.drop_columns = ["encounter"]
+
+        with pytest.raises(ValueError, match="encounter/drop"):
+            _validate(cfg)
+
+    def test_mapping_patient_key_is_checked_as_identity_column(self):
+        cfg = self._base_valid()
+        cfg.data.split = DataSplitConfig(
+            mode="patient_group",
+            identity_mapping_path="identity.csv",
+            mapping_row_key_column="row_id",
+            mapping_patient_key_column="patient_id",
+        )
+        cfg.data.quasi_identifier_columns = ["patient_id"]
+
+        with pytest.raises(ValueError, match="declared/identity"):
             _validate(cfg)
 
     @pytest.mark.parametrize("workers", [0, -1, "many", 1.5])
@@ -450,6 +597,12 @@ class TestValidate:
         cfg = self._base_valid()
         cfg.evaluation.privacy_gate.thresholds = {"mia_recall": {"bound": "max", "value": "high"}}
         with pytest.raises(ValueError, match="privacy_gate.thresholds"):
+            _validate(cfg)
+
+    def test_enabled_privacy_gate_requires_explicit_contract_ids(self):
+        cfg = self._base_valid()
+        cfg.evaluation.privacy_gate.enabled = True
+        with pytest.raises(ValueError, match="explicit.*contract_id"):
             _validate(cfg)
 
 

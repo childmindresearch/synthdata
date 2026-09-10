@@ -22,6 +22,49 @@ import yaml
 
 
 @dataclasses.dataclass
+class DataSplitConfig:
+    """Deterministic population roles used by new dataset profiles.
+
+    ``data.split`` is intentionally optional on :class:`DataConfig` while the
+    historical two-way loader remains readable. New profiles should provide a
+    split explicitly; the resulting roles are always named ``train``,
+    ``tuning``, and ``final_holdout``.
+    """
+
+    mode: str = "row"
+    train_fraction: float = 0.60
+    tuning_fraction: float = 0.20
+    final_holdout_fraction: float = 0.20
+    seed: int | None = None
+    candidate_count: int = 32
+    ratio_tolerance: float = 0.05
+    target_balance_tolerance: float = 0.20
+
+    #: Direct source-column identity, a validated local mapping, or an explicit
+    #: assertion for data whose rows are already one distinct patient each.
+    patient_id_column: str | None = None
+    identity_mapping_path: str | None = None
+    mapping_row_key_column: str | None = None
+    mapping_patient_key_column: str | None = None
+    one_row_per_patient: bool = False
+
+    #: Optional explicit encounter label used when balancing grouped roles.
+    encounter_label_column: str | None = None
+    #: Maximum combined encounter-count and encounter-level target-balance error
+    #: accepted for a candidate assignment.
+    encounter_balance_tolerance: float = 0.20
+
+    #: Global support floors and per-value overrides. Override maps are resolved
+    #: against observed schema values before a split is accepted.
+    minimum_class_count: int = 1
+    class_count_overrides: dict = dataclasses.field(default_factory=dict)
+    minimum_protected_group_count: int = 0
+    protected_group_count_overrides: dict = dataclasses.field(default_factory=dict)
+    minimum_target_by_protected_group_count: int = 0
+    target_by_protected_group_count_overrides: dict = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
 class DataConfig:
     """Where the raw dataset comes from and how columns should be interpreted."""
 
@@ -48,6 +91,12 @@ class DataConfig:
     raw_target_column: str | None = None
     #: Columns treated as protected/sensitive attributes for fairness evaluation.
     sensitive_columns: list = dataclasses.field(default_factory=list)
+    #: Explicit protected attributes for fairness. ``sensitive_columns`` remains
+    #: a compatibility alias for historical configurations.
+    protected_columns: list = dataclasses.field(default_factory=list)
+    #: Explicit quasi-identifiers for privacy protocols. These are distinct from
+    #: protected attributes even when a named protocol intentionally overlaps.
+    quasi_identifier_columns: list = dataclasses.field(default_factory=list)
     #: Columns to drop entirely before any modeling (e.g. free-text/ID columns).
     drop_columns: list = dataclasses.field(default_factory=list)
     #: Drop rows where target_column is null before splitting/imputing. Every
@@ -102,6 +151,13 @@ class DataConfig:
     #: Train/test split.
     train_size: float = 0.6667
     stratify: bool = True
+
+    #: New three-role split contract. A configuration must provide this or set
+    #: ``legacy_two_role`` explicitly; omission is not an implicit compatibility mode.
+    split: DataSplitConfig | None = None
+    #: Explicit opt-in for reading historical train/test artifacts. Legacy data
+    #: is not eligible for new tuning, final-policy, or release claims.
+    legacy_two_role: bool = False
 
     #: Where cached/derived CSVs (raw, imputed, train/test splits) are written.
     data_dir: str = "data/dataset"
@@ -273,6 +329,20 @@ class TabPFGenConfig:
 
 
 @dataclasses.dataclass
+class StageAScreenConfig:
+    """Hard pre-evaluation screens applied to every HPO candidate."""
+
+    #: Minimum count for every observed categorical target value.
+    minimum_class_count: int = 1
+    #: Minimum count for every observed protected-group value.
+    minimum_protected_group_count: int = 1
+    #: Minimum count for every observed protected-group/target cell.
+    minimum_target_by_protected_group_count: int = 1
+    #: Deterministic source relationships, e.g. ``child`` derived from ``parents``.
+    dependency_rules: list = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
 class HPOConfig:
     enabled: bool = True
     n_trials: int = 10
@@ -283,22 +353,17 @@ class HPOConfig:
     model_iter_caps: dict = dataclasses.field(default_factory=lambda: {"pategan": 50})
     #: Cap on TabPFGen custom variant's SGLD step count during search.
     sgld_step_cap: int = 500
-    #: Composite objective: metrics oriented to "higher is better" and averaged.
+    #: Composite objective: only explicitly approved operational utility metrics
+    #: may be used; privacy/calibration metrics fail closed at objective setup.
     metric_config: dict = dataclasses.field(
         default_factory=lambda: {
-            "stats": [
-                "prdc",
-                "alpha_precision",
-                "wasserstein_dist",
-                "inv_kl_divergence",
-            ],
+            "stats": ["wasserstein_dist", "inv_kl_divergence"],
             "sanity": ["nearest_syn_neighbor_distance"],
             "performance": ["xgb"],
-            # DOMIAS is deferred from HPO until its high-dimensional KDE
-            # failure modes have a separately validated treatment.
-            "privacy": ["identifiability_score"],
         }
     )
+    #: Deterministic candidate screens run before any objective metrics.
+    stage_a: StageAScreenConfig = dataclasses.field(default_factory=StageAScreenConfig)
     #: Optuna storage URL, e.g. "sqlite:///output/dataset/optuna_studies.db".
     #: If None, a default sqlite file under the generation output dir is used.
     storage: str | None = None
@@ -337,6 +402,17 @@ class FrameworkSelectionConfig:
     enabled: bool = True
     categories: list | None = None
     metrics: list | None = None
+    #: Explicit quasi-identifiers for SynthCity attribute-inference attacks.
+    #: Empty means those attacks fail closed instead of using every remaining feature.
+    quasi_identifier_columns: list = dataclasses.field(default_factory=list)
+    #: Categorical attribute-inference score used for baseline-adjusted risk.
+    classification_score: str = "balanced_accuracy"
+    #: Optional schema kinds for sensitive attack targets: categorical or continuous.
+    sensitive_target_types: dict = dataclasses.field(default_factory=dict)
+    #: KMeans partitions used by structural privacy proxy screens.
+    structural_n_clusters: list = dataclasses.field(default_factory=lambda: [2, 5, 10, 15])
+    #: Minimum average rows per cluster before a structural proxy partition runs.
+    structural_min_rows_per_cluster: int = 10
 
 
 @dataclasses.dataclass
@@ -391,13 +467,12 @@ class PrivacyGateConfig:
     WARNING log line) but never silently remove a model from the ranked
     table -- see :mod:`synthdata.evaluation.privacy_gate`.
 
-    ``thresholds`` maps a metric's exact result-column name (as it appears in
-    the combined table -- e.g. ``"mia_recall"`` or
-    ``"privacy.identifiability_score.score_OC"``) to
-    ``{"bound": "max"|"min", "value": <float>}``. ``"max"`` means the metric's
-    raw value must be ``<= value`` to pass; ``"min"`` means it must be
-    ``>= value`` to pass. A metric not computed this run (selection/failure)
-    is excluded from the gate check (logged), never silently treated as a pass.
+    ``thresholds`` maps an exact contract identity to
+    ``{"contract_id": <id>, "emitted_key": <key>, "framework": <name>,
+    "bound": "max"|"min", "value": <float>}``. The contract must explicitly
+    allow gate use and be operational. A metric not computed this run
+    (selection/failure) is excluded from the gate check (logged), never
+    silently treated as a pass.
 
     CAUTION: the defaults below are reasonable *starting points* (grounded in
     "meaningfully above chance/baseline"), NOT validated against any specific
@@ -406,7 +481,7 @@ class PrivacyGateConfig:
     for an actual data release or challenge submission.
     """
 
-    enabled: bool = True
+    enabled: bool = False
     thresholds: dict = dataclasses.field(
         default_factory=lambda: {
             # syntheval metrics (exact result-column names -- see catalog.py /
@@ -448,6 +523,11 @@ class EvaluationConfig:
     #: Restrict evaluation to a subset of generated model names (None = all found on disk).
     models: list | None = None
     positive_class: Any = 1
+    #: Evaluation population: ordinary row-level metrics, or a patient/group
+    #: context that requires group-safe metric contracts before policy use.
+    group_mode: str = "row"
+    #: Identifier column required when ``group_mode == "patient_group"``.
+    group_column: str | None = None
 
     synthcity: FrameworkSelectionConfig = dataclasses.field(
         default_factory=FrameworkSelectionConfig
@@ -597,6 +677,7 @@ _NESTED_DATACLASSES = {
     (GenerationConfig, "tabpfn"): TabPFNConfig,
     (GenerationConfig, "tabpfgen"): TabPFGenConfig,
     (GenerationConfig, "hpo"): HPOConfig,
+    (HPOConfig, "stage_a"): StageAScreenConfig,
     (EvaluationConfig, "synthcity"): FrameworkSelectionConfig,
     (EvaluationConfig, "syntheval"): FrameworkSelectionConfig,
     (EvaluationConfig, "custom"): FrameworkSelectionConfig,
@@ -604,6 +685,7 @@ _NESTED_DATACLASSES = {
     (EvaluationConfig, "binary_target"): BinaryTargetConfig,
     (EvaluationConfig, "syntheval_execution"): SynthEvalExecutionConfig,
     (EvaluationConfig, "privacy_gate"): PrivacyGateConfig,
+    (DataConfig, "split"): DataSplitConfig,
 }
 
 
@@ -622,6 +704,133 @@ def load_config(path: str | Path) -> Config:
     return cfg
 
 
+def _validate_nonnegative_integer(value: Any, field_name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer, got {value!r}")
+
+
+def _validate_support_override_map(value: Any, field_name: str, depth: int) -> None:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be a mapping, got {value!r}")
+    for key, nested in value.items():
+        if depth == 1:
+            _validate_nonnegative_integer(nested, f"{field_name}[{key!r}]")
+        else:
+            _validate_support_override_map(nested, f"{field_name}[{key!r}]", depth - 1)
+
+
+def _validate_data_split_config(cfg: DataConfig) -> None:
+    split = cfg.split
+    if split is None:
+        if not isinstance(cfg.legacy_two_role, bool):
+            raise ValueError("data.legacy_two_role must be a boolean when data.split is omitted")
+        return
+    if cfg.legacy_two_role:
+        raise ValueError("data.split and data.legacy_two_role are mutually exclusive")
+    if not isinstance(split, DataSplitConfig):
+        raise ValueError(f"data.split must be a mapping/DataSplitConfig, got {split!r}")
+    if split.mode not in {"row", "patient_group"}:
+        raise ValueError(f"data.split.mode must be 'row' or 'patient_group', got {split.mode!r}")
+
+    fractions = {
+        "train_fraction": split.train_fraction,
+        "tuning_fraction": split.tuning_fraction,
+        "final_holdout_fraction": split.final_holdout_fraction,
+    }
+    for field_name, value in fractions.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < 1:
+            raise ValueError(
+                f"data.split.{field_name} must be a number strictly between 0 and 1, got {value!r}"
+            )
+    if abs(sum(fractions.values()) - 1.0) > 1e-9:
+        raise ValueError(
+            "data.split.train_fraction, tuning_fraction, and final_holdout_fraction must sum "
+            f"to 1.0, got {sum(fractions.values())!r}"
+        )
+    if split.seed is not None and (isinstance(split.seed, bool) or not isinstance(split.seed, int)):
+        raise ValueError(f"data.split.seed must be an integer or null, got {split.seed!r}")
+    if isinstance(split.candidate_count, bool) or not isinstance(split.candidate_count, int):
+        raise ValueError(
+            f"data.split.candidate_count must be a positive integer, got {split.candidate_count!r}"
+        )
+    if split.candidate_count < 1:
+        raise ValueError(
+            f"data.split.candidate_count must be a positive integer, got {split.candidate_count!r}"
+        )
+    for field_name in (
+        "ratio_tolerance",
+        "target_balance_tolerance",
+        "encounter_balance_tolerance",
+    ):
+        value = getattr(split, field_name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+            raise ValueError(
+                f"data.split.{field_name} must be a number between 0 and 1, got {value!r}"
+            )
+
+    identity_sources = sum(
+        value is not None and value != ""
+        for value in (split.patient_id_column, split.identity_mapping_path)
+    ) + int(split.one_row_per_patient)
+    if split.mode == "patient_group" and identity_sources != 1:
+        raise ValueError(
+            "data.split patient_group mode requires exactly one of patient_id_column, "
+            "identity_mapping_path, or one_row_per_patient=true"
+        )
+    if split.mode == "row" and identity_sources:
+        raise ValueError(
+            "data.split identity settings are only valid when data.split.mode='patient_group'"
+        )
+    for field_name in (
+        "patient_id_column",
+        "identity_mapping_path",
+        "mapping_row_key_column",
+        "mapping_patient_key_column",
+        "encounter_label_column",
+    ):
+        value = getattr(split, field_name)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(
+                f"data.split.{field_name} must be a non-empty string or null, got {value!r}"
+            )
+    if split.identity_mapping_path is not None and (
+        split.mapping_row_key_column is None or split.mapping_patient_key_column is None
+    ):
+        raise ValueError(
+            "data.split.mapping_row_key_column and mapping_patient_key_column are required "
+            "when identity_mapping_path is configured"
+        )
+    if split.identity_mapping_path is None and (
+        split.mapping_row_key_column is not None or split.mapping_patient_key_column is not None
+    ):
+        raise ValueError("data.split mapping key columns require identity_mapping_path")
+
+    _validate_nonnegative_integer(split.minimum_class_count, "data.split.minimum_class_count")
+    _validate_nonnegative_integer(
+        split.minimum_protected_group_count,
+        "data.split.minimum_protected_group_count",
+    )
+    _validate_nonnegative_integer(
+        split.minimum_target_by_protected_group_count,
+        "data.split.minimum_target_by_protected_group_count",
+    )
+    _validate_support_override_map(
+        split.class_count_overrides,
+        "data.split.class_count_overrides",
+        depth=1,
+    )
+    _validate_support_override_map(
+        split.protected_group_count_overrides,
+        "data.split.protected_group_count_overrides",
+        depth=2,
+    )
+    _validate_support_override_map(
+        split.target_by_protected_group_count_overrides,
+        "data.split.target_by_protected_group_count_overrides",
+        depth=3,
+    )
+
+
 def _validate(cfg: Config) -> None:
     if cfg.data.source not in ("uci", "csv", "parquet"):
         raise ValueError(f"data.source must be 'uci', 'csv', or 'parquet', got {cfg.data.source!r}")
@@ -631,6 +840,85 @@ def _validate(cfg: Config) -> None:
         raise ValueError("data.path is required when data.source == 'csv'/'parquet'")
     if not cfg.data.target_column:
         raise ValueError("data.target_column must be set")
+    if not isinstance(cfg.data.legacy_two_role, bool):
+        raise ValueError(
+            f"data.legacy_two_role must be a boolean, got {cfg.data.legacy_two_role!r}"
+        )
+    for field_name in ("sensitive_columns", "protected_columns", "quasi_identifier_columns"):
+        value = getattr(cfg.data, field_name)
+        if not isinstance(value, list) or any(not isinstance(column, str) for column in value):
+            raise ValueError(f"data.{field_name} must be a list of column names, got {value!r}")
+        if len(value) != len(set(value)):
+            raise ValueError(f"data.{field_name} must not contain duplicate columns")
+    if (
+        cfg.data.protected_columns
+        and cfg.data.sensitive_columns
+        and (cfg.data.protected_columns != cfg.data.sensitive_columns)
+    ):
+        raise ValueError(
+            "data.protected_columns and legacy data.sensitive_columns disagree; provide one "
+            "protected-attribute declaration"
+        )
+    if cfg.data.target_column in (
+        set(cfg.data.protected_columns)
+        | set(cfg.data.sensitive_columns)
+        | set(cfg.data.quasi_identifier_columns)
+    ):
+        raise ValueError(
+            "data.target_column must not be declared as a protected attribute or quasi-identifier"
+        )
+    _validate_data_split_config(cfg.data)
+    drop_columns = cfg.data.drop_columns or []
+    if not isinstance(drop_columns, list) or any(
+        not isinstance(column, str) for column in drop_columns
+    ):
+        raise ValueError(f"data.drop_columns must be a list of column names, got {drop_columns!r}")
+    if len(drop_columns) != len(set(drop_columns)):
+        raise ValueError("data.drop_columns must not contain duplicate columns")
+    split = cfg.data.split
+    identity_columns = (
+        {
+            column
+            for column in (
+                split.patient_id_column,
+                split.mapping_row_key_column,
+                split.mapping_patient_key_column,
+            )
+            if column is not None
+        }
+        if split is not None
+        else set()
+    )
+    declared_columns = (
+        set(cfg.data.protected_columns)
+        | set(cfg.data.sensitive_columns)
+        | set(cfg.data.quasi_identifier_columns)
+    )
+    conflict_sets = {
+        "target/drop": {cfg.data.target_column} & set(drop_columns),
+        "target/identity": {cfg.data.target_column} & identity_columns,
+        "declared/identity": declared_columns & identity_columns,
+        "declared/drop": declared_columns & set(drop_columns),
+        "drop/identity": set(drop_columns) & identity_columns,
+    }
+    if split is not None and split.encounter_label_column is not None:
+        encounter_column = split.encounter_label_column
+        conflict_sets.update(
+            {
+                "encounter/target": {encounter_column, cfg.data.target_column}
+                if encounter_column == cfg.data.target_column
+                else set(),
+                "encounter/identity": {encounter_column} & identity_columns,
+                "encounter/drop": {encounter_column} & set(drop_columns),
+                "encounter/declared": {encounter_column} & declared_columns,
+            }
+        )
+    conflicts = {name: sorted(values) for name, values in conflict_sets.items() if values}
+    if conflicts:
+        raise ValueError(
+            "Conflicting data column declarations: "
+            + "; ".join(f"{name}={values}" for name, values in conflicts.items())
+        )
     if cfg.device not in ("auto", "cpu", "cuda", "mps"):
         raise ValueError(f"device must be one of auto/cpu/cuda/mps, got {cfg.device!r}")
     if cfg.imputation.method not in ("tabimpute", "refidiff"):
@@ -712,10 +1000,66 @@ def _validate(cfg: Config) -> None:
             raise ValueError(
                 f"imputation.benchmark.hpo.{field_name} must be a non-empty list, got {values!r}"
             )
+    stage_a = cfg.generation.hpo.stage_a
+    for field_name in (
+        "minimum_class_count",
+        "minimum_protected_group_count",
+        "minimum_target_by_protected_group_count",
+    ):
+        _validate_nonnegative_integer(
+            getattr(stage_a, field_name), f"generation.hpo.stage_a.{field_name}"
+        )
+    if not isinstance(stage_a.dependency_rules, list):
+        raise ValueError(
+            "generation.hpo.stage_a.dependency_rules must be a list of mappings, "
+            f"got {stage_a.dependency_rules!r}"
+        )
+    for index, rule in enumerate(stage_a.dependency_rules):
+        if not isinstance(rule, dict):
+            raise ValueError(
+                f"generation.hpo.stage_a.dependency_rules[{index}] must be a mapping, got {rule!r}"
+            )
+        if not isinstance(rule.get("child"), str) or not rule["child"].strip():
+            raise ValueError(
+                f"generation.hpo.stage_a.dependency_rules[{index}].child must be a non-empty string"
+            )
+        parents = rule.get("parents")
+        if (
+            not isinstance(parents, list)
+            or not parents
+            or any(not isinstance(parent, str) or not parent.strip() for parent in parents)
+        ):
+            raise ValueError(
+                f"generation.hpo.stage_a.dependency_rules[{index}].parents must be a non-empty "
+                "list of strings"
+            )
     if cfg.evaluation.ranking_strategy not in ("linear", "summation"):
         raise ValueError(
             "evaluation.ranking_strategy must be 'linear' or 'summation', "
             f"got {cfg.evaluation.ranking_strategy!r}"
+        )
+    if cfg.evaluation.group_mode not in ("row", "patient_group"):
+        raise ValueError(
+            "evaluation.group_mode must be 'row' or 'patient_group', "
+            f"got {cfg.evaluation.group_mode!r}"
+        )
+    if cfg.evaluation.group_column is not None and (
+        not isinstance(cfg.evaluation.group_column, str) or not cfg.evaluation.group_column.strip()
+    ):
+        raise ValueError(
+            "evaluation.group_column must be a non-empty string or null, "
+            f"got {cfg.evaluation.group_column!r}"
+        )
+    if cfg.evaluation.group_mode == "patient_group" and cfg.evaluation.group_column is None:
+        raise ValueError(
+            "evaluation.group_column is required when evaluation.group_mode is 'patient_group'"
+        )
+    if cfg.evaluation.group_column == cfg.data.target_column:
+        raise ValueError("evaluation.group_column must not be the target column")
+    if cfg.evaluation.group_column in (cfg.data.drop_columns or []):
+        raise ValueError(
+            "evaluation.group_column must not be listed in data.drop_columns; the identifier "
+            "is required to validate patient/group evaluation"
         )
     execution = cfg.evaluation.syntheval_execution
     if execution.model_workers != "auto" and (
@@ -789,6 +1133,29 @@ def _validate(cfg: Config) -> None:
                 "evaluation.binary_target.positive_classes and .negative_classes must not "
                 f"overlap: {sorted(overlap, key=str)}"
             )
+    structural = cfg.evaluation.synthcity
+    if structural.classification_score not in {"balanced_accuracy", "macro_f1"}:
+        raise ValueError(
+            "evaluation.synthcity.classification_score must be 'balanced_accuracy' or "
+            f"'macro_f1', got {structural.classification_score!r}"
+        )
+    if not structural.structural_n_clusters or any(
+        not isinstance(value, int) or value < 2 for value in structural.structural_n_clusters
+    ):
+        raise ValueError(
+            "evaluation.synthcity.structural_n_clusters must contain positive integers >= 2, "
+            f"got {structural.structural_n_clusters!r}"
+        )
+    if len(structural.structural_n_clusters) != len(set(structural.structural_n_clusters)):
+        raise ValueError("evaluation.synthcity.structural_n_clusters must not contain duplicates")
+    if (
+        not isinstance(structural.structural_min_rows_per_cluster, int)
+        or structural.structural_min_rows_per_cluster < 1
+    ):
+        raise ValueError(
+            "evaluation.synthcity.structural_min_rows_per_cluster must be a positive integer, "
+            f"got {structural.structural_min_rows_per_cluster!r}"
+        )
     rank_weight_keys = set(cfg.evaluation.rank_weights)
     if rank_weight_keys != {"utility", "privacy", "fairness"}:
         raise ValueError(
@@ -819,4 +1186,11 @@ def _validate(cfg: Config) -> None:
             raise ValueError(
                 f"evaluation.privacy_gate.thresholds[{metric!r}]['value'] must be a number, "
                 f"got {spec['value']!r}"
+            )
+        if cfg.evaluation.privacy_gate.enabled and (
+            not isinstance(spec.get("contract_id"), str) or not spec["contract_id"].strip()
+        ):
+            raise ValueError(
+                f"evaluation.privacy_gate.thresholds[{metric!r}] must name an explicit "
+                "operational contract_id when the privacy gate is enabled"
             )

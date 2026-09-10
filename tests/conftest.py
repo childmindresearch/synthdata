@@ -12,12 +12,14 @@ from sklearn.model_selection import train_test_split
 from synthdata.config import (
     Config,
     DataConfig,
+    DataSplitConfig,
     EvaluationConfig,
     ExperimentConfig,
     GenerationConfig,
     PlotsConfig,
 )
 from synthdata.data import Dataset
+from synthdata.data_roles import allocate_roles, resolve_population_identity
 from synthdata.utils import ensure_dir
 
 
@@ -111,6 +113,109 @@ def make_dataset(tmp_path, sample_mixed_df):
         )
 
     return _make_dataset
+
+
+@pytest.fixture
+def make_canonical_dataset(tmp_path):
+    """Factory for a small canonical dataset with explicit population roles."""
+
+    def _make(identity_mode: str = "column") -> Dataset:
+        if identity_mode == "one_row_per_patient":
+            frame = pd.DataFrame(
+                {
+                    "feature": np.arange(12, dtype=float),
+                    "protected": ["A"] * 6 + ["B"] * 6,
+                    "target": [0, 1] * 6,
+                }
+            )
+            split = DataSplitConfig(
+                mode="patient_group",
+                train_fraction=0.5,
+                tuning_fraction=0.25,
+                final_holdout_fraction=0.25,
+                candidate_count=64,
+                one_row_per_patient=True,
+            )
+        else:
+            patient_ids = np.repeat(np.arange(1, 13), 2)
+            frame = pd.DataFrame(
+                {
+                    "feature": np.arange(24, dtype=float),
+                    "protected": np.repeat(["A"] * 6 + ["B"] * 6, 2),
+                    "target": np.tile([0, 1], 12),
+                }
+            )
+            if identity_mode == "column":
+                frame.insert(0, "patient_id", patient_ids)
+                split = DataSplitConfig(
+                    mode="patient_group",
+                    train_fraction=0.5,
+                    tuning_fraction=0.25,
+                    final_holdout_fraction=0.25,
+                    candidate_count=64,
+                    patient_id_column="patient_id",
+                )
+            elif identity_mode == "mapping":
+                frame.insert(0, "row_id", np.arange(24))
+                mapping_path = tmp_path / "patient_identity.csv"
+                pd.DataFrame({"row_id": np.arange(24), "patient_id": patient_ids}).to_csv(
+                    mapping_path, index=False
+                )
+                split = DataSplitConfig(
+                    mode="patient_group",
+                    train_fraction=0.5,
+                    tuning_fraction=0.25,
+                    final_holdout_fraction=0.25,
+                    candidate_count=64,
+                    identity_mapping_path=str(mapping_path),
+                    mapping_row_key_column="row_id",
+                    mapping_patient_key_column="patient_id",
+                )
+            else:
+                raise ValueError(f"Unknown fixture identity mode: {identity_mode!r}")
+
+        identity = resolve_population_identity(frame, split)
+        model_frame = identity.model_frame.reset_index(drop=True)
+        groups = identity.groups.reset_index(drop=True) if identity.groups is not None else None
+        assignment = allocate_roles(
+            model_frame,
+            "target",
+            split,
+            protected_columns=["protected"],
+            groups=groups,
+            seed=17,
+        )
+        data_dir = ensure_dir(tmp_path / "data" / f"canonical_{identity_mode}")
+        dataset = Dataset(
+            name="canonical_fixture",
+            target_column="target",
+            feature_columns=["feature", "protected"],
+            nominal_columns=["protected"],
+            ordinal_columns=[],
+            sensitive_columns=["protected"],
+            data_dir=data_dir,
+            full_df=model_frame,
+            train_df=None,
+            test_df=None,
+            roles=assignment.frames,
+            role_groups=assignment.groups,
+            assignment=assignment.assignment,
+            role_metadata={"identity": identity.metadata, "split": assignment.metadata},
+            version="fixture-1",
+            protected_columns=["protected"],
+            variable_schema={
+                "feature": {"kind": "continuous", "ordinal_order": None},
+                "protected": {"kind": "categorical", "ordinal_order": None},
+                "target": {"kind": "categorical", "ordinal_order": None},
+            },
+            assignment_fingerprint=assignment.assignment_fingerprint,
+        )
+        dataset.set_imputed_roles(
+            {role: role_frame.copy() for role, role_frame in assignment.frames.items()}
+        )
+        return dataset
+
+    return _make
 
 
 @pytest.fixture

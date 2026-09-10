@@ -22,6 +22,7 @@ from synthdata.data import load_dataset, load_imputed_splits
 from synthdata.evaluation import run_evaluation
 from synthdata.evaluation.combine import simple_rank_summary
 from synthdata.experiment import load_experiment
+from synthdata.imputation.pipeline import _cache_key_record
 from synthdata.utils import get_logger, set_global_seed
 
 logger = get_logger("run_evaluation")
@@ -66,11 +67,14 @@ def main() -> None:
     set_global_seed(cfg.seed)
 
     dataset = load_dataset(cfg)
-    dataset = load_imputed_splits(dataset)
-    if dataset.train_imputed_df is None:
+    dataset = load_imputed_splits(
+        dataset,
+        expected_cache_key=_cache_key_record(cfg, dataset)["cache_key"],
+    )
+    if dataset.role_frame("train", imputed=True) is None:
         raise SystemExit("No imputed data found. Run `synthdata-impute --config <path>` first.")
 
-    experiment = load_experiment(cfg)
+    experiment = load_experiment(cfg, dataset=dataset)
     cfg.generation.output_dir = str(experiment.generation_dir)
     cfg.evaluation.output_dir = str(experiment.evaluation_dir)
     cfg.plots.output_dir = str(experiment.plots_dir)
@@ -113,6 +117,28 @@ def main() -> None:
 
     if "report_path" in extras:
         logger.info("Evaluation report written to %s", extras["report_path"])
+
+    final_holdout_evidence = extras.get("final_holdout_evidence")
+    if final_holdout_evidence is not None:
+        evidence_path = Path(extras["artifact_manifest"]).parent / "final_holdout_evidence.json"
+        final_refit = final_holdout_evidence.get("final_refit", {})
+        experiment.record(
+            "final_holdout_evidence",
+            artifacts={
+                "evidence": str(evidence_path),
+                **(
+                    {
+                        "final_refit_data": final_refit["path"],
+                        "final_refit_metadata": final_refit["metadata_path"],
+                    }
+                    if final_refit.get("path") and final_refit.get("metadata_path")
+                    else {}
+                ),
+            },
+            state=final_holdout_evidence.get("state"),
+            selected_model=final_holdout_evidence.get("selected_model"),
+            fit_roles=final_holdout_evidence.get("fit_roles"),
+        )
 
     experiment.record(
         "evaluation",

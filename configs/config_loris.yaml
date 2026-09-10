@@ -39,13 +39,19 @@ data:
     - DailyMeds__med_type_02
     - DailyMeds__med_type_03
 
-  # Source normalization and split
+  # Source normalization and canonical population roles
   uppercase_columns: false
   remap_binary_one_two: false
   outlier_zscore_threshold: null # Set only with confirmed corrupt/sentinel columns.
   outlier_columns: null
-  train_size: 0.6667
-  stratify: true
+  # This curated wide table has one row per participant and no identity column.
+  split:
+    mode: patient_group
+    train_fraction: 0.60
+    tuning_fraction: 0.20
+    final_holdout_fraction: 0.20
+    one_row_per_patient: true
+    candidate_count: 32
 
   # Local derived-data storage
   data_dir: data/loris
@@ -114,10 +120,14 @@ generation:
     model_iter_caps: { pategan: 30 }
     sgld_step_cap: 2000
     metric_config:
-      stats: [prdc, alpha_precision, wasserstein_dist, inv_kl_divergence]
+      stats: [wasserstein_dist, inv_kl_divergence]
       sanity: [nearest_syn_neighbor_distance]
       performance: [xgb]
-      privacy: [identifiability_score]
+    stage_a:
+      minimum_class_count: 1
+      minimum_protected_group_count: 1
+      minimum_target_by_protected_group_count: 1
+      dependency_rules: []
     storage: null
     best_params_path: null
     final_n_iter_override: null
@@ -129,8 +139,17 @@ evaluation:
   ranking_strategy: linear
   generate_report: true
   save_per_model_syntheval_plots: true
+  # Use patient_group only when this identifier is retained in every evaluated frame.
+  group_mode: row
+  group_column: null
 
-  synthcity: { enabled: true, categories: null, metrics: null }
+  synthcity:
+    enabled: true
+    categories: null
+    metrics: null
+    classification_score: balanced_accuracy
+    structural_n_clusters: [2, 5, 10, 15]
+    structural_min_rows_per_cluster: 10
   syntheval: { enabled: true, categories: null, metrics: null }
   custom: { enabled: true, categories: null, metrics: null }
 
@@ -157,7 +176,9 @@ evaluation:
 
   rank_weights: { utility: 1.0, privacy: 1.0, fairness: 1.0 }
   privacy_gate:
-    enabled: true
+    # Calibration-only starting thresholds; enable only with reviewed
+    # operational contract IDs after privacy calibration.
+    enabled: false
     thresholds:
       mia_recall: { bound: max, value: 0.6 }
       mia_precision: { bound: max, value: 0.6 }

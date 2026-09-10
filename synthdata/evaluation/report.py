@@ -11,7 +11,12 @@ import pandas as pd
 
 from synthdata.config import Config
 from synthdata.data import Dataset
-from synthdata.evaluation.combine import simple_rank_summary
+from synthdata.evaluation.artifacts import (
+    artifact_bundle_dir,
+    expected_evaluation_context,
+    validate_evaluation_bundle,
+)
+from synthdata.evaluation.combine import simple_rank_summary, validate_combined_table
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -277,6 +282,31 @@ def build_evaluation_report(
     compute correct relative plot links); defaults to ``cfg.evaluation.output_dir``,
     matching :func:`save_evaluation_report`'s default write location.
     """
+    validate_combined_table(combined)
+    artifact_manifest = extras.get("artifact_manifest")
+    if artifact_manifest:
+        expected_context = expected_evaluation_context(
+            dataset,
+            classification_score=cfg.evaluation.synthcity.classification_score,
+        )
+        validate_evaluation_bundle(
+            Path(artifact_manifest).parent.parent,
+            expected_config_path=cfg.config_path,
+            expected_role_context_fingerprints=expected_context["role_context_fingerprints"],
+            expected_semantic_context_fingerprint=expected_context["semantic_context_fingerprint"],
+            expected_role_hashes=expected_context["role_hashes"],
+            expected_role_hashes_by_framework=expected_context["role_hashes_by_framework"],
+            expected_population_unit=(
+                "patient_group" if cfg.evaluation.group_mode == "patient_group" else "row"
+            ),
+            expected_group_mode=cfg.evaluation.group_mode,
+            allow_legacy=dataset.legacy_two_role,
+        )
+    elif artifact_bundle_dir(cfg.evaluation.output_dir).is_dir():
+        raise FileNotFoundError(
+            "An evaluation artifact bundle exists but report extras did not provide its "
+            "manifest; refusing to render uncontextualized results"
+        )
     model_names = sorted(extras.get("selected_datasets", {}) or combined.index.tolist())
     report_dir = Path(report_dir) if report_dir else Path(cfg.evaluation.output_dir)
     sections = [

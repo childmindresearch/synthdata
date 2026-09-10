@@ -11,7 +11,12 @@ import numpy as np
 import pandas as pd
 import torch
 
-from synthdata.data import decode_label_encoded_columns, label_encode_non_numeric_columns
+from synthdata.data import (
+    decode_label_encoded_columns,
+    label_encode_non_numeric_columns,
+    semantic_context_digest,
+    validate_semantic_context,
+)
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -223,6 +228,7 @@ def generate_tabpfn_standard(
     n_samples: int,
     target_is_categorical: bool = True,
     variable_schema_fingerprint: str | None = None,
+    semantic_context: dict | None = None,
 ) -> tuple[pd.DataFrame, object]:
     """Features-only synthesis; target label assigned post-hoc via a fresh classifier.
 
@@ -230,6 +236,15 @@ def generate_tabpfn_standard(
     real+synthetic long frame) is useful for real-vs-synthetic plotting.
     """
     validate_tabpfn_target(target_column, target_is_categorical)
+    resolved_semantic_context = validate_semantic_context(
+        semantic_context,
+        target_column=target_column,
+        feature_columns=feature_columns,
+        categorical_columns=categorical_columns,
+        target_is_categorical=target_is_categorical,
+        variable_schema_fingerprint=variable_schema_fingerprint,
+        frame_columns=train_df.columns,
+    )
 
     from tabpfn import TabPFNClassifier
 
@@ -255,6 +270,9 @@ def generate_tabpfn_standard(
     ]
 
     experiment, model_unsupervised = _make_experiment()
+    if resolved_semantic_context is not None:
+        experiment.semantic_context = resolved_semantic_context
+        experiment.semantic_context_digest = semantic_context_digest(resolved_semantic_context)
     logger.info(
         "[tabpfn] standard experiment.run train_shape=%s n_samples=%d "
         "categorical_columns=%s categorical_indices=%s target=%r target_kind=%s "
@@ -303,12 +321,23 @@ def generate_tabpfn_custom(
     n_samples: int,
     target_is_categorical: bool = True,
     variable_schema_fingerprint: str | None = None,
+    semantic_context: dict | None = None,
 ) -> tuple[pd.DataFrame, object]:
     """Features + target modeled jointly (target treated as just another column).
 
     Returns ``(synthetic_df, experiment)``.
     """
     validate_tabpfn_target(target_column, target_is_categorical)
+    feature_columns = [column for column in train_df.columns if column != target_column]
+    resolved_semantic_context = validate_semantic_context(
+        semantic_context,
+        target_column=target_column,
+        feature_columns=feature_columns,
+        categorical_columns=categorical_columns,
+        target_is_categorical=target_is_categorical,
+        variable_schema_fingerprint=variable_schema_fingerprint,
+        frame_columns=train_df.columns,
+    )
 
     # See the comment in generate_tabpfn_standard for why categorical_columns
     # (+ target_column here, since it's modeled jointly with the features) is
@@ -326,6 +355,9 @@ def generate_tabpfn_custom(
     ]
 
     experiment, model_unsupervised = _make_experiment()
+    if resolved_semantic_context is not None:
+        experiment.semantic_context = resolved_semantic_context
+        experiment.semantic_context_digest = semantic_context_digest(resolved_semantic_context)
     logger.info(
         "[tabpfn] custom experiment.run train_shape=%s n_samples=%d "
         "categorical_columns=%s categorical_indices=%s target=%r target_kind=%s "

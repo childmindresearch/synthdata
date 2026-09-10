@@ -29,6 +29,7 @@ import pandas as pd
 from synthdata.config import load_config
 from synthdata.data import load_dataset, load_imputed_splits
 from synthdata.experiment import dataset_plots_dir, load_experiment
+from synthdata.imputation.pipeline import _cache_key_record
 from synthdata.utils import get_logger, set_global_seed
 
 logger = get_logger("run_plots")
@@ -72,7 +73,10 @@ def main() -> None:
     logger.info("Plotting sections: %s", sorted(sections))
 
     dataset = load_dataset(cfg)
-    dataset = load_imputed_splits(dataset)
+    dataset = load_imputed_splits(
+        dataset,
+        expected_cache_key=_cache_key_record(cfg, dataset)["cache_key"],
+    )
 
     if "data" in sections:
         from synthdata.plotting.data_plots import save_data_plots
@@ -88,14 +92,18 @@ def main() -> None:
 
     experiment = None
     if sections & _EXPERIMENT_SECTIONS:
-        experiment = load_experiment(cfg)
+        experiment = load_experiment(cfg, dataset=dataset)
         cfg.generation.output_dir = str(experiment.generation_dir)
         cfg.evaluation.output_dir = str(experiment.evaluation_dir)
         cfg.plots.output_dir = str(experiment.plots_dir)
 
     synthetic_datasets = _load_synthetic_datasets(cfg)
 
-    if "generation" in sections and synthetic_datasets and dataset.train_imputed_df is not None:
+    if (
+        "generation" in sections
+        and synthetic_datasets
+        and dataset.role_frame("train", imputed=True) is not None
+    ):
         from synthdata.plotting.generation_plots import save_generation_plots
 
         save_generation_plots(cfg, dataset, synthetic_datasets, cfg.plots.output_dir)
@@ -107,7 +115,10 @@ def main() -> None:
 
     if "evaluation" in sections:
         from synthdata.evaluation.artifacts import (
+            artifact_bundle_dir,
+            expected_evaluation_context,
             load_log_disparity_reports,
+            validate_evaluation_bundle,
             verify_native_syntheval_artifacts,
         )
         from synthdata.evaluation.combine import load_combined_table
@@ -122,6 +133,19 @@ def main() -> None:
                 f"Evaluation table not found at {combined_path}. "
                 "Run `synthdata-evaluate --config <path>` first."
             )
+        expected_context = expected_evaluation_context(dataset)
+        validate_evaluation_bundle(
+            cfg.evaluation.output_dir,
+            expected_config_path=cfg.config_path,
+            expected_role_context_fingerprints=expected_context["role_context_fingerprints"],
+            expected_role_hashes=expected_context["role_hashes"],
+            expected_role_hashes_by_framework=expected_context["role_hashes_by_framework"],
+            expected_population_unit=(
+                "patient_group" if cfg.evaluation.group_mode == "patient_group" else "row"
+            ),
+            expected_group_mode=cfg.evaluation.group_mode,
+            allow_legacy=dataset.legacy_two_role,
+        )
         combined = load_combined_table(str(combined_path))
         log_disparity_reports = load_log_disparity_reports(cfg.evaluation.output_dir)
         save_rank_tradeoff_plots(cfg, combined, cfg.plots.output_dir)
@@ -138,6 +162,9 @@ def main() -> None:
                 {
                     "selected_datasets": synthetic_datasets,
                     "log_disparity_reports": log_disparity_reports,
+                    "artifact_manifest": str(
+                        artifact_bundle_dir(cfg.evaluation.output_dir) / "manifest.json"
+                    ),
                 },
                 experiment,
             )

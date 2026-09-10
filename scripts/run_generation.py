@@ -20,6 +20,7 @@ from synthdata.data import load_dataset, load_imputed_splits
 from synthdata.experiment import start_experiment
 from synthdata.generation import run_generation
 from synthdata.generation.pipeline import needs_imputed_data
+from synthdata.imputation.pipeline import _cache_key_record
 from synthdata.utils import get_logger, set_global_seed
 
 logger = get_logger("run_generation")
@@ -61,11 +62,14 @@ def main() -> None:
     set_global_seed(cfg.seed)
 
     dataset = load_dataset(cfg)
-    dataset = load_imputed_splits(dataset)
-    if dataset.train_imputed_df is None and needs_imputed_data(cfg.generation):
+    dataset = load_imputed_splits(
+        dataset,
+        expected_cache_key=_cache_key_record(cfg, dataset)["cache_key"],
+    )
+    if dataset.role_frame("train", imputed=True) is None and needs_imputed_data(cfg.generation):
         raise SystemExit("No imputed data found. Run `synthdata-impute --config <path>` first.")
 
-    experiment = start_experiment(cfg)
+    experiment = start_experiment(cfg, dataset=dataset)
     # Nest this run's artifacts under the experiment id (also relocates HPO
     # storage/best-params-cache defaults, which derive from output_dir).
     cfg.generation.output_dir = str(experiment.generation_dir)
@@ -79,11 +83,11 @@ def main() -> None:
         from synthdata.plotting.generation_plots import plot_real_vs_synthetic
 
         def plot_callback(name, df, extra):  # noqa: ARG001 - extra unused, kept for interface symmetry
-            real_df = (
-                dataset.train_imputed_df
-                if dataset.train_imputed_df is not None
-                else dataset.train_df
-            )
+            real_df = dataset.role_frame("train", imputed=True)
+            if real_df is None:
+                real_df = dataset.role_frame("train", imputed=False)
+            if real_df is None:
+                raise RuntimeError("Generation plot callback requires a populated train role")
             real_df = dataset.decode_ordinal_frame(real_df)
             df = dataset.decode_ordinal_frame(df)
             fig = plot_real_vs_synthetic(

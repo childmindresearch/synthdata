@@ -15,6 +15,7 @@ import dataclasses
 import hashlib
 import json
 import types
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -23,6 +24,12 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 
 from synthdata.config import Config
+from synthdata.data_roles import (
+    ROLE_NAMES,
+    RoleAssignment,
+    allocate_roles,
+    resolve_population_identity,
+)
 from synthdata.utils import ensure_dir, get_logger, git_commit
 
 logger = get_logger(__name__)
@@ -54,6 +61,280 @@ def file_fingerprint(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def role_context_payload(dataset, roles: tuple[str, ...] = ROLE_NAMES) -> dict:
+    """Describe the named role inputs and provenance used by one operation."""
+    role_set = set(roles)
+    assignment_fingerprint = None
+    if dataset.assignment is not None:
+        assignment = dataset.assignment[dataset.assignment["role"].isin(role_set)].copy()
+        assignment = assignment.sort_values("row_key").reset_index(drop=True)
+        assignment_fingerprint = dataframe_fingerprint(assignment)
+    role_payload = {}
+    for role in roles:
+        raw_frame = dataset.role_frame(role, imputed=False)
+        imputed_frame = dataset.role_frame(role, imputed=True)
+        frame = imputed_frame if imputed_frame is not None else raw_frame
+        if frame is None:
+            raise ValueError(f"Role context requires a populated {role!r} role")
+        role_payload[role] = {
+            "raw_fingerprint": (
+                dataframe_fingerprint(raw_frame) if raw_frame is not None else None
+            ),
+            "imputed_fingerprint": (
+                dataframe_fingerprint(imputed_frame) if imputed_frame is not None else None
+            ),
+            "rows": int(len(frame)),
+        }
+    return {
+        "schema_version": "role-context-v1",
+        "dataset_name": dataset.name,
+        "dataset_version": dataset.version,
+        "roles": role_payload,
+        "assignment_fingerprint": assignment_fingerprint,
+        "assignment_policy_fingerprint": dataset.assignment_policy_fingerprint,
+        "semantic_fingerprint": dataset.semantic_fingerprint,
+        "variable_schema_fingerprint": dataset.variable_schema_fingerprint,
+        "compatibility_mode": "legacy_two_role" if dataset.legacy_two_role else None,
+    }
+
+
+def role_context_fingerprint(dataset, roles: tuple[str, ...] = ROLE_NAMES) -> str:
+    """Hash the exact role inputs and split/schema provenance for an operation."""
+    payload = role_context_payload(dataset, roles)
+    encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+SEMANTIC_CONTEXT_SCHEMA_VERSION = "semantic-context-v1"
+
+
+def semantic_context_payload(
+    dataset,
+    *,
+    classification_score: str | None = None,
+) -> dict:
+    """Return the resolved semantic declarations used by downstream stages."""
+    if classification_score is not None and classification_score not in {
+        "balanced_accuracy",
+        "macro_f1",
+    }:
+        raise ValueError(
+            "classification_score must be 'balanced_accuracy' or 'macro_f1', "
+            f"got {classification_score!r}"
+        )
+
+    modeling_columns = list(dataset.feature_columns) + [dataset.target_column]
+    feature_types = {
+        column: dataset.variable_schema[column]["kind"]
+        for column in modeling_columns
+        if column in dataset.variable_schema
+    }
+    variable_schema = {
+        column: dict(dataset.variable_schema[column])
+        for column in modeling_columns
+        if column in dataset.variable_schema
+    }
+    payload = {
+        "schema_version": SEMANTIC_CONTEXT_SCHEMA_VERSION,
+        "dataset_name": dataset.name,
+        "dataset_version": dataset.version,
+        "target_column": dataset.target_column,
+        "task_type": "classification" if dataset.target_is_categorical else "regression",
+        "feature_columns": modeling_columns[:-1],
+        "nominal_columns": list(dataset.nominal_columns),
+        "ordinal_columns": list(dataset.ordinal_columns),
+        "categorical_columns": list(dataset.categorical_columns),
+        "protected_columns": list(dataset.protected_columns),
+        "quasi_identifier_columns": list(dataset.quasi_identifier_columns),
+        "feature_types": feature_types,
+        "sensitive_target_types": {
+            column: feature_types[column]
+            for column in dataset.protected_columns
+            if column in feature_types
+        },
+        "source_table": {
+            column: entry["source_table"]
+            for column, entry in variable_schema.items()
+            if entry.get("source_table") is not None
+        },
+        "variable_schema": variable_schema,
+        "variable_schema_fingerprint": dataset.variable_schema_fingerprint,
+        "semantic_fingerprint": dataset.semantic_fingerprint,
+        "compatibility_mode": "legacy_two_role" if dataset.legacy_two_role else None,
+        "classification_score": classification_score,
+    }
+    return json.loads(json.dumps(payload, sort_keys=True, default=str))
+
+
+def semantic_context_digest(payload: Mapping) -> str:
+    """Hash a versioned semantic context payload without including raw data."""
+    if not isinstance(payload, Mapping):
+        raise TypeError("semantic context must be a mapping")
+    if payload.get("schema_version") != SEMANTIC_CONTEXT_SCHEMA_VERSION:
+        raise ValueError(
+            f"semantic context has an unsupported schema: {payload.get('schema_version')!r}"
+        )
+    encoded = json.dumps(dict(payload), sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def validate_semantic_context(
+    payload: Mapping | None,
+    *,
+    target_column: str,
+    feature_columns: Sequence[str],
+    categorical_columns: Sequence[str],
+    target_is_categorical: bool,
+    variable_schema_fingerprint: str | None,
+    frame_columns: Sequence[str] | None = None,
+) -> dict | None:
+    """Validate the semantic envelope consumed by an external generator."""
+    if payload is None:
+        return None
+    if not isinstance(payload, Mapping):
+        raise TypeError("semantic_context must be a mapping or None")
+    context = json.loads(json.dumps(dict(payload), sort_keys=True, default=str))
+    required_fields = (
+        "schema_version",
+        "dataset_name",
+        "dataset_version",
+        "target_column",
+        "task_type",
+        "feature_columns",
+        "nominal_columns",
+        "ordinal_columns",
+        "categorical_columns",
+        "protected_columns",
+        "quasi_identifier_columns",
+        "sensitive_target_types",
+        "feature_types",
+        "source_table",
+        "variable_schema",
+        "variable_schema_fingerprint",
+        "semantic_fingerprint",
+        "compatibility_mode",
+        "classification_score",
+    )
+    missing = [field for field in required_fields if field not in context]
+    if missing:
+        raise ValueError(f"semantic_context is incomplete; missing {missing}")
+    semantic_context_digest(context)
+
+    expected_features = list(feature_columns)
+    model_columns = [*expected_features, target_column]
+    if target_column in expected_features or len(model_columns) != len(set(model_columns)):
+        raise ValueError("semantic_context generator columns must contain a unique target")
+    if context["target_column"] != target_column:
+        raise ValueError(
+            "semantic_context target_column does not match the external generator request"
+        )
+    if context["feature_columns"] != expected_features:
+        raise ValueError(
+            "semantic_context feature_columns do not match the external generator request"
+        )
+    if context["categorical_columns"] != list(categorical_columns):
+        raise ValueError(
+            "semantic_context categorical_columns do not match the external generator request"
+        )
+    expected_task_type = "classification" if target_is_categorical else "regression"
+    if context["task_type"] != expected_task_type:
+        raise ValueError("semantic_context task_type does not match the external generator request")
+    if context["variable_schema_fingerprint"] != variable_schema_fingerprint:
+        raise ValueError(
+            "semantic_context variable_schema_fingerprint does not match the external generator request"
+        )
+
+    if frame_columns is not None:
+        actual_columns = list(frame_columns)
+        if len(actual_columns) != len(set(actual_columns)) or set(actual_columns) != set(
+            model_columns
+        ):
+            raise ValueError(
+                "semantic_context modeling columns do not match the external generator frame"
+            )
+
+    list_fields = (
+        "feature_columns",
+        "nominal_columns",
+        "ordinal_columns",
+        "categorical_columns",
+        "protected_columns",
+        "quasi_identifier_columns",
+    )
+    for field in list_fields:
+        if not isinstance(context[field], list):
+            raise ValueError(f"semantic_context.{field} must be a list")
+    mapping_fields = (
+        "feature_types",
+        "sensitive_target_types",
+        "source_table",
+        "variable_schema",
+    )
+    for field in mapping_fields:
+        if not isinstance(context.get(field), Mapping):
+            raise ValueError(f"semantic_context.{field} must be an object")
+
+    if not set(context["nominal_columns"]) | set(context["ordinal_columns"]) <= set(
+        expected_features
+    ):
+        raise ValueError("semantic_context categorical role columns must be model features")
+    if set(context["categorical_columns"]) != set(context["nominal_columns"]) | set(
+        context["ordinal_columns"]
+    ):
+        raise ValueError("semantic_context categorical_columns disagree with nominal/ordinal roles")
+    if not set(context["protected_columns"]) <= set(model_columns):
+        raise ValueError("semantic_context protected_columns contain unknown modeling columns")
+    if not set(context["quasi_identifier_columns"]) <= set(expected_features):
+        raise ValueError("semantic_context quasi_identifier_columns contain non-feature columns")
+    overlap = sorted(set(context["quasi_identifier_columns"]) & set(context["protected_columns"]))
+    if overlap:
+        raise ValueError(
+            f"semantic_context quasi_identifier_columns overlap protected_columns: {overlap}"
+        )
+
+    feature_types = dict(context["feature_types"])
+    if set(feature_types) != set(model_columns):
+        raise ValueError("semantic_context feature_types must cover every modeling column")
+    if any(value not in {"categorical", "continuous"} for value in feature_types.values()):
+        raise ValueError("semantic_context feature_types contain an unsupported kind")
+    expected_target_kind = "categorical" if target_is_categorical else "continuous"
+    if feature_types[target_column] != expected_target_kind:
+        raise ValueError(
+            "semantic_context target type does not match the external generator request"
+        )
+
+    variable_schema = dict(context["variable_schema"])
+    if set(variable_schema) != set(model_columns):
+        raise ValueError("semantic_context variable_schema must cover every modeling column")
+    for column in model_columns:
+        entry = variable_schema[column]
+        if not isinstance(entry, Mapping) or entry.get("kind") != feature_types[column]:
+            raise ValueError(
+                f"semantic_context variable_schema kind does not match feature_types for {column!r}"
+            )
+    expected_sensitive_types = {
+        column: feature_types[column] for column in context["protected_columns"]
+    }
+    if dict(context["sensitive_target_types"]) != expected_sensitive_types:
+        raise ValueError("semantic_context sensitive_target_types disagree with protected_columns")
+    if not set(context["source_table"]) <= set(model_columns):
+        raise ValueError("semantic_context source_table contains unknown modeling columns")
+    if context["classification_score"] not in {None, "balanced_accuracy", "macro_f1"}:
+        raise ValueError("semantic_context classification_score is unsupported")
+    return context
+
+
+def semantic_context_fingerprint(
+    dataset,
+    *,
+    classification_score: str | None = None,
+) -> str:
+    """Return the digest of the resolved semantic context for a dataset."""
+    return semantic_context_digest(
+        semantic_context_payload(dataset, classification_score=classification_score)
+    )
+
+
 @dataclasses.dataclass
 class Dataset:
     """Container for a loaded dataset plus derived metadata used by every stage."""
@@ -68,13 +349,30 @@ class Dataset:
 
     #: Full dataset, possibly containing missing values (pre-imputation).
     full_df: pd.DataFrame
-    #: Train/test split of full_df (same rows as the imputed splits, pre-imputation).
-    train_df: pd.DataFrame
-    test_df: pd.DataFrame
+    #: Historical two-role frames. New datasets use ``roles`` instead.
+    train_df: pd.DataFrame | None
+    test_df: pd.DataFrame | None
+
+    #: Canonical raw role frames for new datasets. Keys are exactly
+    #: ``train``, ``tuning``, and ``final_holdout``.
+    roles: dict[str, pd.DataFrame] = dataclasses.field(default_factory=dict)
+    #: Non-modeling population groups aligned with each canonical role.
+    role_groups: dict[str, pd.Series | None] = dataclasses.field(default_factory=dict)
+    #: Immutable row-to-role assignment table with hashed population groups only.
+    assignment: pd.DataFrame | None = None
+    #: Resolved split, identity, support, and semantic metadata.
+    role_metadata: dict = dataclasses.field(default_factory=dict)
+    #: Historical data is readable but cannot provide a tuning role.
+    legacy_two_role: bool = False
 
     #: Freeform dataset version label (see DataConfig.version), recorded in
     #: experiment manifests for traceability. None if not set by the user.
     version: str | None = None
+
+    #: Explicit protected attributes and quasi-identifiers. ``sensitive_columns``
+    #: remains as a historical compatibility alias for protected columns.
+    protected_columns: list = dataclasses.field(default_factory=list)
+    quasi_identifier_columns: list = dataclasses.field(default_factory=list)
 
     #: Explicit, resolved variable schema used to derive the categorical roles.
     #: Each entry is ``{"kind": "categorical"|"continuous",
@@ -89,25 +387,142 @@ class Dataset:
     full_fingerprint: str | None = None
     train_split_fingerprint: str | None = None
     test_split_fingerprint: str | None = None
+    role_fingerprints: dict[str, str] = dataclasses.field(default_factory=dict)
+    assignment_fingerprint: str | None = None
+    assignment_policy_fingerprint: str | None = None
+    semantic_fingerprint: str | None = None
 
     #: Numeric model-space frames populated once imputation has run
     #: (see synthdata.imputation).
     full_imputed_df: pd.DataFrame | None = None
     train_imputed_df: pd.DataFrame | None = None
     test_imputed_df: pd.DataFrame | None = None
+    imputed_roles: dict[str, pd.DataFrame] = dataclasses.field(default_factory=dict)
     #: User-facing copies with configured ordinal labels restored.
     full_imputed_decoded_df: pd.DataFrame | None = None
     train_imputed_decoded_df: pd.DataFrame | None = None
     test_imputed_decoded_df: pd.DataFrame | None = None
+    decoded_roles: dict[str, pd.DataFrame] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Capture fingerprints for the exact frames held by this dataset."""
+        """Normalize role state and capture fingerprints for held frames."""
+        if self.protected_columns and self.sensitive_columns:
+            if self.protected_columns != self.sensitive_columns:
+                raise ValueError("Dataset protected_columns and sensitive_columns disagree")
+        elif self.protected_columns:
+            self.sensitive_columns = list(self.protected_columns)
+        else:
+            self.protected_columns = list(self.sensitive_columns)
+
+        if self.roles:
+            if self.legacy_two_role:
+                raise ValueError(
+                    "legacy_two_role datasets must be constructed from train_df/test_df"
+                )
+            if set(self.roles) != set(ROLE_NAMES):
+                raise ValueError(
+                    f"New Dataset.roles must contain exactly {list(ROLE_NAMES)}, got {list(self.roles)}"
+                )
+        elif self.train_df is not None and self.test_df is not None:
+            self.roles = {
+                "train": self.train_df,
+                "final_holdout": self.test_df,
+            }
+            self.role_groups = {"train": None, "final_holdout": None}
+            self.legacy_two_role = True
+        elif self.train_df is not None or self.test_df is not None:
+            raise ValueError("Dataset requires both historical train_df and test_df")
+        elif not self.legacy_two_role:
+            raise ValueError("New Dataset requires canonical train/tuning/final_holdout roles")
+
+        if self.role_groups and set(self.role_groups) - set(self.roles):
+            raise ValueError("Dataset.role_groups contains a role not present in Dataset.roles")
+        if not self.role_groups:
+            self.role_groups = {role: None for role in self.roles}
+        for role in self.roles:
+            if role not in self.role_fingerprints:
+                self.role_fingerprints[role] = dataframe_fingerprint(self.roles[role])
+
         if self.full_fingerprint is None:
             self.full_fingerprint = dataframe_fingerprint(self.full_df)
-        if self.train_split_fingerprint is None:
+        if self.train_split_fingerprint is None and self.train_df is not None:
             self.train_split_fingerprint = dataframe_fingerprint(self.train_df)
-        if self.test_split_fingerprint is None:
+        if self.test_split_fingerprint is None and self.test_df is not None:
             self.test_split_fingerprint = dataframe_fingerprint(self.test_df)
+        if self.assignment is not None and self.assignment_fingerprint is None:
+            self.assignment_fingerprint = dataframe_fingerprint(self.assignment)
+        if self.assignment_policy_fingerprint is None:
+            split_metadata = self.role_metadata.get("split", {})
+            self.assignment_policy_fingerprint = split_metadata.get("assignment_policy_fingerprint")
+
+    @property
+    def has_canonical_roles(self) -> bool:
+        """Whether this dataset has the complete three-role contract."""
+        return not self.legacy_two_role and set(self.roles) == set(ROLE_NAMES)
+
+    def require_canonical_roles(self, operation: str) -> None:
+        """Reject historical two-role data at new selection/policy boundaries."""
+        if not self.has_canonical_roles:
+            raise RuntimeError(
+                f"{operation} requires canonical train/tuning/final_holdout roles; "
+                "this dataset is labeled legacy_two_role and cannot be used for new "
+                "HPO, final-policy, or release claims"
+            )
+
+    def role_frame(self, role: str, *, imputed: bool = False) -> pd.DataFrame | None:
+        """Return a named role, with an explicit legacy-only compatibility view."""
+        frames = self.imputed_roles if imputed else self.roles
+        frame = frames.get(role)
+        if frame is not None:
+            return frame
+        if self.legacy_two_role:
+            if role == "train":
+                return self.train_imputed_df if imputed else self.train_df
+            if role == "final_holdout":
+                return self.test_imputed_df if imputed else self.test_df
+        return None
+
+    def set_imputed_roles(self, frames: dict[str, pd.DataFrame]) -> None:
+        """Attach role-specific imputed frames and derived compatibility views."""
+        if set(frames) != set(self.roles):
+            raise ValueError(
+                f"Imputed role keys {list(frames)} do not match raw role keys {list(self.roles)}"
+            )
+        for role, frame in frames.items():
+            if frame.columns.tolist() != self.full_df.columns.tolist():
+                raise ValueError(f"Imputed role {role!r} columns do not match the raw model frame")
+            if len(frame) != len(self.roles[role]):
+                raise ValueError(
+                    f"Imputed role {role!r} has {len(frame)} rows; expected {len(self.roles[role])}"
+                )
+        self.imputed_roles = {role: frame.copy() for role, frame in frames.items()}
+        if self.has_canonical_roles:
+            if self.assignment is None:
+                raise ValueError(
+                    "Canonical Dataset requires an assignment table to reconstruct full row order"
+                )
+            ordered_frames = [self.imputed_roles[role] for role in ROLE_NAMES]
+            row_keys = pd.concat(
+                [
+                    self.assignment.loc[self.assignment["role"] == role, "row_key"]
+                    for role in ROLE_NAMES
+                ],
+                ignore_index=True,
+            )
+            if len(row_keys) != len(pd.concat(ordered_frames, ignore_index=True)):
+                raise ValueError(
+                    "Canonical Dataset assignment row counts do not match imputed role rows"
+                )
+            full_imputed = pd.concat(ordered_frames, ignore_index=True)
+            full_imputed.index = row_keys.to_numpy()
+            self.full_imputed_df = full_imputed.sort_index().reset_index(drop=True)
+            self.train_imputed_df = None
+            self.test_imputed_df = None
+        else:
+            self.full_imputed_df = self.imputed_roles.get("train")
+            self.train_imputed_df = self.imputed_roles.get("train")
+            self.test_imputed_df = self.imputed_roles.get("final_holdout")
+        self.attach_decoded_imputed_splits()
 
     @property
     def categorical_columns(self) -> list:
@@ -160,35 +575,48 @@ class Dataset:
 
     def paths(self) -> dict:
         d = self.data_dir
-        return {
+        paths = {
             "full": d / "full.csv",
-            "train": d / "train.csv",
-            "test": d / "test.csv",
             "full_imputed": d / "full_imputed.csv",
-            "train_imputed": d / "train_imputed.csv",
-            "test_imputed": d / "test_imputed.csv",
             "full_imputed_decoded": d / "full_imputed_decoded.csv",
-            "train_imputed_decoded": d / "train_imputed_decoded.csv",
-            "test_imputed_decoded": d / "test_imputed_decoded.csv",
         }
+        for role in self.roles:
+            paths[role] = d / f"{role}.csv"
+            paths[f"{role}_imputed"] = d / f"{role}_imputed.csv"
+            paths[f"{role}_imputed_decoded"] = d / f"{role}_imputed_decoded.csv"
+        if self.legacy_two_role:
+            paths.update(
+                {
+                    "test": d / "test.csv",
+                    "test_imputed": d / "test_imputed.csv",
+                    "test_imputed_decoded": d / "test_imputed_decoded.csv",
+                }
+            )
+        return paths
 
     def attach_decoded_imputed_splits(self) -> None:
-        """Attach decoded user-facing views for any loaded imputed splits."""
+        """Attach decoded user-facing views for any loaded imputed roles."""
+        self.decoded_roles = {
+            role: self.decode_ordinal_frame(frame) for role, frame in self.imputed_roles.items()
+        }
         self.full_imputed_decoded_df = (
             self.decode_ordinal_frame(self.full_imputed_df)
             if self.full_imputed_df is not None
             else None
         )
-        self.train_imputed_decoded_df = (
-            self.decode_ordinal_frame(self.train_imputed_df)
-            if self.train_imputed_df is not None
-            else None
-        )
-        self.test_imputed_decoded_df = (
-            self.decode_ordinal_frame(self.test_imputed_df)
-            if self.test_imputed_df is not None
-            else None
-        )
+        self.train_imputed_decoded_df = self.decoded_roles.get("train")
+        self.test_imputed_decoded_df = self.decoded_roles.get("final_holdout")
+        if self.legacy_two_role:
+            self.train_imputed_decoded_df = (
+                self.decode_ordinal_frame(self.train_imputed_df)
+                if self.train_imputed_df is not None
+                else None
+            )
+            self.test_imputed_decoded_df = (
+                self.decode_ordinal_frame(self.test_imputed_df)
+                if self.test_imputed_df is not None
+                else None
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +714,187 @@ def _schema_fingerprint(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+_SCHEMA_OPTIONAL_FIELDS = {
+    "ordinal_order",
+    "source_table",
+    "lower_bound",
+    "upper_bound",
+    "causal_parents",
+    "categorical_values",
+}
+
+
+def _parse_schema_json_list(
+    raw_value: str,
+    schema_path: Path,
+    row_number: int,
+    column: str,
+    field_name: str,
+) -> list:
+    if not raw_value.strip():
+        return []
+    try:
+        value = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Variable schema {schema_path} row {row_number} column {column!r} has invalid "
+            f"{field_name}; expected a JSON list: {exc.msg}."
+        ) from exc
+    if not isinstance(value, list):
+        raise ValueError(
+            f"Variable schema {schema_path} row {row_number} column {column!r} must use a "
+            f"JSON list for {field_name}."
+        )
+    encoded_values = [json.dumps(item, sort_keys=True, default=str) for item in value]
+    if len(encoded_values) != len(set(encoded_values)):
+        raise ValueError(
+            f"Variable schema {schema_path} row {row_number} column {column!r} has duplicate "
+            f"{field_name} values."
+        )
+    return value
+
+
+def _parse_schema_bound(
+    raw_value: str,
+    schema_path: Path,
+    row_number: int,
+    column: str,
+    field_name: str,
+) -> float | int | None:
+    if not raw_value.strip():
+        return None
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Variable schema {schema_path} row {row_number} column {column!r} has a non-numeric "
+            f"{field_name}: {raw_value!r}."
+        ) from exc
+    if not np.isfinite(value):
+        raise ValueError(
+            f"Variable schema {schema_path} row {row_number} column {column!r} has a non-finite "
+            f"{field_name}: {raw_value!r}."
+        )
+    return int(value) if value.is_integer() else value
+
+
+def validate_schema_dag(schema: dict, schema_path: str | Path | None = None) -> None:
+    """Validate advisory causal-parent metadata without executing dependencies."""
+    path_label = f" in {schema_path}" if schema_path is not None else ""
+    declared_columns = set(schema)
+    graph = {}
+    for column, entry in schema.items():
+        parents = entry.get("causal_parents") or []
+        unknown = sorted(set(parents) - declared_columns)
+        if unknown:
+            raise ValueError(
+                f"Variable schema{path_label} column {column!r} references unknown causal parent(s): "
+                f"{unknown}"
+            )
+        if column in parents:
+            raise ValueError(
+                f"Variable schema{path_label} column {column!r} cannot list itself as a causal parent"
+            )
+        graph[column] = list(parents)
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(column: str) -> None:
+        if column in visiting:
+            raise ValueError(
+                f"Variable schema{path_label} causal_parents contains a cycle involving {column!r}"
+            )
+        if column in visited:
+            return
+        visiting.add(column)
+        for parent in graph[column]:
+            visit(parent)
+        visiting.remove(column)
+        visited.add(column)
+
+    for column in graph:
+        visit(column)
+
+
+def schema_semantic_fingerprint(metadata: dict) -> str:
+    """Return a stable digest for resolved schema semantics, not just CSV bytes."""
+    encoded = json.dumps(metadata, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def resolve_schema_metadata(schema: dict, train_frame: pd.DataFrame) -> tuple[dict, str]:
+    """Resolve categorical vocabularies and numeric bounds from the fit role only."""
+    resolved = {}
+    for column, entry in schema.items():
+        if column not in train_frame.columns:
+            raise KeyError(f"Schema column {column!r} is missing from the train role")
+        observed = train_frame[column].dropna().unique().tolist()
+        if not observed:
+            raise ValueError(
+                f"Schema column {column!r} has no observed values in the train role; "
+                "cannot resolve its modeling semantics"
+            )
+        result = dict(entry)
+        if entry["kind"] == "categorical":
+            configured = entry.get("categorical_values")
+            vocabulary = list(configured) if configured else observed
+            unknown = [value for value in observed if value not in vocabulary]
+            if unknown:
+                raise ValueError(
+                    f"Schema column {column!r} has train values not present in its declared "
+                    f"categorical_values: {unknown}"
+                )
+            result["resolved_vocabulary"] = vocabulary
+            result["resolved_lower_bound"] = None
+            result["resolved_upper_bound"] = None
+        else:
+            if entry.get("categorical_values"):
+                raise ValueError(
+                    f"Continuous schema column {column!r} cannot declare categorical_values"
+                )
+            numeric = pd.to_numeric(train_frame[column], errors="coerce")
+            if numeric.isna().all():
+                raise ValueError(
+                    f"Continuous schema column {column!r} has no numeric values in the train role"
+                )
+            observed_min = float(numeric.min())
+            observed_max = float(numeric.max())
+            lower_bound = entry.get("lower_bound")
+            upper_bound = entry.get("upper_bound")
+            if lower_bound is not None and observed_min < lower_bound:
+                raise ValueError(
+                    f"Train values for {column!r} fall below declared lower_bound "
+                    f"{lower_bound}: observed minimum={observed_min}"
+                )
+            if upper_bound is not None and observed_max > upper_bound:
+                raise ValueError(
+                    f"Train values for {column!r} exceed declared upper_bound "
+                    f"{upper_bound}: observed maximum={observed_max}"
+                )
+            result["resolved_vocabulary"] = None
+            result["resolved_lower_bound"] = (
+                lower_bound if lower_bound is not None else observed_min
+            )
+            result["resolved_upper_bound"] = (
+                upper_bound if upper_bound is not None else observed_max
+            )
+        resolved[column] = result
+    metadata = {
+        "columns": resolved,
+        "source_table": {
+            column: entry.get("source_table")
+            for column, entry in resolved.items()
+            if entry.get("source_table") is not None
+        },
+        "causal_parents": {
+            column: entry.get("causal_parents", []) for column, entry in resolved.items()
+        },
+        "fit_role": "train",
+    }
+    return metadata, schema_semantic_fingerprint(metadata)
+
+
 def load_variable_schema(path: str | Path, modeling_columns: list) -> tuple[dict, str]:
     """Read and strictly validate the explicit variable schema CSV.
 
@@ -341,14 +950,16 @@ def load_variable_schema(path: str | Path, modeling_columns: list) -> tuple[dict
             f"once after source cleanup; {'; '.join(details)}."
         )
 
-    schema_columns = ["column", "kind"]
-    if "ordinal_order" in schema_df.columns:
-        schema_columns.append("ordinal_order")
+    unknown_schema_fields = set(schema_df.columns) - {"column", "kind"} - _SCHEMA_OPTIONAL_FIELDS
+    if unknown_schema_fields:
+        raise ValueError(
+            f"Variable schema {schema_path} contains unsupported field(s): "
+            f"{sorted(unknown_schema_fields)}"
+        )
     schema = {}
-    for row_number, values in enumerate(
-        schema_df[schema_columns].itertuples(index=False, name=None), start=2
-    ):
-        column, raw_kind, *order_values = values
+    for row_number, row in enumerate(schema_df.to_dict(orient="records"), start=2):
+        column = row["column"]
+        raw_kind = row["kind"]
         kind = raw_kind.strip().lower()
         if kind not in {"categorical", "continuous"}:
             raise ValueError(
@@ -356,7 +967,7 @@ def load_variable_schema(path: str | Path, modeling_columns: list) -> tuple[dict
                 f"kind {kind!r}; expected 'categorical' or 'continuous'."
             )
 
-        raw_order = order_values[0] if order_values else ""
+        raw_order = row.get("ordinal_order", "")
         raw_order = raw_order.strip()
         ordinal_order = None
         if raw_order:
@@ -378,7 +989,9 @@ def load_variable_schema(path: str | Path, modeling_columns: list) -> tuple[dict
                     "non-empty square-bracketed list for ordinal_order."
                 )
             try:
-                unique_order_values = {json.dumps(value, sort_keys=True) for value in ordinal_order}
+                unique_order_values = {
+                    json.dumps(value, sort_keys=True, default=str) for value in ordinal_order
+                }
             except (TypeError, ValueError) as exc:
                 raise ValueError(
                     f"Variable schema {schema_path} row {row_number} column {column!r} has an "
@@ -389,7 +1002,58 @@ def load_variable_schema(path: str | Path, modeling_columns: list) -> tuple[dict
                     f"Variable schema {schema_path} row {row_number} column {column!r} has duplicate "
                     "ordinal_order values."
                 )
-        schema[column] = {"kind": kind, "ordinal_order": ordinal_order}
+        source_table = row.get("source_table", "").strip() or None
+        lower_bound = _parse_schema_bound(
+            row.get("lower_bound", ""), schema_path, row_number, column, "lower_bound"
+        )
+        upper_bound = _parse_schema_bound(
+            row.get("upper_bound", ""), schema_path, row_number, column, "upper_bound"
+        )
+        if lower_bound is not None and upper_bound is not None and lower_bound > upper_bound:
+            raise ValueError(
+                f"Variable schema {schema_path} row {row_number} column {column!r} has "
+                f"lower_bound {lower_bound} greater than upper_bound {upper_bound}."
+            )
+        if (lower_bound is not None or upper_bound is not None) and kind != "continuous":
+            raise ValueError(
+                f"Variable schema {schema_path} row {row_number} column {column!r} supplies "
+                "numeric bounds but is not declared continuous."
+            )
+        causal_parents = _parse_schema_json_list(
+            row.get("causal_parents", ""),
+            schema_path,
+            row_number,
+            column,
+            "causal_parents",
+        )
+        if any(not isinstance(parent, str) or not parent.strip() for parent in causal_parents):
+            raise ValueError(
+                f"Variable schema {schema_path} row {row_number} column {column!r} must use "
+                "non-empty string causal parent names"
+            )
+        categorical_values = _parse_schema_json_list(
+            row.get("categorical_values", ""),
+            schema_path,
+            row_number,
+            column,
+            "categorical_values",
+        )
+        if categorical_values and kind != "categorical":
+            raise ValueError(
+                f"Variable schema {schema_path} row {row_number} column {column!r} supplies "
+                "categorical_values but is not declared categorical."
+            )
+        schema[column] = {
+            "kind": kind,
+            "ordinal_order": ordinal_order,
+            "source_table": source_table,
+            "lower_bound": lower_bound,
+            "upper_bound": upper_bound,
+            "causal_parents": causal_parents,
+            "categorical_values": categorical_values or None,
+        }
+
+    validate_schema_dag(schema, schema_path)
 
     logger.info(
         "Loaded strict variable schema from %s: %d columns (%d categorical, %d ordinal)",
@@ -732,6 +1396,110 @@ def mask_outliers_as_missing(df: pd.DataFrame, columns: list, threshold: float) 
 # ---------------------------------------------------------------------------
 
 
+def _persist_role_assignment(dataset: Dataset, assignment: RoleAssignment) -> None:
+    """Persist an immutable assignment under its digest and a small mutable pointer."""
+    assignment_root = ensure_dir(dataset.data_dir / "assignments")
+    assignment_id = assignment.assignment_fingerprint
+    if assignment.assignment_policy_fingerprint:
+        assignment_id = f"{assignment_id}-{assignment.assignment_policy_fingerprint}"
+    assignment_dir = assignment_root / assignment_id
+    ensure_dir(assignment_dir)
+    assignment_path = assignment_dir / "assignment.csv"
+    manifest_path = assignment_dir / "manifest.json"
+    if assignment_path.exists():
+        existing = pd.read_csv(assignment_path)
+        if existing.to_dict(orient="records") != assignment.assignment.to_dict(orient="records"):
+            raise ValueError(
+                f"Assignment digest collision or corruption at {assignment_path}; "
+                "refusing to overwrite an immutable split assignment"
+            )
+    else:
+        assignment.assignment.to_csv(assignment_path, index=False)
+    if manifest_path.exists():
+        with manifest_path.open() as manifest_file:
+            existing_manifest = json.load(manifest_file)
+        if existing_manifest.get("assignment_fingerprint") != assignment.assignment_fingerprint:
+            raise ValueError(
+                f"Assignment manifest {manifest_path} does not match its directory digest"
+            )
+    else:
+        with manifest_path.open("w") as manifest_file:
+            json.dump(
+                {
+                    "assignment_fingerprint": assignment.assignment_fingerprint,
+                    "assignment_policy_fingerprint": assignment.assignment_policy_fingerprint,
+                    "assignment_path": str(assignment_path),
+                    "metadata": assignment.metadata,
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "git_commit": git_commit(),
+                },
+                manifest_file,
+                indent=2,
+                default=str,
+            )
+    pointer_path = dataset.data_dir / "assignment_index.json"
+    with pointer_path.open("w") as pointer_file:
+        json.dump(
+            {
+                "assignment_fingerprint": assignment.assignment_fingerprint,
+                "assignment_policy_fingerprint": assignment.assignment_policy_fingerprint,
+                "assignment_id": assignment_id,
+                "assignment_manifest": str(manifest_path),
+            },
+            pointer_file,
+            indent=2,
+        )
+
+
+def _configured_identity_columns(split_cfg) -> set[str]:
+    if split_cfg is None:
+        return set()
+    return {
+        column
+        for column in (
+            split_cfg.patient_id_column,
+            split_cfg.mapping_row_key_column,
+            split_cfg.mapping_patient_key_column,
+        )
+        if column is not None
+    }
+
+
+def _validate_loader_column_declarations(
+    cfg: Config,
+    target_column: str,
+    split_cfg,
+) -> dict[str, list[str]]:
+    declarations = {
+        "protected_columns": list(cfg.data.protected_columns or cfg.data.sensitive_columns),
+        "quasi_identifier_columns": list(cfg.data.quasi_identifier_columns),
+    }
+    identity_columns = _configured_identity_columns(split_cfg)
+    conflicts = {
+        "target/identity": sorted({target_column} & identity_columns),
+        "target/drop": sorted({target_column} & set(cfg.data.drop_columns)),
+    }
+    for declaration_name, columns in declarations.items():
+        conflicts[f"{declaration_name}/identity"] = sorted(set(columns) & identity_columns)
+        conflicts[f"{declaration_name}/drop"] = sorted(set(columns) & set(cfg.data.drop_columns))
+
+    encounter_column = split_cfg.encounter_label_column if split_cfg is not None else None
+    if encounter_column is not None:
+        conflicts["encounter/target"] = sorted({encounter_column} & {target_column})
+        conflicts["encounter/identity"] = sorted({encounter_column} & identity_columns)
+        conflicts["encounter/drop"] = sorted({encounter_column} & set(cfg.data.drop_columns))
+        for declaration_name, columns in declarations.items():
+            conflicts[f"encounter/{declaration_name}"] = sorted({encounter_column} & set(columns))
+
+    nonempty_conflicts = {name: values for name, values in conflicts.items() if values}
+    if nonempty_conflicts:
+        raise ValueError(
+            "Conflicting data column declarations: "
+            + "; ".join(f"{name}={values}" for name, values in nonempty_conflicts.items())
+        )
+    return declarations
+
+
 def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
     """Record which dataset version/source produced ``dataset.data_dir``.
 
@@ -757,16 +1525,45 @@ def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
         "variable_schema_fingerprint": dataset.variable_schema_fingerprint,
         "source_fingerprint": dataset.source_fingerprint,
         "full_fingerprint": dataframe_fingerprint(dataset.full_df),
-        "train_split_fingerprint": dataframe_fingerprint(dataset.train_df),
-        "test_split_fingerprint": dataframe_fingerprint(dataset.test_df),
+        "train_split_fingerprint": dataset.train_split_fingerprint,
+        "test_split_fingerprint": dataset.test_split_fingerprint,
         "sensitive_columns": dataset.sensitive_columns,
         "n_rows": int(len(dataset.full_df)),
-        "n_train": int(len(dataset.train_df)),
-        "n_test": int(len(dataset.test_df)),
         "seed": cfg.seed,
         "last_loaded_at": datetime.now(UTC).isoformat(),
         "git_commit": git_commit(),
     }
+    if dataset.has_canonical_roles:
+        manifest.update(
+            {
+                "compatibility_mode": None,
+                "protected_columns": dataset.protected_columns,
+                "quasi_identifier_columns": dataset.quasi_identifier_columns,
+                "role_names": list(ROLE_NAMES),
+                "role_fingerprints": dataset.role_fingerprints,
+                "role_metadata": dataset.role_metadata,
+                "assignment_fingerprint": dataset.assignment_fingerprint,
+                "assignment_policy_fingerprint": dataset.assignment_policy_fingerprint,
+                "semantic_fingerprint": dataset.semantic_fingerprint,
+                "n_roles": {role: int(len(dataset.roles[role])) for role in ROLE_NAMES},
+                "role_paths": {role: str(dataset.paths()[role]) for role in ROLE_NAMES},
+            }
+        )
+    else:
+        manifest.update(
+            {
+                "compatibility_mode": "legacy_two_role",
+                "role_names": ["train", "final_holdout"],
+                "n_train": int(len(dataset.train_df)) if dataset.train_df is not None else 0,
+                "n_test": int(len(dataset.test_df)) if dataset.test_df is not None else 0,
+                "legacy_restrictions": [
+                    "no_tuning_role",
+                    "ineligible_for_new_hpo",
+                    "ineligible_for_final_policy",
+                    "ineligible_for_release_claims",
+                ],
+            }
+        )
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2, default=str)
 
@@ -774,10 +1571,9 @@ def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
 def load_dataset(cfg: Config) -> Dataset:
     """Load, type, and split the dataset described by ``cfg.data``.
 
-    Produces (and caches to ``cfg.data.data_dir/data_v_<cfg.data.version>``)
-    ``full.csv``, ``train.csv``, and ``test.csv``. These are the
-    pre-imputation splits; :mod:`synthdata.imputation` later fills in
-    ``*_imputed.csv`` variants aligned to the same row indices.
+    A configured ``data.split`` produces canonical ``train``, ``tuning``, and
+    ``final_holdout`` roles before any learned transformation. Historical
+    two-role loading requires the explicit ``data.legacy_two_role: true`` flag.
     """
     data_dir_base = Path(cfg.data.data_dir)
     data_version_scope = f"data_v_{cfg.data.version}" if cfg.data.version else "data_v_unversioned"
@@ -796,9 +1592,6 @@ def load_dataset(cfg: Config) -> Dataset:
         df.columns = df.columns.str.upper()
         if variable_types is not None:
             variable_types = {k.upper(): v for k, v in variable_types.items()}
-
-    if cfg.data.drop_columns:
-        df = df.drop(columns=[c for c in cfg.data.drop_columns if c in df.columns])
 
     if cfg.data.raw_target_column and cfg.data.raw_target_column in df.columns:
         df = df.rename(columns={cfg.data.raw_target_column: cfg.data.target_column})
@@ -823,6 +1616,33 @@ def load_dataset(cfg: Config) -> Dataset:
                 n_before,
                 target_column,
             )
+
+    split_cfg = cfg.data.split
+    if split_cfg is None and not cfg.data.legacy_two_role:
+        raise ValueError(
+            "data.split is required for canonical roles; set data.legacy_two_role=true "
+            "only when intentionally reading historical train/test data"
+        )
+    if split_cfg is not None and cfg.data.legacy_two_role:
+        raise ValueError("data.split and data.legacy_two_role are mutually exclusive")
+    semantic_declarations = _validate_loader_column_declarations(
+        cfg,
+        target_column,
+        split_cfg,
+    )
+    identity = resolve_population_identity(df, split_cfg)
+    df = identity.model_frame
+    groups = identity.groups
+
+    configured_identity_columns = _configured_identity_columns(split_cfg)
+
+    if cfg.data.drop_columns:
+        if split_cfg is not None and set(cfg.data.drop_columns) & configured_identity_columns:
+            raise ValueError(
+                "data.drop_columns cannot contain population identity columns; identity is "
+                "removed from model frames by the split resolver"
+            )
+        df = df.drop(columns=[c for c in cfg.data.drop_columns if c in df.columns])
 
     feature_columns = [c for c in df.columns if c != target_column]
     modeling_columns = feature_columns + [target_column]
@@ -862,6 +1682,11 @@ def load_dataset(cfg: Config) -> Dataset:
                 if column == target_column or column in nominal_columns + ordinal_columns
                 else "continuous",
                 "ordinal_order": cfg.data.ordinal_column_categories.get(column),
+                "source_table": None,
+                "lower_bound": None,
+                "upper_bound": None,
+                "causal_parents": [],
+                "categorical_values": None,
             }
             for column in modeling_columns
         }
@@ -887,44 +1712,119 @@ def load_dataset(cfg: Config) -> Dataset:
         ]
         df = mask_outliers_as_missing(df, outlier_columns, cfg.data.outlier_zscore_threshold)
 
-    missing_sensitive = [c for c in cfg.data.sensitive_columns if c not in df.columns]
-    if missing_sensitive:
-        raise KeyError(f"sensitive_columns not found in data: {missing_sensitive}")
+    protected_columns = semantic_declarations["protected_columns"]
+    quasi_identifier_columns = semantic_declarations["quasi_identifier_columns"]
+    for declaration_name, columns in semantic_declarations.items():
+        missing = [column for column in columns if column not in df.columns]
+        if missing:
+            raise KeyError(
+                f"data.{declaration_name} references column(s) not present in the modeling "
+                f"frame: {missing}; available columns: {list(df.columns)}"
+            )
+        if target_column in columns:
+            raise ValueError(
+                f"data.{declaration_name} must not contain target column {target_column!r}"
+            )
 
-    train_df, test_df = train_test_split(
-        df,
-        train_size=cfg.data.train_size,
-        random_state=cfg.seed,
-        stratify=df[target_column] if cfg.data.stratify else None,
-    )
-
-    dataset = Dataset(
-        name=cfg.name,
-        target_column=target_column,
-        feature_columns=feature_columns,
-        nominal_columns=nominal_columns,
-        ordinal_columns=ordinal_columns,
-        sensitive_columns=list(cfg.data.sensitive_columns),
-        data_dir=data_dir,
-        full_df=df,
-        train_df=train_df,
-        test_df=test_df,
-        version=cfg.data.version,
-        variable_schema=variable_schema,
-        variable_schema_fingerprint=variable_schema_fingerprint,
-        source_fingerprint=source_fingerprint,
-    )
-
-    paths = dataset.paths()
-    df.to_csv(paths["full"], index=False)
-    train_df.to_csv(paths["train"], index=False)
-    test_df.to_csv(paths["test"], index=False)
+    if split_cfg is None:
+        train_df, test_df = train_test_split(
+            df,
+            train_size=cfg.data.train_size,
+            random_state=cfg.seed,
+            stratify=df[target_column] if cfg.data.stratify else None,
+        )
+        dataset = Dataset(
+            name=cfg.name,
+            target_column=target_column,
+            feature_columns=feature_columns,
+            nominal_columns=nominal_columns,
+            ordinal_columns=ordinal_columns,
+            sensitive_columns=list(protected_columns),
+            data_dir=data_dir,
+            full_df=df,
+            train_df=train_df,
+            test_df=test_df,
+            version=cfg.data.version,
+            protected_columns=list(protected_columns),
+            quasi_identifier_columns=quasi_identifier_columns,
+            variable_schema=variable_schema,
+            variable_schema_fingerprint=variable_schema_fingerprint,
+            source_fingerprint=source_fingerprint,
+            role_metadata={
+                "compatibility_mode": "legacy_two_role",
+                "identity": identity.metadata,
+            },
+        )
+        paths = dataset.paths()
+        df.to_csv(paths["full"], index=False)
+        train_df.to_csv(paths["train"], index=False)
+        test_df.to_csv(paths["test"], index=False)
+    else:
+        if split_cfg.mode == "patient_group" and groups is None:
+            raise ValueError(
+                "patient_group mode resolved no population groups; refusing to fall back to row mode"
+            )
+        df = df.reset_index(drop=True)
+        if groups is not None:
+            groups = groups.reset_index(drop=True)
+        role_assignment = allocate_roles(
+            df,
+            target_column,
+            split_cfg,
+            protected_columns=protected_columns,
+            groups=groups,
+            seed=cfg.seed,
+        )
+        resolved_semantics, semantic_fingerprint = resolve_schema_metadata(
+            variable_schema, role_assignment.frames["train"]
+        )
+        role_metadata = {
+            "compatibility_mode": None,
+            "identity": identity.metadata,
+            "split": role_assignment.metadata,
+            "semantic": resolved_semantics,
+        }
+        dataset = Dataset(
+            name=cfg.name,
+            target_column=target_column,
+            feature_columns=feature_columns,
+            nominal_columns=nominal_columns,
+            ordinal_columns=ordinal_columns,
+            sensitive_columns=list(protected_columns),
+            data_dir=data_dir,
+            full_df=df,
+            train_df=None,
+            test_df=None,
+            roles=role_assignment.frames,
+            role_groups=role_assignment.groups,
+            assignment=role_assignment.assignment,
+            role_metadata=role_metadata,
+            version=cfg.data.version,
+            protected_columns=list(protected_columns),
+            quasi_identifier_columns=quasi_identifier_columns,
+            variable_schema=variable_schema,
+            variable_schema_fingerprint=variable_schema_fingerprint,
+            source_fingerprint=source_fingerprint,
+            assignment_fingerprint=role_assignment.assignment_fingerprint,
+            assignment_policy_fingerprint=role_assignment.assignment_policy_fingerprint,
+            semantic_fingerprint=semantic_fingerprint,
+        )
+        paths = dataset.paths()
+        df.to_csv(paths["full"], index=False)
+        for role in ROLE_NAMES:
+            dataset.roles[role].to_csv(paths[role], index=False)
+        _persist_role_assignment(dataset, role_assignment)
 
     write_dataset_manifest(cfg, dataset)
 
+    role_log = (
+        ", ".join(f"{role}={len(dataset.roles[role])}" for role in dataset.roles)
+        if dataset.roles
+        else "none"
+    )
     logger.info(
         "Loaded dataset '%s' (version=%s): %d rows, %d features (%d categorical: %d nominal + "
-        "%d ordinal), target=%r, sensitive=%s, train=%d/test=%d",
+        "%d ordinal), target=%r, protected=%s, roles=%s, compatibility=%s",
         cfg.name,
         cfg.data.version or "unversioned",
         len(df),
@@ -933,21 +1833,27 @@ def load_dataset(cfg: Config) -> Dataset:
         len(nominal_columns),
         len(ordinal_columns),
         target_column,
-        dataset.sensitive_columns,
-        len(train_df),
-        len(test_df),
+        protected_columns,
+        role_log,
+        "legacy_two_role" if dataset.legacy_two_role else "canonical",
     )
     return dataset
 
 
-def load_imputed_splits(dataset: Dataset) -> Dataset:
-    """Attach imputed CSVs only when their source and split provenance still matches."""
+def load_imputed_splits(
+    dataset: Dataset,
+    expected_cache_key: str | None = None,
+) -> Dataset:
+    """Attach imputed role CSVs only when their provenance still matches."""
     paths = dataset.paths()
-    imputed_paths = {
-        "full": paths["full_imputed"],
-        "train": paths["train_imputed"],
-        "test": paths["test_imputed"],
-    }
+    if dataset.has_canonical_roles:
+        imputed_paths = {role: paths[f"{role}_imputed"] for role in ROLE_NAMES}
+    else:
+        imputed_paths = {
+            "full": paths["full_imputed"],
+            "train": paths["train_imputed"],
+            "test": paths["test_imputed"],
+        }
     if not all(path.exists() for path in imputed_paths.values()):
         return dataset
 
@@ -973,12 +1879,35 @@ def load_imputed_splits(dataset: Dataset) -> Dataset:
         )
         return dataset
 
-    expected_provenance = {
-        "source_fingerprint": dataset.source_fingerprint,
-        "full_fingerprint": dataframe_fingerprint(dataset.full_df),
-        "train_split_fingerprint": dataframe_fingerprint(dataset.train_df),
-        "test_split_fingerprint": dataframe_fingerprint(dataset.test_df),
-    }
+    if expected_cache_key is not None and provenance.get("cache_key") != expected_cache_key:
+        logger.warning(
+            "Ignoring imputed CSVs under %s because cache key differs: stored=%s, expected=%s; "
+            "rerun imputation",
+            dataset.data_dir,
+            provenance.get("cache_key"),
+            expected_cache_key,
+        )
+        return dataset
+
+    if dataset.has_canonical_roles:
+        expected_provenance = {
+            "cache_contract": "canonical_roles_v1",
+            "source_fingerprint": dataset.source_fingerprint,
+            "full_fingerprint": dataframe_fingerprint(dataset.full_df),
+            "role_names": list(ROLE_NAMES),
+            "role_fingerprints": dataset.role_fingerprints,
+            "assignment_fingerprint": dataset.assignment_fingerprint,
+            "semantic_fingerprint": dataset.semantic_fingerprint,
+            "fit_role": "train",
+            "fit_role_fingerprint": dataset.role_fingerprints["train"],
+        }
+    else:
+        expected_provenance = {
+            "source_fingerprint": dataset.source_fingerprint,
+            "full_fingerprint": dataframe_fingerprint(dataset.full_df),
+            "train_split_fingerprint": dataframe_fingerprint(dataset.train_df),
+            "test_split_fingerprint": dataframe_fingerprint(dataset.test_df),
+        }
     mismatches = {
         field: (provenance.get(field), expected)
         for field, expected in expected_provenance.items()
@@ -992,7 +1921,16 @@ def load_imputed_splits(dataset: Dataset) -> Dataset:
         )
         return dataset
 
-    frames = {name: pd.read_csv(path) for name, path in imputed_paths.items()}
+    try:
+        frames = {name: pd.read_csv(path) for name, path in imputed_paths.items()}
+    except (OSError, pd.errors.ParserError) as exc:
+        logger.warning(
+            "Ignoring imputed CSVs under %s because a role cache could not be read: %s; "
+            "rerun imputation",
+            dataset.data_dir,
+            exc,
+        )
+        return dataset
     expected_columns = dataset.full_df.columns.tolist()
     recorded_row_counts = provenance.get("imputed_row_counts")
     if isinstance(recorded_row_counts, dict) and all(
@@ -1000,11 +1938,14 @@ def load_imputed_splits(dataset: Dataset) -> Dataset:
     ):
         expected_rows = {name: recorded_row_counts[name] for name in imputed_paths}
     else:
-        expected_rows = {
-            "full": len(dataset.full_df),
-            "train": len(dataset.train_df),
-            "test": len(dataset.test_df),
-        }
+        if dataset.has_canonical_roles:
+            expected_rows = {role: len(dataset.roles[role]) for role in ROLE_NAMES}
+        else:
+            expected_rows = {
+                "full": len(dataset.full_df),
+                "train": len(dataset.train_df),
+                "test": len(dataset.test_df),
+            }
     invalid_frames = {
         name: {
             "rows": len(frame),
@@ -1022,8 +1963,15 @@ def load_imputed_splits(dataset: Dataset) -> Dataset:
         )
         return dataset
 
-    dataset.full_imputed_df = frames["full"]
-    dataset.train_imputed_df = frames["train"]
-    dataset.test_imputed_df = frames["test"]
-    dataset.attach_decoded_imputed_splits()
+    if dataset.has_canonical_roles:
+        dataset.set_imputed_roles(frames)
+    else:
+        dataset.full_imputed_df = frames["full"]
+        dataset.train_imputed_df = frames["train"]
+        dataset.test_imputed_df = frames["test"]
+        dataset.imputed_roles = {
+            "train": frames["train"],
+            "final_holdout": frames["test"],
+        }
+        dataset.attach_decoded_imputed_splits()
     return dataset

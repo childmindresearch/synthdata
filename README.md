@@ -40,16 +40,112 @@ target,categorical,
 > [!TIP]
 > Treat the example configurations as templates, not defaults for your data. Dataset paths, feature roles, target, version, generation methods, and evaluation settings should be reviewed for each project.
 
+New dataset profiles must define the three canonical population roles in
+`data.split`: `train` is the only role allowed to fit learned state,
+`tuning` drives HPO and candidate selection, and `final_holdout` is reserved
+for post-selection evidence. Use `mode: patient_group` with
+`patient_id_column` (or a complete identity mapping sidecar) when rows are
+repeated observations. If the data is patient-level but has no identifier,
+use `one_row_per_patient: true`; this is an explicit assertion, not an
+inference. Patient identity is removed from model frames and retained only in
+local role-assignment metadata.
+
+Historical `train`/`test` artifacts are supported only when the profile sets
+`data.legacy_two_role: true`. They remain readable for compatibility, but
+evaluation writes an explicit blocked result without candidate metric
+evaluation or ranking; they cannot produce new HPO, final-policy, or release
+claims.
+
+SynthCity attribute-inference attacks require an explicit quasi-identifier
+panel in `data.quasi_identifier_columns`; an evaluation-level
+`evaluation.synthcity.quasi_identifier_columns` value, when supplied, must
+match it. Sensitive target kinds come from the dataset variable schema, and
+`evaluation.synthcity.sensitive_target_types` may only repeat matching schema
+values. Leaving the Dataset QI panel empty records an explicit failed attack
+result instead of silently treating every remaining feature as attacker input.
+Set `evaluation.synthcity.classification_score` to
+`balanced_accuracy` (the default) or `macro_f1`; the selected score drives the
+baseline-adjusted categorical attack value while both diagnostics are retained.
+
+The SynthCity structural privacy screens (`k-anonymization`, `distinct
+l-diversity`, `k-map`, and `delta-presence`) are configurable KMeans proxy
+screens, not formal privacy guarantees. Their calibration is tied to
+`evaluation.synthcity.structural_n_clusters`,
+`evaluation.synthcity.structural_min_rows_per_cluster`, the selected sensitive
+features, the DataLoader representation, sample sizes, and the random seed.
+Changing those inputs requires fresh calibration; prior thresholds do not
+carry over automatically.
+
 ## Pipeline behavior
 
 The four commands form an ordered pipeline:
 
-1. **Impute** missing feature values using TabImpute or RefiDiff, with schema-aware caching and automatic CPU/GPU device selection.
-2. **Generate** candidate synthetic datasets with configured SynthCity, TabPFN, and TabPFGen models; optional Optuna hyperparameter searches are persisted and resumable.
-3. **Evaluate** candidates for utility, privacy, and fairness. Evaluation can process models in parallel within configured resource limits and writes a ranked table, report, and diagnostics.
+1. **Impute** missing feature values using TabImpute or RefiDiff, with schema-aware caching and automatic CPU/GPU device selection. Canonical TabImpute roles fit reusable encoding/scaling state on `train` only, transform `tuning` and `final_holdout`, and record that state provenance in the local cache sidecar.
+2. **Generate** candidate synthetic datasets with configured SynthCity, TabPFN, and TabPFGen models; optional Optuna hyperparameter searches are persisted and resumable. Each HPO context is stored in a digest-versioned sidecar with a latest pointer, so changing the objective creates a new study identity without overwriting prior context evidence.
+3. **Evaluate** candidates for utility, privacy, and fairness. Candidate ranking uses only `train` plus `tuning`; after selection, the chosen generator is refit on those two roles and evaluated once against `final_holdout`. Evaluation can process models in parallel within configured resource limits and writes a ranked table, report, and diagnostics.
 4. **Plot** recorded data-quality, generation, HPO, and evaluation artifacts without rerunning earlier stages.
 
 Artifacts are namespaced by dataset name, dataset version, and experiment ID. Their folder names make both levels explicit: for example, `data_v_1.2/exp_v_0.4/`. Generation creates a new experiment by default; evaluation and plotting use the latest one or accept `--experiment-id` to revisit a prior run. This preserves cached inputs, model outputs, HPO state, metrics, and figures across dataset revisions.
+
+Evaluation always retains raw metric values for audit. The ranked columns are
+derived separately and include only complete, decision-eligible policy metrics;
+failed, diagnostic, calibration-only, and blocked results remain visible in
+the raw table or validation sidecars. Each evaluation bundle also records
+`evaluation_artifacts-v1/metric_contract_manifest.json`,
+`evaluation_artifacts-v1/synthcity_metric_status.json`,
+`evaluation_artifacts-v1/syntheval_metric_status.json`, and
+`evaluation_artifacts-v1/syntheval_execution.json`,
+`evaluation_artifacts-v1/custom_metric_status.json`, and
+`evaluation_artifacts-v1/final_holdout_evidence.json` when those framework
+results are present. The final-holdout sidecar is written after candidate
+selection, points to the selected model's refit artifact, and is never merged
+into `combined_evaluation.csv`. Its refit metadata records `fit_roles` as
+`["train", "tuning"]`; successful evidence verifies both the synthetic CSV
+and its cache metadata by SHA-256. The SynthEval execution sidecar retains terminal
+per-method status plus legacy and versioned normalized rows. All are
+referenced and integrity-hashed by
+`evaluation_artifacts-v1/manifest.json`. The sidecars contain per-model metric
+states, role fingerprints, source metadata, and the contract digest used for
+that run. The experiment manifest also records a separate
+`final_holdout_evidence` stage. Legacy two-role datasets write an explicit
+blocked final-evidence record instead of making a release claim.
+
+Evaluation defaults to row-level populations:
+
+```yaml
+evaluation:
+  group_mode: row
+  group_column: null
+```
+
+Set `group_mode: patient_group` and provide a non-empty `group_column` when
+rows represent repeated observations of the same patient or entity. The
+identifier must be present and non-null in the imputed train, holdout, and
+synthetic evaluation frames, and real train/holdout groups must be disjoint.
+
+The shipped privacy thresholds are calibration-only and disabled by default.
+Enabling `evaluation.privacy_gate` requires each threshold to name an exact
+operational `contract_id`; calibration-only and audit-only metrics remain
+visible as evidence but cannot authorize a release recommendation.
+The evaluation sidecars record group counts and role-scoped fingerprints, not
+raw identifiers. Until a metric has an explicit `group_safe` contract,
+patient-group evaluation keeps its result for audit but marks it
+`group_unsafe` and excludes it from policy ranking; this bridge does not claim
+group-aware aggregation yet.
+
+The generic HPO objective is limited to the approved utility set in
+`HPOConfig.metric_config` (`wasserstein_dist`, `inv_kl_divergence`, nearest
+synthetic-neighbor distance, and XGB utility). Privacy, diagnostic, and
+calibration-only metrics fail closed at HPO setup rather than becoming tuning
+objectives by default.
+
+Before those objective metrics run, every HPO candidate passes the configured
+`generation.hpo.stage_a` screens for shape/schema, source-derived numeric and
+categorical validity, target/protected-group support, deterministic dependency
+rules, exact row reuse (zero tolerance), and subgroup collapse. Failed screens
+are persisted as per-trial prune results under the generation experiment and
+cannot become partial objective evidence. No privacy or fairness attack is
+invoked by Stage A.
 
 > [!TIP]
 > See [`synthdata/config.py`](synthdata/config.py) for cache, device, model, HPO, parallel evaluation, artifact, experiment, metric, ranking, privacy-gate, and plot options.

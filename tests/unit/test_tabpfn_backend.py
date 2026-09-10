@@ -3,9 +3,12 @@
 import sys
 import types
 
+import numpy as np
 import pandas as pd
 import pytest
+import torch
 
+from synthdata.data import semantic_context_digest, semantic_context_payload
 from synthdata.generation import tabpfn_backend
 
 pytestmark = pytest.mark.unit
@@ -74,3 +77,47 @@ def test_explicit_type_patch_is_idempotent(monkeypatch):
 def test_tabpfn_generators_reject_continuous_target(generator, arguments):
     with pytest.raises(ValueError, match="target column 'target'.*continuous"):
         generator(*arguments, target_is_categorical=False)
+
+
+def test_tabpfn_custom_consumes_semantic_context(make_canonical_dataset, mocker):
+    dataset = make_canonical_dataset("column")
+    train_frame = dataset.role_frame("train", imputed=True).reset_index(drop=True)
+    semantic_context = semantic_context_payload(
+        dataset,
+        classification_score="macro_f1",
+    )
+
+    class FakeExperiment:
+        def __init__(self):
+            self.data = train_frame.copy()
+            self.synthetic_X = torch.zeros((2, len(train_frame.columns)))
+
+        def run(self, **kwargs):
+            self.run_kwargs = kwargs
+
+    experiment = FakeExperiment()
+
+    class FakeClassifier:
+        def fit(self, features, labels):
+            del features, labels
+            return self
+
+        def predict(self, features):
+            return np.zeros(len(features), dtype=int)
+
+    mocker.patch.object(tabpfn_backend, "_make_experiment", return_value=(experiment, object()))
+    mocker.patch("tabpfn.TabPFNClassifier", FakeClassifier)
+
+    generated, returned_experiment = tabpfn_backend.generate_tabpfn_custom(
+        train_frame,
+        dataset.categorical_columns,
+        dataset.target_column,
+        2,
+        target_is_categorical=True,
+        variable_schema_fingerprint=dataset.variable_schema_fingerprint,
+        semantic_context=semantic_context,
+    )
+
+    assert len(generated) == 2
+    assert returned_experiment.semantic_context == semantic_context
+    assert returned_experiment.semantic_context_digest == semantic_context_digest(semantic_context)

@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 from synthdata.config import Config
+from synthdata.data import role_context_fingerprint, role_context_payload
+from synthdata.data_roles import ROLE_NAMES
 from synthdata.utils import ensure_dir, get_logger, git_commit
 
 logger = get_logger(__name__)
@@ -93,6 +95,8 @@ class Experiment:
     manifest_path: Path
     created_at: str
     git_commit: str | None
+    role_context_fingerprint: str | None = None
+    role_context: dict[str, Any] | None = None
 
     def record(self, stage: str, artifacts: dict[str, Any] | None = None, **extra: Any) -> None:
         """Append a stage entry to this experiment's manifest.json."""
@@ -103,6 +107,8 @@ class Experiment:
             "artifacts": artifacts or {},
             **extra,
         }
+        if self.role_context_fingerprint is not None:
+            entry["role_context_fingerprint"] = self.role_context_fingerprint
         manifest = self._load_manifest()
         manifest.setdefault("runs", []).append(entry)
         self._save_manifest(manifest)
@@ -119,6 +125,14 @@ class Experiment:
             "dataset_version": self.dataset_version,
             "created_at": self.created_at,
             "git_commit": self.git_commit,
+            **(
+                {
+                    "role_context_fingerprint": self.role_context_fingerprint,
+                    "role_context": self.role_context,
+                }
+                if self.role_context_fingerprint is not None
+                else {}
+            ),
             "runs": [],
         }
 
@@ -128,11 +142,17 @@ class Experiment:
             json.dump(manifest, f, indent=2, default=str)
 
 
-def _build_experiment(experiment_id: str, cfg: Config) -> Experiment:
+def _build_experiment(experiment_id: str, cfg: Config, dataset=None) -> Experiment:
     scope = dataset_version_scope(cfg)
     experiment_scope = f"exp_v_{experiment_id}"
     experiment_root = _experiments_root(cfg) / experiment_scope
     manifest_path = experiment_root / "manifest.json"
+    role_context = None
+    role_context_digest = None
+    if dataset is not None:
+        role_names = ROLE_NAMES if dataset.has_canonical_roles else ("train", "final_holdout")
+        role_context = role_context_payload(dataset, role_names)
+        role_context_digest = role_context_fingerprint(dataset, role_names)
     if manifest_path.exists():
         with open(manifest_path) as f:
             manifest = json.load(f)
@@ -144,6 +164,14 @@ def _build_experiment(experiment_id: str, cfg: Config) -> Experiment:
                 f"manifest belongs to dataset {actual_identity[0]!r}@{actual_identity[1]!r}, "
                 f"not {expected_identity[0]!r}@{expected_identity[1]!r}."
             )
+        if role_context_digest is not None:
+            recorded_context = manifest.get("role_context_fingerprint")
+            if recorded_context != role_context_digest:
+                raise ValueError(
+                    f"Refusing to resume experiment '{experiment_id}' at {manifest_path}: "
+                    "resolved dataset role context does not match the recorded context "
+                    f"(recorded={recorded_context!r}, current={role_context_digest!r})."
+                )
 
     generation_dir = ensure_dir(Path(cfg.generation.output_dir) / scope / experiment_scope)
     evaluation_dir = ensure_dir(Path(cfg.evaluation.output_dir) / scope / experiment_scope)
@@ -161,6 +189,8 @@ def _build_experiment(experiment_id: str, cfg: Config) -> Experiment:
         manifest_path=manifest_path,
         created_at=datetime.now(UTC).isoformat(),
         git_commit=git_commit(),
+        role_context_fingerprint=role_context_digest,
+        role_context=role_context,
     )
 
     config_snapshot_path = experiment_root / "config_snapshot.json"
@@ -185,7 +215,7 @@ def _read_latest_pointer(cfg: Config) -> str | None:
         return json.load(f).get("experiment_id")
 
 
-def start_experiment(cfg: Config) -> Experiment:
+def start_experiment(cfg: Config, dataset=None) -> Experiment:
     """Start (or explicitly resume) an experiment; used by `synthdata-generate`.
 
     If ``cfg.experiment.id`` is not set, a new timestamped id is generated
@@ -193,7 +223,7 @@ def start_experiment(cfg: Config) -> Experiment:
     "latest" experiment for this dataset's output directory.
     """
     experiment_id = cfg.experiment.id or _timestamp_id(cfg.experiment.tag)
-    experiment = _build_experiment(experiment_id, cfg)
+    experiment = _build_experiment(experiment_id, cfg, dataset=dataset)
     _write_latest_pointer(cfg, experiment_id)
     logger.info(
         "Experiment '%s' (tag=%s, dataset=%s@%s)",
@@ -205,7 +235,7 @@ def start_experiment(cfg: Config) -> Experiment:
     return experiment
 
 
-def load_experiment(cfg: Config) -> Experiment:
+def load_experiment(cfg: Config, dataset=None) -> Experiment:
     """Load a previously-started experiment; used by `synthdata-evaluate`/`synthdata-plot`.
 
     Resolution order: ``cfg.experiment.id`` if explicitly set, else the
@@ -218,7 +248,7 @@ def load_experiment(cfg: Config) -> Experiment:
             "No experiment found to load. Run `synthdata-generate` first, or pass "
             "--experiment-id to target a specific past experiment."
         )
-    experiment = _build_experiment(experiment_id, cfg)
+    experiment = _build_experiment(experiment_id, cfg, dataset=dataset)
     logger.info(
         "Loaded experiment '%s' (tag=%s, dataset=%s@%s)",
         experiment.id,

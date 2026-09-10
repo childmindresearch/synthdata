@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from synthdata.config import Config, DataConfig
+from synthdata.config import Config, DataConfig, DataSplitConfig
 from synthdata.data import (
     _load_local_file,
     cast_integer_like_columns,
@@ -190,6 +190,7 @@ class TestVariableSchema:
                 data_dir=str(tmp_path / "derived"),
                 train_size=0.5,
                 stratify=True,
+                legacy_two_role=True,
             ),
         )
 
@@ -234,6 +235,7 @@ class TestVariableSchema:
                 data_dir=str(tmp_path / "derived"),
                 train_size=0.5,
                 stratify=False,
+                legacy_two_role=True,
             ),
         )
 
@@ -242,6 +244,73 @@ class TestVariableSchema:
         assert dataset.target_is_categorical is False
         assert dataset.all_categorical_columns == []
         assert pd.api.types.is_float_dtype(dataset.full_df["target"])
+
+    @staticmethod
+    def _canonical_config(raw_path, schema_path, data_dir, split):
+        return Config(
+            name="canonical_loader_test",
+            data=DataConfig(
+                source="csv",
+                path=str(raw_path),
+                target_column="target",
+                variable_schema_path=str(schema_path),
+                data_dir=str(data_dir),
+                split=split,
+            ),
+        )
+
+    def test_loader_rejects_encounter_label_that_would_be_dropped(self, tmp_path):
+        raw_path = tmp_path / "raw.csv"
+        pd.DataFrame(
+            {
+                "patient_id": [1, 1, 2, 2, 3, 3],
+                "encounter": ["early", "late"] * 3,
+                "feature": [1, 2, 3, 4, 5, 6],
+                "target": [0, 1, 0, 1, 0, 1],
+            }
+        ).to_csv(raw_path, index=False)
+        schema_path = tmp_path / "schema.csv"
+        schema_path.write_text(
+            "column,kind\nencounter,categorical\nfeature,continuous\ntarget,categorical\n"
+        )
+        split = DataSplitConfig(
+            mode="patient_group",
+            patient_id_column="patient_id",
+            encounter_label_column="encounter",
+        )
+        cfg = self._canonical_config(raw_path, schema_path, tmp_path / "derived", split)
+        cfg.data.drop_columns = ["encounter"]
+
+        with pytest.raises(ValueError, match="encounter/drop"):
+            load_dataset(cfg)
+
+    def test_loader_rejects_mapping_patient_key_overlap_with_protected_column(self, tmp_path):
+        raw_path = tmp_path / "raw.csv"
+        pd.DataFrame(
+            {
+                "row_id": [10, 11, 12, 13, 14, 15],
+                "feature": [1, 2, 3, 4, 5, 6],
+                "target": [0, 1, 0, 1, 0, 1],
+            }
+        ).to_csv(raw_path, index=False)
+        mapping_path = tmp_path / "identity.csv"
+        pd.DataFrame({"row_id": [10, 11, 12, 13, 14, 15], "patient_id": [1, 1, 2, 2, 3, 3]}).to_csv(
+            mapping_path,
+            index=False,
+        )
+        schema_path = tmp_path / "schema.csv"
+        schema_path.write_text("column,kind\nfeature,continuous\ntarget,categorical\n")
+        split = DataSplitConfig(
+            mode="patient_group",
+            identity_mapping_path=str(mapping_path),
+            mapping_row_key_column="row_id",
+            mapping_patient_key_column="patient_id",
+        )
+        cfg = self._canonical_config(raw_path, schema_path, tmp_path / "derived", split)
+        cfg.data.protected_columns = ["patient_id"]
+
+        with pytest.raises(ValueError, match="protected_columns/identity"):
+            load_dataset(cfg)
 
 
 def test_legacy_dataset_assumes_categorical_target(make_dataset):

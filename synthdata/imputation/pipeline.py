@@ -23,9 +23,15 @@ from synthdata.data import (
     dataframe_fingerprint,
     load_imputed_splits,
 )
+from synthdata.data_roles import ROLE_NAMES
 from synthdata.utils import ensure_dir, get_logger, resolve_device
 
 logger = get_logger(__name__)
+
+
+class RoleIsolationError(RuntimeError):
+    """Raised when an imputation backend cannot honor canonical role isolation."""
+
 
 #: Sidecar filename (under ``dataset.data_dir``) recording the config fields that
 #: determined the currently-cached imputed CSVs -- see :func:`_cache_key_record`.
@@ -35,11 +41,16 @@ _CACHE_KEY_FILENAME = IMPUTATION_CACHE_KEY_FILENAME
 def _persist_decoded_imputed_splits(dataset: Dataset) -> None:
     """Persist label-preserving views alongside numeric model-space caches."""
     dataset.attach_decoded_imputed_splits()
-    decoded_frames = {
-        "full_imputed_decoded": dataset.full_imputed_decoded_df,
-        "train_imputed_decoded": dataset.train_imputed_decoded_df,
-        "test_imputed_decoded": dataset.test_imputed_decoded_df,
-    }
+    decoded_frames = {"full_imputed_decoded": dataset.full_imputed_decoded_df}
+    decoded_frames.update(
+        {f"{role}_imputed_decoded": dataset.decoded_roles.get(role) for role in dataset.roles}
+    )
+    if dataset.legacy_two_role:
+        decoded_frames = {
+            "full_imputed_decoded": dataset.full_imputed_decoded_df,
+            "train_imputed_decoded": dataset.train_imputed_decoded_df,
+            "test_imputed_decoded": dataset.test_imputed_decoded_df,
+        }
     missing = [name for name, frame in decoded_frames.items() if frame is None]
     if missing:
         raise RuntimeError(
@@ -50,7 +61,7 @@ def _persist_decoded_imputed_splits(dataset: Dataset) -> None:
         frame.to_csv(paths[name], index=False)
     logger.info(
         "Wrote ordinal-decoded imputed splits under %s (model-space caches remain in "
-        "full_imputed.csv/train_imputed.csv/test_imputed.csv)",
+        "role-specific imputed CSVs)",
         dataset.data_dir,
     )
 
@@ -84,6 +95,71 @@ def _impute_dataframe(cfg: Config, df: pd.DataFrame, dataset: Dataset, device: s
     # Unreachable in practice: Config._validate() already restricts
     # imputation.method to {"tabimpute", "refidiff"} before this runs.
     raise ValueError(f"Unknown imputation.method: {method!r}")
+
+
+def _impute_canonical_roles(
+    cfg: Config, dataset: Dataset, device: str
+) -> tuple[dict[str, pd.DataFrame], dict | None]:
+    """Fit on train once, then transform tuning and final_holdout without refit."""
+    dataset.require_canonical_roles("canonical imputation")
+    role_frames = dataset.roles
+    n_missing = {
+        role: int(frame[dataset.feature_columns].isna().sum().sum())
+        for role, frame in role_frames.items()
+    }
+    if not any(n_missing.values()):
+        logger.info("Canonical roles contain no missing feature values; imputation is a no-op")
+        state_metadata = None
+        if cfg.imputation.method == "tabimpute":
+            from synthdata.imputation.tabimpute_backend import no_fit_state_metadata
+
+            state_metadata = no_fit_state_metadata(
+                dataset.feature_columns,
+                dataset.categorical_columns,
+                dataframe_fingerprint(role_frames["train"]),
+                "not_required",
+            )
+        return {role: frame.copy() for role, frame in role_frames.items()}, state_metadata
+
+    if cfg.imputation.method == "tabimpute":
+        from synthdata.imputation.tabimpute_backend import (
+            fit_dataframe,
+            state_metadata,
+            transform_dataframe,
+        )
+
+        state = fit_dataframe(
+            role_frames["train"],
+            dataset.feature_columns,
+            dataset.categorical_columns,
+            dataset.target_column,
+            device=device,
+        )
+        transformed = {
+            role: transform_dataframe(
+                state,
+                role_frames[role],
+                dataset.feature_columns,
+                dataset.categorical_columns,
+                dataset.target_column,
+                role,
+            )
+            for role in ROLE_NAMES
+        }
+        return transformed, state_metadata(
+            state,
+            dataframe_fingerprint(role_frames["train"]),
+        )
+
+    if cfg.imputation.method == "refidiff":
+        raise RoleIsolationError(
+            "refidiff cannot be used for canonical train/tuning/final_holdout imputation: "
+            "its current backend fits categorical encoders, scaling, warm-up models, and "
+            "the diffusion model on every supplied frame. Use tabimpute for canonical roles "
+            "or add a stateful refidiff fit/transform implementation before enabling it. "
+            f"missing_values_by_role={n_missing}"
+        )
+    raise ValueError(f"Unknown imputation.method: {cfg.imputation.method!r}")
 
 
 def apply_rounding(
@@ -176,9 +252,32 @@ def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
         "variable_schema_fingerprint": dataset.variable_schema_fingerprint,
         "source_fingerprint": dataset.source_fingerprint,
         "full_fingerprint": dataframe_fingerprint(dataset.full_df),
-        "train_split_fingerprint": dataframe_fingerprint(dataset.train_df),
-        "test_split_fingerprint": dataframe_fingerprint(dataset.test_df),
     }
+    if dataset.has_canonical_roles:
+        payload.update(
+            {
+                "cache_contract": "canonical_roles_v1",
+                "role_names": list(ROLE_NAMES),
+                "role_fingerprints": dataset.role_fingerprints,
+                "assignment_fingerprint": dataset.assignment_fingerprint,
+                "assignment_policy_fingerprint": dataset.assignment_policy_fingerprint,
+                "identity_fingerprint": dataset.role_metadata.get("identity", {}).get(
+                    "identity_fingerprint"
+                ),
+                "semantic_fingerprint": dataset.semantic_fingerprint,
+                "fit_role": "train",
+                "fit_role_fingerprint": dataset.role_fingerprints["train"],
+                "role_row_counts": {role: len(dataset.roles[role]) for role in ROLE_NAMES},
+            }
+        )
+    else:
+        payload.update(
+            {
+                "cache_contract": "legacy_two_role_v1",
+                "train_split_fingerprint": dataframe_fingerprint(dataset.train_df),
+                "test_split_fingerprint": dataframe_fingerprint(dataset.test_df),
+            }
+        )
     if imp_cfg.method == "refidiff":
         payload["refidiff"] = dataclasses.asdict(imp_cfg.refidiff)
     return payload
@@ -203,11 +302,17 @@ def _load_cached_key(path: Path) -> str | None:
     cache miss: safe to self-heal by retraining and rewriting the file, since
     this is cache metadata, not a scientific artifact.
     """
+    record = _load_cache_record(path)
+    return record.get("cache_key") if record is not None else None
+
+
+def _load_cache_record(path: Path) -> dict | None:
+    """Read a cache sidecar record, returning None for absent/corrupt metadata."""
     if not path.exists():
         return None
     try:
         with open(path) as f:
-            return json.load(f).get("cache_key")
+            record = json.load(f)
     except json.JSONDecodeError as exc:
         logger.warning(
             "Failed to parse imputation cache-key file %s (%s); treating cached imputed data "
@@ -216,13 +321,58 @@ def _load_cached_key(path: Path) -> str | None:
             exc,
         )
         return None
+    if not isinstance(record, dict):
+        logger.warning(
+            "Imputation cache-key file %s does not contain a JSON object; treating cached "
+            "imputed data as stale and retraining",
+            path,
+        )
+        return None
+    return record
+
+
+def _canonical_tabimpute_state_is_valid(
+    cfg: Config, dataset: Dataset, cached_record: dict | None
+) -> bool:
+    """Require an intact train-fitted state record for canonical TabImpute caches."""
+    from synthdata.imputation.tabimpute_backend import (
+        TABIMPUTE_STATE_SCHEMA_VERSION,
+        state_metadata_fingerprint,
+    )
+
+    if not dataset.has_canonical_roles or cfg.imputation.method != "tabimpute":
+        return True
+    state = cached_record.get("fit_state") if cached_record is not None else None
+    if not isinstance(state, dict):
+        return False
+    if state.get("status") not in {"fitted", "not_required", "disabled"}:
+        return False
+    if state.get("schema_version") != TABIMPUTE_STATE_SCHEMA_VERSION:
+        return False
+    if state.get("backend") != "tabimpute" or state.get("fit_role") != "train":
+        return False
+    if state.get("fit_frame_fingerprint") != dataframe_fingerprint(dataset.roles["train"]):
+        return False
+    if state.get("feature_columns") != list(dataset.feature_columns):
+        return False
+    if state.get("categorical_columns") != list(dataset.categorical_columns):
+        return False
+    if state.get("status") == "fitted" and (
+        not isinstance(state.get("category_map_fingerprints"), dict)
+        or not isinstance(state.get("scaling_state_fingerprint"), str)
+        or not isinstance(state.get("block_slices"), dict)
+    ):
+        return False
+    return state.get("state_fingerprint") == state_metadata_fingerprint(state)
 
 
 def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
-    """Impute ``dataset.full_df`` and populate the ``*_imputed`` splits.
+    """Impute dataset roles and populate the role-specific imputed frames.
 
-    Caches to ``full_imputed.csv``/``train_imputed.csv``/``test_imputed.csv`` under
-    ``cfg.data.data_dir``; reused on subsequent runs unless ``cfg.imputation.cache``
+    Canonical datasets cache ``train_imputed.csv``/``tuning_imputed.csv``/
+    ``final_holdout_imputed.csv``; legacy datasets retain their historical
+    ``full_imputed.csv``/``train_imputed.csv``/``test_imputed.csv`` cache. Caches are
+    reused on subsequent runs unless ``cfg.imputation.cache``
     is False. Reuse also requires the cache-key sidecar file
     ``.imputation_cache_key.json``, also under ``data_dir``) to match a fresh
     hash of the current config's imputation-relevant fields and exact
@@ -235,29 +385,38 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
     cache_key_path = dataset.data_dir / _CACHE_KEY_FILENAME
     cache_record = _cache_key_record(cfg, dataset)
     current_key = cache_record["cache_key"]
-    cached_key = _load_cached_key(cache_key_path)
+    cached_record = _load_cache_record(cache_key_path)
+    cached_key = cached_record.get("cache_key") if cached_record is not None else None
 
-    cached_csvs_exist = (
-        paths["full_imputed"].exists()
-        and paths["train_imputed"].exists()
-        and paths["test_imputed"].exists()
+    cached_paths = (
+        [paths[f"{role}_imputed"] for role in ROLE_NAMES]
+        if dataset.has_canonical_roles
+        else [paths["full_imputed"], paths["train_imputed"], paths["test_imputed"]]
     )
+    cached_csvs_exist = all(path.exists() for path in cached_paths)
 
     if cfg.imputation.cache and cached_csvs_exist and cached_key == current_key:
-        dataset = load_imputed_splits(dataset)
-        if dataset.full_imputed_df is not None:
-            _persist_decoded_imputed_splits(dataset)
-            logger.info(
-                "Using cached imputed data at %s (cache_key=%s)",
+        if _canonical_tabimpute_state_is_valid(cfg, dataset, cached_record):
+            dataset = load_imputed_splits(dataset, expected_cache_key=current_key)
+            if dataset.full_imputed_df is not None:
+                _persist_decoded_imputed_splits(dataset)
+                logger.info(
+                    "Using cached imputed data at %s (cache_key=%s)",
+                    dataset.data_dir,
+                    current_key[:16],
+                )
+                return dataset
+            logger.warning(
+                "Imputation cache key matched at %s, but cached frames failed provenance/shape "
+                "validation; retraining",
                 dataset.data_dir,
-                current_key[:16],
             )
-            return dataset
-        logger.warning(
-            "Imputation cache key matched at %s, but cached frames failed provenance/shape "
-            "validation; retraining",
-            dataset.data_dir,
-        )
+        else:
+            logger.warning(
+                "Canonical TabImpute cache at %s lacks valid train-fitted state provenance; "
+                "retraining",
+                dataset.data_dir,
+            )
 
     if cfg.imputation.cache and cached_csvs_exist and cached_key != current_key:
         logger.info(
@@ -269,7 +428,31 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
             current_key[:16],
         )
 
-    if not cfg.imputation.enabled:
+    fit_state_metadata = None
+    if not cfg.imputation.enabled and dataset.has_canonical_roles:
+        missing_by_role = {
+            role: int(frame[dataset.feature_columns].isna().sum().sum())
+            for role, frame in dataset.roles.items()
+        }
+        if any(missing_by_role.values()):
+            raise RoleIsolationError(
+                "imputation.enabled=false cannot produce canonical role frames with missing "
+                f"features; enable imputation or provide complete roles. missing_values_by_role="
+                f"{missing_by_role}"
+            )
+        role_imputed = {role: frame.copy() for role, frame in dataset.roles.items()}
+        dataset.set_imputed_roles(role_imputed)
+        full_imputed = dataset.full_imputed_df
+        if cfg.imputation.method == "tabimpute":
+            from synthdata.imputation.tabimpute_backend import no_fit_state_metadata
+
+            fit_state_metadata = no_fit_state_metadata(
+                dataset.feature_columns,
+                dataset.categorical_columns,
+                dataframe_fingerprint(dataset.roles["train"]),
+                "disabled",
+            )
+    elif not cfg.imputation.enabled:
         logger.info("Imputation disabled; using rows with complete cases only")
         full_imputed = dataset.full_df.dropna().copy()
         if full_imputed.empty:
@@ -288,47 +471,86 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
             cfg.imputation.method,
             device,
         )
-        full_imputed = _impute_dataframe(cfg, dataset.full_df, dataset, device)
-        full_imputed = apply_rounding(
-            full_imputed,
-            dataset.feature_columns,
-            cfg.imputation.round_rules,
-            cfg.imputation.round_to_int_default,
-        )
+        if dataset.has_canonical_roles:
+            role_imputed, fit_state_metadata = _impute_canonical_roles(cfg, dataset, device)
+            role_imputed = {
+                role: apply_rounding(
+                    frame,
+                    dataset.feature_columns,
+                    cfg.imputation.round_rules,
+                    cfg.imputation.round_to_int_default,
+                )
+                for role, frame in role_imputed.items()
+            }
+            dataset.set_imputed_roles(role_imputed)
+            full_imputed = dataset.full_imputed_df
+        else:
+            full_imputed = _impute_dataframe(cfg, dataset.full_df, dataset, device)
+            full_imputed = apply_rounding(
+                full_imputed,
+                dataset.feature_columns,
+                cfg.imputation.round_rules,
+                cfg.imputation.round_to_int_default,
+            )
+
+    if full_imputed is None:
+        raise RuntimeError("Imputation did not produce a full model-space frame")
 
     ensure_dir(dataset.data_dir)
     full_imputed.to_csv(paths["full_imputed"], index=False)
 
-    # When imputation is disabled, full_imputed is a complete-case subset of
-    # full_df (dropna()), so its index may no longer contain every train/test
-    # row -- intersect rather than assume a full match (still a strict subset
-    # when imputation ran, since full_imputed then shares full_df's index).
-    train_imputed = full_imputed.loc[full_imputed.index.intersection(dataset.train_df.index)]
-    test_imputed = full_imputed.loc[full_imputed.index.intersection(dataset.test_df.index)]
-    if not cfg.imputation.enabled and (
-        len(train_imputed) < len(dataset.train_df) or len(test_imputed) < len(dataset.test_df)
-    ):
-        logger.info(
-            "Complete-case filtering dropped train %d->%d, test %d->%d rows",
-            len(dataset.train_df),
-            len(train_imputed),
-            len(dataset.test_df),
-            len(test_imputed),
-        )
-    train_imputed.to_csv(paths["train_imputed"], index=False)
-    test_imputed.to_csv(paths["test_imputed"], index=False)
-    cache_record["imputed_row_counts"] = {
-        "full": len(full_imputed),
-        "train": len(train_imputed),
-        "test": len(test_imputed),
-    }
+    if dataset.has_canonical_roles:
+        for role in ROLE_NAMES:
+            dataset.imputed_roles[role].to_csv(paths[f"{role}_imputed"], index=False)
+        if cfg.imputation.method == "tabimpute":
+            if fit_state_metadata is None:
+                raise RuntimeError(
+                    "Canonical TabImpute imputation completed without fitted-state provenance"
+                )
+            cache_record["fit_state"] = fit_state_metadata
+        cache_record["imputed_row_counts"] = {
+            "full": len(full_imputed),
+            **{role: len(dataset.imputed_roles[role]) for role in ROLE_NAMES},
+        }
+    else:
+        # When imputation is disabled, full_imputed is a complete-case subset of
+        # full_df (dropna()), so its index may no longer contain every train/test
+        # row -- intersect rather than assume a full match (still a strict subset
+        # when imputation ran, since full_imputed then shares full_df's index).
+        train_imputed = full_imputed.loc[full_imputed.index.intersection(dataset.train_df.index)]
+        test_imputed = full_imputed.loc[full_imputed.index.intersection(dataset.test_df.index)]
+        if not cfg.imputation.enabled and (
+            len(train_imputed) < len(dataset.train_df) or len(test_imputed) < len(dataset.test_df)
+        ):
+            logger.info(
+                "Complete-case filtering dropped train %d->%d, test %d->%d rows",
+                len(dataset.train_df),
+                len(train_imputed),
+                len(dataset.test_df),
+                len(test_imputed),
+            )
+        train_imputed.to_csv(paths["train_imputed"], index=False)
+        test_imputed.to_csv(paths["test_imputed"], index=False)
+        cache_record["imputed_row_counts"] = {
+            "full": len(full_imputed),
+            "train": len(train_imputed),
+            "test": len(test_imputed),
+        }
+
     with open(cache_key_path, "w") as f:
         json.dump(cache_record, f, indent=2, sort_keys=True, default=str)
     logger.info("Wrote imputation cache-key %s to %s", current_key[:16], cache_key_path)
 
-    dataset.full_imputed_df = full_imputed
-    dataset.train_imputed_df = train_imputed
-    dataset.test_imputed_df = test_imputed
+    if dataset.has_canonical_roles:
+        dataset.full_imputed_df = full_imputed
+    else:
+        dataset.full_imputed_df = full_imputed
+        dataset.train_imputed_df = train_imputed
+        dataset.test_imputed_df = test_imputed
+        dataset.imputed_roles = {
+            "train": train_imputed,
+            "final_holdout": test_imputed,
+        }
     _persist_decoded_imputed_splits(dataset)
     return dataset
 

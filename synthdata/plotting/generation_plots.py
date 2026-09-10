@@ -10,14 +10,19 @@ import pandas as pd
 
 from synthdata.config import Config
 from synthdata.data import Dataset
-from synthdata.generation.hpo import default_storage_url
+from synthdata.generation.hpo import (
+    HPO_CONTEXT_SCHEMA_VERSION,
+    contextual_study_name,
+    default_storage_url,
+    hpo_context_digest,
+)
 from synthdata.plotting import (
     add_histogram_with_kde,
     ordered_categories,
     save_matplotlib_figure,
     save_plotly_figure,
 )
-from synthdata.utils import get_logger
+from synthdata.utils import get_logger, load_json
 
 logger = get_logger(__name__)
 
@@ -108,14 +113,14 @@ def save_generation_plots(
 ) -> None:
     """Save one real-vs-synthetic figure per generated model.
 
-    All comparisons use the imputed train split as the "real" reference (even
+    All comparisons use the imputed ``train`` role as the "real" reference (even
     for TabPFN variants fit on the pre-imputation split), since it is fully
     observed and comparable across every column.
     """
     import matplotlib.pyplot as plt
 
     output_dir = Path(output_dir) / "generation"
-    real_model_df = dataset.train_imputed_df
+    real_model_df = dataset.role_frame("train", imputed=True)
     if real_model_df is None:
         raise RuntimeError("save_generation_plots() requires imputed training data")
     real_df = dataset.decode_ordinal_frame(real_model_df)
@@ -153,7 +158,11 @@ def _load_study(study_name: str, storage: str):
         return None
 
 
-def save_hpo_plots(cfg: Config, output_dir: str | Path) -> None:
+def save_hpo_plots(
+    cfg: Config,
+    output_dir: str | Path,
+    hpo_context: dict | None = None,
+) -> None:
     """Save Optuna optimization-history/param-importance/slice plots per HPO'd model."""
     from optuna.visualization import (
         plot_optimization_history,
@@ -165,6 +174,42 @@ def save_hpo_plots(cfg: Config, output_dir: str | Path) -> None:
     if not gen_cfg.hpo.enabled:
         logger.info("HPO disabled; skipping HPO plots")
         return
+
+    if hpo_context is None:
+        context_path = Path(gen_cfg.output_dir) / "hpo_context.json"
+        if not context_path.is_file():
+            raise FileNotFoundError(
+                f"HPO context is missing at {context_path}; refusing to plot an uncontextualized study"
+            )
+        try:
+            context_payload = load_json(context_path)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"HPO context at {context_path} is unreadable") from exc
+        if not isinstance(context_payload, dict):
+            raise ValueError(f"HPO context at {context_path} must be an object")
+        if context_payload.get("schema_version") != HPO_CONTEXT_SCHEMA_VERSION:
+            raise ValueError(f"HPO context at {context_path} has an unsupported schema")
+        hpo_context = context_payload.get("context")
+        if not isinstance(hpo_context, dict):
+            raise ValueError(f"HPO context at {context_path} is missing its context object")
+        if context_payload.get("context_digest") != hpo_context_digest(hpo_context):
+            raise ValueError(f"HPO context at {context_path} failed its digest check")
+        context_file = context_payload.get("context_file")
+        if not isinstance(context_file, str) or not context_file:
+            raise ValueError(f"HPO context at {context_path} is missing its versioned context file")
+        versioned_context_path = context_path.parent / context_file
+        if not versioned_context_path.is_file():
+            raise FileNotFoundError(f"Versioned HPO context is missing at {versioned_context_path}")
+        try:
+            versioned_payload = load_json(versioned_context_path)
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                f"Versioned HPO context at {versioned_context_path} is unreadable"
+            ) from exc
+        if versioned_payload != context_payload:
+            raise ValueError(
+                f"HPO context pointer at {context_path} does not match {versioned_context_path}"
+            )
 
     storage = gen_cfg.hpo.storage or default_storage_url(gen_cfg.output_dir)
     output_dir = Path(output_dir) / "hpo"
@@ -178,10 +223,20 @@ def save_hpo_plots(cfg: Config, output_dir: str | Path) -> None:
         if "custom" in gen_cfg.tabpfgen.variants:
             study_names.append("hpo_tabpfgen_custom")
 
-    for study_name in study_names:
+    contextual_study_names = [contextual_study_name(name, hpo_context) for name in study_names]
+    for study_name in contextual_study_names:
         study = _load_study(study_name, storage)
         if study is None or not study.trials:
             continue
+        expected_context_digest = hpo_context_digest(hpo_context)
+        if (
+            study.user_attrs.get("hpo_context_schema_version") != HPO_CONTEXT_SCHEMA_VERSION
+            or study.user_attrs.get("hpo_context_digest") != expected_context_digest
+            or study.user_attrs.get("hpo_context") != hpo_context
+        ):
+            raise ValueError(
+                f"HPO study {study_name!r} context does not match the persisted generation context"
+            )
         try:
             save_plotly_figure(
                 plot_optimization_history(study), output_dir / f"{study_name}_history", ("html",)
