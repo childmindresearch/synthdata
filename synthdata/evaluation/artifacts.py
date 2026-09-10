@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from numbers import Real
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 
@@ -2049,7 +2049,7 @@ def _fork_attribution(path: Path, distribution: str) -> dict[str, Any]:
     ]
     license_digests = {name: _file_digest(path / name) for name in license_files}
     try:
-        metadata = importlib.metadata.metadata(distribution)
+        metadata = cast(Mapping[str, str], importlib.metadata.metadata(distribution))
         package_name = metadata.get("Name")
         package_license = metadata.get("License")
     except importlib.metadata.PackageNotFoundError:
@@ -2232,7 +2232,7 @@ def _validate_release_score_payload(payload: Mapping[str, Any], *, path: Path) -
     _string_list(
         candidate_audit_models, "Release-score evidence candidate audit models", unique=True
     )
-    if selected_model not in candidate_audit_models:
+    if selected_model not in (candidate_audit_models or []):
         raise ValueError(
             f"Release-score selected model {selected_model!r} is absent from candidate audit models"
         )
@@ -2375,7 +2375,7 @@ def persist_evaluation_artifacts(
             "digest": metric_contract_manifest.get("digest"),
         }
 
-    status_artifacts = {}
+    status_artifacts: dict[str, Any] = {}
     if synthcity_validation_results is not None:
         status_payload = {
             **semantic_sidecar_fields,

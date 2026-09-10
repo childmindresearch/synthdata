@@ -1,6 +1,7 @@
 """Unit tests for contract-aware absolute privacy gates."""
 
 import dataclasses
+from typing import NotRequired, TypedDict, Unpack, cast
 
 import pandas as pd
 import pytest
@@ -20,33 +21,110 @@ from synthdata.evaluation.privacy_gate import (
 pytestmark = pytest.mark.unit
 
 
+def _dataframe(
+    data: dict[object, list[object]], index: list[str] | pd.Index | None = None
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        cast("dict[str, list[object]]", data),
+        index=pd.Index(index) if index is not None else None,
+    )
+
+
+class _ContractOptions(TypedDict, total=False):
+    contract_id: str
+    framework: str
+    emitted_key_pattern: str
+    semantic_family: str
+    direction: str | None
+    value_role: str
+    lifecycle_state: str
+    allowed_uses: frozenset[str]
+    execution_pass: str
+    target_view: str
+    population_unit: str
+    group_safety: str
+    required_roles: tuple[str, ...]
+    uncertainty_field: str | None
+    sample_size_field: str | None
+    status_reason: str
+
+
+class _ObservationOptions(TypedDict, total=False):
+    execution_pass: str
+    target_view: str
+    role_hashes: dict[str, str]
+    direction: str | None
+    error: str | None
+    fit_roles: tuple[str, ...]
+    support: dict[str, object]
+    bandwidth: float | None
+    provenance: dict[str, object]
+    sample_size: int | None
+
+
+class _ContextOptions(TypedDict, total=False):
+    execution_pass: str
+    target_view: str
+    evaluation_role: str
+    population_unit: str
+    group_mode: str
+    role_hashes: dict[str, str]
+    resolved_configuration: dict[str, object]
+
+
+class _EvaluateOptions(TypedDict, total=False):
+    context: NotRequired[MetricEvaluationContext]
+
+
+def _contract(options: dict[str, object]) -> MetricContract:
+    return MetricContract(**cast("_ContractOptions", options))
+
+
 class _FakeGateConfig:
     def __init__(self, enabled=True, thresholds=None):
         self.enabled = enabled
         self.thresholds = thresholds if thresholds is not None else {}
 
 
-def _combined(metric_name: str, values: dict, framework="syntheval", type_="privacy"):
-    df = pd.DataFrame(index=list(values))
+_PrivacyGateCase = tuple[
+    pd.DataFrame,
+    _FakeGateConfig,
+    MetricContractRegistry,
+    dict[tuple[str, str], dict[str, object]],
+    MetricEvaluationContext,
+]
+
+
+def _combined(
+    metric_name: str,
+    values: dict[str, float | None],
+    framework: str = "syntheval",
+    type_: str = "privacy",
+) -> pd.DataFrame:
+    df = _dataframe({}, index=list(values))
     df[(framework, type_, metric_name)] = pd.Series(values)
     df.columns = pd.MultiIndex.from_tuples(df.columns)
     return df
 
 
 def _case(
-    metrics: dict[str, dict],
+    metrics: dict[str, dict[str, object]],
     *,
-    context_overrides: dict | None = None,
-    observed_values: dict[str, dict] | None = None,
+    context_overrides: _ContextOptions | None = None,
+    observed_values: dict[str, dict[str, float | None]] | None = None,
     requested_use: str = "gate",
 ):
     contracts = []
     definitions = {}
     model_names = sorted(
-        {model for definition in metrics.values() for model in definition["values"]}
+        {
+            model
+            for definition in metrics.values()
+            for model in cast("dict[str, float | None]", definition["values"])
+        }
     )
     for emitted_key, definition in metrics.items():
-        framework = definition.get("framework", "syntheval")
+        framework = cast("str", definition.get("framework", "syntheval"))
         contract_options = {
             "contract_id": f"test.{framework}.{emitted_key}",
             "framework": framework,
@@ -56,39 +134,39 @@ def _case(
             "value_role": "policy_scalar",
             "lifecycle_state": "operational",
             "allowed_uses": frozenset({"audit", "gate"}),
-            "execution_pass": definition.get("execution_pass", "main"),
-            "target_view": definition.get("target_view", "native"),
-            "population_unit": definition.get("population_unit", "row"),
-            "group_safety": definition.get("group_safety", "row_only"),
+            "execution_pass": cast("str", definition.get("execution_pass", "main")),
+            "target_view": cast("str", definition.get("target_view", "native")),
+            "population_unit": cast("str", definition.get("population_unit", "row")),
+            "group_safety": cast("str", definition.get("group_safety", "row_only")),
             "required_roles": ("train", "tuning"),
             "uncertainty_field": None,
             "sample_size_field": None,
             "status_reason": "",
         }
-        contract_options.update(definition.get("contract", {}))
+        contract_options.update(cast("_ContractOptions", definition.get("contract", {})))
         if contract_options["lifecycle_state"] != "operational":
             contract_options["allowed_uses"] = frozenset({"audit"})
             contract_options["status_reason"] = contract_options.get("status_reason") or (
                 "Test contract is intentionally not operational"
             )
-        contract = MetricContract(**contract_options)
+        contract = _contract(contract_options)
         contracts.append(contract)
         definitions[emitted_key] = (framework, contract)
 
     registry = MetricContractRegistry(contracts)
-    context_options = {
+    context_options: _ContextOptions = {
         "role_hashes": {"train": "train-hash", "tuning": "tuning-hash"},
         "resolved_configuration": {"protocol": "test-v1"},
     }
     context_options.update(context_overrides or {})
     context = MetricEvaluationContext(**context_options)
-    combined = pd.DataFrame(index=model_names)
+    combined = _dataframe({}, index=model_names)
     validations = {}
     observed_values = observed_values or {}
     for emitted_key, definition in metrics.items():
         framework, contract = definitions[emitted_key]
         combined[(framework, "privacy", emitted_key)] = pd.Series(
-            definition["values"], index=model_names
+            cast("dict[str, float | None]", definition["values"]), index=model_names
         )
     combined.columns = pd.MultiIndex.from_tuples(combined.columns)
     for model_name in model_names:
@@ -100,17 +178,18 @@ def _case(
                 "target_view": contract.target_view,
                 "role_hashes": dict(context.role_hashes),
             }
-            observation_options.update(definition.get("observation", {}))
-            raw_value = observed_values.get(emitted_key, {}).get(
-                model_name, definition["values"].get(model_name)
+            observation_options.update(
+                cast("_ObservationOptions", definition.get("observation", {}))
             )
+            values = cast("dict[str, float | None]", definition["values"])
+            raw_value = observed_values.get(emitted_key, {}).get(model_name, values.get(model_name))
             observations.append(
                 MetricObservation(
                     model_name=model_name,
                     framework=framework,
                     emitted_key=emitted_key,
                     raw_value=raw_value,
-                    **observation_options,
+                    **cast("_ObservationOptions", observation_options),
                 )
             )
         for framework in {item[0] for item in definitions.values()}:
@@ -144,15 +223,18 @@ def _case(
     return combined, cfg, registry, validations, context
 
 
-def _evaluate(case, **kwargs):
+def _evaluate(case: _PrivacyGateCase, **kwargs: Unpack[_EvaluateOptions]) -> pd.DataFrame:
     combined, cfg, registry, validations, context = case
     kwargs.setdefault("context", context)
-    return evaluate_privacy_gate(
-        combined,
-        cfg,
-        registry=registry,
-        validation_results=validations,
-        **kwargs,
+    return cast(
+        "pd.DataFrame",
+        evaluate_privacy_gate(
+            combined,
+            cfg,
+            registry=registry,
+            validation_results=validations,
+            **kwargs,
+        ),
     )
 
 
@@ -232,6 +314,7 @@ class TestEvaluatePrivacyGate:
         combined = _combined("mia_recall", {"model_a": 0.5})
         cfg = _FakeGateConfig(thresholds={"not_a_real_metric": {"bound": "max", "value": 0.6}})
         result = evaluate_privacy_gate(combined, cfg)
+        assert result is not None
         assert result.loc["model_a", "pass"] == False  # noqa: E712
         assert result.loc["model_a", "status"] == "indeterminate"
         assert "contract" in result.loc["model_a", "violations"]
@@ -246,6 +329,7 @@ class TestEvaluatePrivacyGate:
             }
         )
         result = _evaluate(case)
+        assert result is not None
         assert bool(result.loc["model_a", "pass"])
         assert result.loc["model_b", "pass"] == False  # noqa: E712
         assert "mia_recall=0.9" in result.loc["model_b", "violations"]
@@ -335,6 +419,7 @@ class TestEvaluatePrivacyGate:
                 ("syntheval", "mia_recall", "model_b"): "binary_target",
             },
         )
+        assert result is not None
 
         assert result.loc["model_a", "pass"]
         assert result.loc["model_b", "pass"]
@@ -365,6 +450,7 @@ class TestEvaluatePrivacyGate:
             }
         )
         result = _evaluate(case)
+        assert result is not None
         assert result.loc["model_a", "pass"] == False  # noqa: E712
         assert "non_finite" in result.loc["model_a", "violations"]
 

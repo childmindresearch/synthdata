@@ -11,7 +11,7 @@ import hmac
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import numpy as np
 import pandas as pd
@@ -46,6 +46,17 @@ class RoleAssignment:
     metadata: dict[str, Any]
     assignment_fingerprint: str
     assignment_policy_fingerprint: str
+
+
+class _CandidateRecord(TypedDict):
+    candidate_number: int
+    positions_by_role: dict[str, np.ndarray]
+    frames: dict[str, pd.DataFrame]
+    violations: list[str]
+    ratio_errors: dict[str, float]
+    target_balance_error: float
+    encounter_metrics: dict[str, float]
+    encounter_balance_error: float
 
 
 def _stable_value(value: Any) -> str:
@@ -495,20 +506,19 @@ def _summary_for_role(
         }
         for column in protected_columns
     }
-    target_by_protected = {
-        column: {
-            str(protected_value): {
-                str(target_value): int(count)
-                for (protected_value, target_value), count in frame.groupby(
-                    [column, target_column], dropna=False, observed=False
-                )
-                .size()
-                .items()
-            }
-            for protected_value in frame[column].dropna().unique().tolist()
+    target_by_protected = {}
+    for column in protected_columns:
+        column_counts = {
+            str(protected_value): {} for protected_value in frame[column].dropna().unique().tolist()
         }
-        for column in protected_columns
-    }
+        for group_key, count in (
+            frame.groupby([column, target_column], dropna=False, observed=False).size().items()
+        ):
+            if not isinstance(group_key, tuple) or len(group_key) != 2:
+                raise TypeError("groupby key must contain protected and target values")
+            protected_value, target_value = group_key
+            column_counts.setdefault(str(protected_value), {})[str(target_value)] = int(count)
+        target_by_protected[column] = column_counts
     return {
         "rows": int(len(frame)),
         "groups": int(groups.nunique()) if groups is not None else None,
@@ -892,7 +902,7 @@ def allocate_roles(
     constraints = resolve_support_constraints(frame, target_column, protected_columns, split)
     counts = _role_counts(len(frame), split)
     rng_seed = split.seed if split.seed is not None else seed
-    candidate_records = []
+    candidate_records: list[_CandidateRecord] = []
     n_candidates = split.candidate_count
     for candidate_number in range(n_candidates):
         rng = np.random.default_rng(rng_seed + candidate_number)
@@ -1001,6 +1011,8 @@ def allocate_roles(
     if groups is not None:
         assignment["population_group_hash"] = groups.to_numpy(copy=True)
     assignment_payload = assignment.to_json(orient="records", date_format="iso")
+    if not isinstance(assignment_payload, str):
+        raise TypeError("role assignment JSON payload must be a string")
     assignment_fingerprint = hashlib.sha256(assignment_payload.encode()).hexdigest()
     assignment_policy = {
         "schema_version": "role-assignment-policy-v2",

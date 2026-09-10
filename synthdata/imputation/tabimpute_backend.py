@@ -14,6 +14,7 @@ out-of-memory errors, see :mod:`synthdata.imputation.refidiff_backend`.
 import dataclasses
 import hashlib
 import json
+from typing import Protocol, cast
 
 import numpy as np
 import pandas as pd
@@ -24,6 +25,16 @@ from synthdata.utils import get_logger
 _SHIM_APPLIED = False
 TABIMPUTE_STATE_SCHEMA_VERSION = "tabimpute-state-v1"
 logger = get_logger(__name__)
+
+ColumnNames = list[str]
+
+
+class _Imputer(Protocol):
+    def get_imputation(self, values: np.ndarray) -> tuple[np.ndarray, object]: ...
+
+
+class _ImputePFNFactory(Protocol):
+    def __call__(self, *, device: str, preprocessors: list[object] | None) -> _Imputer: ...
 
 
 @dataclasses.dataclass
@@ -36,7 +47,7 @@ class TabImputeState:
     means: np.ndarray
     stds: np.ndarray
     block_slices: dict[str, tuple[int, int]]
-    imputer: object
+    imputer: _Imputer
     device: str = "cpu"
 
 
@@ -75,8 +86,8 @@ def state_metadata(state: TabImputeState, fit_frame_fingerprint: str) -> dict:
 
 
 def no_fit_state_metadata(
-    feature_columns: list,
-    categorical_columns: list,
+    feature_columns: ColumnNames,
+    categorical_columns: ColumnNames,
     fit_frame_fingerprint: str,
     status: str,
 ) -> dict:
@@ -159,8 +170,8 @@ def _encode_with_fixed_maps(
 
 def _build_matrix(
     encoded: pd.DataFrame,
-    feature_columns: list,
-    categorical_columns: list,
+    feature_columns: ColumnNames,
+    categorical_columns: ColumnNames,
     category_maps: dict,
 ) -> tuple[np.ndarray, dict[str, tuple[int, int]]]:
     """Build a fixed-width numeric matrix and remember each feature's block."""
@@ -227,8 +238,8 @@ def _fit_scaling(matrix: np.ndarray, feature_columns: list, block_slices: dict) 
 
 def fit_dataframe(
     train_df: pd.DataFrame,
-    feature_columns: list,
-    categorical_columns: list,
+    feature_columns: ColumnNames,
+    categorical_columns: ColumnNames,
     target_column: str,
     device: str = "cpu",
 ) -> TabImputeState:
@@ -261,15 +272,15 @@ def fit_dataframe(
         stds=stds,
         block_slices=block_slices,
         device=device,
-        imputer=ImputePFN(device=device, preprocessors=None),
+        imputer=cast(_ImputePFNFactory, ImputePFN)(device=device, preprocessors=None),
     )
 
 
 def transform_dataframe(
     state: TabImputeState,
     df: pd.DataFrame,
-    feature_columns: list,
-    categorical_columns: list,
+    feature_columns: ColumnNames,
+    categorical_columns: ColumnNames,
     target_column: str,
     role_name: str,
 ) -> pd.DataFrame:
@@ -340,7 +351,7 @@ def impute_dataframe(
 
     x_imputed = imputer.impute(x_full.copy(), categorical_columns=cat_indices)
 
-    imputed_df = pd.DataFrame(x_imputed, columns=feature_columns, index=df.index)
+    imputed_df = pd.DataFrame(x_imputed, columns=pd.Index(feature_columns), index=df.index)
     imputed_df = decode_label_encoded_columns(imputed_df, category_maps)
     imputed_df[target_column] = df[target_column].values
     return imputed_df[list(df.columns)]

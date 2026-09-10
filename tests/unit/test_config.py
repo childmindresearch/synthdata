@@ -1,6 +1,7 @@
 """Unit tests for synthdata.config: dataclass composition, validation, YAML loading."""
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 import yaml
@@ -552,7 +553,7 @@ class TestValidate:
 
     def test_auto_nominal_typing_is_rejected(self):
         cfg = self._base_valid()
-        cfg.data.nominal_columns = "auto"
+        cfg.data.nominal_columns = cast(list[str] | None, "auto")
         with pytest.raises(ValueError, match="no longer supported"):
             _validate(cfg)
 
@@ -685,12 +686,15 @@ class TestLoadConfig:
         ]
         assert cfg.evaluation.privacy_policy.k_required == 5
         assert cfg.evaluation.privacy_policy.mia_epsilon_repetitions == 10
+        assert cfg.data.split is not None
         assert cfg.data.split.patient_id_column is None
+        assert cfg.generation.hpo.utility_policy_provenance is not None
         assert cfg.generation.hpo.utility_policy_provenance.startswith("Task 13")
 
     def test_loris_hpo_policy_provenance_describes_fixed_fail_closed_policy(self):
         cfg = load_config(Path(__file__).parents[2] / "configs" / "config_loris.yaml")
         provenance = cfg.generation.hpo.utility_policy_provenance
+        assert provenance is not None
         assert "consumes fixed generation.hpo.utility_policy" in provenance
         assert "mismatches fail closed" in provenance
         assert "not wired" not in provenance
@@ -757,7 +761,7 @@ class TestLoadConfig:
 
     def test_canonical_missing_anchor_is_rejected(self):
         cfg = self._canonical_fixture()
-        cfg.evaluation.scoring_policy.bh_alpha = None
+        cfg.evaluation.scoring_policy.bh_alpha = cast(float, None)
         with pytest.raises(ValueError, match="bh_alpha"):
             _validate(cfg)
 
@@ -793,6 +797,7 @@ class TestLoadConfig:
 
     def test_canonical_nested_identity_is_rejected_directly(self):
         cfg = self._canonical_fixture()
+        assert cfg.data.split is not None
         cfg.data.split.patient_id_column = "patient_id"
         with pytest.raises(ValueError, match="nested split identity"):
             _validate(cfg)

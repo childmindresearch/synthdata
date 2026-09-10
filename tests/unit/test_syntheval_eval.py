@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -22,6 +23,7 @@ from synthdata.evaluation.catalog import (
     syntheval_execution_keys_by_framework,
     syntheval_execution_manifest,
 )
+from synthdata.evaluation.metric_contracts import MetricValidationResult
 from synthdata.evaluation.syntheval_eval import (
     BINARY_ONLY_METRICS,
     _atomic_parquet,
@@ -54,6 +56,10 @@ from synthdata.evaluation.syntheval_eval import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def _model_index(*names: str) -> pd.Index:
+    return pd.Index(names)
 
 
 class TestBuildBinaryTargetSeries:
@@ -173,11 +179,12 @@ class TestEvaluationRoleContext:
         self, released_argument, make_canonical_dataset, tmp_path
     ):
         dataset = make_canonical_dataset()
-        released = {
-            "released_synthetic_datasets": {"model_a": dataset.role_frame("train", imputed=True)},
-            "released_final_holdout_frame": dataset.role_frame("final_holdout", imputed=True),
-        }
-        released.pop(released_argument)
+        released_synthetic = {"model_a": dataset.role_frame("train", imputed=True)}
+        released_holdout = dataset.role_frame("final_holdout", imputed=True)
+        if released_argument == "released_synthetic_datasets":
+            released_synthetic = None
+        else:
+            released_holdout = None
 
         with pytest.raises(ValueError, match="must be provided together"):
             run_syntheval_evaluation(
@@ -186,7 +193,8 @@ class TestEvaluationRoleContext:
                 FrameworkSelectionConfig(),
                 preset_dir=tmp_path,
                 evaluation_role="final_holdout",
-                **released,
+                released_synthetic_datasets=released_synthetic,
+                released_final_holdout_frame=released_holdout,
             )
 
     def test_binary_released_inputs_must_be_paired(self, make_canonical_dataset, tmp_path):
@@ -426,12 +434,12 @@ class TestSynthEvalExecutionManifest:
 
 class TestMergeBinaryTargetResults:
     @staticmethod
-    def _comb_df(metric_values: dict, rank: float, index=("m1",)) -> pd.DataFrame:
+    def _comb_df(metric_values: dict, rank: float | list[float], index=("m1",)) -> pd.DataFrame:
         """Build a DataFrame matching SynthEval.benchmark()'s real comb_df structure:
         a (metric, 'value'/'error') MultiIndex for metrics, plus a scalar 'rank'
         column that pandas pads to ('rank', '') once the MultiIndex is set.
         """
-        df = pd.DataFrame(index=list(index))
+        df = pd.DataFrame(index=pd.Index(index))
         for metric, (value, error) in metric_values.items():
             df[(metric, "value")] = value
             df[(metric, "error")] = error
@@ -446,30 +454,32 @@ class TestMergeBinaryTargetResults:
 
     def test_binary_none_returns_main_unchanged(self):
         main_results = self._comb_df({"dwm": ([1.0], [0.1])}, rank=[0.9])
-        main_ranks = pd.DataFrame({"dwm": [1.0], "rank": [0.9]}, index=["m1"])
+        main_ranks = pd.DataFrame({"dwm": [1.0], "rank": [0.9]}, index=_model_index("m1"))
         results, ranks = merge_binary_target_results(main_results, main_ranks, None, None)
         assert results is main_results
         assert ranks is main_ranks
 
     def test_main_none_returns_binary_unchanged(self):
         binary_results = self._comb_df({"auroc_diff": ([0.5], [0.05])}, rank=[0.3])
-        binary_ranks = pd.DataFrame({"auroc_diff": [0.5], "rank": [0.3]}, index=["m1"])
+        binary_ranks = pd.DataFrame({"auroc_diff": [0.5], "rank": [0.3]}, index=_model_index("m1"))
         results, ranks = merge_binary_target_results(None, None, binary_results, binary_ranks)
         assert results is binary_results
         assert ranks is binary_ranks
 
     def test_merges_new_metric_columns_without_touching_existing(self):
         main_results = self._comb_df({"dwm": ([1.0], [0.1])}, rank=[0.9])
-        main_ranks = pd.DataFrame({"dwm": [1.0], "rank": [0.9]}, index=["m1"])
+        main_ranks = pd.DataFrame({"dwm": [1.0], "rank": [0.9]}, index=_model_index("m1"))
 
         # rank=[0.3] here is the mini-benchmark's OWN aggregate rank (computed
         # from only auroc_diff) -- it must NOT overwrite the main pass's rank.
         binary_results = self._comb_df({"auroc_diff": ([0.5], [0.05])}, rank=[0.3])
-        binary_ranks = pd.DataFrame({"auroc_diff": [0.7], "rank": [0.3]}, index=["m1"])
+        binary_ranks = pd.DataFrame({"auroc_diff": [0.7], "rank": [0.3]}, index=_model_index("m1"))
 
         results, ranks = merge_binary_target_results(
             main_results, main_ranks, binary_results, binary_ranks
         )
+        assert results is not None
+        assert ranks is not None
 
         assert results[("dwm", "value")].tolist() == [1.0]
         assert results[("auroc_diff", "value")].tolist() == [0.5]
@@ -481,13 +491,15 @@ class TestMergeBinaryTargetResults:
 
     def test_native_metric_wins_when_binary_pass_collides(self):
         main_results = self._comb_df({"auroc": ([0.1], [0.01])}, rank=[0.9])
-        main_ranks = pd.DataFrame({"auroc": [0.9], "rank": [0.9]}, index=["m1"])
+        main_ranks = pd.DataFrame({"auroc": [0.9], "rank": [0.9]}, index=_model_index("m1"))
         binary_results = self._comb_df({"auroc": ([0.6], [0.06])}, rank=[0.2])
-        binary_ranks = pd.DataFrame({"auroc": [0.4], "rank": [0.2]}, index=["m1"])
+        binary_ranks = pd.DataFrame({"auroc": [0.4], "rank": [0.2]}, index=_model_index("m1"))
 
         results, ranks = merge_binary_target_results(
             main_results, main_ranks, binary_results, binary_ranks
         )
+        assert results is not None
+        assert ranks is not None
 
         assert results[("auroc", "value")].tolist() == [0.1]
         assert results[("auroc", "error")].tolist() == [0.01]
@@ -496,10 +508,10 @@ class TestMergeBinaryTargetResults:
 
 class TestSynthEvalMetricValidation:
     def test_native_cls_acc_cannot_satisfy_canonical_tstr(self):
-        results = pd.DataFrame(index=["model_a"])
+        results = pd.DataFrame(index=_model_index("model_a"))
         results[("avg_macro_F1_diff_v2", "value")] = [0.2]
         results.columns = pd.MultiIndex.from_tuples(results.columns)
-        ranks = pd.DataFrame({"avg_macro_F1_diff_v2": [0.8]}, index=["model_a"])
+        ranks = pd.DataFrame({"avg_macro_F1_diff_v2": [0.8]}, index=_model_index("model_a"))
 
         validations = validate_syntheval_results(
             results,
@@ -646,10 +658,10 @@ class TestSynthEvalMetricValidation:
         assert ranks.loc["model_a", "corr_mat_diff_v2"] == 0.8
 
     def test_selected_normalized_metric_missing_is_indeterminate(self):
-        results = pd.DataFrame(index=["model_a"])
+        results = pd.DataFrame(index=_model_index("model_a"))
         results[("avg_dwm_diff", "value")] = [0.2]
         results.columns = pd.MultiIndex.from_tuples(results.columns)
-        ranks = pd.DataFrame({"avg_dwm_diff": [0.8]}, index=["model_a"])
+        ranks = pd.DataFrame({"avg_dwm_diff": [0.8]}, index=_model_index("model_a"))
         expected = {
             "syntheval": ["avg_dwm_diff", "pca_eigval_diff"],
             "custom": [],
@@ -672,12 +684,12 @@ class TestSynthEvalMetricValidation:
         assert validation.decision_status == "indeterminate"
 
     def test_observed_qualified_diagnostics_are_contract_checked(self):
-        results = pd.DataFrame(index=["model_a"])
+        results = pd.DataFrame(index=_model_index("model_a"))
         results[("statistical_parity", "value")] = [0.1]
         results[("sp_target_sex", "value")] = [0.2]
         results.columns = pd.MultiIndex.from_tuples(results.columns)
         ranks = pd.DataFrame(
-            {"statistical_parity": [0.9], "sp_target_sex": [0.8]}, index=["model_a"]
+            {"statistical_parity": [0.9], "sp_target_sex": [0.8]}, index=_model_index("model_a")
         )
         expected = extend_syntheval_expected_diagnostics(
             {"syntheval": ["statistical_parity"], "custom": []},
@@ -703,10 +715,10 @@ class TestSynthEvalMetricValidation:
         assert diagnostic_record.status == "unexpected"
 
     def test_missing_declared_qualified_diagnostic_is_indeterminate(self):
-        results = pd.DataFrame(index=["model_a"])
+        results = pd.DataFrame(index=_model_index("model_a"))
         results[("statistical_parity", "value")] = [0.1]
         results.columns = pd.MultiIndex.from_tuples(results.columns)
-        ranks = pd.DataFrame({"statistical_parity": [0.9]}, index=["model_a"])
+        ranks = pd.DataFrame({"statistical_parity": [0.9]}, index=_model_index("model_a"))
         expected = syntheval_execution_keys_by_framework(
             syntheval_execution_manifest(
                 {"statistical_parity": {"full_output": True}},
@@ -926,10 +938,13 @@ class TestSynthEvalMetricValidation:
                 self.completed_keys = expected_keys if completed_keys is None else completed_keys
 
         execution_passes = build_metric_execution_passes(
-            {
-                ("syntheval", "main"): {"model_a": Validation(("auroc", "avg_dwm_diff"))},
-                ("syntheval", "binary_target"): {"model_a": Validation(("auroc",))},
-            }
+            cast(
+                dict[tuple[str, str], dict[str, MetricValidationResult]],
+                {
+                    ("syntheval", "main"): {"model_a": Validation(("auroc", "avg_dwm_diff"))},
+                    ("syntheval", "binary_target"): {"model_a": Validation(("auroc",))},
+                },
+            )
         )
 
         assert execution_passes[("syntheval", "auroc", "model_a")] == "main"
@@ -942,23 +957,26 @@ class TestSynthEvalMetricValidation:
                 self.completed_keys = completed_keys
 
         execution_passes = build_metric_execution_passes(
-            {
-                ("syntheval", "main"): {
-                    "model_a": Validation(("auroc",), ("auroc",)),
-                    "model_b": Validation(("auroc",)),
+            cast(
+                dict[tuple[str, str], dict[str, MetricValidationResult]],
+                {
+                    ("syntheval", "main"): {
+                        "model_a": Validation(("auroc",), ("auroc",)),
+                        "model_b": Validation(("auroc",)),
+                    },
+                    ("syntheval", "binary_target"): {
+                        "model_a": Validation(("auroc",), ("auroc",)),
+                        "model_b": Validation(("auroc",), ("auroc",)),
+                    },
                 },
-                ("syntheval", "binary_target"): {
-                    "model_a": Validation(("auroc",), ("auroc",)),
-                    "model_b": Validation(("auroc",), ("auroc",)),
-                },
-            }
+            )
         )
 
         assert execution_passes[("syntheval", "auroc", "model_a")] == "main"
         assert execution_passes[("syntheval", "auroc", "model_b")] == "binary_target"
 
     def test_binary_pass_owns_repeated_key_when_main_is_missing(self):
-        main_results = pd.DataFrame(index=["model_a"])
+        main_results = pd.DataFrame(index=_model_index("model_a"))
         main_validations = validate_syntheval_results(
             main_results,
             None,
@@ -968,10 +986,10 @@ class TestSynthEvalMetricValidation:
             requested_use="audit",
         )
 
-        binary_results = pd.DataFrame(index=["model_a"])
+        binary_results = pd.DataFrame(index=_model_index("model_a"))
         binary_results[("auroc", "value")] = [0.6]
         binary_results.columns = pd.MultiIndex.from_tuples(binary_results.columns)
-        binary_ranks = pd.DataFrame({"auroc": [0.4]}, index=["model_a"])
+        binary_ranks = pd.DataFrame({"auroc": [0.4]}, index=_model_index("model_a"))
         binary_validations = validate_syntheval_results(
             binary_results,
             binary_ranks,
@@ -1092,10 +1110,10 @@ class TestGroupContext:
             )
 
     def test_patient_group_validation_marks_row_only_metric_unsafe(self):
-        results = pd.DataFrame(index=["model_a"])
+        results = pd.DataFrame(index=_model_index("model_a"))
         results[("avg_dwm_diff", "value")] = [0.2]
         results.columns = pd.MultiIndex.from_tuples(results.columns)
-        ranks = pd.DataFrame({"avg_dwm_diff": [0.8]}, index=["model_a"])
+        ranks = pd.DataFrame({"avg_dwm_diff": [0.8]}, index=_model_index("model_a"))
 
         validations = validate_syntheval_results(
             results,
@@ -1112,8 +1130,10 @@ class TestGroupContext:
         validation = validations[("syntheval", "main")]["model_a"]
         assert validation.expected_records[0].status == "group_unsafe"
         assert validation.decision_eligible is False
-        assert validation.evaluation_context.group_mode == "patient_group"
-        assert validation.evaluation_context.resolved_configuration["group_column"] == "patient_id"
+        context = validation.evaluation_context
+        assert context is not None
+        assert context.group_mode == "patient_group"
+        assert context.resolved_configuration["group_column"] == "patient_id"
 
     @pytest.mark.parametrize(
         ("framework", "emitted_key"),
@@ -1127,9 +1147,9 @@ class TestGroupContext:
     def test_patient_group_validation_blocks_unsupported_metric_families(
         self, framework, emitted_key
     ):
-        results = pd.DataFrame({(emitted_key, "value"): [0.2]}, index=["model_a"])
+        results = pd.DataFrame({(emitted_key, "value"): [0.2]}, index=_model_index("model_a"))
         results.columns = pd.MultiIndex.from_tuples(results.columns)
-        ranks = pd.DataFrame({emitted_key: [0.2]}, index=["model_a"])
+        ranks = pd.DataFrame({emitted_key: [0.2]}, index=_model_index("model_a"))
 
         validations = validate_syntheval_results(
             results,
@@ -1195,7 +1215,7 @@ class TestGroupContext:
 
 def _make_results(index=("m1", "m2")) -> pd.DataFrame:
     """Minimal benchmark_results DataFrame with a MultiIndex column level."""
-    df = pd.DataFrame(index=list(index))
+    df = pd.DataFrame(index=pd.Index(index))
     df[("dwm", "value")] = [0.8, 0.7]
     df[("dwm", "error")] = [0.01, 0.02]
     df.columns = pd.MultiIndex.from_tuples(df.columns)
@@ -1204,7 +1224,7 @@ def _make_results(index=("m1", "m2")) -> pd.DataFrame:
 
 
 def _make_ranks(index=("m1", "m2")) -> pd.DataFrame:
-    return pd.DataFrame({"dwm": [0.8, 0.7], "rank": [0.9, 0.8]}, index=list(index))
+    return pd.DataFrame({"dwm": [0.8, 0.7], "rank": [0.9, 0.8]}, index=pd.Index(index))
 
 
 class TestComputeCacheKey:
@@ -1340,10 +1360,11 @@ class TestResolveModelWorkers:
         monkeypatch.setattr(
             "synthdata.evaluation.syntheval_eval._available_memory_gib", lambda: 118.0
         )
-        monkeypatch.setattr(
-            "synthdata.evaluation.syntheval_eval.Path.read_text",
-            lambda _path: pytest.fail("worker resolution must not read MemTotal"),
-        )
+
+        def fail_read(_path: Path) -> bool:
+            raise AssertionError("worker resolution must not read MemTotal")
+
+        monkeypatch.setattr("synthdata.evaluation.syntheval_eval.Path.read_text", fail_read)
 
         assert resolve_model_workers(cfg, n_models=18, n_columns=1038) == 6
 

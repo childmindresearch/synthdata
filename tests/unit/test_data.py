@@ -2,6 +2,7 @@
 
 import json
 import logging
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -324,6 +325,9 @@ class TestVariableSchema:
 
     def test_canonical_loader_keeps_identity_sidecar_out_of_all_artifacts(self, tmp_path):
         dataset = load_dataset(self._write_canonical_inputs(tmp_path))
+        assert dataset.identity_sidecar is not None
+        assert dataset.full_df is not None
+        assert dataset.assignment is not None
         payload = semantic_context_payload(dataset)
         manifest = json.loads((dataset.data_dir / "dataset_manifest.json").read_text())
         assignment_files = list((dataset.data_dir / "assignments").glob("*/assignment.csv"))
@@ -333,10 +337,9 @@ class TestVariableSchema:
         assert "patient_id" not in dataset.full_df.columns
         assert all("patient_id" not in frame.columns for frame in dataset.roles.values())
         assert "patient_id" not in dataset.feature_columns
-        assert all(
-            set(groups.astype(str)).isdisjoint({str(value) for value in range(1, 13)})
-            for groups in dataset.role_groups.values()
-        )
+        for groups in dataset.role_groups.values():
+            groups = cast(pd.Series, groups)
+            assert set(groups.astype(str)).isdisjoint({str(value) for value in range(1, 13)})
         assert "patient_id" not in str(dataset.assignment.to_dict())
         assert "identity_sidecar" not in manifest
         assert "patient_id" not in json.dumps(payload)

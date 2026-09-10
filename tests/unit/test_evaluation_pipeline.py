@@ -4,6 +4,7 @@ import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pandas as pd
 import pytest
@@ -29,6 +30,16 @@ from synthdata.evaluation.release_score import compute_release_score
 from synthdata.generation import pipeline as generation_pipeline
 
 pytestmark = pytest.mark.unit
+
+
+def _dataframe(
+    data: dict[object, list[object]], index: list[str] | pd.Index | None = None
+) -> pd.DataFrame:
+    """Construct test frames while keeping pandas' heterogeneous columns typed."""
+    return pd.DataFrame(
+        cast("dict[str, list[object]]", data),
+        index=pd.Index(index) if index is not None else None,
+    )
 
 
 def test_metric_validation_failure_keeps_finite_release_score_indeterminate():
@@ -104,7 +115,7 @@ def test_run_evaluation_validates_ranks_and_persists_status(
         for column in dataset.full_df.columns
     }
     synthetic = dataset.role_frame("train", imputed=True).copy()
-    synthcity_report = pd.DataFrame(
+    synthcity_report = _dataframe(
         {"mean": [0.25], "direction": ["minimize"]},
         index=["privacy.identifiability_score.score_OC"],
     )
@@ -241,7 +252,7 @@ def test_run_evaluation_persists_generator_metadata_sidecars(
     (generation_dir / "model_a.cache.json").write_text(
         json.dumps({"generator_metadata": generator_metadata})
     )
-    report = pd.DataFrame(
+    report = _dataframe(
         {"mean": [0.25], "direction": ["minimize"]},
         index=["privacy.identifiability_score.score_OC"],
     )
@@ -308,7 +319,7 @@ def test_generation_metadata_preserves_current_cache_envelope(make_config):
 
 
 def test_selection_uses_complete_tuning_utility_and_ignores_gate_and_legacy_rank():
-    combined = pd.DataFrame(index=["model_a"])
+    combined = _dataframe({}, index=["model_a"])
     combined[("__all__", "overall", "rank")] = [1.0]
     combined[("__all__", "privacy_gate", "pass")] = [False]
     combined[("__all__", "utility", "U_tuning")] = [0.75]
@@ -321,7 +332,7 @@ def test_selection_uses_complete_tuning_utility_and_ignores_gate_and_legacy_rank
 
 
 def test_selection_requires_complete_finite_tuning_utility():
-    combined = pd.DataFrame(
+    combined = _dataframe(
         {
             ("__all__", "overall", "rank"): [1.0],
             ("__all__", "utility", "U_tuning"): [float("nan")],
@@ -343,7 +354,7 @@ def test_selection_failure_persists_auditable_blocked_final_evidence(
     cfg.evaluation.generate_report = False
     dataset = make_canonical_dataset()
     synthetic = dataset.role_frame("train", imputed=True).copy()
-    combined = pd.DataFrame(
+    combined = _dataframe(
         {
             ("__all__", "overall", "rank"): [1.0],
             ("__all__", "utility", "U_tuning"): [float("nan")],
@@ -372,7 +383,7 @@ def test_selection_failure_persists_auditable_blocked_final_evidence(
 
 
 def test_multi_model_selection_does_not_rerank_on_final_holdout_evidence():
-    combined = pd.DataFrame(
+    combined = _dataframe(
         {
             ("__all__", "utility", "U_tuning"): [0.90, 0.80],
             ("__all__", "overall", "rank"): [0.90, 0.80],
@@ -523,7 +534,7 @@ def test_run_evaluation_propagates_patient_group_context(
         for column in dataset.full_df.columns
     }
     synthetic = dataset.role_frame("train", imputed=True).copy()
-    synthcity_report = pd.DataFrame(
+    synthcity_report = _dataframe(
         {"mean": [0.25], "direction": ["minimize"]},
         index=["privacy.identifiability_score.score_OC"],
     )
@@ -594,7 +605,7 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     syntheval_fit_frames = []
     syntheval_released_datasets = []
     syntheval_released_references = []
-    synthcity_report = pd.DataFrame(
+    synthcity_report = _dataframe(
         {"mean": [0.25] * 4, "direction": ["minimize"] * 4},
         index=[
             "privacy.identifiability_score.score",
@@ -682,7 +693,7 @@ def test_run_evaluation_keeps_multi_model_selection_outside_final_holdout(
     selected_models = []
     final_task12_models = []
     final_custom_models = []
-    synthcity_report = pd.DataFrame(
+    synthcity_report = _dataframe(
         {"mean": [0.25] * 4, "direction": ["minimize"] * 4},
         index=[
             "privacy.identifiability_score.score",
@@ -710,7 +721,7 @@ def test_run_evaluation_keeps_multi_model_selection_outside_final_holdout(
             final_custom_models.append(set(selected))
         return {}
 
-    combined = pd.DataFrame(
+    combined = _dataframe(
         {
             ("__all__", "utility", "U_tuning"): [0.90, 0.80],
             ("__all__", "overall", "rank"): [0.90, 0.80],
@@ -773,7 +784,7 @@ def test_run_evaluation_records_authoritative_final_task10_evidence(
     }
     refit_hash = hashlib.sha256(b"refit-raw").hexdigest()
     final_role_hashes["refit_fit"] = refit_hash
-    synthcity_report = pd.DataFrame(
+    synthcity_report = _dataframe(
         {"mean": [0.25] * 4, "direction": ["minimize"] * 4},
         index=[
             "privacy.identifiability_score.score",
@@ -810,6 +821,8 @@ def test_run_evaluation_records_authoritative_final_task10_evidence(
     def run_authoritative_task10(*args, **kwargs):
         tstr_calls.append(kwargs["evaluation_role"])
         result = real_run_tstr(*args, **kwargs)
+        assert result.report is not None
+        assert result.envelope is not None
         metadata = result.report["result_metadata"]
         metadata["role_hashes"] = final_role_hashes
         result.report["prediction_artifact"]["role_hashes"] = final_role_hashes
@@ -999,7 +1012,7 @@ def test_run_evaluation_blocks_legacy_before_candidate_ranking(
     dataset.test_imputed_df = dataset.test_df.copy()
     synthetic = dataset.test_imputed_df.copy()
     synthcity_calls = []
-    synthcity_report = pd.DataFrame(
+    synthcity_report = _dataframe(
         {"mean": [0.25], "direction": ["minimize"]},
         index=["privacy.identifiability_score.score_OC"],
     )
@@ -1037,11 +1050,11 @@ def test_run_evaluation_persists_failed_final_framework_evidence(
 
     dataset = make_canonical_dataset()
     synthetic = dataset.role_frame("train", imputed=True).copy()
-    synthcity_report = pd.DataFrame(
+    synthcity_report = _dataframe(
         {"mean": [0.25], "direction": ["minimize"]},
         index=["privacy.identifiability_score.score_OC"],
     )
-    failed_report = pd.DataFrame({"error": ["framework failed"], "error_type": ["RuntimeError"]})
+    failed_report = _dataframe({"error": ["framework failed"], "error_type": ["RuntimeError"]})
     disabled_syntheval_calls = []
 
     def fake_run_synthcity_evaluation(*args, **kwargs):
@@ -1117,7 +1130,7 @@ def test_run_evaluation_persists_failed_final_syntheval_worker(
 
     dataset = make_canonical_dataset()
     synthetic = dataset.role_frame("train", imputed=True).copy()
-    synthcity_report = pd.DataFrame(
+    synthcity_report = _dataframe(
         {"mean": [0.25] * 4, "direction": ["minimize"] * 4},
         index=[
             "privacy.identifiability_score.score",
@@ -1178,7 +1191,7 @@ def test_run_evaluation_passes_real_fit_to_final_binary_evidence(
 
     dataset = make_canonical_dataset()
     synthetic = dataset.role_frame("train", imputed=True).copy()
-    synthcity_report = pd.DataFrame(
+    synthcity_report = _dataframe(
         {"mean": [0.25] * 4, "direction": ["minimize"] * 4},
         index=[
             "privacy.identifiability_score.score",

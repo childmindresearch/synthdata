@@ -2,6 +2,8 @@
 min-max scaling, and the combined ranked table.
 """
 
+from collections.abc import Mapping, Sequence
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -24,6 +26,20 @@ from synthdata.evaluation.synthcity_eval import validate_synthcity_report
 from synthdata.evaluation.syntheval_eval import validate_syntheval_results
 
 pytestmark = pytest.mark.unit
+
+
+def _dataframe(
+    data: Mapping[object, Sequence[object]] | Sequence[Sequence[object]] | None = None,
+    *,
+    index: Sequence[object] | pd.Index | None = None,
+    columns: Sequence[object] | pd.Index | None = None,
+) -> pd.DataFrame:
+    """Construct test frames at pandas' dynamically typed boundary."""
+    normalized_index = index if isinstance(index, pd.Index) else pd.Index(index) if index else None
+    normalized_columns = (
+        columns if isinstance(columns, pd.Index) else pd.Index(columns) if columns else None
+    )
+    return pd.DataFrame(data, index=normalized_index, columns=normalized_columns)
 
 
 class TestMinMaxScale:
@@ -54,7 +70,7 @@ class TestSynthcityFrames:
         assert list(raw.index) == ["a", "b"]
 
     def test_builds_multiindex_columns_oriented_by_direction(self):
-        result = pd.DataFrame(
+        result = _dataframe(
             {"mean": [0.5, 0.3, 0.2], "direction": ["maximize", "minimize", "minimize"]},
             index=[
                 "stats.ks_test",
@@ -78,10 +94,8 @@ class TestSynthcityFrames:
         )
 
     def test_failed_model_excluded_not_raising(self):
-        ok_result = pd.DataFrame(
-            {"mean": [0.5], "direction": ["maximize"]}, index=["stats.ks_test"]
-        )
-        failed_result = pd.DataFrame({"error": ["boom"], "error_type": ["ValueError"]})
+        ok_result = _dataframe({"mean": [0.5], "direction": ["maximize"]}, index=["stats.ks_test"])
+        failed_result = _dataframe({"error": ["boom"], "error_type": ["ValueError"]})
         raw, oriented = _synthcity_frames(
             {"model_a": ok_result, "model_b": failed_result},
             model_names=["model_a", "model_b"],
@@ -91,7 +105,7 @@ class TestSynthcityFrames:
         assert raw.loc["model_a", ("synthcity", "utility", "stats.ks_test")] == 0.5
 
     def test_missing_expected_identity_is_materialized_with_model_state(self):
-        result = pd.DataFrame(
+        result = _dataframe(
             {"mean": [0.25], "direction": ["maximize"]},
             index=["stats.ks_test.marginal"],
         )
@@ -124,9 +138,7 @@ class TestSynthcityFrames:
         assert oriented.empty
 
     def test_failed_model_keeps_expected_raw_columns_and_failure_state(self):
-        failed_result = pd.DataFrame(
-            {"error": ["framework crashed"], "error_type": ["RuntimeError"]}
-        )
+        failed_result = _dataframe({"error": ["framework crashed"], "error_type": ["RuntimeError"]})
         validation = validate_synthcity_report(
             "model_a",
             failed_result,
@@ -152,13 +164,13 @@ class TestSynthcityFrames:
         assert oriented.empty
 
     def test_all_models_failed_returns_empty_frame(self):
-        failed_result = pd.DataFrame({"error": ["boom"], "error_type": ["ValueError"]})
+        failed_result = _dataframe({"error": ["boom"], "error_type": ["ValueError"]})
         raw, oriented = _synthcity_frames({"model_a": failed_result}, model_names=["model_a"])
         assert raw.loc["model_a", ("synthcity", "audit", "__model_error")] == "boom"
         assert oriented.empty
 
     def test_redundant_naive_alpha_precision_submetrics_excluded(self):
-        result = pd.DataFrame(
+        result = _dataframe(
             {
                 "mean": [0.9, 0.9, 0.5, 0.5],
                 "direction": ["maximize", "maximize", "maximize", "maximize"],
@@ -178,7 +190,7 @@ class TestSynthcityFrames:
         assert oriented.columns.get_level_values(2).tolist() == raw_metrics.tolist()
 
     def test_contract_validation_keeps_audit_raw_values_out_of_policy_rank(self):
-        result = pd.DataFrame(
+        result = _dataframe(
             {"mean": [0.4], "direction": ["minimize"]},
             index=["privacy.identifiability_score.score_OC"],
         )
@@ -204,7 +216,7 @@ class TestSynthcityFrames:
         assert oriented.empty
 
     def test_build_combined_table_all_audit_only_results(self):
-        result = pd.DataFrame(
+        result = _dataframe(
             {"mean": [0.4], "direction": ["minimize"]},
             index=["privacy.identifiability_score.score_OC"],
         )
@@ -261,14 +273,14 @@ class TestSyntheEvalFrames:
         )
 
     def _benchmark_results(self):
-        df = pd.DataFrame(index=["model_a", "model_b"])
+        df = _dataframe(index=["model_a", "model_b"])
         df[("ks_tvd_stat", "value")] = [0.1, 0.2]
         df[("equal_opportunity", "value")] = [0.05, 0.9]
         df.columns = pd.MultiIndex.from_tuples(df.columns)
         return df
 
     def _benchmark_ranks(self):
-        return pd.DataFrame(
+        return _dataframe(
             {
                 "ks_tvd_stat": [0.9, 0.8],
                 "equal_opportunity": [0.6, 0.1],
@@ -296,10 +308,10 @@ class TestSyntheEvalFrames:
         assert raw.loc["model_a", ("syntheval", "utility", "ks_tvd_stat")] == pytest.approx(0.1)
 
     def test_missing_expected_identity_is_materialized_from_validation(self):
-        benchmark_results = pd.DataFrame(index=["model_a"])
+        benchmark_results = _dataframe(index=["model_a"])
         benchmark_results[("avg_dwm_diff", "value")] = [0.1]
         benchmark_results.columns = pd.MultiIndex.from_tuples(benchmark_results.columns)
-        benchmark_ranks = pd.DataFrame({"avg_dwm_diff": [0.9]}, index=["model_a"])
+        benchmark_ranks = _dataframe({"avg_dwm_diff": [0.9]}, index=["model_a"])
         validations = validate_syntheval_results(
             benchmark_results,
             benchmark_ranks,
@@ -322,10 +334,10 @@ class TestSyntheEvalFrames:
         )
 
     def test_pass_ownership_is_resolved_per_model(self):
-        benchmark_results = pd.DataFrame(index=["model_a", "model_b"])
+        benchmark_results = _dataframe(index=["model_a", "model_b"])
         benchmark_results[("auroc", "value")] = [0.1, np.nan]
         benchmark_results.columns = pd.MultiIndex.from_tuples(benchmark_results.columns)
-        benchmark_ranks = pd.DataFrame(
+        benchmark_ranks = _dataframe(
             {"auroc": [0.9, 0.8]},
             index=["model_a", "model_b"],
         )
@@ -408,10 +420,10 @@ class TestBuildCombinedTable:
 
     def test_combines_single_source_and_ranks(self):
         synthcity_results = {
-            "model_a": pd.DataFrame(
+            "model_a": _dataframe(
                 {"mean": [0.9], "direction": ["maximize"]}, index=["stats.ks_test"]
             ),
-            "model_b": pd.DataFrame(
+            "model_b": _dataframe(
                 {"mean": [0.1], "direction": ["maximize"]}, index=["stats.ks_test"]
             ),
         }
@@ -426,7 +438,7 @@ class TestBuildCombinedTable:
     def test_load_combined_table_validates_round_trip(self, tmp_path):
         combined = build_combined_table(
             {
-                "model_a": pd.DataFrame(
+                "model_a": _dataframe(
                     {"mean": [0.9], "direction": ["maximize"]}, index=["stats.ks_test"]
                 )
             },
@@ -444,7 +456,7 @@ class TestBuildCombinedTable:
 
     def test_loads_empty_blocked_legacy_table(self, tmp_path):
         columns = pd.MultiIndex.from_arrays([[], [], []], names=["framework", "type", "metric"])
-        combined = pd.DataFrame(index=pd.Index([], name="model"), columns=columns)
+        combined = _dataframe(index=pd.Index([], name="model"), columns=columns)
         path = tmp_path / "combined_evaluation.csv"
         combined.to_csv(path)
 
@@ -454,7 +466,7 @@ class TestBuildCombinedTable:
         assert loaded.shape == (0, 0)
 
     def test_combined_table_requires_overall_rank(self):
-        combined = pd.DataFrame(index=["model_a"])
+        combined = _dataframe(index=["model_a"])
         combined[("__all__", "utility", "rank")] = [0.5]
         combined.columns = pd.MultiIndex.from_tuples(combined.columns)
 
@@ -462,7 +474,7 @@ class TestBuildCombinedTable:
             validate_combined_table(combined)
 
     def test_combined_table_rejects_non_finite_metric_values(self):
-        combined = pd.DataFrame(index=["model_a"])
+        combined = _dataframe(index=["model_a"])
         combined[("syntheval", "utility", "metric_a")] = [np.inf]
         combined[("__all__", "overall", "rank")] = [0.5]
         combined.columns = pd.MultiIndex.from_tuples(combined.columns)
@@ -471,7 +483,7 @@ class TestBuildCombinedTable:
             validate_combined_table(combined)
 
     def test_combined_table_rejects_duplicate_metric_identities(self):
-        combined = pd.DataFrame([[0.5, 0.5]], index=["model_a"])
+        combined = _dataframe([[0.5, 0.5]], index=["model_a"])
         combined.columns = pd.MultiIndex.from_tuples(
             [
                 ("syntheval", "utility", "metric_a"),
@@ -484,7 +496,7 @@ class TestBuildCombinedTable:
 
     def test_combines_multiple_sources(self):
         synthcity_results = {
-            "model_a": pd.DataFrame(
+            "model_a": _dataframe(
                 {"mean": [0.9], "direction": ["maximize"]}, index=["stats.ks_test"]
             )
         }
@@ -508,19 +520,19 @@ class TestBuildCombinedTable:
         # Unvalidated SynthEval rank values remain audit evidence and cannot
         # create a policy group, even when their raw columns are present.
         synthcity_results = {
-            "model_a": pd.DataFrame(
+            "model_a": _dataframe(
                 {"mean": [1.0] * 5, "direction": ["maximize"] * 5},
                 index=[f"stats.metric_{i}" for i in range(5)],
             ),
-            "model_b": pd.DataFrame(
+            "model_b": _dataframe(
                 {"mean": [0.0] * 5, "direction": ["maximize"] * 5},
                 index=[f"stats.metric_{i}" for i in range(5)],
             ),
         }
-        benchmark_results = pd.DataFrame(index=["model_a", "model_b"])
+        benchmark_results = _dataframe(index=["model_a", "model_b"])
         benchmark_results[("avg_F1_diff", "value")] = [0.0, 1.0]
         benchmark_results.columns = pd.MultiIndex.from_tuples(benchmark_results.columns)
-        benchmark_ranks = pd.DataFrame(
+        benchmark_ranks = _dataframe(
             {"avg_F1_diff": [0.0, 1.0], "rank": [0.0, 1.0]}, index=["model_a", "model_b"]
         )
         combined = build_combined_table(
@@ -536,10 +548,10 @@ class TestBuildCombinedTable:
 
     def test_incomplete_fixed_utility_is_indeterminate_regardless_of_rank_weights(self):
         synthcity_results = {
-            "model_a": pd.DataFrame(
+            "model_a": _dataframe(
                 {"mean": [1.0], "direction": ["maximize"]}, index=["privacy.identifiability_score"]
             ),
-            "model_b": pd.DataFrame(
+            "model_b": _dataframe(
                 {"mean": [0.0], "direction": ["maximize"]}, index=["privacy.identifiability_score"]
             ),
         }
@@ -555,11 +567,11 @@ class TestBuildCombinedTable:
 
     def test_rank_weights_asymmetric_changes_sort_order(self):
         synthcity_results = {
-            "model_a": pd.DataFrame(
+            "model_a": _dataframe(
                 {"mean": [1.0, 0.0], "direction": ["maximize", "maximize"]},
                 index=["stats.utility_metric", "privacy.identifiability_score"],
             ),
-            "model_b": pd.DataFrame(
+            "model_b": _dataframe(
                 {"mean": [0.0, 1.0], "direction": ["maximize", "maximize"]},
                 index=["stats.utility_metric", "privacy.identifiability_score"],
             ),
@@ -579,10 +591,10 @@ class TestBuildCombinedTable:
 
     def test_default_rank_weights_used_when_none_passed(self):
         synthcity_results = {
-            "model_a": pd.DataFrame(
+            "model_a": _dataframe(
                 {"mean": [0.9], "direction": ["maximize"]}, index=["stats.ks_test"]
             ),
-            "model_b": pd.DataFrame(
+            "model_b": _dataframe(
                 {"mean": [0.1], "direction": ["maximize"]}, index=["stats.ks_test"]
             ),
         }

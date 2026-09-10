@@ -600,6 +600,7 @@ def evaluate_privacy_gate(
                 continue
 
             value = _as_finite_number(values.loc[model])
+            assert record is not None
             record_value = _as_finite_number(record.raw_value)
             if value is None or record_value is None:
                 pass_mask.loc[model] = False

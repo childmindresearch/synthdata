@@ -3,6 +3,7 @@ statistical functions.
 """
 
 import math
+from typing import cast
 
 import pandas as pd
 import pytest
@@ -194,7 +195,7 @@ class TestBinLabelHelpers:
 
     def test_generate_bin_labels_rejects_non_list(self):
         with pytest.raises(ValueError, match="at least 2"):
-            generate_bin_labels((1.0, 2.0))
+            generate_bin_labels(cast("list[float]", (1.0, 2.0)))
 
 
 class TestPrepareDataForAnalysis:

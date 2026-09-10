@@ -54,6 +54,7 @@ def _persist_decoded_imputed_splits(dataset: Dataset) -> None:
         )
     paths = dataset.paths()
     for name, frame in decoded_frames.items():
+        assert frame is not None
         frame.to_csv(paths[name], index=False)
     logger.info(
         "Wrote ordinal-decoded imputed splits under %s (model-space caches remain in "
@@ -292,6 +293,8 @@ def _cache_key_payload(cfg: Config, dataset: Dataset, phase: str = "candidate") 
             }
         )
     else:
+        assert dataset.train_df is not None
+        assert dataset.test_df is not None
         payload.update(
             {
                 "cache_contract": "legacy_two_role_v1",
@@ -558,6 +561,8 @@ def run_imputation(cfg: Config, dataset: Dataset, phase: str = "candidate") -> D
         # full_df (dropna()), so its index may no longer contain every train/test
         # row -- intersect rather than assume a full match (still a strict subset
         # when imputation ran, since full_imputed then shares full_df's index).
+        assert dataset.train_df is not None
+        assert dataset.test_df is not None
         train_imputed = full_imputed.loc[full_imputed.index.intersection(dataset.train_df.index)]
         test_imputed = full_imputed.loc[full_imputed.index.intersection(dataset.test_df.index)]
         if not cfg.imputation.enabled and (

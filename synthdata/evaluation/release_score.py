@@ -21,10 +21,6 @@ DEFAULT_ANCHORS: dict[str, float] = {
     "worst_absolute_log_disparity": 0.69314718056,
 }
 
-_UTILITY_KEYS = ("tstr", "mmd", "jsd")
-_PRIVACY_KEYS = ("k", "l", "dcr", "epsilon", "mia", "attribute")
-_FAIRNESS_KEYS = ("representation", "eo", "worst_log_disparity")
-
 
 def _finite(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
@@ -226,9 +222,7 @@ def compute_release_score(
         else None
     )
     final = (
-        0.45 * cast(float, utility_value)
-        + 0.30 * cast(float, privacy_value)
-        + 0.25 * cast(float, fairness_value)
+        0.45 * utility_value + 0.30 * cast(float, privacy_value) + 0.25 * fairness_value
         if utility_value is not None and privacy_value is not None and fairness_value is not None
         else None
     )

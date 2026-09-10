@@ -7,6 +7,7 @@ import inspect
 import json
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Protocol, cast
 
 import optuna
 import pandas as pd
@@ -29,6 +30,14 @@ from synthdata.generation.hpo import (
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
+
+
+class _BenchmarksAPI(Protocol):
+    @staticmethod
+    def evaluate(
+        generators: list[tuple[str, str, dict]], train_loader: object, **kwargs: object
+    ) -> dict[str, pd.DataFrame]: ...
+
 
 GENERATOR_METADATA_SCHEMA_VERSION = "generator-metadata-v1"
 _PATE_ACCOUNTING_SCHEMA_VERSION = "pate-accounting-v1"
@@ -501,7 +510,7 @@ def build_synthcity_objective(
     expected_keys = (
         list(expected_emitted_keys)
         if expected_emitted_keys is not None
-        else list(utility_policy["metrics"])
+        else list(utility_policy["metrics"] if utility_policy is not None else ())
         if canonical
         else emitted_keys_for_synthcity_metrics(hpo_cfg.metric_config)
     )
@@ -572,6 +581,8 @@ def build_synthcity_objective(
             set_trial_attr(trial, "generator_metadata_state", "pending")
         except (TypeError, ValueError, RuntimeError) as exc:
             if stage_a_contract is not None:
+                if stage_a_root is None or study_name is None:
+                    raise RuntimeError("Stage A screening context is incomplete") from exc
                 persist_stage_a_trial_exception(
                     trial,
                     stage_a_root,
@@ -590,6 +601,8 @@ def build_synthcity_objective(
         trial_id = f"trial_{trial.number}"
         candidate_screen = None
         if stage_a_contract is not None:
+            if stage_a_root is None or study_name is None or stage_a_source_df is None:
+                raise RuntimeError("Stage A screening context is incomplete")
 
             def candidate_screen(candidate_df: pd.DataFrame):
                 return screen_stage_a_trial(
@@ -609,13 +622,15 @@ def build_synthcity_objective(
                 trial, "semantic_context_digest", semantic_digest
             ) if semantic_digest is not None else None
             if canonical:
+                if train_df is None or tuning_df is None or target_column is None:
+                    raise RuntimeError("Canonical SynthCity HPO inputs were not resolved")
                 candidate_df, generator_metadata = fit_generate(
                     name,
                     params,
                     train_loader,
                     synthetic_size or len(train_loader),
                     seed,
-                    workspace=workspace_path,
+                    workspace=str(workspace_path),
                     device=trial_device,
                 )
                 if candidate_screen is not None:
@@ -649,14 +664,14 @@ def build_synthcity_objective(
                     "group_mode": group_mode,
                     "classification_score": classification_score,
                     "semantic_context": semantic_context,
-                    "workspace": workspace_path,
+                    "workspace": str(workspace_path),
                     "fit_on_X": True,
                 }
                 if synthetic_size is not None:
                     evaluate_kwargs["synthetic_size"] = synthetic_size
                 if candidate_screen is not None:
                     evaluate_kwargs["candidate_screen"] = candidate_screen
-                report = Benchmarks.evaluate(
+                report = cast(_BenchmarksAPI, Benchmarks).evaluate(
                     [(trial_id, name, params)], train_loader, **evaluate_kwargs
                 )
                 if not isinstance(report, dict) or trial_id not in report:
@@ -711,6 +726,8 @@ def build_synthcity_objective(
             if stage_a_contract is not None and not getattr(trial, "user_attrs", {}).get(
                 "stage_a_state"
             ):
+                if stage_a_root is None or study_name is None:
+                    raise RuntimeError("Stage A screening context is incomplete") from exc
                 persist_stage_a_trial_exception(
                     trial,
                     stage_a_root,

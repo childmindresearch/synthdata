@@ -1,6 +1,7 @@
 """Unit tests for the explicit scope of resumable HPO artifacts."""
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,20 @@ from synthdata.generation.synthcity_backend import build_synthcity_objective
 from tests.unit.synthcity_emitted_key_fixtures import HPO_SYNTHCITY_EMITTED_KEY_FIXTURES
 
 pytestmark = pytest.mark.unit
+
+
+def _strings(*values: str) -> np.ndarray:
+    """Build pandas-compatible string arrays with explicit element typing."""
+    return np.asarray(values, dtype=str)
+
+
+def _screen_trial_callback(
+    callback: Callable[[optuna.trial.Trial], float],
+) -> Callable[[optuna.trial.Trial], float]:
+    def wrapped(trial: optuna.trial.Trial) -> float:
+        return callback(trial)
+
+    return wrapped
 
 
 def _hpo_context(**overrides):
@@ -122,7 +137,9 @@ def test_loris_config_loads_canonical_versioned_equal_thirds_policy():
 
 
 def test_canonical_hpo_partial_set_fails_closed():
-    report = pd.DataFrame({"mean": [0.2], "direction": ["minimize"]}, index=["mixed_mmd.v1"])
+    report = pd.DataFrame(
+        {"mean": [0.2], "direction": _strings("minimize")}, index=_strings("mixed_mmd.v1")
+    )
     report.attrs["canonical_hpo"] = True
     report.attrs["canonical_hpo_keys"] = ("mixed_mmd.v1", "elastic_net_jsd.v1")
     report.attrs["hpo_provenance"] = _hpo_context()
@@ -164,13 +181,13 @@ def test_patient_group_hpo_accepts_group_safe_objective_contract():
 
 
 def test_patient_group_hpo_resolves_reordered_rows_by_stable_identity(mocker):
-    train = pd.DataFrame({"x": [0.0, 1.0], "target": [0, 1]}, index=["a", "b"])
-    tuning = pd.DataFrame({"x": [2.0, 3.0], "target": [0, 1]}, index=["c", "d"])
+    train = pd.DataFrame({"x": [0.0, 1.0], "target": [0, 1]}, index=_strings("a", "b"))
+    tuning = pd.DataFrame({"x": [2.0, 3.0], "target": [0, 1]}, index=_strings("c", "d"))
     groups = {"a": "p1", "b": "p2"}
     tuning_groups = {"c": "p3", "d": "p4"}
     report = pd.DataFrame(
-        {"mean": [0.2, 0.3, 0.8], "direction": ["minimize", "minimize", "maximize"]},
-        index=["mixed_mmd.v1", "elastic_net_jsd.v1", "tstr_macro_f1.v1"],
+        {"mean": [0.2, 0.3, 0.8], "direction": _strings("minimize", "minimize", "maximize")},
+        index=_strings("mixed_mmd.v1", "elastic_net_jsd.v1", "tstr_macro_f1.v1"),
     )
     report.attrs["hpo_provenance"] = _hpo_context()
 
@@ -202,8 +219,8 @@ def test_patient_group_hpo_resolves_reordered_rows_by_stable_identity(mocker):
 
 
 def test_patient_group_hpo_rejects_misaligned_group_rows():
-    train = pd.DataFrame({"x": [0.0, 1.0], "target": [0, 1]}, index=["a", "b"])
-    tuning = pd.DataFrame({"x": [2.0, 3.0], "target": [0, 1]}, index=["c", "d"])
+    train = pd.DataFrame({"x": [0.0, 1.0], "target": [0, 1]}, index=_strings("a", "b"))
+    tuning = pd.DataFrame({"x": [2.0, 3.0], "target": [0, 1]}, index=_strings("c", "d"))
 
     with pytest.raises(ValueError, match="do not align"):
         build_synthetic_eval_fn(
@@ -464,7 +481,9 @@ def test_hpo_cache_rejects_noncanonical_provenance_contract(tmp_path, field_valu
 
 
 def test_hpo_score_rejects_provenance_free_report():
-    report = pd.DataFrame({"mean": [0.2], "direction": ["minimize"]}, index=["mixed_mmd.v1"])
+    report = pd.DataFrame(
+        {"mean": [0.2], "direction": _strings("minimize")}, index=_strings("mixed_mmd.v1")
+    )
     with pytest.raises(ValueError, match="missing required hpo_provenance"):
         hpo_score(report)
 
@@ -493,9 +512,9 @@ def test_canonical_score_retains_provenance_metadata(mocker):
     report = pd.DataFrame(
         {
             "mean": [0.2, 0.3, 0.8],
-            "direction": ["minimize", "minimize", "maximize"],
+            "direction": _strings("minimize", "minimize", "maximize"),
         },
-        index=["mixed_mmd.v1", "elastic_net_jsd.v1", "tstr_macro_f1.v1"],
+        index=_strings("mixed_mmd.v1", "elastic_net_jsd.v1", "tstr_macro_f1.v1"),
     )
     report.attrs["hpo_provenance"] = provenance
     assert _score(report) == pytest.approx(-((0.8 + 0.7 + 0.8) / 3))
@@ -761,13 +780,18 @@ def test_stage_a_trial_prune_and_persist_result(tmp_path):
     study = optuna.create_study(direction="minimize")
 
     study.optimize(
-        lambda trial: screen_stage_a_trial(
-            trial,
-            source.copy(),
-            contract,
-            source,
-            tmp_path,
-            "hpo_test",
+        _screen_trial_callback(
+            lambda trial: (
+                screen_stage_a_trial(
+                    trial,
+                    source.copy(),
+                    contract,
+                    source,
+                    tmp_path,
+                    "hpo_test",
+                ),
+                0.0,
+            )[1]
         ),
         n_trials=1,
     )
@@ -789,13 +813,18 @@ def test_stage_a_trial_persists_screen_exception_as_pruned(tmp_path):
     study = optuna.create_study(direction="minimize")
 
     study.optimize(
-        lambda trial: screen_stage_a_trial(
-            trial,
-            source.copy(),
-            contract,
-            changed_source,
-            tmp_path,
-            "hpo_exception",
+        _screen_trial_callback(
+            lambda trial: (
+                screen_stage_a_trial(
+                    trial,
+                    source.copy(),
+                    contract,
+                    changed_source,
+                    tmp_path,
+                    "hpo_exception",
+                ),
+                0.0,
+            )[1]
         ),
         n_trials=1,
     )
@@ -900,7 +929,7 @@ def test_completed_hpo_checkpoint_is_durable_and_resume_skips_terminal_trial(tmp
     assert checkpoint["objective_value"] == pytest.approx(0.25)
 
     def should_not_run(_trial):
-        pytest.fail("a completed HPO trial was recomputed during resume")
+        raise AssertionError("a completed HPO trial was recomputed during resume")
 
     run_study(
         "hpo_checkpoint",
@@ -962,7 +991,7 @@ def test_hpo_checkpoint_resume_rejects_changed_implementation_fingerprint(tmp_pa
         )
 
     def should_not_run(_trial):
-        pytest.fail("a checkpoint from another implementation was reused")
+        raise AssertionError("a checkpoint from another implementation was reused")
 
     with pytest.raises(RuntimeError, match="does not match the current implementation"):
         run_study(
@@ -1112,8 +1141,8 @@ def test_hpo_builders_reject_unsafe_config_before_backend_execution():
 
 def test_hpo_score_rejects_diagnostic_or_failed_rows():
     diagnostic = pd.DataFrame(
-        {"mean": [0.5], "direction": ["maximize"]},
-        index=["stats.prdc"],
+        {"mean": [0.5], "direction": _strings("maximize")},
+        index=_strings("stats.prdc"),
     )
     with pytest.raises(ValueError, match="not decision-eligible"):
         _score(diagnostic)
@@ -1121,11 +1150,11 @@ def test_hpo_score_rejects_diagnostic_or_failed_rows():
     failed = pd.DataFrame(
         {
             "mean": [float("nan")],
-            "direction": ["minimize"],
+            "direction": _strings("minimize"),
             "errors": [1],
             "error_types": ["ValueError"],
         },
-        index=["mixed_mmd.v1"],
+        index=_strings("mixed_mmd.v1"),
     )
     with pytest.raises(ValueError, match="not decision-eligible"):
         _score(failed)
@@ -1135,9 +1164,9 @@ def test_hpo_score_rejects_partial_static_metric_set():
     report = pd.DataFrame(
         {
             "mean": [0.25],
-            "direction": ["minimize"],
+            "direction": _strings("minimize"),
         },
-        index=["mixed_mmd.v1"],
+        index=_strings("mixed_mmd.v1"),
     )
 
     with pytest.raises(ValueError, match="incomplete metric set.*missing"):
@@ -1151,7 +1180,9 @@ def test_hpo_score_rejects_partial_static_metric_set():
 
 
 def test_canonical_hpo_partial_report_is_indeterminate():
-    report = pd.DataFrame({"mean": [0.25], "direction": ["minimize"]}, index=["mixed_mmd.v1"])
+    report = pd.DataFrame(
+        {"mean": [0.25], "direction": _strings("minimize")}, index=_strings("mixed_mmd.v1")
+    )
     report.attrs["canonical_hpo"] = True
     with pytest.raises(ValueError, match="incomplete metric set"):
         _score(report)
@@ -1162,9 +1193,9 @@ def test_hpo_score_rejects_duplicate_static_metric_set():
     report = pd.DataFrame(
         {
             "mean": [0.25, 0.3],
-            "direction": ["minimize", "minimize"],
+            "direction": _strings("minimize", "minimize"),
         },
-        index=[metric_key, metric_key],
+        index=_strings(metric_key, metric_key),
     )
 
     with pytest.raises(ValueError, match="incomplete metric set.*duplicate"):
@@ -1175,9 +1206,9 @@ def test_hpo_score_accepts_only_approved_operational_rows():
     report = pd.DataFrame(
         {
             "mean": [0.25, 0.75, 0.5],
-            "direction": ["minimize", "maximize", "minimize"],
+            "direction": _strings("minimize", "maximize", "minimize"),
         },
-        index=["mixed_mmd.v1", "tstr_macro_f1.v1", "elastic_net_jsd.v1"],
+        index=_strings("mixed_mmd.v1", "tstr_macro_f1.v1", "elastic_net_jsd.v1"),
     )
 
     assert _score(report) == pytest.approx(-(0.75 + 0.75 + 0.5) / 3)
@@ -1187,14 +1218,9 @@ def test_hpo_score_rejects_extra_metric_rows_without_expected_keys():
     report = pd.DataFrame(
         {
             "mean": [0.25, 0.75, 0.5, 0.1],
-            "direction": ["minimize", "maximize", "minimize", "minimize"],
+            "direction": _strings("minimize", "maximize", "minimize", "minimize"),
         },
-        index=[
-            "mixed_mmd.v1",
-            "tstr_macro_f1.v1",
-            "elastic_net_jsd.v1",
-            "unexpected.v1",
-        ],
+        index=_strings("mixed_mmd.v1", "tstr_macro_f1.v1", "elastic_net_jsd.v1", "unexpected.v1"),
     )
 
     with pytest.raises(ValueError, match="not decision-eligible"):
@@ -1205,9 +1231,9 @@ def test_hpo_score_uses_fixed_release_formula_and_jsd_safety_orientation():
     report = pd.DataFrame(
         {
             "mean": [0.8, 0.2, 0.4],
-            "direction": ["maximize", "minimize", "minimize"],
+            "direction": _strings("maximize", "minimize", "minimize"),
         },
-        index=["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"],
+        index=_strings("tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"),
     )
     assert _score(report) == pytest.approx(-((0.8 + 0.8 + 0.6) / 3))
     with pytest.raises(ValueError, match="fixed to equal thirds"):
@@ -1218,9 +1244,9 @@ def test_hpo_score_rejects_legacy_two_metric_utility_policy():
     report = pd.DataFrame(
         {
             "mean": [0.8, 0.2, 0.4],
-            "direction": ["maximize", "minimize", "minimize"],
+            "direction": _strings("maximize", "minimize", "minimize"),
         },
-        index=["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"],
+        index=_strings("tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"),
     )
 
     with pytest.raises(ValueError, match="fixed to equal thirds"):
@@ -1237,9 +1263,9 @@ def test_hpo_score_accepts_canonical_equal_thirds_utility_policy():
     report = pd.DataFrame(
         {
             "mean": [0.8, 0.2, 0.4],
-            "direction": ["maximize", "minimize", "minimize"],
+            "direction": _strings("maximize", "minimize", "minimize"),
         },
-        index=["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"],
+        index=_strings("tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"),
     )
 
     assert _score(
@@ -1255,13 +1281,9 @@ def test_hpo_score_is_invariant_to_candidate_metric_order():
     report = pd.DataFrame(
         {
             "mean": [0.4, 0.8, 0.2],
-            "direction": ["minimize", "maximize", "minimize"],
+            "direction": _strings("minimize", "maximize", "minimize"),
         },
-        index=[
-            "elastic_net_jsd.v1",
-            "tstr_macro_f1.v1",
-            "mixed_mmd.v1",
-        ],
+        index=_strings("elastic_net_jsd.v1", "tstr_macro_f1.v1", "mixed_mmd.v1"),
     )
     reordered = report.iloc[[2, 1, 0]]
 
@@ -1762,7 +1784,7 @@ def test_tabpfgen_hpo_checkpoint_metadata_is_durable(mocker, tmp_path):
     assert generator["metadata"]["random_state"] == 13
 
     def should_not_run(_trial):
-        pytest.fail("a completed TabPFGen trial was recomputed during resume")
+        raise AssertionError("a completed TabPFGen trial was recomputed during resume")
 
     run_study(
         "hpo_tabpfgen_checkpoint_metadata",
@@ -2039,8 +2061,8 @@ def test_canonical_tabpfgen_eval_uses_canonical_producer_not_native_metrics(mock
     canonical = mocker.patch(
         "synthdata.generation.hpo.evaluate_canonical_hpo_metrics",
         return_value=pd.DataFrame(
-            {"mean": [0.25, 0.5, 0.75], "direction": ["minimize", "minimize", "maximize"]},
-            index=["mixed_mmd.v1", "elastic_net_jsd.v1", "tstr_macro_f1.v1"],
+            {"mean": [0.25, 0.5, 0.75], "direction": _strings("minimize", "minimize", "maximize")},
+            index=_strings("mixed_mmd.v1", "elastic_net_jsd.v1", "tstr_macro_f1.v1"),
         ),
     )
     canonical.return_value.attrs["hpo_provenance"] = _hpo_context()

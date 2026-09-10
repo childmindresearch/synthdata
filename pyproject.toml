@@ -137,6 +137,18 @@ explicit = true
 reportInvalidTypeForm = "none"
 reportUnusedExpression = "none"
 
+[tool.ty.environment]
+python-version = "3.11"
+
+[tool.ty.src]
+# Default production scope: `uv run ty check` checks `synthdata` and `scripts`
+# while excluding `scripts/document_pipeline`.
+include = ["synthdata", "scripts"]
+exclude = ["scripts/document_pipeline"]
+
+[tool.ty.terminal]
+output-format = "concise"
+
 [tool.ruff]
 target-version = "py311"
 line-length = 100

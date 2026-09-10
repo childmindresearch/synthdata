@@ -394,7 +394,10 @@ def _max_decimal_places(edges: list[float]) -> int:
     max_places = 0
     for edge in edges:
         dec = Decimal(str(edge))
-        places = max(0, -dec.as_tuple().exponent)
+        exponent = dec.as_tuple().exponent
+        if not isinstance(exponent, int):
+            raise ValueError("bin edges must be finite numeric values")
+        places = max(0, -exponent)
         max_places = max(max_places, places)
     return max_places
 
@@ -683,9 +686,17 @@ def compute_log_disparity_report(
     # Aggregate counts
     group_cols = protected_group_cols + ["TARGET_LABEL"]
     baseline_counts = (
-        real_prepared.groupby(group_cols, dropna=False).size().reset_index(name="background_n")
+        real_prepared.groupby(group_cols, dropna=False)
+        .size()
+        .reset_index()
+        .rename(columns={0: "background_n"})
     )
-    user_counts = synth_prepared.groupby(group_cols, dropna=False).size().reset_index(name="user_n")
+    user_counts = (
+        synth_prepared.groupby(group_cols, dropna=False)
+        .size()
+        .reset_index()
+        .rename(columns={0: "user_n"})
+    )
 
     total_background = int(baseline_counts["background_n"].sum())
     total_user = int(user_counts["user_n"].sum())
@@ -785,7 +796,10 @@ def compute_log_disparity_report(
     }
 
     label_counts = (
-        leaf.groupby(["Model", "EquityLabel"], dropna=False).size().reset_index(name="count")
+        leaf.groupby(["Model", "EquityLabel"], dropna=False)
+        .size()
+        .reset_index()
+        .rename(columns={0: "count"})
     )
 
     return {
@@ -1034,16 +1048,15 @@ def _build_leaf_equity_table(
     protected_group_cols: list[str],
 ) -> pd.DataFrame:
     """Create formatted equity table for leaf (intersectional) subgroup combinations."""
-    _empty = pd.DataFrame(
-        columns=[
-            "Characteristic",
-            "Protected Subgroup",
-            "Equity Value",
-            "BH-adjusted p-value",
-            "EquityLabel",
-            "EquityColor",
-        ]
+    empty_columns = (
+        "Characteristic",
+        "Protected Subgroup",
+        "Equity Value",
+        "BH-adjusted p-value",
+        "EquityLabel",
+        "EquityColor",
     )
+    _empty = pd.DataFrame({column: pd.Series(dtype="object") for column in empty_columns})
 
     if len(protected_group_cols) == 0:
         return _empty

@@ -14,10 +14,10 @@ import socket
 import time
 import traceback
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from numbers import Real
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -96,6 +96,9 @@ def _candidate_role_frames(dataset: Dataset) -> tuple[pd.DataFrame, pd.DataFrame
         raise RuntimeError(
             "SynthEval requires populated imputed role frame(s): " + ", ".join(missing)
         )
+    assert fit_frame is not None
+    assert tuning_frame is not None
+    assert final_holdout_frame is not None
     return fit_frame, tuning_frame, final_holdout_frame
 
 
@@ -975,7 +978,8 @@ def _model_worker(
     try:
         from syntheval import AnalysisConfig, SynthEval
 
-        analysis_config = AnalysisConfig(
+        analysis_config_factory = cast(Callable[..., AnalysisConfig], AnalysisConfig)
+        analysis_config = analysis_config_factory(
             dataset=real_frame,
             target_vars=target_column,
             confounder_vars=None,
@@ -990,7 +994,7 @@ def _model_worker(
             os.chdir(plot_dir)
         se = SynthEval(
             real_frame,
-            holdout_dataframe=holdout_frame,
+            holdout_dataframe=cast(pd.DataFrame, holdout_frame),
             cat_cols=cat_cols,
             verbose=False,
             enable_plots=plot_dir is not None,
@@ -1585,31 +1589,34 @@ def _run_resumable_syntheval(
                 model_name, frame, model_fingerprint = next(pending_iter)
             except StopIteration:
                 return False
-            process = context.Process(
-                target=_model_worker,
-                args=(
-                    model_name,
-                    frame,
-                    fit_frame,
-                    tuning_frame,
-                    dataset.all_categorical_columns,
-                    dataset.target_column,
-                    dataset.sensitive_columns,
-                    str(preset_path.resolve()),
-                    str(checkpoint_root),
-                    pass_name,
-                    expected_output_manifest,
-                    target_view,
-                    expected_manifest_digest,
-                    context_fingerprint,
-                    model_fingerprint,
-                    str(plots_output_dir) if plots_output_dir else None,
-                    execution_cfg.cores_per_model,
-                    group_context,
-                    role_context,
-                    semantic_context,
+            process = cast(
+                multiprocessing.Process,
+                context.Process(
+                    target=_model_worker,
+                    args=(
+                        model_name,
+                        frame,
+                        fit_frame,
+                        tuning_frame,
+                        dataset.all_categorical_columns,
+                        dataset.target_column,
+                        dataset.sensitive_columns,
+                        str(preset_path.resolve()),
+                        str(checkpoint_root),
+                        pass_name,
+                        expected_output_manifest,
+                        target_view,
+                        expected_manifest_digest,
+                        context_fingerprint,
+                        model_fingerprint,
+                        str(plots_output_dir) if plots_output_dir else None,
+                        execution_cfg.cores_per_model,
+                        group_context,
+                        role_context,
+                        semantic_context,
+                    ),
+                    name=f"syntheval-{pass_name}-{model_name}",
                 ),
-                name=f"syntheval-{pass_name}-{model_name}",
             )
             process.start()
             active[model_name] = process
@@ -2356,6 +2363,8 @@ def merge_binary_target_results(
     for metric in new_metrics:
         benchmark_results[(metric, "value")] = binary_results[(metric, "value")]
         benchmark_results[(metric, "error")] = binary_results[(metric, "error")]
+        assert binary_ranks is not None
+        assert benchmark_ranks is not None
         benchmark_ranks[metric] = binary_ranks[metric]
     return benchmark_results, benchmark_ranks
 

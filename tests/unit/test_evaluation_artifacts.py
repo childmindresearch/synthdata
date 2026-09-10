@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pandas as pd
@@ -42,8 +43,22 @@ from synthdata.log_disparity.metric_log_disparity import build_log_disparity_rep
 pytestmark = pytest.mark.unit
 
 
+def _dataframe(
+    data: Mapping[object, Sequence[object]] | Sequence[Sequence[object]] | None = None,
+    *,
+    index: Sequence[object] | pd.Index | None = None,
+    columns: Sequence[object] | pd.Index | None = None,
+) -> pd.DataFrame:
+    """Construct test frames at pandas' dynamically typed boundary."""
+    normalized_index = index if isinstance(index, pd.Index) else pd.Index(index) if index else None
+    normalized_columns = (
+        columns if isinstance(columns, pd.Index) else pd.Index(columns) if columns else None
+    )
+    return pd.DataFrame(data, index=normalized_index, columns=normalized_columns)
+
+
 def _combined() -> pd.DataFrame:
-    frame = pd.DataFrame(index=["model_a"])
+    frame = _dataframe(index=pd.Index(["model_a"]))
     frame[("__all__", "utility", "rank")] = [0.5]
     frame[("__all__", "privacy", "rank")] = [0.5]
     frame[("__all__", "fairness", "rank")] = [0.5]
@@ -623,7 +638,7 @@ def test_current_generation_cache_tampering_fails_after_hash_refresh(tmp_path, t
 
 
 def _report() -> dict:
-    hierarchy = pd.DataFrame(
+    hierarchy = _dataframe(
         {
             "Model": ["model_a"],
             "level": ["target"],
@@ -648,7 +663,7 @@ def _report() -> dict:
         },
         "leaf_results": hierarchy.copy(),
         "hierarchy_results": hierarchy,
-        "subgroup_table": pd.DataFrame(
+        "subgroup_table": _dataframe(
             {
                 "Characteristic": ["Target"],
                 "Protected Subgroup": ["positive"],
@@ -658,7 +673,7 @@ def _report() -> dict:
                 "EquityLabel": ["Equal"],
             }
         ),
-        "leaf_equity_table": pd.DataFrame(
+        "leaf_equity_table": _dataframe(
             {
                 "Protected Subgroup": ["positive"],
                 "Equity Value": ["0.000"],
@@ -667,16 +682,14 @@ def _report() -> dict:
                 "EquityLabel": ["Equal"],
             }
         ),
-        "legend_table": pd.DataFrame(
+        "legend_table": _dataframe(
             {
                 "Description": ["Equal"],
                 "Metric Value Rule": ["0"],
                 "Color": ["#ffffff"],
             }
         ),
-        "label_counts": pd.DataFrame(
-            {"Model": ["model_a"], "EquityLabel": ["Equal"], "count": [1]}
-        ),
+        "label_counts": _dataframe({"Model": ["model_a"], "EquityLabel": ["Equal"], "count": [1]}),
         "protected_group_cols": [],
         "protected_order_map": {},
         "target_order": ["positive"],
@@ -1034,7 +1047,13 @@ def test_failed_syntheval_execution_evidence_round_trips_without_becoming_cachea
         expected_manifest_digest="execution-digest",
         expected_output_manifest={"statistics": ("corr_mat_diff_v2",)},
         context_fingerprint="context-digest",
-        role_context=None,
+        role_context={
+            "schema_version": "evaluation-role-context-v1",
+            "fit_roles": ["train"],
+            "evidence_role": "tuning",
+            "fit_frame": "fit-frame",
+            "evidence_frame": "evidence-frame",
+        },
         group_context=None,
         failure_status={"exit_code": 1, "failure_reason": "worker failed"},
     )
@@ -1117,9 +1136,9 @@ def test_partial_syntheval_execution_evidence_round_trips_with_sibling_rows(tmp_
 
 
 def test_group_unsafe_syntheval_status_round_trips_as_audit_evidence(tmp_path):
-    results = pd.DataFrame({("avg_dwm_diff", "value"): [0.2]}, index=["model_a"])
+    results = _dataframe({("avg_dwm_diff", "value"): [0.2]}, index=pd.Index(["model_a"]))
     results.columns = pd.MultiIndex.from_tuples(results.columns)
-    ranks = pd.DataFrame({"avg_dwm_diff": [0.2]}, index=["model_a"])
+    ranks = _dataframe({"avg_dwm_diff": [0.2]}, index=pd.Index(["model_a"]))
     validations = validate_syntheval_results(
         results,
         ranks,
@@ -1151,7 +1170,7 @@ def test_group_unsafe_syntheval_status_round_trips_as_audit_evidence(tmp_path):
 
 
 def test_group_unsafe_synthcity_status_round_trips_as_audit_evidence(tmp_path):
-    report = pd.DataFrame(
+    report = _dataframe(
         {
             "mean": [float("nan")],
             "errors": [1],

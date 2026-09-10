@@ -1,9 +1,11 @@
 """Evaluation figures: interactive rank trade-offs and log-disparity reports."""
 
 from pathlib import Path
+from typing import cast
 
 import matplotlib.pyplot as plt
 import pandas as pd
+from matplotlib.colors import ListedColormap
 
 from synthdata.config import Config
 from synthdata.plotting import save_matplotlib_figure, save_plotly_figure
@@ -33,7 +35,17 @@ def plot_rank_tradeoff(
 
     models = list(combined.index)
     base_models = sorted({_base_model(model) for model in models})
-    palette = dict(zip(base_models, plt.cm.tab20.colors[: len(base_models)], strict=True))
+    palette_colors = cast(
+        list[tuple[float, float, float, float]],
+        cast(ListedColormap, plt.get_cmap("tab20")).colors,
+    )
+    palette = dict(
+        zip(
+            base_models,
+            palette_colors[: len(base_models)],
+            strict=True,
+        )
+    )
 
     fig, ax = plt.subplots(figsize=(11, 7))
     for model in models:

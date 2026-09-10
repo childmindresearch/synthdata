@@ -65,8 +65,9 @@ def role_context_payload(dataset, roles: tuple[str, ...] = ROLE_NAMES) -> dict:
     """Describe the named role inputs and provenance used by one operation."""
     role_set = set(roles)
     assignment_fingerprint = None
-    if dataset.assignment is not None:
-        assignment = dataset.assignment[dataset.assignment["role"].isin(role_set)].copy()
+    assignment = dataset.assignment
+    if assignment is not None:
+        assignment = assignment[assignment["role"].isin(role_set)].copy()
         assignment = assignment.sort_values("row_key").reset_index(drop=True)
         assignment_fingerprint = dataframe_fingerprint(assignment)
     role_payload = {}
@@ -86,8 +87,8 @@ def role_context_payload(dataset, roles: tuple[str, ...] = ROLE_NAMES) -> dict:
             "rows": int(len(frame)),
         }
     identity_fingerprint = dataset.identity_fingerprint
-    if dataset.assignment is not None and "population_group_hash" in dataset.assignment:
-        selected = dataset.assignment[dataset.assignment["role"].isin(role_set)]
+    if assignment is not None and "population_group_hash" in assignment:
+        selected = assignment[assignment["role"].isin(role_set)]
         identity_fingerprint = dataframe_fingerprint(
             selected[["row_key", "population_group_hash"]].sort_values("row_key")
         )
@@ -761,6 +762,7 @@ def _fetch_uci_dataset(uci_id: int, cache_dir: Path):
 
 
 def _load_uci(cfg: Config, data_dir: Path) -> tuple:
+    assert cfg.data.uci_id is not None
     repo = _fetch_uci_dataset(cfg.data.uci_id, data_dir / cfg.data.raw_cache_subdir)
     df = pd.concat([repo.data.features, repo.data.targets], axis=1)
     variable_types = None
@@ -781,6 +783,7 @@ def _load_local_file(cfg: Config) -> tuple:
     mismatched ``source`` value (e.g. ``source: csv`` pointing at a ``.parquet``
     file) still loads correctly instead of silently mis-parsing the file.
     """
+    assert cfg.data.path is not None
     path = Path(cfg.data.path)
     suffix = path.suffix.lower()
     if suffix in _PARQUET_SUFFIXES:
@@ -1688,6 +1691,7 @@ def load_dataset(cfg: Config) -> Dataset:
         source_fingerprint = dataframe_fingerprint(df)
     elif cfg.data.source in ("csv", "parquet"):
         df, variable_types = _load_local_file(cfg)
+        assert cfg.data.path is not None
         source_fingerprint = file_fingerprint(cfg.data.path)
     else:
         raise ValueError(f"Unknown data.source: {cfg.data.source!r}")
@@ -2054,6 +2058,8 @@ def load_imputed_splits(
             "fit_role_fingerprint": dataset.role_fingerprints["train"],
         }
     else:
+        assert dataset.train_df is not None
+        assert dataset.test_df is not None
         expected_provenance = {
             "source_fingerprint": dataset.source_fingerprint,
             "full_fingerprint": dataframe_fingerprint(dataset.full_df),
@@ -2093,6 +2099,8 @@ def load_imputed_splits(
         if dataset.has_canonical_roles:
             expected_rows = {role: len(dataset.roles[role]) for role in ROLE_NAMES}
         else:
+            assert dataset.train_df is not None
+            assert dataset.test_df is not None
             expected_rows = {
                 "full": len(dataset.full_df),
                 "train": len(dataset.train_df),

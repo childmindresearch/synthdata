@@ -1,6 +1,7 @@
 """Tests for the versioned metric contract registry and resolver."""
 
 import math
+from typing import TypedDict, cast
 
 import pytest
 from synthcity.metrics.eval_attacks import DataLeakageLinear, DataLeakageMLP, DataLeakageXGB
@@ -56,6 +57,18 @@ from synthdata.evaluation.metric_contracts import (
 pytestmark = pytest.mark.unit
 
 
+class _ContextOptions(TypedDict, total=False):
+    role_hashes: dict[str, str]
+    target_view: str
+    population_unit: str
+    evaluation_role: str
+    resolved_configuration: dict[str, object]
+
+
+def _context_from_options(options: dict[str, object]) -> MetricEvaluationContext:
+    return MetricEvaluationContext(**cast("_ContextOptions", options))
+
+
 def _contract(
     key: str = "test.metric",
     *,
@@ -92,7 +105,7 @@ def _context(**overrides) -> MetricEvaluationContext:
         "population_unit": "row",
     }
     values.update(overrides)
-    return MetricEvaluationContext(**values)
+    return _context_from_options(values)
 
 
 class TestDefaultRegistry:

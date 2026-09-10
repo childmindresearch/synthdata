@@ -5,6 +5,7 @@ SGLD sampler needs fully-observed numeric inputs).
 """
 
 from collections.abc import Callable
+from typing import Protocol, cast
 
 import numpy as np
 import optuna
@@ -27,6 +28,22 @@ from synthdata.generation.hpo import (
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
+
+ColumnNames = list[str]
+
+
+class _ClassificationGenerator(Protocol):
+    def generate_classification(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        n_samples: int,
+        balance_classes: bool,
+    ) -> tuple[np.ndarray, np.ndarray | None]: ...
+
+
+class _GeneratorFactory(Protocol):
+    def __call__(self, **params: object) -> _ClassificationGenerator: ...
 
 
 def validate_tabpfgen_target(
@@ -197,8 +214,8 @@ class TabPFGenSGLDLabels(TabPFGen):
 
 def generate_tabpfgen_standard(
     train_imputed_df: pd.DataFrame,
-    feature_columns: list,
-    categorical_columns: list,
+    feature_columns: ColumnNames,
+    categorical_columns: ColumnNames,
     target_column: str,
     n_samples: int,
     tabpfgen_params: dict | None = None,
@@ -216,6 +233,7 @@ def generate_tabpfgen_standard(
     stable across sampled hyperparameters).
     """
     validate_tabpfgen_target(target_column, target_is_categorical)
+    assert target_is_categorical is not None
     validate_semantic_context(
         semantic_context,
         target_column=target_column,
@@ -223,7 +241,7 @@ def generate_tabpfgen_standard(
         categorical_columns=categorical_columns,
         target_is_categorical=target_is_categorical,
         variable_schema_fingerprint=variable_schema_fingerprint,
-        frame_columns=train_imputed_df.columns,
+        frame_columns=list(train_imputed_df.columns),
     )
     # TabPFGen's SGLD sampler requires a purely numeric input array. The
     # imputed train split can still have string-valued declared-categorical
@@ -246,7 +264,7 @@ def generate_tabpfgen_standard(
     )
     x_synth, y_synth = _trim_classification_output(x_synth, y_synth, n_samples)
 
-    synthetic_encoded = pd.DataFrame(x_synth, columns=feature_columns)
+    synthetic_encoded = pd.DataFrame(x_synth, columns=pd.Index(feature_columns))
 
     if relabel_with_classifier:
         from tabpfn import TabPFNClassifier
@@ -256,6 +274,8 @@ def generate_tabpfgen_standard(
         target_values = clf.predict(synthetic_encoded.to_numpy(dtype=float))
     else:
         n_cls = train_imputed_df[target_column].nunique()
+        if y_synth is None:
+            raise RuntimeError("TabPFGen returned no labels for classification output")
         target_values = pd.Series(y_synth.astype(int)).clip(0, n_cls - 1).values
 
     synthetic = decode_label_encoded_columns(synthetic_encoded, category_maps)
@@ -265,8 +285,8 @@ def generate_tabpfgen_standard(
 
 def generate_tabpfgen_custom(
     train_imputed_df: pd.DataFrame,
-    feature_columns: list,
-    categorical_columns: list,
+    feature_columns: ColumnNames,
+    categorical_columns: ColumnNames,
     target_column: str,
     n_samples: int,
     seed: int = 42,
@@ -283,6 +303,7 @@ def generate_tabpfgen_custom(
     subsample proportionally.
     """
     validate_tabpfgen_target(target_column, target_is_categorical)
+    assert target_is_categorical is not None
     validate_semantic_context(
         semantic_context,
         target_column=target_column,
@@ -290,7 +311,7 @@ def generate_tabpfgen_custom(
         categorical_columns=categorical_columns,
         target_is_categorical=target_is_categorical,
         variable_schema_fingerprint=variable_schema_fingerprint,
-        frame_columns=train_imputed_df.columns,
+        frame_columns=list(train_imputed_df.columns),
     )
     # See the comment in generate_tabpfgen_standard for why declared
     # categorical_columns must be force-factorized before the float cast.
@@ -317,10 +338,12 @@ def generate_tabpfgen_custom(
         n_to_generate,
     )
 
-    synth_all_encoded = pd.DataFrame(x_synth_all, columns=feature_columns)
+    synth_all_encoded = pd.DataFrame(x_synth_all, columns=pd.Index(feature_columns))
     synth_all = decode_label_encoded_columns(synth_all_encoded, category_maps)
 
     n_classes_enc = train_imputed_df[target_column].nunique()
+    if y_synth_all is None:
+        raise RuntimeError("TabPFGen returned no labels for classification output")
     synth_all[target_column] = pd.Series(y_synth_all.astype(int)).clip(0, n_classes_enc - 1).values
 
     parts = []
@@ -341,8 +364,8 @@ def generate_tabpfgen_custom(
 
 def build_tabpfgen_standard_objective(
     train_imputed_df: pd.DataFrame,
-    feature_columns: list,
-    categorical_columns: list,
+    feature_columns: ColumnNames,
+    categorical_columns: ColumnNames,
     target_column: str,
     n_samples: int,
     sgld_step_cap: int,
@@ -359,6 +382,7 @@ def build_tabpfgen_standard_objective(
 ):
     """Optuna objective searching TabPFGen's SGLD hyperparameters (standard variant)."""
     validate_tabpfgen_target(target_column, target_is_categorical)
+    assert target_is_categorical is not None
     validate_semantic_context(
         semantic_context,
         target_column=target_column,
@@ -366,11 +390,19 @@ def build_tabpfgen_standard_objective(
         categorical_columns=categorical_columns,
         target_is_categorical=target_is_categorical,
         variable_schema_fingerprint=variable_schema_fingerprint,
-        frame_columns=train_imputed_df.columns,
+        frame_columns=list(train_imputed_df.columns),
     )
     from tabpfn import TabPFNClassifier
 
     prepare_stage_a_screen(stage_a_contract, stage_a_source_df, stage_a_root, study_name)
+    if stage_a_contract is not None:
+        if stage_a_root is None or study_name is None or stage_a_source_df is None:
+            raise RuntimeError(
+                "Enabled Stage A screening requires root, study name, and source data"
+            )
+        stage_root = stage_a_root
+        stage_name = study_name
+        stage_source = stage_a_source_df
 
     # See the comment in generate_tabpfgen_standard for why declared
     # categorical_columns must be force-factorized before the float cast.
@@ -380,7 +412,7 @@ def build_tabpfgen_standard_objective(
         )
     except (TypeError, ValueError, RuntimeError) as exc:
         if stage_a_contract is not None:
-            persist_stage_a_exception(stage_a_root, study_name, stage_a_contract, exc)
+            persist_stage_a_exception(stage_root, stage_name, stage_a_contract, exc)
         raise
     x_feat = encoded_features.to_numpy(dtype=float)
     y_label = train_imputed_df[target_column].values
@@ -404,7 +436,7 @@ def build_tabpfgen_standard_objective(
             "sgld_noise_scale": noise_scale,
         }
         try:
-            gen = TabPFGen(**params)
+            gen = cast(_GeneratorFactory, TabPFGen)(**params)
             x_s, _ = gen.generate_classification(
                 X_train=x_feat,
                 y_train=y_label,
@@ -412,7 +444,7 @@ def build_tabpfgen_standard_objective(
                 balance_classes=True,
             )
             x_s, _ = _trim_classification_output(x_s, None, n_samples)
-            syn_encoded = pd.DataFrame(x_s, columns=feature_columns)
+            syn_encoded = pd.DataFrame(x_s, columns=pd.Index(feature_columns))
             clf = TabPFNClassifier()
             clf.fit(x_feat, y_label)
             target_values = clf.predict(syn_encoded.to_numpy(dtype=float))
@@ -431,8 +463,8 @@ def build_tabpfgen_standard_objective(
             if stage_a_contract is not None:
                 persist_stage_a_trial_exception(
                     trial,
-                    stage_a_root,
-                    study_name,
+                    stage_root,
+                    stage_name,
                     stage_a_contract,
                     exc,
                 )
@@ -443,9 +475,9 @@ def build_tabpfgen_standard_objective(
                 trial,
                 syn,
                 stage_a_contract,
-                stage_a_source_df,
-                stage_a_root,
-                study_name,
+                stage_source,
+                stage_root,
+                stage_name,
             )
         return eval_fn(syn)
 
@@ -454,8 +486,8 @@ def build_tabpfgen_standard_objective(
 
 def build_tabpfgen_custom_objective(
     train_imputed_df: pd.DataFrame,
-    feature_columns: list,
-    categorical_columns: list,
+    feature_columns: ColumnNames,
+    categorical_columns: ColumnNames,
     target_column: str,
     n_samples: int,
     sgld_step_cap: int,
@@ -472,6 +504,7 @@ def build_tabpfgen_custom_objective(
 ):
     """Optuna objective searching TabPFGenSGLDLabels's SGLD hyperparameters."""
     validate_tabpfgen_target(target_column, target_is_categorical)
+    assert target_is_categorical is not None
     validate_semantic_context(
         semantic_context,
         target_column=target_column,
@@ -479,9 +512,17 @@ def build_tabpfgen_custom_objective(
         categorical_columns=categorical_columns,
         target_is_categorical=target_is_categorical,
         variable_schema_fingerprint=variable_schema_fingerprint,
-        frame_columns=train_imputed_df.columns,
+        frame_columns=list(train_imputed_df.columns),
     )
     prepare_stage_a_screen(stage_a_contract, stage_a_source_df, stage_a_root, study_name)
+    if stage_a_contract is not None:
+        if stage_a_root is None or study_name is None or stage_a_source_df is None:
+            raise RuntimeError(
+                "Enabled Stage A screening requires root, study name, and source data"
+            )
+        stage_root = stage_a_root
+        stage_name = study_name
+        stage_source = stage_a_source_df
     # See the comment in generate_tabpfgen_standard for why declared
     # categorical_columns must be force-factorized before the float cast.
     try:
@@ -490,7 +531,7 @@ def build_tabpfgen_custom_objective(
         )
     except (TypeError, ValueError, RuntimeError) as exc:
         if stage_a_contract is not None:
-            persist_stage_a_exception(stage_a_root, study_name, stage_a_contract, exc)
+            persist_stage_a_exception(stage_root, stage_name, stage_a_contract, exc)
         raise
     x_feat = encoded_features.to_numpy(dtype=float)
     y_label = train_imputed_df[target_column].values
@@ -515,14 +556,16 @@ def build_tabpfgen_custom_objective(
         }
         try:
             n_per = int(np.ceil(n_samples * proportions.max()))
-            gen = TabPFGenSGLDLabels(**params)
+            gen = cast(_GeneratorFactory, TabPFGenSGLDLabels)(**params)
             x_s, y_s = gen.generate_classification(
                 x_feat,
                 y_label,
                 n_samples=n_per * len(proportions),
                 balance_classes=True,
             )
-            all_df_encoded = pd.DataFrame(x_s, columns=feature_columns)
+            all_df_encoded = pd.DataFrame(x_s, columns=pd.Index(feature_columns))
+            if y_s is None:
+                raise RuntimeError("TabPFGen returned no labels for classification output")
             all_df = decode_label_encoded_columns(all_df_encoded, category_maps)
             all_df[target_column] = (
                 pd.Series(y_s.astype(int))
@@ -553,8 +596,8 @@ def build_tabpfgen_custom_objective(
             if stage_a_contract is not None:
                 persist_stage_a_trial_exception(
                     trial,
-                    stage_a_root,
-                    study_name,
+                    stage_root,
+                    stage_name,
                     stage_a_contract,
                     exc,
                 )
@@ -565,9 +608,9 @@ def build_tabpfgen_custom_objective(
                 trial,
                 syn,
                 stage_a_contract,
-                stage_a_source_df,
-                stage_a_root,
-                study_name,
+                stage_source,
+                stage_root,
+                stage_name,
             )
         return eval_fn(syn)
 

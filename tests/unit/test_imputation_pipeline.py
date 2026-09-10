@@ -2,6 +2,7 @@
 
 import json
 import logging
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -24,6 +25,7 @@ from synthdata.imputation.pipeline import (
 )
 from synthdata.imputation.tabimpute_backend import (
     TabImputeState,
+    _Imputer,
     state_metadata,
     state_metadata_fingerprint,
 )
@@ -409,7 +411,7 @@ class TestTabImputeStateMetadata:
             stds=np.array([2.0, 0.5, 0.5]),
             block_slices={"feature": (0, 1), "category": (1, 3)},
             device="cpu",
-            imputer=object(),
+            imputer=cast(_Imputer, object()),
         )
 
     def test_state_metadata_is_stable_for_same_train_fit(self):

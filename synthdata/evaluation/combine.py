@@ -14,6 +14,8 @@ and rolled up across frameworks per ``type``, plus one overall rank.
 import math
 from collections.abc import Mapping
 from numbers import Real
+from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -118,7 +120,7 @@ def validate_combined_table(combined: pd.DataFrame) -> pd.DataFrame:
 def _materialize_validation_records(
     raw: pd.DataFrame,
     model_names: list,
-    records_by_model: Mapping[str, tuple],
+    records_by_model: Mapping[str, tuple[Any, ...] | list[Any]],
 ) -> pd.DataFrame:
     """Add every validated identity to the raw table, including missing rows.
 
@@ -163,7 +165,7 @@ def _append_validation_status_columns(
     if not validations:
         return raw
 
-    status = pd.DataFrame(index=model_names)
+    status = pd.DataFrame(index=pd.Index(model_names))
     status_values = {
         f"{prefix}_audit_status": {},
         f"{prefix}_succeeded": {},
@@ -217,7 +219,7 @@ def _synthcity_frames(
     evidence columns. They never contribute oriented ranking values.
     """
     if not synthcity_results and not synthcity_validations:
-        empty = pd.DataFrame(index=model_names)
+        empty = pd.DataFrame(index=pd.Index(model_names))
         return empty, empty
 
     failed = {name for name, res in synthcity_results.items() if "error" in res.columns}
@@ -227,7 +229,7 @@ def _synthcity_frames(
     raw = (
         pd.DataFrame({name: res["mean"] for name, res in ok_results.items()}).T
         if ok_results
-        else pd.DataFrame(index=model_names)
+        else pd.DataFrame(index=pd.Index(model_names))
     )
 
     redundant_cols = [c for c in raw.columns if is_redundant_synthcity_submetric(c)]
@@ -354,7 +356,7 @@ def _syntheval_frames(
     syntheval_validations: Mapping[tuple[str, str], Mapping[str, MetricValidationResult]]
     | None = None,
     metric_execution_passes: Mapping[tuple[str, str, str], str] | None = None,
-) -> "tuple[pd.DataFrame, pd.DataFrame]":
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Build (raw, oriented) models x metric-name tables from SynthEval results.
 
     Metrics matching is_custom_syntheval_metric() (fork-only additions, plus
@@ -362,18 +364,18 @@ def _syntheval_frames(
     are tagged framework="custom" instead of "syntheval".
     """
     if benchmark_results is None and not syntheval_validations:
-        empty = pd.DataFrame(index=model_names)
+        empty = pd.DataFrame(index=pd.Index(model_names))
         return empty, empty
 
     raw = (
         extract_raw_values(benchmark_results).reindex(model_names)
         if benchmark_results is not None
-        else pd.DataFrame(index=model_names)
+        else pd.DataFrame(index=pd.Index(model_names))
     )
     oriented = (
         extract_oriented_values(benchmark_ranks).reindex(model_names)
         if benchmark_ranks is not None
-        else pd.DataFrame(index=model_names)
+        else pd.DataFrame(index=pd.Index(model_names))
     )
     oriented = oriented.reindex(columns=raw.columns.intersection(oriented.columns))
 
@@ -467,13 +469,13 @@ def _log_disparity_frames(
     custom_validations: Mapping[str, MetricValidationResult] | None = None,
 ) -> "tuple[pd.DataFrame, pd.DataFrame]":
     if not reports and not custom_validations:
-        empty = pd.DataFrame(index=model_names)
+        empty = pd.DataFrame(index=pd.Index(model_names))
         return empty, empty
 
     raw = (
         build_log_disparity_summary_table(reports).reindex(model_names)
         if reports
-        else pd.DataFrame(index=model_names)
+        else pd.DataFrame(index=pd.Index(model_names))
     )
     if custom_validations:
         raw = _materialize_validation_records(
@@ -536,10 +538,10 @@ def _task12_frames(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Materialize canonical custom evidence; blocked records stay audit-visible."""
     if not validations:
-        empty = pd.DataFrame(index=model_names)
+        empty = pd.DataFrame(index=pd.Index(model_names))
         return empty, empty
     keys = sorted({record.expected_key for item in validations.values() for record in item.records})
-    raw = pd.DataFrame(index=model_names, columns=keys, dtype=float)
+    raw = pd.DataFrame(index=pd.Index(model_names), columns=pd.Index(keys), dtype=float)
     for model, validation in validations.items():
         for record in validation.records:
             if record.status == "succeeded" and record.raw_value is not None:
@@ -664,7 +666,7 @@ def build_combined_table(
         pd.concat(oriented_parts, axis=1)
         if oriented_parts
         else pd.DataFrame(
-            index=model_names,
+            index=pd.Index(model_names),
             columns=pd.MultiIndex.from_arrays([[], [], []], names=["framework", "type", "metric"]),
         )
     )
@@ -705,7 +707,7 @@ def build_combined_table(
         "mmd": "mixed_mmd.v1",
         "jsd": "elastic_net_jsd.v1",
     }
-    utility = pd.DataFrame(index=model_names, dtype=float)
+    utility = pd.DataFrame(index=pd.Index(model_names), dtype=float)
     validations = task12_validations or {}
     for component, metric in utility_keys.items():
         values = pd.Series(float("nan"), index=model_names, dtype=float)
@@ -766,12 +768,10 @@ def build_combined_table(
     return validate_combined_table(combined)
 
 
-def load_combined_table(path: "str", *, validate_artifact: bool = True) -> pd.DataFrame:
+def load_combined_table(path: str | Path, *, validate_artifact: bool = True) -> pd.DataFrame:
     """Load a ``combined_evaluation.csv`` written by :func:`build_combined_table`,
     reconstructing its 3-level ``(framework, type, metric)`` column MultiIndex.
     """
-    from pathlib import Path
-
     path = Path(path)
     if validate_artifact:
         from synthdata.evaluation.artifacts import artifact_bundle_dir, validate_evaluation_bundle

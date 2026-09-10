@@ -2,6 +2,8 @@
 generation from a combined table + extras dict.
 """
 
+from typing import cast
+
 import pandas as pd
 import pytest
 
@@ -10,8 +12,17 @@ from synthdata.evaluation.report import build_evaluation_report, save_evaluation
 pytestmark = pytest.mark.unit
 
 
+def _dataframe(
+    data: dict[object, list[object]], index: list[str] | pd.Index | None = None
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        cast("dict[str, list[object]]", data),
+        index=pd.Index(index) if index is not None else None,
+    )
+
+
 def _combined_table(with_gate: bool = False, all_pass: bool = True):
-    df = pd.DataFrame(index=["model_a", "model_b"])
+    df = _dataframe({}, index=["model_a", "model_b"])
     df[("syntheval", "utility", "ks_test")] = [0.9, 0.1]
     df[("__all__", "utility", "rank")] = [1.0, 0.0]
     df[("__all__", "privacy", "rank")] = [0.5, 0.5]

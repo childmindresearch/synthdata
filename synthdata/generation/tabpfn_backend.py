@@ -7,6 +7,8 @@ see ``generation.tabpfn.data_variants`` in the pipeline config, which drives
 :func:`synthdata.generation.pipeline.run_generation`.
 """
 
+from typing import Protocol, cast
+
 import numpy as np
 import pandas as pd
 import torch
@@ -20,6 +22,12 @@ from synthdata.data import (
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
+
+ColumnNames = list[str]
+
+
+class _PlotPatchTarget(Protocol):
+    plot: object
 
 
 def validate_tabpfn_target(target_column: str, target_is_categorical: bool) -> None:
@@ -216,14 +224,15 @@ def _make_experiment():
     # Disable the internal auto-plot: should_plot=False is not respected by this
     # version and self.data has duplicate indices after pd.concat, which breaks
     # seaborn reindex.
-    experiment.plot = lambda **kwargs: None
+    # Compatibility monkey-patch: this third-party object has no typed plot API.
+    cast(_PlotPatchTarget, experiment).plot = lambda **kwargs: None
     return experiment, model_unsupervised
 
 
 def generate_tabpfn_standard(
     train_df: pd.DataFrame,
-    feature_columns: list,
-    categorical_columns: list,
+    feature_columns: ColumnNames,
+    categorical_columns: ColumnNames,
     target_column: str,
     n_samples: int,
     target_is_categorical: bool = True,
@@ -243,7 +252,7 @@ def generate_tabpfn_standard(
         categorical_columns=categorical_columns,
         target_is_categorical=target_is_categorical,
         variable_schema_fingerprint=variable_schema_fingerprint,
-        frame_columns=train_df.columns,
+        frame_columns=list(train_df.columns),
     )
 
     from tabpfn import TabPFNClassifier
@@ -302,7 +311,7 @@ def generate_tabpfn_standard(
     # pairplot, even with should_plot=False -- reading it back would silently
     # give ``len(train_df)`` rows instead of the requested n_samples.
     synthetic_values = np.asarray(experiment.synthetic_X.detach().cpu().numpy(), dtype=float)
-    synthetic_encoded = pd.DataFrame(synthetic_values, columns=attribute_names)
+    synthetic_encoded = pd.DataFrame(synthetic_values, columns=pd.Index(attribute_names))
 
     clf = TabPFNClassifier()
     clf.fit(x, y)
@@ -316,7 +325,7 @@ def generate_tabpfn_standard(
 
 def generate_tabpfn_custom(
     train_df: pd.DataFrame,
-    categorical_columns: list,
+    categorical_columns: ColumnNames,
     target_column: str,
     n_samples: int,
     target_is_categorical: bool = True,
@@ -336,7 +345,7 @@ def generate_tabpfn_custom(
         categorical_columns=categorical_columns,
         target_is_categorical=target_is_categorical,
         variable_schema_fingerprint=variable_schema_fingerprint,
-        frame_columns=train_df.columns,
+        frame_columns=list(train_df.columns),
     )
 
     # See the comment in generate_tabpfn_standard for why categorical_columns

@@ -2,6 +2,7 @@
 
 import sys
 import types
+from typing import Protocol, cast
 
 import numpy as np
 import pandas as pd
@@ -16,15 +17,26 @@ from synthdata.generation.pipeline import run_generation
 pytestmark = pytest.mark.unit
 
 
-def _install_unsupervised_module(monkeypatch):
+class _UnsupervisedModule(Protocol):
+    def infer_categorical_features(
+        self, features: object, categorical_features: list[int]
+    ) -> list[int]: ...
+
+
+class _ExperimentWithSemanticContext(Protocol):
+    semantic_context: object
+    semantic_context_digest: str
+
+
+def _install_unsupervised_module(monkeypatch) -> _UnsupervisedModule:
     extensions = types.ModuleType("tabpfn_extensions")
     extensions.__path__ = []
     unsupervised_package = types.ModuleType("tabpfn_extensions.unsupervised")
     unsupervised_package.__path__ = []
     unsupervised_module = types.ModuleType("tabpfn_extensions.unsupervised.unsupervised")
 
-    extensions.unsupervised = unsupervised_package
-    unsupervised_package.unsupervised = unsupervised_module
+    extensions.__dict__["unsupervised"] = unsupervised_package
+    unsupervised_package.__dict__["unsupervised"] = unsupervised_module
     monkeypatch.setitem(sys.modules, "tabpfn_extensions", extensions)
     monkeypatch.setitem(sys.modules, "tabpfn_extensions.unsupervised", unsupervised_package)
     monkeypatch.setitem(
@@ -32,7 +44,7 @@ def _install_unsupervised_module(monkeypatch):
         "tabpfn_extensions.unsupervised.unsupervised",
         unsupervised_module,
     )
-    return unsupervised_module
+    return cast(_UnsupervisedModule, unsupervised_module)
 
 
 def test_explicit_type_patch_disables_cardinality_inference(monkeypatch):
@@ -119,6 +131,7 @@ def test_tabpfn_custom_consumes_semantic_context(make_canonical_dataset, mocker)
         variable_schema_fingerprint=dataset.variable_schema_fingerprint,
         semantic_context=semantic_context,
     )
+    returned_experiment = cast(_ExperimentWithSemanticContext, returned_experiment)
 
     assert len(generated) == 2
     assert returned_experiment.semantic_context == semantic_context
@@ -253,9 +266,13 @@ def test_canonical_hpo_evaluator_is_train_fit_tuning_only_and_excludes_holdout(m
 
     def fake_canonical(train_df, tuning_df, synthetic_df, **kwargs):
         captured.update(train=train_df, tuning=tuning_df, synthetic=synthetic_df, kwargs=kwargs)
+        metric_keys = ["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"]
         report = pd.DataFrame(
-            {"mean": [0.8, 0.2, 0.4], "direction": ["maximize", "minimize", "minimize"]},
-            index=["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"],
+            {
+                "mean": np.asarray([0.8, 0.2, 0.4]),
+                "direction": np.asarray(["maximize", "minimize", "minimize"]),
+            },
+            index=pd.Index(metric_keys),
         )
         report.attrs["canonical_hpo"] = True
         report.attrs["canonical_hpo_keys"] = tuple(report.index)

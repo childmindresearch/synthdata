@@ -4,7 +4,9 @@ disparity / fork-only fairness) evaluators, combined into one ranked table.
 
 import json
 import math
+from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 
 import pandas as pd
 
@@ -614,6 +616,8 @@ def _run_final_holdout_evidence(
         "refit_fit_frame_fingerprint": refit_metadata["fit_frame_fingerprint"],
     }
 
+    train_group_ids = dataset.role_groups.get("train")
+    tuning_group_ids = dataset.role_groups.get("tuning")
     final_synthcity_results = synthcity_eval.run_synthcity_evaluation(
         selected_dataset,
         real_fit_frame,
@@ -623,11 +627,10 @@ def _run_final_holdout_evidence(
         eval_cfg.synthcity,
         n_samples=cfg.generation.n_samples,
         seed=cfg.seed,
-        workspace=output_dir / "synthcity_final_holdout_workspace",
+        workspace=str(output_dir / "synthcity_final_holdout_workspace"),
         real_reference_group_ids=dataset.role_groups.get("final_holdout"),
-        real_train_group_ids=(
-            list(dataset.role_groups.get("train", [])) + list(dataset.role_groups.get("tuning", []))
-        ),
+        real_train_group_ids=(list(train_group_ids) if train_group_ids is not None else [])
+        + (list(tuning_group_ids) if tuning_group_ids is not None else []),
         sensitive_target_types=synthcity_semantics["sensitive_target_types"],
         feature_types=synthcity_semantics["feature_types"],
         source_table=synthcity_semantics["source_table"],
@@ -1188,7 +1191,7 @@ def run_evaluation(
         eval_cfg.synthcity,
         n_samples=cfg.generation.n_samples,
         seed=cfg.seed,
-        workspace=output_dir / "synthcity_workspace",
+        workspace=str(output_dir / "synthcity_workspace"),
         real_reference_group_ids=dataset.role_groups.get("tuning"),
         real_train_group_ids=dataset.role_groups.get("train"),
         sensitive_target_types=synthcity_semantics["sensitive_target_types"],
@@ -1376,9 +1379,13 @@ def run_evaluation(
         if eval_cfg.custom.enabled
         else {}
     )
+    raw_train_frame = dataset.role_frame("train", imputed=False)
+    raw_tuning_frame = dataset.role_frame("tuning", imputed=False)
+    if raw_train_frame is None or raw_tuning_frame is None:
+        raise RuntimeError("Evaluation requires populated raw train and tuning role frames")
     raw_candidate_role_hashes = {
-        "train": dataframe_fingerprint(dataset.role_frame("train", imputed=False)),
-        "tuning": dataframe_fingerprint(dataset.role_frame("tuning", imputed=False)),
+        "train": dataframe_fingerprint(raw_train_frame),
+        "tuning": dataframe_fingerprint(raw_tuning_frame),
     }
     custom_validations = (
         custom_eval.validate_log_disparity_results(
@@ -1467,7 +1474,7 @@ def run_evaluation(
         eval_cfg.privacy_gate,
         registry=DEFAULT_METRIC_CONTRACT_REGISTRY,
         validation_results=gate_validation_results,
-        execution_passes=metric_execution_passes,
+        execution_passes=cast(Mapping[tuple[str, ...], str], metric_execution_passes),
     )
     combined = privacy_gate.merge_privacy_gate_results(combined, gate_result)
 

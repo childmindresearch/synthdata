@@ -571,7 +571,10 @@ def refit_selected_model(
             important_features=dataset.quasi_identifier_columns,
             group_ids=(
                 pd.concat(
-                    [dataset.role_groups["train"], dataset.role_groups["tuning"]],
+                    cast(
+                        list[pd.Series],
+                        [dataset.role_groups["train"], dataset.role_groups["tuning"]],
+                    ),
                     ignore_index=True,
                 )
                 if dataset.role_groups.get("train") is not None
@@ -589,7 +592,7 @@ def refit_selected_model(
                 fit_loader,
                 gen_cfg.n_samples,
                 cfg.seed,
-                workspace=output_root / "synthcity_workspace",
+                workspace=str(output_root / "synthcity_workspace"),
                 device=device,
             )
 
@@ -1052,6 +1055,8 @@ def run_generation(
     # synthcity models
     # ------------------------------------------------------------------
     if gen_cfg.synthcity.enabled and gen_cfg.synthcity.names:
+        if fit_imputed_df is None:
+            raise RuntimeError("SynthCity generation requires an imputed train role")
         fairness_column = dataset.sensitive_columns[0] if dataset.sensitive_columns else None
         train_loader = sc.make_loader(
             fit_imputed_df,
@@ -1102,7 +1107,7 @@ def run_generation(
                     train_loader,
                     n_samples,
                     seed,
-                    workspace=output_dir / "synthcity_workspace",
+                    workspace=str(output_dir / "synthcity_workspace"),
                     device=device,
                 ),
             )
@@ -1115,7 +1120,7 @@ def run_generation(
                         train_loader,
                         gen_cfg.hpo,
                         seed,
-                        workspace=output_dir / "synthcity_workspace",
+                        workspace=str(output_dir / "synthcity_workspace"),
                         device=device,
                         tuning_loader=tuning_loader,
                         task_type=task_type,
@@ -1124,10 +1129,14 @@ def run_generation(
                         synthetic_size=n_samples,
                         stage_a_contract=stage_a_contract,
                         stage_a_source_df=fit_imputed_df,
-                        stage_a_root=stage_a_root,
+                        stage_a_root=str(stage_a_root) if stage_a_root is not None else None,
                         study_name=hpo_mod.contextual_study_name(f"hpo_{name}", hpo_context),
                         group_context=hpo_group_context,
-                        expected_emitted_keys=hpo_context["expected_emitted_keys"],
+                        expected_emitted_keys=(
+                            hpo_context["expected_emitted_keys"]
+                            if hpo_context is not None
+                            else None
+                        ),
                         train_df=fit_imputed_df,
                         tuning_df=tuning_df,
                         target_column=dataset.target_column,
@@ -1165,7 +1174,7 @@ def run_generation(
                         train_loader,
                         n_samples,
                         seed,
-                        workspace=output_dir / "synthcity_workspace",
+                        workspace=str(output_dir / "synthcity_workspace"),
                         device=device,
                     ),
                     hpo_context=hpo_context,
@@ -1185,6 +1194,8 @@ def run_generation(
             else:
                 train_df_variant = _role_frame(dataset, "train", imputed=False)
                 suffix = ""
+            if train_df_variant is None:
+                raise RuntimeError(f"TabPFN {data_variant} generation requires a train role")
 
             if "standard" in gen_cfg.tabpfn.variants:
                 _cached_or_build(
@@ -1257,10 +1268,15 @@ def run_generation(
                 group_context=hpo_group_context,
                 train_group_ids=dataset.role_groups.get("train"),
                 holdout_group_ids=dataset.role_groups.get("tuning"),
-                expected_emitted_keys=hpo_context["expected_emitted_keys"],
+                expected_emitted_keys=(
+                    hpo_context["expected_emitted_keys"] if hpo_context is not None else None
+                ),
                 release_generalization=dataset.release_generalization,
                 utility_policy=gen_cfg.hpo.utility_policy,
             )
+            if eval_fn is None:
+                raise RuntimeError("Enabled HPO requires a synthetic-data evaluator")
+        evaluator = cast(Callable[[pd.DataFrame], float], eval_fn)
 
         if "standard" in gen_cfg.tabpfgen.variants:
             standard_params = dict(gen_cfg.tabpfgen.standard_params)
@@ -1290,11 +1306,11 @@ def run_generation(
                         dataset.target_column,
                         n_samples,
                         gen_cfg.hpo.sgld_step_cap,
-                        eval_fn,
+                        evaluator,
                         seed=seed,
                         stage_a_contract=stage_a_contract,
                         stage_a_source_df=fit_imputed_df,
-                        stage_a_root=stage_a_root,
+                        stage_a_root=str(stage_a_root) if stage_a_root is not None else None,
                         study_name=hpo_mod.contextual_study_name(
                             "hpo_tabpfgen_standard", hpo_context
                         ),
@@ -1364,11 +1380,11 @@ def run_generation(
                         dataset.target_column,
                         n_samples,
                         gen_cfg.hpo.sgld_step_cap,
-                        eval_fn,
+                        evaluator,
                         seed=seed,
                         stage_a_contract=stage_a_contract,
                         stage_a_source_df=fit_imputed_df,
-                        stage_a_root=stage_a_root,
+                        stage_a_root=str(stage_a_root) if stage_a_root is not None else None,
                         study_name=hpo_mod.contextual_study_name(
                             "hpo_tabpfgen_custom", hpo_context
                         ),

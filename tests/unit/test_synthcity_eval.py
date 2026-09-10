@@ -245,7 +245,7 @@ class TestResolveMetricConfig:
                     "errors": [0],
                     "direction": ["minimize"],
                 },
-                index=["sanity.data_mismatch.score"],
+                index=pd.Index(["sanity.data_mismatch.score"]),
             )
 
         monkeypatch.setattr(Metrics, "evaluate", staticmethod(fake_evaluate))
@@ -282,7 +282,7 @@ class TestResolveMetricConfig:
             workspaces.append(kwargs["workspace"])
             return pd.DataFrame(
                 {"mean": [0.0], "direction": ["minimize"]},
-                index=["sanity.data_mismatch.score"],
+                index=pd.Index(["sanity.data_mismatch.score"]),
             )
 
         monkeypatch.setattr(Metrics, "evaluate", staticmethod(fake_evaluate))
@@ -543,7 +543,7 @@ class TestSynthcityContractBridge:
                 "errors": [0],
                 "direction": ["maximize"],
             },
-            index=["stats.ks_test.marginal"],
+            index=pd.Index(["stats.ks_test.marginal"]),
         )
 
         validation = validate_synthcity_report(
@@ -569,7 +569,7 @@ class TestSynthcityContractBridge:
                 "stddev": [None],
                 "rounds": [None],
             },
-            index=["attack.data_leakage_xgb.n_eval.secret"],
+            index=pd.Index(["attack.data_leakage_xgb.n_eval.secret"]),
         )
 
         validation = validate_synthcity_report(
@@ -592,7 +592,7 @@ class TestSynthcityContractBridge:
                 "stddev": [None],
                 "rounds": [None],
             },
-            index=["attack.data_leakage_xgb.uncertainty_v2.secret"],
+            index=pd.Index(["attack.data_leakage_xgb.uncertainty_v2.secret"]),
         )
         protocol = {
             "schema_version": "attribute-inference-v4",
@@ -628,7 +628,7 @@ class TestSynthcityContractBridge:
                 "stddev": [None],
                 "rounds": [None],
             },
-            index=["privacy.identifiability_score.score_entropy_weighted"],
+            index=pd.Index(["privacy.identifiability_score.score_entropy_weighted"]),
         )
         protocol = {
             "result_version": "identifiability-v2",
@@ -669,7 +669,7 @@ class TestSynthcityContractBridge:
     def test_patient_group_validation_blocks_unsupported_paths(self, emitted_key):
         report = pd.DataFrame(
             {"mean": [0.25], "direction": ["minimize"]},
-            index=[emitted_key],
+            index=pd.Index([emitted_key]),
         )
         context = MetricEvaluationContext(
             role_hashes={"train": "train-hash", "tuning": "tuning-hash"},
@@ -694,7 +694,7 @@ class TestSynthcityContractBridge:
                 "errors": [0],
                 "direction": ["maximize"],
             },
-            index=["stats.ks_test.marginal"],
+            index=pd.Index(["stats.ks_test.marginal"]),
         )
         report.attrs["metric_metadata"] = {
             "privacy.k-anonymization": {
@@ -719,7 +719,7 @@ class TestSynthcityContractBridge:
                 "errors": [0, 0],
                 "direction": ["maximize", "maximize"],
             },
-            index=["stats.ks_test.marginal", "stats.ks_test.marginal"],
+            index=pd.Index(["stats.ks_test.marginal", "stats.ks_test.marginal"]),
         )
 
         validation = validate_synthcity_report(
@@ -740,7 +740,7 @@ class TestSynthcityContractBridge:
                 "error_messages": ["invalid input shape"],
                 "direction": ["minimize"],
             },
-            index=["stats.ks_test"],
+            index=pd.Index(["stats.ks_test"]),
         )
 
         validation = validate_synthcity_report(
@@ -751,7 +751,7 @@ class TestSynthcityContractBridge:
 
         record = validation.expected_records[0]
         assert record.status == "failed"
-        assert "ValueError" in record.error
+        assert "ValueError" in (record.error or "")
         assert validation.complete is False
 
     def test_benchmark_metric_failure_reaches_root_status_bridge(self, monkeypatch, tmp_path):
@@ -806,8 +806,8 @@ class TestSynthcityContractBridge:
 
         record = validation.expected_records[0]
         assert record.status == "failed"
-        assert "ValueError" in record.error
-        assert "metric evaluation exploded" in record.error
+        assert "ValueError" in (record.error or "")
+        assert "metric evaluation exploded" in (record.error or "")
         assert validation.complete is False
 
     def test_non_finite_score_is_retained_as_failed_observation(self):
@@ -833,7 +833,7 @@ class TestSynthcityContractBridge:
         assert record.status == "failed"
         assert record.raw_value is None
         assert record.policy_value is None
-        assert "NonFiniteMetricResult" in record.error
+        assert "NonFiniteMetricResult" in (record.error or "")
         assert validation.complete is False
 
     def test_feature_rank_failure_has_no_policy_value(self):
@@ -845,7 +845,7 @@ class TestSynthcityContractBridge:
                 "error_messages": ["SHAP output did not preserve feature axis"],
                 "direction": ["maximize"],
             },
-            index=["performance.feat_rank_distance.corr"],
+            index=pd.Index(["performance.feat_rank_distance.corr"]),
         )
 
         validation = validate_synthcity_report(
@@ -927,7 +927,7 @@ class TestSynthcityContractBridge:
         assert corr_record.value_role == "policy_scalar"
 
     def test_group_unsafe_report_is_retained_as_expected_status(self):
-        report = pd.DataFrame(index=["sanity.common_rows_proportion"])
+        report = pd.DataFrame(index=pd.Index(["sanity.common_rows_proportion"]))
         report.attrs["group_safety"] = {
             "schema_version": "group-safety-v1",
             "status": "group_unsafe",
@@ -949,7 +949,7 @@ class TestSynthcityContractBridge:
         record = validation.expected_records[0]
         assert record.expected_key == "sanity.common_rows_proportion.score"
         assert record.status == "group_unsafe"
-        assert "not group-safe" in record.error
+        assert "not group-safe" in (record.error or "")
         assert record.source_metadata["group_safety"]["schema_version"] == "group-safety-v1"
 
     def test_model_level_failure_expands_selected_base_keys(self):
@@ -965,7 +965,7 @@ class TestSynthcityContractBridge:
         record = validation.expected_records[0]
         assert record.expected_key == "stats.ks_test.marginal"
         assert record.status == "failed"
-        assert "RuntimeError" in record.error
+        assert "RuntimeError" in (record.error or "")
 
     def test_declared_selection_retains_omitted_metric_as_missing(self):
         report = pd.DataFrame(
@@ -974,7 +974,7 @@ class TestSynthcityContractBridge:
                 "errors": [0],
                 "direction": ["maximize"],
             },
-            index=["stats.ks_test.marginal"],
+            index=pd.Index(["stats.ks_test.marginal"]),
         )
 
         validation = validate_synthcity_report(
@@ -1001,7 +1001,7 @@ class TestSynthcityContractBridge:
                 "errors": [0],
                 "direction": ["maximize"],
             },
-            index=["stats.prdc.precision"],
+            index=pd.Index(["stats.prdc.precision"]),
         )
 
         validation = validate_synthcity_report(
@@ -1032,7 +1032,7 @@ class TestSynthcityContractBridge:
                 "errors": [0],
                 "direction": ["minimize"],
             },
-            index=["stats.jensenshannon_dist.marginal"],
+            index=pd.Index(["stats.jensenshannon_dist.marginal"]),
         )
 
         validation = validate_synthcity_results(
@@ -1065,10 +1065,12 @@ class TestSynthcityContractBridge:
                 "errors": [0, 0],
                 "direction": ["minimize", "minimize"],
             },
-            index=[
-                "stats.jensenshannon_dist.marginal",
-                "stats.jensenshannon_dist.variable_v2.unexpected",
-            ],
+            index=pd.Index(
+                [
+                    "stats.jensenshannon_dist.marginal",
+                    "stats.jensenshannon_dist.variable_v2.unexpected",
+                ]
+            ),
         )
 
         validation = validate_synthcity_report(
@@ -1103,11 +1105,13 @@ class TestSynthcityContractBridge:
                 "errors": [0, 0, 0],
                 "direction": ["minimize", "minimize", "minimize"],
             },
-            index=[
-                "attack.data_leakage_xgb.baseline_adjusted_advantage_v2",
-                "attack.data_leakage_xgb.legacy_accuracy",
-                "attack.data_leakage_xgb.mean",
-            ],
+            index=pd.Index(
+                [
+                    "attack.data_leakage_xgb.baseline_adjusted_advantage_v2",
+                    "attack.data_leakage_xgb.legacy_accuracy",
+                    "attack.data_leakage_xgb.mean",
+                ]
+            ),
         )
 
         validation = validate_synthcity_results(
@@ -1142,7 +1146,7 @@ class TestSynthcityContractBridge:
                 "errors": [0] * len(expected_keys),
                 "direction": ["minimize"] * len(expected_keys),
             },
-            index=expected_keys,
+            index=pd.Index(expected_keys),
         )
 
         validation = validate_synthcity_results(
@@ -1190,7 +1194,7 @@ class TestSynthcityContractBridge:
             {"model_a": pd.DataFrame()},
             {category: [metric_name]},
             context=self._context(),
-            variable_columns=SELECTED_SYNTHCITY_VARIABLE_COLUMNS,
+            variable_columns=list(SELECTED_SYNTHCITY_VARIABLE_COLUMNS),
             attack_target_types=SELECTED_SYNTHCITY_ATTACK_TARGET_TYPES,
         )["model_a"]
 
@@ -1205,7 +1209,7 @@ class TestSynthcityContractBridge:
                 "errors": [0],
                 "direction": ["maximize"],
             },
-            index=["stats.future_metric.observed"],
+            index=pd.Index(["stats.future_metric.observed"]),
         )
 
         with pytest.raises(ValueError, match="no static emitted-key contract"):
