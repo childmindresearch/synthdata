@@ -254,10 +254,11 @@ class RefiDiffBenchmarkConfig:
 @dataclasses.dataclass
 class ImputationConfig:
     enabled: bool = True
-    #: "tabimpute" (default, TabPFN-based) or "refidiff" (predictive+diffusion
-    #: hybrid; better suited to wide datasets where tabimpute's one-hot
-    #: categorical encoding OOMs -- see synthdata/imputation/refidiff_backend.py).
-    method: str = "tabimpute"
+    #: "hyperimpute" is canonical; tabimpute/refidiff are deferred legacy
+    #: compatibility methods for explicit two-role datasets.
+    method: str = "hyperimpute"
+    #: Fixed HyperImpute plugin for continuous features; no automated selection.
+    continuous_plugin: str = "median"
     #: "auto" | "cpu" | "cuda" | "mps"
     device: str = "auto"
     #: Optional per-column rounding precision (decimal places) applied post-imputation.
@@ -1191,6 +1192,11 @@ def _validate(cfg: Config) -> None:
     if cfg.imputation.method not in ("tabimpute", "refidiff", "hyperimpute"):
         raise ValueError(
             f"imputation.method must be 'tabimpute', 'refidiff', or 'hyperimpute', got {cfg.imputation.method!r}"
+        )
+    if cfg.imputation.continuous_plugin not in ("median", "mean"):
+        raise ValueError(
+            "imputation.continuous_plugin must be 'median' or 'mean', "
+            f"got {cfg.imputation.continuous_plugin!r}"
         )
     if cfg.imputation.refidiff.denoiser not in ("auto", "mamba", "mlp"):
         raise ValueError(

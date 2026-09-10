@@ -1,4 +1,4 @@
-"""Append-only, train-only masked-cell validation and HPO for RefiDiff.
+"""Append-only, train-only masked-cell validation helpers.
 
 This module never writes ordinary ``*_imputed.csv`` cache files. It hides only
 originally observed, non-sensitive feature cells in ``Dataset.train_df``, then
@@ -14,16 +14,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
-import optuna
 import pandas as pd
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 
-from synthdata.config import Config, RefiDiffConfig
+from synthdata.config import Config
 from synthdata.data import Dataset
 from synthdata.experiment import dataset_version_scope
-from synthdata.generation.hpo import create_study
-from synthdata.imputation.refidiff_backend import impute_dataframe
-from synthdata.utils import ensure_dir, get_logger, git_commit, resolve_device
+from synthdata.utils import ensure_dir, get_logger
 
 logger = get_logger(__name__)
 
@@ -263,151 +260,8 @@ def _persist_mask(
 
 
 def run_refidiff_benchmark(cfg: Config, dataset: Dataset, study_id: str | None = None) -> Path:
-    """Create/resume a RefiDiff benchmark and return its immutable study directory."""
-    if cfg.imputation.method != "refidiff":
-        raise ValueError("RefiDiff benchmarking requires imputation.method: refidiff.")
-    if not cfg.imputation.benchmark.enabled:
-        raise ValueError(
-            "RefiDiff benchmarking is disabled. Set imputation.benchmark.enabled: true in the "
-            "dedicated benchmark config before starting a study."
-        )
-    study_dir = benchmark_study_dir(cfg, study_id or _study_id())
-    identity = _study_identity(cfg, dataset)
-    _write_or_validate_identity(study_dir, identity, cfg)
-    benchmark_cfg = cfg.imputation.benchmark
-    score_columns = resolve_score_columns(dataset, benchmark_cfg.score_columns)
-    logger.info(
-        "refidiff benchmark: masking/scoring %d selected feature columns while retaining all %d "
-        "features as imputation context",
-        len(score_columns),
-        len(dataset.feature_columns),
+    """Reject deferred RefiDiff benchmark execution explicitly."""
+    raise RuntimeError(
+        "RefiDiff benchmark is deferred and blocked: legacy RefiDiff execution is not "
+        "available in role-isolated Task 6. No study was started."
     )
-    masks: list[tuple[str, int, dict[str, list[int]]]] = []
-    for mechanism_idx, mechanism in enumerate(benchmark_cfg.mechanisms):
-        for mask_index in range(benchmark_cfg.n_masks):
-            seed = cfg.seed + mechanism_idx * 10_000 + mask_index
-            mask = create_artificial_mask(
-                dataset.train_df,
-                score_columns,
-                dataset.sensitive_columns,
-                benchmark_cfg.mask_fraction,
-                mechanism,
-                seed,
-            )
-            _persist_mask(study_dir, mechanism, mask_index, mask)
-            masks.append((mechanism, mask_index, mask))
-
-    def evaluate_candidate(candidate: RefiDiffConfig, candidate_name: str) -> float:
-        candidate_dir = ensure_dir(study_dir / "candidates" / candidate_name)
-        aggregate_path = candidate_dir / "aggregate.json"
-        if aggregate_path.exists():
-            with open(aggregate_path) as f:
-                aggregate = json.load(f)
-            logger.info(
-                "refidiff benchmark candidate=%s already completed at %s (objective=%.6f)",
-                candidate_name,
-                candidate_dir,
-                aggregate["objective"],
-            )
-            return float(aggregate["objective"])
-        with open(candidate_dir / "config.json", "w") as f:
-            json.dump(dataclasses.asdict(candidate), f, indent=2, sort_keys=True)
-        summaries = []
-        for mechanism, mask_index, mask in masks:
-            masked = apply_artificial_mask(dataset.train_df, mask)
-            mask_dir = ensure_dir(candidate_dir / f"{mechanism}_{mask_index:02d}")
-            try:
-                imputed = impute_dataframe(
-                    masked,
-                    dataset.feature_columns,
-                    dataset.categorical_columns,
-                    dataset.target_column,
-                    device=resolve_device(cfg.imputation.device),
-                    refidiff_cfg=candidate,
-                    data_dir=mask_dir,
-                    seed=cfg.seed,
-                    refinement_columns=score_columns,
-                    decode_diagnostics_path=mask_dir / "categorical_decode_diagnostics.json",
-                )
-                metric_table, summary = score_masked_cells(
-                    dataset.train_df, imputed, mask, dataset.categorical_columns
-                )
-                metric_table.to_csv(mask_dir / "column_metrics.csv", index=False)
-                with open(mask_dir / "summary.json", "w") as f:
-                    json.dump(summary, f, indent=2, sort_keys=True)
-                summaries.append({"mechanism": mechanism, "mask_index": mask_index, **summary})
-            except (ImportError, RuntimeError, ValueError, TypeError, OSError) as exc:
-                failure = {
-                    "candidate": candidate_name,
-                    "mechanism": mechanism,
-                    "mask_index": mask_index,
-                    "exception_type": type(exc).__name__,
-                    "message": str(exc),
-                    "git_commit": git_commit(),
-                }
-                with open(mask_dir / "failure.json", "w") as f:
-                    json.dump(failure, f, indent=2, sort_keys=True)
-                logger.error("refidiff benchmark candidate=%s failed: %s", candidate_name, failure)
-                raise
-        summaries_df = pd.DataFrame(summaries)
-        summaries_df.to_csv(candidate_dir / "mask_summaries.csv", index=False)
-        aggregate = {
-            "objective": float(summaries_df["objective"].mean()),
-            "n_masks": len(summaries_df),
-        }
-        with open(aggregate_path, "w") as f:
-            json.dump(aggregate, f, indent=2, sort_keys=True)
-        return aggregate["objective"]
-
-    hpo_cfg = benchmark_cfg.hpo
-    if not hpo_cfg.enabled:
-        score = evaluate_candidate(cfg.imputation.refidiff, "baseline")
-        logger.info("refidiff benchmark baseline complete at %s (objective=%.6f)", study_dir, score)
-        return study_dir
-
-    generation_like_hpo = dataclasses.replace(
-        cfg.generation.hpo,
-        n_trials=hpo_cfg.n_trials,
-        timeout_seconds=hpo_cfg.timeout_seconds,
-        storage=f"sqlite:///{study_dir / 'optuna_studies.db'}",
-    )
-    study = create_study("refidiff_masked_fidelity", generation_like_hpo, study_dir, cfg.seed)
-
-    def objective(trial: optuna.Trial) -> float:
-        candidate = dataclasses.replace(
-            cfg.imputation.refidiff,
-            hidden_dim=trial.suggest_categorical("hidden_dim", hpo_cfg.hidden_dims),
-            num_steps=trial.suggest_categorical("num_steps", hpo_cfg.num_steps),
-            num_trials=trial.suggest_categorical("num_trials", hpo_cfg.num_trials),
-            epochs=trial.suggest_categorical("epochs", hpo_cfg.epochs),
-            early_stopping_patience=trial.suggest_categorical(
-                "early_stopping_patience", hpo_cfg.early_stopping_patience
-            ),
-        )
-        trial.set_user_attr("candidate", dataclasses.asdict(candidate))
-        return evaluate_candidate(candidate, f"trial_{trial.number:04d}")
-
-    completed = sum(trial.state == optuna.trial.TrialState.COMPLETE for trial in study.trials)
-    remaining = max(hpo_cfg.n_trials - completed, 0)
-    if remaining:
-        study.optimize(
-            objective,
-            n_trials=remaining,
-            timeout=hpo_cfg.timeout_seconds,
-            catch=(ImportError, RuntimeError, ValueError, TypeError, OSError),
-        )
-    if not any(trial.state == optuna.trial.TrialState.COMPLETE for trial in study.trials):
-        raise RuntimeError(f"RefiDiff benchmark study at {study_dir} has no completed trials.")
-    with open(study_dir / "best_trial.json", "w") as f:
-        json.dump(
-            {
-                "number": study.best_trial.number,
-                "value": study.best_value,
-                "params": study.best_params,
-            },
-            f,
-            indent=2,
-            sort_keys=True,
-        )
-    logger.info("refidiff benchmark HPO complete at %s best=%.6f", study_dir, study.best_value)
-    return study_dir

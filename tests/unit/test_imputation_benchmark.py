@@ -9,6 +9,7 @@ from synthdata.imputation.benchmark import (
     benchmark_study_dir,
     create_artificial_mask,
     resolve_score_columns,
+    run_refidiff_benchmark,
     score_masked_cells,
 )
 
@@ -117,3 +118,12 @@ def test_score_panel_excludes_sensitive_columns(make_dataset):
     ]
     with pytest.raises(ValueError, match="non-sensitive feature"):
         resolve_score_columns(dataset, [excluded])
+
+
+def test_refidiff_benchmark_is_blocked_without_creating_study(make_config, make_dataset, tmp_path):
+    cfg = make_config()
+    cfg.imputation.benchmark.output_dir = str(tmp_path)
+    dataset = make_dataset()
+    with pytest.raises(RuntimeError, match="deferred and blocked"):
+        run_refidiff_benchmark(cfg, dataset, "blocked")
+    assert not list(tmp_path.rglob("benchmark_blocked"))

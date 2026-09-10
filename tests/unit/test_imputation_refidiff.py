@@ -119,6 +119,7 @@ class TestMeanStd:
 class TestPipelineDispatch:
     def test_dispatches_to_tabimpute_backend(self, make_config, make_dataset, mocker):
         cfg = make_config()
+        cfg.imputation.method = "tabimpute"
         dataset = make_dataset()
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",

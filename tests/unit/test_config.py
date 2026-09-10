@@ -408,6 +408,16 @@ class TestValidate:
         cfg.imputation.method = method
         _validate(cfg)  # should not raise
 
+    def test_hyperimpute_is_default_and_continuous_plugin_is_validated(self):
+        cfg = self._base_valid()
+        assert cfg.imputation.method == "hyperimpute"
+        assert cfg.imputation.continuous_plugin == "median"
+        cfg.imputation.continuous_plugin = "mean"
+        _validate(cfg)
+        cfg.imputation.continuous_plugin = "bogus"
+        with pytest.raises(ValueError, match="continuous_plugin"):
+            _validate(cfg)
+
     def test_bad_refidiff_denoiser_raises(self):
         cfg = self._base_valid()
         cfg.imputation.refidiff.denoiser = "bogus"

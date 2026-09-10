@@ -1,11 +1,7 @@
-"""Method-agnostic imputation pipeline: caching, dispatch, rounding, validation.
+"""Role-isolated HyperImpute pipeline with legacy two-role compatibility.
 
-:func:`run_imputation` dispatches to the configured backend's
-``impute_dataframe`` (``synthdata.imputation.tabimpute_backend`` by default, or
-``synthdata.imputation.refidiff_backend`` when ``imputation.method ==
-"refidiff"``), then applies shared post-processing (rounding, caching to CSV,
-validation reporting) identically regardless of which backend produced the
-imputed values.
+Canonical roles use fixed HyperImpute plugins. Legacy TabImpute and RefiDiff
+remain available only for explicit two-role datasets.
 """
 
 import dataclasses
@@ -69,6 +65,18 @@ def _persist_decoded_imputed_splits(dataset: Dataset) -> None:
 def _impute_dataframe(cfg: Config, df: pd.DataFrame, dataset: Dataset, device: str) -> pd.DataFrame:
     """Dispatch to the configured imputation backend's ``impute_dataframe``."""
     method = cfg.imputation.method
+    if method == "hyperimpute":
+        from synthdata.imputation.hyperimpute_backend import fit_dataframe, transform_dataframe
+
+        state = fit_dataframe(
+            df,
+            dataset.feature_columns,
+            dataset.categorical_columns,
+            fit_roles=("train", "final_holdout"),
+            continuous_plugin=getattr(cfg.imputation, "continuous_plugin", "median"),
+            random_state=cfg.seed,
+        )
+        return transform_dataframe(state, df)
     if method == "tabimpute":
         from synthdata.imputation.tabimpute_backend import impute_dataframe
 
@@ -92,74 +100,77 @@ def _impute_dataframe(cfg: Config, df: pd.DataFrame, dataset: Dataset, device: s
             data_dir=dataset.data_dir,
             seed=cfg.seed,
         )
-    # Unreachable in practice: Config._validate() already restricts
-    # imputation.method to {"tabimpute", "refidiff"} before this runs.
+    # Unreachable in practice: Config._validate() restricts method names.
     raise ValueError(f"Unknown imputation.method: {method!r}")
 
 
 def _impute_canonical_roles(
-    cfg: Config, dataset: Dataset, device: str
+    cfg: Config, dataset: Dataset, device: str, phase: str = "candidate"
 ) -> tuple[dict[str, pd.DataFrame], dict | None]:
-    """Fit on train once, then transform tuning and final_holdout without refit."""
+    """Run candidate (train fit) or final (train+tuning fit) role isolation."""
     dataset.require_canonical_roles("canonical imputation")
     role_frames = dataset.roles
+    if phase not in {"candidate", "final"}:
+        raise ValueError("canonical imputation phase must be 'candidate' or 'final'")
     n_missing = {
         role: int(frame[dataset.feature_columns].isna().sum().sum())
         for role, frame in role_frames.items()
     }
+    if cfg.imputation.method in {"tabimpute", "refidiff"}:
+        raise RoleIsolationError(
+            f"Canonical imputation method {cfg.imputation.method!r} is deferred: "
+            "TabImpute/RefiDiff are not supported for role-isolated execution. "
+            "Use fixed HyperImpute plugins with a non-legacy method."
+        )
+
     if not any(n_missing.values()):
         logger.info("Canonical roles contain no missing feature values; imputation is a no-op")
-        state_metadata = None
-        if cfg.imputation.method == "tabimpute":
-            from synthdata.imputation.tabimpute_backend import no_fit_state_metadata
+        from synthdata.imputation.hyperimpute_backend import state_metadata as hyper_state_metadata
 
-            state_metadata = no_fit_state_metadata(
-                dataset.feature_columns,
-                dataset.categorical_columns,
-                dataframe_fingerprint(role_frames["train"]),
-                "not_required",
-            )
+        fit_frame = (
+            role_frames["train"]
+            if phase == "candidate"
+            else pd.concat([role_frames["train"], role_frames["tuning"]], axis=0)
+        )
+        state_metadata = hyper_state_metadata(
+            None,
+            status="not_required",
+            transform_roles=(["train", "tuning"] if phase == "candidate" else ["final_holdout"]),
+            fit_roles=["train"] if phase == "candidate" else ["train", "tuning"],
+            fit_frame_fingerprint=dataframe_fingerprint(fit_frame),
+            feature_columns=dataset.feature_columns,
+            categorical_columns=dataset.categorical_columns,
+            continuous_plugin=cfg.imputation.continuous_plugin,
+        )
         return {role: frame.copy() for role, frame in role_frames.items()}, state_metadata
 
-    if cfg.imputation.method == "tabimpute":
-        from synthdata.imputation.tabimpute_backend import (
-            fit_dataframe,
-            state_metadata,
-            transform_dataframe,
-        )
+    from synthdata.imputation.hyperimpute_backend import fit_dataframe, transform_dataframe
+    from synthdata.imputation.hyperimpute_backend import state_metadata as hyper_state_metadata
 
-        state = fit_dataframe(
-            role_frames["train"],
-            dataset.feature_columns,
-            dataset.categorical_columns,
-            dataset.target_column,
-            device=device,
-        )
+    fit_frame = (
+        role_frames["train"]
+        if phase == "candidate"
+        else pd.concat([role_frames["train"], role_frames["tuning"]], axis=0)
+    )
+    state = fit_dataframe(
+        fit_frame,
+        dataset.feature_columns,
+        dataset.categorical_columns,
+        fit_roles=("train",) if phase == "candidate" else ("train", "tuning"),
+        continuous_plugin=getattr(cfg.imputation, "continuous_plugin", "median"),
+        random_state=cfg.seed,
+    )
+    if phase == "candidate":
         transformed = {
-            role: transform_dataframe(
-                state,
-                role_frames[role],
-                dataset.feature_columns,
-                dataset.categorical_columns,
-                dataset.target_column,
-                role,
-            )
-            for role in ROLE_NAMES
+            role: transform_dataframe(state, role_frames[role]) for role in ("train", "tuning")
         }
-        return transformed, state_metadata(
-            state,
-            dataframe_fingerprint(role_frames["train"]),
-        )
-
-    if cfg.imputation.method == "refidiff":
-        raise RoleIsolationError(
-            "refidiff cannot be used for canonical train/tuning/final_holdout imputation: "
-            "its current backend fits categorical encoders, scaling, warm-up models, and "
-            "the diffusion model on every supplied frame. Use tabimpute for canonical roles "
-            "or add a stateful refidiff fit/transform implementation before enabling it. "
-            f"missing_values_by_role={n_missing}"
-        )
-    raise ValueError(f"Unknown imputation.method: {cfg.imputation.method!r}")
+        transformed["final_holdout"] = role_frames["final_holdout"].copy()
+        roles = ["train", "tuning"]
+    else:
+        transformed = {role: role_frames[role].copy() for role in ("train", "tuning")}
+        transformed["final_holdout"] = transform_dataframe(state, role_frames["final_holdout"])
+        roles = ["final_holdout"]
+    return transformed, hyper_state_metadata(state, transform_roles=roles)
 
 
 def apply_rounding(
@@ -216,7 +227,7 @@ def validate_imputed_column(
     }
 
 
-def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
+def _cache_key_payload(cfg: Config, dataset: Dataset, phase: str = "candidate") -> dict:
     """Build the dict of config/dataset fields that determine imputed values.
 
     Deliberately narrower than "the whole Config": only fields that actually
@@ -248,6 +259,8 @@ def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
         "imputation_method": imp_cfg.method,
         "round_rules": imp_cfg.round_rules,
         "round_to_int_default": imp_cfg.round_to_int_default,
+        "continuous_plugin": imp_cfg.continuous_plugin,
+        "categorical_plugin": "most_frequent",
         "dataset_version": dataset.version,
         "variable_schema_fingerprint": dataset.variable_schema_fingerprint,
         "source_fingerprint": dataset.source_fingerprint,
@@ -265,8 +278,16 @@ def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
                     "identity_fingerprint"
                 ),
                 "semantic_fingerprint": dataset.semantic_fingerprint,
-                "fit_role": "train",
-                "fit_role_fingerprint": dataset.role_fingerprints["train"],
+                "phase": phase,
+                "fit_roles": ["train"] if phase == "candidate" else ["train", "tuning"],
+                "transform_roles": ["train", "tuning"]
+                if phase == "candidate"
+                else ["final_holdout"],
+                "fit_frame_fingerprint": dataframe_fingerprint(
+                    dataset.roles["train"]
+                    if phase == "candidate"
+                    else pd.concat([dataset.roles["train"], dataset.roles["tuning"]], axis=0)
+                ),
                 "role_row_counts": {role: len(dataset.roles[role]) for role in ROLE_NAMES},
             }
         )
@@ -280,12 +301,15 @@ def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
         )
     if imp_cfg.method == "refidiff":
         payload["refidiff"] = dataclasses.asdict(imp_cfg.refidiff)
+    if imp_cfg.method == "hyperimpute" and not dataset.has_canonical_roles:
+        payload["fit_roles"] = ["train", "final_holdout"]
+        payload["transform_roles"] = ["train", "final_holdout"]
     return payload
 
 
-def _cache_key_record(cfg: Config, dataset: Dataset) -> dict:
+def _cache_key_record(cfg: Config, dataset: Dataset, phase: str = "candidate") -> dict:
     """``_cache_key_payload`` plus its own sha256 digest under ``"cache_key"``."""
-    payload = _cache_key_payload(cfg, dataset)
+    payload = _cache_key_payload(cfg, dataset, phase)
     encoded = json.dumps(payload, sort_keys=True, default=str)
     record = dict(payload)
     record["cache_key"] = hashlib.sha256(encoded.encode()).hexdigest()
@@ -331,42 +355,44 @@ def _load_cache_record(path: Path) -> dict | None:
     return record
 
 
-def _canonical_tabimpute_state_is_valid(
-    cfg: Config, dataset: Dataset, cached_record: dict | None
+def _canonical_hyperimpute_state_is_valid(
+    cfg: Config, dataset: Dataset, cached_record: dict | None, phase: str = "candidate"
 ) -> bool:
-    """Require an intact train-fitted state record for canonical TabImpute caches."""
-    from synthdata.imputation.tabimpute_backend import (
-        TABIMPUTE_STATE_SCHEMA_VERSION,
-        state_metadata_fingerprint,
-    )
-
-    if not dataset.has_canonical_roles or cfg.imputation.method != "tabimpute":
+    """Require an intact train-fitted state record for canonical HyperImpute caches."""
+    if not dataset.has_canonical_roles or cfg.imputation.method != "hyperimpute":
         return True
     state = cached_record.get("fit_state") if cached_record is not None else None
     if not isinstance(state, dict):
         return False
     if state.get("status") not in {"fitted", "not_required", "disabled"}:
         return False
-    if state.get("schema_version") != TABIMPUTE_STATE_SCHEMA_VERSION:
+    expected_fit_roles = ["train"] if phase == "candidate" else ["train", "tuning"]
+    expected_transform_roles = ["train", "tuning"] if phase == "candidate" else ["final_holdout"]
+    if state.get("backend") != "hyperimpute" or state.get("fit_roles") != expected_fit_roles:
         return False
-    if state.get("backend") != "tabimpute" or state.get("fit_role") != "train":
+    if state.get("transform_roles") != expected_transform_roles:
         return False
-    if state.get("fit_frame_fingerprint") != dataframe_fingerprint(dataset.roles["train"]):
+    if state.get("continuous_plugin") != cfg.imputation.continuous_plugin:
+        return False
+    if state.get("categorical_plugin") != "most_frequent":
+        return False
+    fit_frame = (
+        dataset.roles["train"]
+        if phase == "candidate"
+        else pd.concat([dataset.roles["train"], dataset.roles["tuning"]], axis=0)
+    )
+    if state.get("fit_frame_fingerprint") != dataframe_fingerprint(fit_frame):
         return False
     if state.get("feature_columns") != list(dataset.feature_columns):
         return False
     if state.get("categorical_columns") != list(dataset.categorical_columns):
         return False
-    if state.get("status") == "fitted" and (
-        not isinstance(state.get("category_map_fingerprints"), dict)
-        or not isinstance(state.get("scaling_state_fingerprint"), str)
-        or not isinstance(state.get("block_slices"), dict)
-    ):
-        return False
-    return state.get("state_fingerprint") == state_metadata_fingerprint(state)
+    from synthdata.imputation.hyperimpute_backend import metadata_fingerprint
+
+    return state.get("state_fingerprint") == metadata_fingerprint(state)
 
 
-def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
+def run_imputation(cfg: Config, dataset: Dataset, phase: str = "candidate") -> Dataset:
     """Impute dataset roles and populate the role-specific imputed frames.
 
     Canonical datasets cache ``train_imputed.csv``/``tuning_imputed.csv``/
@@ -381,9 +407,15 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
     rerunning correctly retrains instead of silently reusing stale imputed
     CSVs from before the change.
     """
+    if dataset.has_canonical_roles and cfg.imputation.method in {"tabimpute", "refidiff"}:
+        raise RoleIsolationError(
+            f"Canonical imputation method {cfg.imputation.method!r} is deferred: "
+            "TabImpute/RefiDiff are not supported for role-isolated execution. "
+            "Use canonical method='hyperimpute'."
+        )
     paths = dataset.paths()
     cache_key_path = dataset.data_dir / _CACHE_KEY_FILENAME
-    cache_record = _cache_key_record(cfg, dataset)
+    cache_record = _cache_key_record(cfg, dataset, phase)
     current_key = cache_record["cache_key"]
     cached_record = _load_cache_record(cache_key_path)
     cached_key = cached_record.get("cache_key") if cached_record is not None else None
@@ -396,7 +428,7 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
     cached_csvs_exist = all(path.exists() for path in cached_paths)
 
     if cfg.imputation.cache and cached_csvs_exist and cached_key == current_key:
-        if _canonical_tabimpute_state_is_valid(cfg, dataset, cached_record):
+        if _canonical_hyperimpute_state_is_valid(cfg, dataset, cached_record, phase):
             dataset = load_imputed_splits(dataset, expected_cache_key=current_key)
             if dataset.full_imputed_df is not None:
                 _persist_decoded_imputed_splits(dataset)
@@ -413,7 +445,7 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
             )
         else:
             logger.warning(
-                "Canonical TabImpute cache at %s lacks valid train-fitted state provenance; "
+                "Canonical HyperImpute cache at %s lacks valid phase-fitted state provenance; "
                 "retraining",
                 dataset.data_dir,
             )
@@ -443,14 +475,23 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
         role_imputed = {role: frame.copy() for role, frame in dataset.roles.items()}
         dataset.set_imputed_roles(role_imputed)
         full_imputed = dataset.full_imputed_df
-        if cfg.imputation.method == "tabimpute":
-            from synthdata.imputation.tabimpute_backend import no_fit_state_metadata
+        if cfg.imputation.method == "hyperimpute":
+            from synthdata.imputation.hyperimpute_backend import state_metadata
 
-            fit_state_metadata = no_fit_state_metadata(
-                dataset.feature_columns,
-                dataset.categorical_columns,
-                dataframe_fingerprint(dataset.roles["train"]),
-                "disabled",
+            fit_frame = (
+                dataset.roles["train"]
+                if phase == "candidate"
+                else pd.concat([dataset.roles["train"], dataset.roles["tuning"]])
+            )
+            fit_state_metadata = state_metadata(
+                None,
+                status="disabled",
+                fit_roles=["train"] if phase == "candidate" else ["train", "tuning"],
+                fit_frame_fingerprint=dataframe_fingerprint(fit_frame),
+                feature_columns=dataset.feature_columns,
+                categorical_columns=dataset.categorical_columns,
+                continuous_plugin=cfg.imputation.continuous_plugin,
+                transform_roles=["train", "tuning"] if phase == "candidate" else ["final_holdout"],
             )
     elif not cfg.imputation.enabled:
         logger.info("Imputation disabled; using rows with complete cases only")
@@ -472,7 +513,7 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
             device,
         )
         if dataset.has_canonical_roles:
-            role_imputed, fit_state_metadata = _impute_canonical_roles(cfg, dataset, device)
+            role_imputed, fit_state_metadata = _impute_canonical_roles(cfg, dataset, device, phase)
             role_imputed = {
                 role: apply_rounding(
                     frame,
@@ -502,10 +543,10 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
     if dataset.has_canonical_roles:
         for role in ROLE_NAMES:
             dataset.imputed_roles[role].to_csv(paths[f"{role}_imputed"], index=False)
-        if cfg.imputation.method == "tabimpute":
+        if cfg.imputation.method == "hyperimpute":
             if fit_state_metadata is None:
                 raise RuntimeError(
-                    "Canonical TabImpute imputation completed without fitted-state provenance"
+                    "Canonical HyperImpute imputation completed without fitted-state provenance"
                 )
             cache_record["fit_state"] = fit_state_metadata
         cache_record["imputed_row_counts"] = {

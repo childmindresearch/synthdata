@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""CLI: load a dataset and run TabImpute-based imputation.
+"""CLI: load a dataset and run role-isolated fixed-plugin imputation.
 
 Usage:
     synthdata-impute --config configs/config.yaml [--plot] [--dataset-version v2]
@@ -18,7 +18,7 @@ logger = get_logger("run_imputation")
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Load a dataset and run TabImpute-based missing-data imputation."
+        description="Load a dataset and run fixed-plugin HyperImpute missing-data imputation."
     )
     parser.add_argument("--config", required=True, help="Path to the YAML config file.")
     parser.add_argument("--plot", action="store_true", help="Also save data + imputation QA plots.")

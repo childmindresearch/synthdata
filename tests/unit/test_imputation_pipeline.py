@@ -9,6 +9,12 @@ import pytest
 
 from synthdata.data import dataframe_fingerprint, load_imputed_splits
 from synthdata.imputation import pipeline as imputation_pipeline
+from synthdata.imputation.hyperimpute_backend import (
+    HyperImputeError,
+    HyperImputeState,
+    fit_dataframe,
+    transform_dataframe,
+)
 from synthdata.imputation.pipeline import (
     _CACHE_KEY_FILENAME,
     _cache_key_payload,
@@ -23,6 +29,77 @@ from synthdata.imputation.tabimpute_backend import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize("plugin", ["median", "mean"])
+def test_fixed_hyperimpute_plugins_fill_values_and_preserve_identity(plugin):
+    frame = pd.DataFrame(
+        {
+            "value": [1.0, 2.0, 100.0, None],
+            "category": ["a", "b", "b", None],
+            "patient_id": [1, 2, 3, 4],
+            "target": [0, 1, 0, 1],
+        }
+    )
+    state = fit_dataframe(
+        frame, ["value", "category"], ["category"], fit_roles=("train",), continuous_plugin=plugin
+    )
+    result = transform_dataframe(state, frame)
+    assert result.loc[3, "value"] == (2.0 if plugin == "median" else 34.333333333333336)
+    assert result.loc[3, "category"] == "b"
+    assert result["patient_id"].equals(frame["patient_id"])
+    assert result["target"].equals(frame["target"])
+
+
+def test_fixed_hyperimpute_rejects_all_missing_training_feature():
+    frame = pd.DataFrame({"value": [None, None], "target": [0, 1]})
+    with pytest.raises(HyperImputeError, match="no observed training value"):
+        fit_dataframe(frame, ["value"], [], fit_roles=("train",))
+
+
+def test_final_phase_fits_train_and_tuning_and_transforms_holdout_only(
+    make_config, make_canonical_dataset, mocker
+):
+    cfg = make_config()
+    cfg.imputation.method = "hyperimpute"
+    dataset = make_canonical_dataset()
+    dataset.roles["final_holdout"].loc[dataset.roles["final_holdout"].index[0], "feature"] = np.nan
+    state = HyperImputeState(
+        ("feature", "protected"),
+        ("protected",),
+        "median",
+        "most_frequent",
+        object(),
+        object(),
+        ("train", "tuning"),
+        "fit",
+    )
+    fit = mocker.patch("synthdata.imputation.hyperimpute_backend.fit_dataframe", return_value=state)
+    transform = mocker.patch(
+        "synthdata.imputation.hyperimpute_backend.transform_dataframe",
+        side_effect=lambda _, frame: frame.copy(),
+    )
+    imputation_pipeline._impute_canonical_roles(cfg, dataset, "cpu", phase="final")
+    pd.testing.assert_frame_equal(
+        fit.call_args.args[0], pd.concat([dataset.roles["train"], dataset.roles["tuning"]])
+    )
+    assert transform.call_count == 1
+    pd.testing.assert_frame_equal(transform.call_args.args[1], dataset.roles["final_holdout"])
+
+
+def test_final_phase_noop_metadata_uses_concat_fit_fingerprint(make_config, make_canonical_dataset):
+    cfg = make_config()
+    cfg.imputation.method = "hyperimpute"
+    dataset = make_canonical_dataset()
+    _, metadata = imputation_pipeline._impute_canonical_roles(cfg, dataset, "cpu", phase="final")
+    fit_frame = pd.concat([dataset.roles["train"], dataset.roles["tuning"]])
+    assert metadata is not None
+    assert metadata["fit_roles"] == ["train", "tuning"]
+    assert metadata["transform_roles"] == ["final_holdout"]
+    assert metadata["fit_frame_fingerprint"] == dataframe_fingerprint(fit_frame)
+    from synthdata.imputation.hyperimpute_backend import metadata_fingerprint
+
+    assert metadata["state_fingerprint"] == metadata_fingerprint(metadata)
 
 
 class TestCacheKeyPayload:
@@ -123,6 +200,19 @@ class TestCacheKeyPayload:
             == _cache_key_record(cfg_b, dataset)["cache_key"]
         )
 
+    def test_phase_and_plugin_change_cache_key(self, make_config, make_canonical_dataset):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+        candidate = _cache_key_record(cfg, dataset, phase="candidate")
+        final = _cache_key_record(cfg, dataset, phase="final")
+        cfg.imputation.continuous_plugin = "mean"
+        mean = _cache_key_record(cfg, dataset, phase="candidate")
+        assert candidate["cache_key"] != final["cache_key"]
+        assert candidate["cache_key"] != mean["cache_key"]
+        assert final["fit_roles"] == ["train", "tuning"]
+        assert final["transform_roles"] == ["final_holdout"]
+
 
 class TestLoadCachedKey:
     def test_missing_file_returns_none(self, tmp_path):
@@ -148,26 +238,28 @@ class TestLoadCachedKey:
 
 
 class TestRunImputationCaching:
-    def test_canonical_tabimpute_cache_records_train_fit_state(
+    def test_canonical_hyperimpute_cache_records_train_fit_state(
         self, make_config, make_canonical_dataset
     ):
         cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
         dataset = make_canonical_dataset()
 
         run_imputation(cfg, dataset)
 
         record = json.loads((dataset.data_dir / _CACHE_KEY_FILENAME).read_text())
         fit_state = record["fit_state"]
-        assert fit_state["backend"] == "tabimpute"
-        assert fit_state["fit_role"] == "train"
+        assert fit_state["backend"] == "hyperimpute"
+        assert fit_state["fit_roles"] == ["train"]
         assert fit_state["status"] == "not_required"
         assert fit_state["fit_frame_fingerprint"] == dataframe_fingerprint(dataset.roles["train"])
-        assert fit_state["state_fingerprint"] == state_metadata_fingerprint(fit_state)
+        assert fit_state["transform_roles"] == ["train", "tuning"]
 
     def test_canonical_cache_without_fit_state_retrains(
         self, make_config, make_canonical_dataset, mocker
     ):
         cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
         dataset = make_canonical_dataset()
         run_imputation(cfg, dataset)
 
@@ -188,6 +280,7 @@ class TestRunImputationCaching:
 
     def test_persists_and_reloads_decoded_ordinal_splits(self, make_config, make_dataset, mocker):
         cfg = make_config()
+        cfg.imputation.method = "tabimpute"
         encoded = pd.DataFrame(
             {
                 "activity": [0.0, 1.0, None, 0.0],
@@ -246,6 +339,7 @@ class TestRunImputationCaching:
 
     def test_first_run_calls_backend_and_writes_cache_key(self, make_config, make_dataset, mocker):
         cfg = make_config()
+        cfg.imputation.method = "tabimpute"
         dataset = make_dataset()
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",
@@ -257,6 +351,7 @@ class TestRunImputationCaching:
 
     def test_second_run_with_unchanged_config_reuses_cache(self, make_config, make_dataset, mocker):
         cfg = make_config()
+        cfg.imputation.method = "tabimpute"
         dataset = make_dataset()
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",
@@ -268,6 +363,7 @@ class TestRunImputationCaching:
 
     def test_nominal_columns_change_forces_retrain(self, make_config, make_dataset, mocker):
         cfg = make_config()
+        cfg.imputation.method = "tabimpute"
         dataset = make_dataset(nominal_columns=["smoker"])
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",
@@ -285,6 +381,7 @@ class TestRunImputationCaching:
 
     def test_source_data_change_forces_retrain(self, make_config, make_dataset, mocker):
         cfg = make_config()
+        cfg.imputation.method = "tabimpute"
         dataset = make_dataset()
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",
@@ -334,6 +431,7 @@ class TestTabImputeStateMetadata:
         self, make_config, make_canonical_dataset, mocker
     ):
         cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
         first = make_canonical_dataset()
         second = make_canonical_dataset()
         for dataset in (first, second):
@@ -344,18 +442,18 @@ class TestTabImputeStateMetadata:
         second.roles["tuning"].loc[second.roles["tuning"].index[1], "feature"] = 999.0
         second.roles["final_holdout"].loc[second.roles["final_holdout"].index[1], "feature"] = 999.0
 
-        fit_state = TabImputeState(
-            feature_columns=("feature", "protected"),
-            categorical_columns=("protected",),
-            category_maps={"protected": pd.Index(["A", "B"])},
-            means=np.array([1.0, 0.5, 0.5]),
-            stds=np.array([2.0, 0.5, 0.5]),
-            block_slices={"feature": (0, 1), "protected": (1, 3)},
-            device="cpu",
-            imputer=object(),
+        fit_state = HyperImputeState(
+            ("feature", "protected"),
+            ("protected",),
+            "median",
+            "most_frequent",
+            object(),
+            object(),
+            ("train",),
+            "train-fingerprint",
         )
         fit = mocker.patch(
-            "synthdata.imputation.tabimpute_backend.fit_dataframe", return_value=fit_state
+            "synthdata.imputation.hyperimpute_backend.fit_dataframe", return_value=fit_state
         )
 
         def transform(*args):
@@ -363,9 +461,8 @@ class TestTabImputeStateMetadata:
             transformed["feature"] = transformed["feature"].fillna(0.0)
             return transformed
 
-        mocker.patch(
-            "synthdata.imputation.tabimpute_backend.transform_dataframe",
-            side_effect=transform,
+        transform_mock = mocker.patch(
+            "synthdata.imputation.hyperimpute_backend.transform_dataframe", side_effect=transform
         )
 
         _, first_metadata = imputation_pipeline._impute_canonical_roles(cfg, first, "cpu")
@@ -374,11 +471,41 @@ class TestTabImputeStateMetadata:
         assert first_metadata == second_metadata
         assert fit.call_args_list[0].args[0].equals(first.roles["train"])
         assert fit.call_args_list[1].args[0].equals(second.roles["train"])
+        for call, expected in zip(
+            transform_mock.call_args_list,
+            [first.roles[role] for role in ("train", "tuning")]
+            + [second.roles[role] for role in ("train", "tuning")],
+            strict=True,
+        ):
+            pd.testing.assert_frame_equal(call.args[1], expected)
+
+    @pytest.mark.parametrize("method", ["tabimpute", "refidiff"])
+    def test_canonical_legacy_methods_are_deferred(
+        self, make_config, make_canonical_dataset, method
+    ):
+        cfg = make_config()
+        cfg.imputation.method = method
+        with pytest.raises(imputation_pipeline.RoleIsolationError, match="deferred"):
+            run_imputation(cfg, make_canonical_dataset())
+
+    @pytest.mark.parametrize("method", ["tabimpute", "refidiff"])
+    def test_disabled_canonical_legacy_methods_are_deferred_before_cache(
+        self, make_config, make_canonical_dataset, method
+    ):
+        cfg = make_config()
+        cfg.imputation.method = method
+        cfg.imputation.enabled = False
+        dataset = make_canonical_dataset()
+        dataset.full_imputed_df = None
+        with pytest.raises(imputation_pipeline.RoleIsolationError, match="deferred"):
+            run_imputation(cfg, dataset)
+        assert dataset.full_imputed_df is None
 
     def test_changed_split_membership_rejects_cached_imputation(
         self, make_config, make_dataset, mocker
     ):
         cfg = make_config()
+        cfg.imputation.method = "tabimpute"
         dataset = make_dataset()
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",
@@ -400,6 +527,7 @@ class TestTabImputeStateMetadata:
         self, make_config, make_dataset, mocker
     ):
         cfg = make_config()
+        cfg.imputation.method = "tabimpute"
         dataset = make_dataset()
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",
@@ -416,6 +544,7 @@ class TestTabImputeStateMetadata:
 
     def test_cache_disabled_always_retrains(self, make_config, make_dataset, mocker):
         cfg = make_config()
+        cfg.imputation.method = "tabimpute"
         cfg.imputation.cache = False
         dataset = make_dataset()
         mock_impute = mocker.patch(
@@ -428,6 +557,7 @@ class TestTabImputeStateMetadata:
 
     def test_corrupt_cache_key_file_forces_retrain(self, make_config, make_dataset, mocker):
         cfg = make_config()
+        cfg.imputation.method = "tabimpute"
         dataset = make_dataset()
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",

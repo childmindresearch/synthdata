@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""CLI: run an append-only train-only masked-cell RefiDiff benchmark/HPO study."""
+"""CLI: blocked legacy RefiDiff benchmark entrypoint."""
 
 import argparse
 
@@ -13,7 +13,7 @@ logger = get_logger("run_imputation_benchmark")
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run a resumable, masked-cell RefiDiff benchmark on the training split."
+        description="Legacy RefiDiff benchmark (deferred; execution is blocked)."
     )
     parser.add_argument("--config", required=True, help="Path to the YAML config file.")
     parser.add_argument(
