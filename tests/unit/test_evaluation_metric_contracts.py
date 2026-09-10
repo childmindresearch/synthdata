@@ -38,7 +38,7 @@ from synthcity.metrics.eval_statistical import (
     WassersteinDistance,
 )
 
-from synthdata.evaluation.catalog import SYNTHCITY_METRIC_CONFIG
+from synthdata.evaluation.catalog import SYNTHCITY_METRIC_CONFIG, TASK12_HPO_ALLOWLIST
 from synthdata.evaluation.metric_contracts import (
     DEFAULT_METRIC_CONTRACT_REGISTRY,
     SYNTHCITY_METRIC_DIRECTIONS,
@@ -49,6 +49,7 @@ from synthdata.evaluation.metric_contracts import (
     MetricObservation,
     MetricValidationResult,
     UnknownMetricContractError,
+    is_verified_task10_tstr,
     resolve_metric_observations,
 )
 
@@ -445,6 +446,34 @@ class TestDefaultRegistry:
 
 
 class TestMetricContractRegistry:
+    def test_task12_hpo_allowlist_is_exact(self):
+        eligible = {
+            contract.emitted_key_pattern
+            for contract in DEFAULT_METRIC_CONTRACT_REGISTRY
+            if "hpo_objective" in contract.allowed_uses
+        }
+        assert eligible == TASK12_HPO_ALLOWLIST
+
+    def test_final_audit_score_is_distinct_and_legacy_is_blocked(self):
+        final = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
+            framework="custom", emitted_key="equalized_odds.final.v1", execution_pass="final_audit"
+        )
+        assert "final_audit_score" in final.allowed_uses
+        assert "hpo_objective" not in final.allowed_uses
+        legacy = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
+            framework="syntheval", emitted_key="syntheval.median_DCR.legacy"
+        )
+        assert legacy.lifecycle_state == "blocked"
+        assert legacy.allowed_uses == {"audit"}
+
+    def test_final_audit_score_is_not_hpo_gate_or_audit_alias(self):
+        final = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
+            framework="custom", emitted_key="representation_evidence.v1"
+        )
+        assert final.allowed_uses == {"audit", "final_audit_score"}
+        assert "hpo_objective" not in final.allowed_uses
+        assert "gate" not in final.allowed_uses
+
     def test_duplicate_selected_keys_are_rejected(self):
         registry = MetricContractRegistry([_contract()])
         with pytest.raises(ValueError, match="unique"):
@@ -514,6 +543,79 @@ class TestMetricContractRegistry:
 
 
 class TestResolveMetricObservations:
+    def test_forged_task10_artifact_is_rejected(self):
+        assert not is_verified_task10_tstr(
+            {
+                "result_metadata": {
+                    "producer": "task10_tstr",
+                    "protocol_version": "tstr-v1",
+                    "evaluation_role": "final_holdout",
+                    "source_role": "synthetic",
+                    "release_form": True,
+                    "seed": 1,
+                    "fit_roles": ["train", "tuning"],
+                    "common_protocol_digest": "forged",
+                    "release_transform_digest": "forged",
+                    "role_hashes": {"final_holdout": "forged"},
+                },
+                "prediction_artifact": {"artifact_digest": "forged"},
+            }
+        )
+
+    def test_task10_release_transform_digest_trust_anchor_rejects_mismatch(self):
+        payload = {
+            "result_metadata": {
+                "producer": "task10_tstr",
+                "protocol_version": "tstr-v1",
+                "evaluation_role": "final_holdout",
+                "source_role": "synthetic",
+                "release_form": True,
+                "seed": 1,
+                "fit_roles": ["train", "tuning"],
+                "common_protocol_digest": "0" * 64,
+                "release_transform_digest": "1" * 64,
+                "role_hashes": {"final_holdout": "2" * 64},
+            },
+        }
+        assert not is_verified_task10_tstr(payload, trusted_release_transform_digest="3" * 64)
+
+    def test_task12_provenance_contract_rejects_wrong_roles_support_bandwidth_digest_protocol_seed(
+        self,
+    ):
+        contract = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
+            framework="synthcity", emitted_key="mixed_mmd.v1"
+        )
+        context = MetricEvaluationContext(
+            role_hashes={"train": "train-hash", "tuning": "tuning-hash"}
+        )
+        observation = MetricObservation(
+            "model_a",
+            "synthcity",
+            "mixed_mmd.v1",
+            0.2,
+            direction=contract.direction,
+            role_hashes=dict(context.role_hashes),
+            fit_roles=("tuning",),
+            support={"support_contract": contract.required_support},
+            bandwidth=1.0,
+            provenance={
+                "bandwidth_fit_roles": ["tuning"],
+                "release_transform_digest": contract.release_transform_digest,
+                "protocol_version": contract.protocol_version,
+                "seed": contract.seed,
+            },
+        )
+        result = resolve_metric_observations(
+            registry=DEFAULT_METRIC_CONTRACT_REGISTRY,
+            model_name="model_a",
+            framework="synthcity",
+            expected_keys=["mixed_mmd.v1"],
+            observations=[observation],
+            context=context,
+            requested_use="hpo_objective",
+        )
+        assert result.expected_records[0].status == "wrong_role"
+
     def test_success_orients_policy_scalar(self):
         registry = MetricContractRegistry([_contract(direction="minimize")])
         result = resolve_metric_observations(

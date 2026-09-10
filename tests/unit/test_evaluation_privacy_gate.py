@@ -157,6 +157,65 @@ def _evaluate(case, **kwargs):
 
 
 class TestEvaluatePrivacyGate:
+    def test_enabled_release_privacy_gate_consumes_task12_validation(self):
+        digest = "a" * 64
+        support = {
+            "support_contract": "declared_support_v1",
+            "state": "valid",
+            "role_population_floor": 1,
+            "protected_slices": {"state": "not_applicable"},
+            "roles": {
+                "synthetic": {"population": 20, "population_floor": 1, "role_hash": "syn"},
+                "reference": {"population": 20, "population_floor": 1, "role_hash": "tune"},
+            },
+        }
+        case = _case(
+            {
+                "release_privacy.v1": {
+                    "framework": "custom",
+                    "values": {"model_a": 0.2},
+                    "contract": {
+                        "contract_id": "test.custom.release_privacy.v1",
+                        "required_support": "declared_support_v1",
+                        "protocol_version": "task12-evaluation-v1",
+                        "required_roles": ("train", "tuning"),
+                    },
+                    "observation": {
+                        "role_hashes": {"train": "train-hash", "tuning": "tuning-hash"},
+                        "fit_roles": ("train",),
+                        "support": support,
+                        "provenance": {
+                            "producer": "task12_release_privacy",
+                            "protocol_version": "task12-evaluation-v1",
+                            "seed": 0,
+                            "release_transform_digest": digest,
+                            "release_support": support,
+                            "common_protocol_digest": digest,
+                            "role_hashes": {"train": "train-hash", "tuning": "tuning-hash"},
+                        },
+                    },
+                    "threshold": {
+                        "contract_id": "test.custom.release_privacy.v1",
+                        "emitted_key": "release_privacy.v1",
+                        "framework": "custom",
+                        "bound": "max",
+                        "value": 0.1,
+                    },
+                }
+            },
+            context_overrides={
+                "resolved_configuration": {
+                    "protocol": "test-v1",
+                    "fit_roles": ("train",),
+                    "release_transform_digest": digest,
+                }
+            },
+        )
+        result = _evaluate(case)
+
+        assert result.loc["model_a", "status"] == "failed"
+        assert result.loc["model_a", "pass"] == False  # noqa: E712
+
     def test_disabled_returns_none(self):
         combined = _combined("mia_recall", {"model_a": 0.5})
         cfg = _FakeGateConfig(

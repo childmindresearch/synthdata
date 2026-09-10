@@ -297,43 +297,33 @@ SELECTED_SYNTHCITY_EMITTED_KEY_FIXTURES = (
 
 HPO_SYNTHCITY_EMITTED_KEY_FIXTURES = (
     (
-        "sanity.nearest_syn_neighbor_distance",
-        {"sanity": ["nearest_syn_neighbor_distance"]},
-        ("sanity.nearest_syn_neighbor_distance.mean",),
+        "elastic_net_jsd.v1",
+        {"task12": ["elastic_net_jsd.v1"]},
+        ("elastic_net_jsd.v1",),
     ),
     (
-        "stats.wasserstein_dist",
-        {"stats": ["wasserstein_dist"]},
-        ("stats.wasserstein_dist.joint",),
+        "mixed_mmd.v1",
+        {"task12": ["mixed_mmd.v1"]},
+        ("mixed_mmd.v1",),
     ),
     (
-        "stats.inv_kl_divergence",
-        {"stats": ["inv_kl_divergence"]},
-        ("stats.inv_kl_divergence.marginal",),
-    ),
-    (
-        "performance.xgb",
-        {"performance": ["xgb"]},
-        (
-            "performance.xgb.gt",
-            "performance.xgb.syn_id",
-            "performance.xgb.syn_ood",
-        ),
+        "tstr_macro_f1.v1",
+        {"task12": ["tstr_macro_f1.v1"]},
+        ("tstr_macro_f1.v1",),
     ),
     (
         "default",
         {
-            "stats": ["wasserstein_dist", "inv_kl_divergence"],
-            "sanity": ["nearest_syn_neighbor_distance"],
-            "performance": ["xgb"],
+            "task12": [
+                "elastic_net_jsd.v1",
+                "mixed_mmd.v1",
+                "tstr_macro_f1.v1",
+            ],
         },
         (
-            "stats.wasserstein_dist.joint",
-            "stats.inv_kl_divergence.marginal",
-            "sanity.nearest_syn_neighbor_distance.mean",
-            "performance.xgb.gt",
-            "performance.xgb.syn_id",
-            "performance.xgb.syn_ood",
+            "elastic_net_jsd.v1",
+            "mixed_mmd.v1",
+            "tstr_macro_f1.v1",
         ),
     ),
 )

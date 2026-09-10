@@ -6,8 +6,11 @@ SynthEval result-column classification helpers.
 import pytest
 
 from synthdata.evaluation.catalog import (
+    LEGACY_AUDIT_MANIFEST,
     LOG_DISPARITY_METRICS,
     SYNTHCITY_METRIC_CONFIG,
+    TASK12_EXPECTED_MANIFEST,
+    TASK12_HPO_ALLOWLIST,
     classify_syntheval_metric,
     emitted_keys_for_synthcity_metrics,
     is_custom_syntheval_metric,
@@ -15,7 +18,10 @@ from synthdata.evaluation.catalog import (
     resolve_selection,
     syntheval_execution_manifest,
 )
-from synthdata.evaluation.metric_contracts import UnknownMetricContractError
+from synthdata.evaluation.metric_contracts import (
+    DEFAULT_METRIC_CONTRACT_REGISTRY,
+    UnknownMetricContractError,
+)
 from tests.unit.synthcity_emitted_key_fixtures import (
     SELECTED_SYNTHCITY_ATTACK_TARGET_TYPES,
     SELECTED_SYNTHCITY_EMITTED_KEY_FIXTURES,
@@ -129,6 +135,29 @@ class TestIsRedundantSynthcitySubmetric:
 
 
 class TestContextualEmittedKeys:
+    def test_task12_manifests_are_exact_and_disjoint_by_owner(self):
+        assert TASK12_EXPECTED_MANIFEST == (
+            "elastic_net_jsd.v1",
+            "mixed_mmd.v1",
+            "release_privacy.v1",
+            "tstr_macro_f1.v1",
+            "equalized_odds.final.v1",
+            "representation_evidence.v1",
+        )
+        assert {"elastic_net_jsd.v1", "mixed_mmd.v1", "tstr_macro_f1.v1"} == TASK12_HPO_ALLOWLIST
+        assert (
+            tuple(
+                contract.contract_id
+                for contract in DEFAULT_METRIC_CONTRACT_REGISTRY
+                if contract.lifecycle_state == "blocked" and "legacy" in contract.qualifiers
+            )
+            == LEGACY_AUDIT_MANIFEST
+        )
+
+    def test_manifest_is_not_expanded_by_observed_keys(self):
+        manifest = syntheval_execution_manifest({"dwm": {}}, include_holdout_outputs=False)
+        assert manifest == {"dwm": ("avg_dwm_diff",)}
+
     def test_synthcity_manifest_expands_declared_variables_and_attack_targets(self):
         keys = emitted_keys_for_synthcity_metrics(
             {

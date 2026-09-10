@@ -8,6 +8,74 @@ and target context, never discovered from an observed result table.
 
 from collections.abc import Mapping, Sequence
 
+# Task 12 release identities.  These are deliberately literal: adapters must
+# validate against these manifests instead of inferring identities from rows.
+TASK12_METRIC_MANIFEST = {
+    "elastic_net_jsd": "elastic_net_jsd.v1",
+    "mixed_mmd": "mixed_mmd.v1",
+    "release_privacy": "release_privacy.v1",
+    "tstr_macro_f1": "tstr_macro_f1.v1",
+    "equalized_odds": "equalized_odds.final.v1",
+    "representation_evidence": "representation_evidence.v1",
+}
+
+TASK12_EXPECTED_MANIFEST = tuple(TASK12_METRIC_MANIFEST.values())
+TASK12_HPO_ALLOWLIST = frozenset(
+    {
+        TASK12_METRIC_MANIFEST["elastic_net_jsd"],
+        TASK12_METRIC_MANIFEST["mixed_mmd"],
+        TASK12_METRIC_MANIFEST["tstr_macro_f1"],
+    }
+)
+
+LEGACY_AUDIT_MANIFEST = (
+    "synthcity.privacy.k-anonymization.v1",
+    "synthcity.privacy.k-map.v1",
+    "synthcity.privacy.distinct-l-diversity.v1",
+    "syntheval.median_DCR.legacy",
+    "syntheval.eps_identif_risk.legacy",
+    "syntheval.mia_recall.legacy",
+    "syntheval.att_discl_risk.legacy",
+    "synthcity.performance.hidden_split.legacy",
+    "custom.fairness.synthetic_cv.legacy",
+    "syntheval.avg_macro_F1_diff_v2.legacy",
+    "syntheval.avg_F1_diff.legacy",
+)
+
+# Framework-facing manifests are intentionally separate so each adapter can
+# bind only identities it owns.  A copy is returned by helper below; callers
+# must not mutate these module constants.
+SYNTHCITY_TASK12_MANIFEST = (
+    TASK12_METRIC_MANIFEST["elastic_net_jsd"],
+    TASK12_METRIC_MANIFEST["mixed_mmd"],
+)
+SYNTHEVAL_TASK12_MANIFEST = (TASK12_METRIC_MANIFEST["tstr_macro_f1"],)
+CUSTOM_TASK12_MANIFEST = (
+    TASK12_METRIC_MANIFEST["release_privacy"],
+    TASK12_METRIC_MANIFEST["equalized_odds"],
+    TASK12_METRIC_MANIFEST["representation_evidence"],
+)
+
+TASK12_MANIFEST_BY_FRAMEWORK = {
+    "synthcity": SYNTHCITY_TASK12_MANIFEST,
+    "syntheval": SYNTHEVAL_TASK12_MANIFEST,
+    "custom": CUSTOM_TASK12_MANIFEST,
+}
+
+
+def task12_expected_manifest() -> tuple[str, ...]:
+    """Return immutable release metric identities in canonical order."""
+    return TASK12_EXPECTED_MANIFEST
+
+
+def task12_manifest_for_framework(framework: str) -> tuple[str, ...]:
+    """Return exact Task 12 identities owned by ``framework``."""
+    try:
+        return TASK12_MANIFEST_BY_FRAMEWORK[framework]
+    except KeyError as exc:
+        raise ValueError(f"Unknown Task 12 framework: {framework!r}") from exc
+
+
 # ---------------------------------------------------------------------------
 # synthcity
 # ---------------------------------------------------------------------------
@@ -194,6 +262,21 @@ def emitted_keys_for_synthcity_metrics(
             )
 
     emitted_keys = []
+
+    # Canonical Task 12 objectives are emitted by the adapter, not by a
+    # native SynthCity category/name lookup.  Keep this branch explicit so a
+    # framework report cannot silently rename an unrelated native metric.
+    canonical = {
+        TASK12_METRIC_MANIFEST["elastic_net_jsd"],
+        TASK12_METRIC_MANIFEST["mixed_mmd"],
+    }
+    selected = [str(name) for names in metric_config.values() for name in names]
+    if any(name in canonical for name in selected):
+        if set(selected) - canonical:
+            raise ValueError(
+                "Canonical SynthCity HPO metrics must be selected without native metrics"
+            )
+        return list(selected)
 
     def add(key: str) -> None:
         if key not in emitted_keys:
@@ -648,9 +731,10 @@ def resolve_selection(
 ) -> list:
     """Resolve partial-selection config into a concrete list of metric names.
 
-    Precedence: disabled -> [] ; explicit `metrics` (validated against
-    `all_metric_names`) -> that list ; `categories` (utility/privacy/fairness,
-    matched via `metric_type_map`) -> matching metrics ; neither given -> all.
+    Precedence: disabled -> [] (callers must skip execution and validation);
+    explicit `metrics` (validated against `all_metric_names`) -> that list ;
+    `categories` (utility/privacy/fairness, matched via `metric_type_map`) ->
+    matching metrics ; neither given -> all.
     """
     if not enabled:
         return []

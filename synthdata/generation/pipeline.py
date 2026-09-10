@@ -111,7 +111,7 @@ def needs_imputed_data(gen_cfg) -> bool:
 
 
 def _role_frame(dataset: Dataset, role: str, *, imputed: bool) -> pd.DataFrame | None:
-    """Return a named role, retaining only the historical adapter fallback."""
+    """Return a named role, retaining only train compatibility fallback."""
     frame = dataset.role_frame(role, imputed=imputed)
     if frame is not None:
         return frame
@@ -119,7 +119,10 @@ def _role_frame(dataset: Dataset, role: str, *, imputed: bool) -> pd.DataFrame |
         if role == "train":
             return dataset.train_imputed_df if imputed else dataset.train_df
         if role == "final_holdout":
-            return dataset.test_imputed_df if imputed else dataset.test_df
+            raise RuntimeError(
+                "Legacy final_holdout access is blocked in generation helpers; "
+                "final_holdout is never a tuning or fit role"
+            )
     return None
 
 
@@ -744,6 +747,10 @@ def run_generation(
     gen_cfg = cfg.generation
     if gen_cfg.hpo.enabled:
         dataset.require_canonical_roles("generation HPO")
+        hpo_mod.validate_hpo_metric_config(
+            gen_cfg.hpo.metric_config,
+            group_context={"group_mode": cfg.evaluation.group_mode},
+        )
 
     fit_imputed_df = _role_frame(dataset, "train", imputed=True)
     if fit_imputed_df is None and needs_imputed_data(gen_cfg):
@@ -762,6 +769,7 @@ def run_generation(
     generation_semantic_context = semantic_context_payload(
         dataset,
         classification_score=cfg.evaluation.synthcity.classification_score,
+        roles=context_roles,
     )
     generation_semantic_context_digest = semantic_context_digest(generation_semantic_context)
 
@@ -1064,6 +1072,13 @@ def run_generation(
                         study_name=hpo_mod.contextual_study_name(f"hpo_{name}", hpo_context),
                         group_context=hpo_group_context,
                         expected_emitted_keys=hpo_context["expected_emitted_keys"],
+                        train_df=fit_imputed_df,
+                        tuning_df=tuning_df,
+                        target_column=dataset.target_column,
+                        feature_types={
+                            column: entry["kind"]
+                            for column, entry in dataset.variable_schema.items()
+                        },
                     )
                     params = hpo_mod.run_study(
                         f"hpo_{name}",

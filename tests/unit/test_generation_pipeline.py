@@ -104,6 +104,7 @@ def test_tabpfn_generation_forwards_schema_derived_feature_roles(make_config, ma
     assert keyword_arguments["semantic_context"] == semantic_context_payload(
         dataset,
         classification_score=cfg.evaluation.synthcity.classification_score,
+        roles=("train",),
     )
     assert result["tabpfn_custom"].equals(generated)
 
@@ -132,6 +133,7 @@ def test_tabpfgen_generation_forwards_complete_semantic_context(
     assert keyword_arguments["semantic_context"] == semantic_context_payload(
         dataset,
         classification_score=cfg.evaluation.synthcity.classification_score,
+        roles=("train",),
     )
 
 
@@ -709,11 +711,12 @@ def test_patient_group_hpo_rejects_row_only_objective_before_generation(
     cfg.generation.synthcity.names = ["ctgan"]
     cfg.generation.tabpfn.enabled = False
     cfg.generation.tabpfgen.enabled = False
+    cfg.generation.hpo.metric_config = {"stats": ["wasserstein_dist"]}
     dataset = make_canonical_dataset()
 
     fit_generate = mocker.patch("synthdata.generation.pipeline.sc.fit_generate")
 
-    with pytest.raises(ValueError, match="patient_group HPO requires group-safe metrics"):
+    with pytest.raises(ValueError, match="canonical HPO allowlist"):
         run_generation(cfg, dataset)
 
     fit_generate.assert_not_called()

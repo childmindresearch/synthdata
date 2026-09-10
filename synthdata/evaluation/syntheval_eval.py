@@ -38,6 +38,7 @@ from synthdata.evaluation.metric_contracts import (
     MetricObservation,
     MetricValidationResult,
     UnknownMetricContractError,
+    is_verified_task10_tstr,
     resolve_metric_observations,
 )
 from synthdata.utils import ensure_dir, get_logger, save_json
@@ -78,7 +79,10 @@ def _candidate_role_frames(dataset: Dataset) -> tuple[pd.DataFrame, pd.DataFrame
     tuning_frame = dataset.role_frame("tuning", imputed=True)
     final_holdout_frame = dataset.role_frame("final_holdout", imputed=True)
     if tuning_frame is None and dataset.legacy_two_role:
-        tuning_frame = final_holdout_frame
+        raise RuntimeError(
+            "SynthEval legacy two-role datasets cannot substitute final_holdout for tuning; "
+            "legacy evidence is audit-only and blocked for candidate evaluation"
+        )
     missing = [
         role
         for role, frame in (
@@ -99,11 +103,12 @@ def _evaluation_role_frames(
     dataset: Dataset, evaluation_role: str
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return the train fit frame and one explicitly named evidence frame."""
+    if evaluation_role == "final_holdout":
+        dataset.require_canonical_roles("final-holdout evaluation")
     fit_frame, tuning_frame, final_holdout_frame = _candidate_role_frames(dataset)
     if evaluation_role == "tuning":
         return fit_frame, tuning_frame
     if evaluation_role == "final_holdout":
-        dataset.require_canonical_roles("final-holdout evaluation")
         return fit_frame, final_holdout_frame
     raise ValueError(
         f"Unsupported SynthEval evaluation_role {evaluation_role!r}; "
@@ -1783,6 +1788,10 @@ def run_syntheval_evaluation(
     ``positive_class`` (from ``cfg.evaluation.positive_class``) is forwarded to
     :func:`build_preset` for the 3 fairness metrics -- see its docstring.
     """
+    if not selection_cfg.enabled:
+        logger.info("[syntheval] disabled; skipping execution")
+        return (None, None, {}) if return_execution else (None, None)
+
     target_frame = dataset.role_frame("train", imputed=True)
     target_is_binary = (
         dataset.target_is_categorical
@@ -2040,6 +2049,10 @@ def run_binary_target_syntheval_evaluation(
     BINARY_ONLY_METRICS are selected. When ``return_execution`` is true, the
     structured per-model execution payloads are appended.
     """
+    if not selection_cfg.enabled:
+        logger.info("[syntheval] disabled; skipping binary-target execution")
+        return (None, None, {}) if return_execution else (None, None)
+
     preset = build_binary_preset(selection_cfg)
     if not preset:
         logger.info("[syntheval] binary-target pass: no eligible metrics selected; skipping")
@@ -2538,10 +2551,29 @@ def _structured_observations(
                 emitted_key = str(row.get("metric"))
                 if emitted_key == "None":
                     continue
+                metadata = _result_metadata_payload(row)
+                # A producer cannot self-label a row canonical. The Task 10
+                # envelope must verify before identity enters shared resolver.
+                if emitted_key == "tstr_macro_f1.v1" and not is_verified_task10_tstr(
+                    {**row, "result_metadata": metadata}
+                ):
+                    emitted_key = "syntheval.tstr_macro_f1.v1.legacy"
+                # Native cls_acc is not TSTR macro-F1.  Keep it observable as
+                # legacy evidence rather than silently relabeling semantics.
+                if item.get("method") == "cls_acc" and emitted_key in {
+                    "avg_macro_F1_diff_v2",
+                    "avg_F1_diff",
+                }:
+                    emitted_key = f"syntheval.{emitted_key}.legacy"
+                if (
+                    item.get("method") in {"tstr", "tstr_macro_f1", "tstr_evaluation"}
+                    and (emitted_key in {"macro_f1", "tstr_macro_f1"} or "macro_f1" in row)
+                    and is_verified_task10_tstr({**row, "result_metadata": metadata})
+                ):
+                    emitted_key = "tstr_macro_f1.v1"
                 observed_keys.add(emitted_key)
                 contract = _structured_metric_contract(emitted_key, execution_pass)
                 normalized_value = row.get("normalized_value", row.get("n_val"))
-                metadata = _result_metadata_payload(row)
                 uncertainty_field = contract.uncertainty_field if contract else None
                 sample_size_field = contract.sample_size_field if contract else None
                 uncertainty = _structured_uncertainty(row, uncertainty_field)
@@ -2576,6 +2608,10 @@ def _structured_observations(
                             "execution_state": status.get("state"),
                         },
                         result_metadata=metadata,
+                        fit_roles=tuple(metadata.get("fit_roles", ())),
+                        support=metadata.get("support", metadata.get("class_supports")),
+                        bandwidth=metadata.get("bandwidth"),
+                        provenance=metadata,
                     )
                 )
             for failed_key in failed_keys - observed_keys:
@@ -2656,6 +2692,28 @@ def validate_syntheval_results(
         else None
     )
 
+    if structured_by_model is not None and "syntheval" in expected_keys_by_framework:
+        expected_tstr = "tstr_macro_f1.v1" in expected_keys_by_framework["syntheval"]
+        if expected_tstr:
+            for model_name in model_names:
+                if not any(
+                    item.emitted_key == "tstr_macro_f1.v1"
+                    for item in structured_by_model.get(model_name, ())
+                ):
+                    structured_by_model.setdefault(model_name, []).append(
+                        MetricObservation(
+                            model_name=model_name,
+                            framework="syntheval",
+                            emitted_key="tstr_macro_f1.v1",
+                            raw_value=None,
+                            execution_pass=execution_pass,
+                            target_view=target_view,
+                            role_hashes=role_hashes,
+                            error="Task 10 TSTR producer result/provenance is unavailable",
+                            provenance={"tstr_producer_available": False},
+                        )
+                    )
+
     for model_name in model_names:
         if structured_by_model is not None:
             for observation in structured_by_model.get(model_name, ()):
@@ -2691,6 +2749,29 @@ def validate_syntheval_results(
                     result_metadata={},
                 )
             )
+
+    # A canonical TSTR expectation must never be satisfied by native cls_acc.
+    # If Task 10 did not provide its durable result, retain an explicit blocked
+    # observation instead of allowing a missing row to look like success.
+    if "tstr_macro_f1.v1" in expected_keys_by_framework.get("syntheval", ()):
+        for model_name in model_names:
+            model_observations = observations_by_framework.setdefault("syntheval", {}).setdefault(
+                model_name, []
+            )
+            if not any(item.emitted_key == "tstr_macro_f1.v1" for item in model_observations):
+                model_observations.append(
+                    MetricObservation(
+                        model_name=model_name,
+                        framework="syntheval",
+                        emitted_key="tstr_macro_f1.v1",
+                        raw_value=None,
+                        execution_pass=execution_pass,
+                        target_view=target_view,
+                        role_hashes=role_hashes,
+                        error="Task 10 TSTR producer result/provenance is unavailable",
+                        provenance={"tstr_producer_available": False},
+                    )
+                )
 
     context = MetricEvaluationContext(
         execution_pass=execution_pass,

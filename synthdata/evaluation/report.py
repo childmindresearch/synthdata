@@ -169,6 +169,14 @@ def _fairness_highlights_section(combined: pd.DataFrame, extras: dict) -> str:
         "significance testing). Lower is better for every number below."
     )
     lines.append("")
+    task12 = extras.get("task12_validation") or {}
+    if task12:
+        lines.append("### Task 12 release evidence")
+        lines.append("")
+        for model, validation in sorted(task12.items()):
+            status = validation.get("decision_status", validation.get("status", "unknown"))
+            lines.append(f"- `{model}`: `{status}` (canonical release/fairness evidence)")
+        lines.append("")
 
     lines.append("### Subgroup gap metrics (0 = perfectly fair)")
     lines.append("")

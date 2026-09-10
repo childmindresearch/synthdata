@@ -527,6 +527,65 @@ def _log_disparity_frames(
     return raw, oriented
 
 
+def _task12_frames(
+    validations: Mapping[str, MetricValidationResult] | None,
+    model_names: list,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Materialize canonical custom evidence; blocked records stay audit-visible."""
+    if not validations:
+        empty = pd.DataFrame(index=model_names)
+        return empty, empty
+    keys = sorted({record.expected_key for item in validations.values() for record in item.records})
+    raw = pd.DataFrame(index=model_names, columns=keys, dtype=float)
+    for model, validation in validations.items():
+        for record in validation.records:
+            if record.status == "succeeded" and record.raw_value is not None:
+                raw.loc[model, record.expected_key] = record.raw_value
+    oriented = raw.copy()
+    for key in keys:
+        contract = next(
+            (item for item in DEFAULT_METRIC_CONTRACT_REGISTRY if item.emitted_key_pattern == key),
+            None,
+        )
+        if (
+            key == "equalized_odds.final.v1"
+            or contract is None
+            or contract.lifecycle_state != "operational"
+            or "policy_rank" not in contract.allowed_uses
+        ):
+            oriented[key] = pd.NA
+        elif contract.direction == "minimize":
+            oriented[key] = -oriented[key]
+    raw = _append_validation_status_columns(
+        raw, model_names, validations, prefix="__model_custom_task12"
+    )
+    raw.columns = pd.MultiIndex.from_tuples(
+        [
+            (
+                "custom",
+                "audit"
+                if str(key).startswith("__model_")
+                else "privacy"
+                if key == "release_privacy.v1"
+                else "fairness",
+                key,
+            )
+            for key in raw.columns
+        ]
+    )
+    oriented.columns = pd.MultiIndex.from_tuples(
+        [
+            (
+                "custom",
+                "privacy" if key == "release_privacy.v1" else "fairness",
+                key,
+            )
+            for key in oriented.columns
+        ]
+    )
+    return raw, oriented
+
+
 def _minmax_scale(col: pd.Series) -> pd.Series:
     """Per-column min-max scaling; NaN-safe (ties -> 0.5, NaNs preserved)."""
     valid = col.dropna()
@@ -560,6 +619,7 @@ def build_combined_table(
     | None = None,
     metric_execution_passes: Mapping[tuple[str, str, str], str] | None = None,
     custom_validations: Mapping[str, MetricValidationResult] | None = None,
+    task12_validations: Mapping[str, MetricValidationResult] | None = None,
 ) -> pd.DataFrame:
     """Build the single combined, ranked, multi-index evaluation table.
 
@@ -600,9 +660,12 @@ def build_combined_table(
         model_names,
         custom_validations=custom_validations,
     )
+    task12_raw, task12_oriented = _task12_frames(task12_validations, model_names)
 
-    raw_parts = [df for df in (sc_raw, se_raw, ld_raw) if not df.empty]
-    oriented_parts = [df for df in (sc_oriented, se_oriented, ld_oriented) if not df.empty]
+    raw_parts = [df for df in (sc_raw, se_raw, ld_raw, task12_raw) if not df.empty]
+    oriented_parts = [
+        df for df in (sc_oriented, se_oriented, ld_oriented, task12_oriented) if not df.empty
+    ]
 
     if not raw_parts:
         raise ValueError("No evaluation results to combine: check evaluation config selection")

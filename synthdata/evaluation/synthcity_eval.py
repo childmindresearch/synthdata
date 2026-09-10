@@ -25,6 +25,7 @@ from synthdata.evaluation.catalog import (
     SYNTHCITY_CATEGORY_TO_TYPE,
     SYNTHCITY_EMITTED_KEY_SUFFIXES,
     SYNTHCITY_METRIC_CONFIG,
+    SYNTHCITY_TASK12_MANIFEST,
     emitted_keys_for_synthcity_metrics,
     is_known_synthcity_emitted_key,
     resolve_selection,
@@ -147,6 +148,13 @@ def _declared_expected_keys(
         resolved = []
     if len(resolved) != len(set(resolved)):
         raise ValueError("SynthCity expected emitted metric keys must be unique")
+    task12_keys = set(SYNTHCITY_TASK12_MANIFEST)
+    unsafe_task12 = [key for key in resolved if key in task12_keys]
+    if unsafe_task12:
+        raise ValueError(
+            "SynthCity Task 12 identities require canonical metric producers, not native report aliases: "
+            + ", ".join(unsafe_task12)
+        )
     return resolved
 
 
@@ -258,6 +266,10 @@ def build_synthcity_observations(
                     "result_metadata": _metric_result_metadata(report_metadata, key),
                 },
                 result_metadata=_metric_result_metadata(report_metadata, key),
+                fit_roles=tuple(source_metadata.get("fit_roles", ())),
+                support=_metric_result_metadata(report_metadata, key).get("support"),
+                bandwidth=_metric_result_metadata(report_metadata, key).get("bandwidth"),
+                provenance=source_metadata,
             )
             for key in expected_keys
         )
@@ -286,6 +298,10 @@ def build_synthcity_observations(
                     "result_metadata": _metric_result_metadata(report_metadata, key),
                 },
                 result_metadata=_metric_result_metadata(report_metadata, key),
+                fit_roles=tuple(source_metadata.get("fit_roles", ())),
+                support=_metric_result_metadata(report_metadata, key).get("support"),
+                bandwidth=_metric_result_metadata(report_metadata, key).get("bandwidth"),
+                provenance=source_metadata,
             )
             for key in declared_keys
         )
@@ -306,7 +322,7 @@ def build_synthcity_observations(
         direction = _row_value(row, "direction")
         if not isinstance(direction, str):
             direction = None
-        uncertainty = _row_value(row, uncertainty_field)
+        uncertainty = _row_value(row, uncertainty_field) if uncertainty_field else None
         if not isinstance(uncertainty, Real):
             uncertainty = None
         sample_size = _row_sample_size(row, sample_size_field)
@@ -336,9 +352,54 @@ def build_synthcity_observations(
                     "result_metadata": result_metadata,
                 },
                 result_metadata=result_metadata,
+                fit_roles=tuple(
+                    result_metadata.get("fit_roles", source_metadata.get("fit_roles", ()))
+                ),
+                support=result_metadata.get("support"),
+                bandwidth=result_metadata.get("bandwidth"),
+                provenance={**source_metadata, **result_metadata},
             )
         )
     return expected_keys, tuple(observations)
+
+
+def build_task12_synthcity_observations(
+    model_name: str,
+    values: Mapping[str, Any],
+    *,
+    fit_roles: tuple[str, ...],
+    support: Any,
+    bandwidth: Any = None,
+    provenance: Mapping[str, Any] | None = None,
+    role_hashes: Mapping[str, str] | None = None,
+) -> tuple[str, tuple[MetricObservation, ...]]:
+    """Build one canonical Task 12 SynthCity observation per declared value.
+
+    This narrow adapter accepts only canonical HPO identities; native report
+    rows cannot expand or rename this manifest.
+    """
+    expected = tuple(values)
+    if set(expected) != set(SYNTHCITY_TASK12_MANIFEST):
+        raise ValueError("Task 12 SynthCity values must contain exactly canonical HPO identities")
+    metadata = dict(provenance or {})
+    metadata.update({"fit_roles": list(fit_roles), "support": support, "bandwidth": bandwidth})
+    observations = tuple(
+        MetricObservation(
+            model_name=model_name,
+            framework="synthcity",
+            emitted_key=key,
+            raw_value=values[key],
+            role_hashes=dict(role_hashes or {}),
+            fit_roles=fit_roles,
+            support=support,
+            bandwidth=bandwidth,
+            provenance=metadata,
+            source_metadata=metadata,
+            result_metadata=metadata,
+        )
+        for key in SYNTHCITY_TASK12_MANIFEST
+    )
+    return model_name, observations
 
 
 def validate_synthcity_report(

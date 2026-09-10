@@ -639,6 +639,16 @@ def evaluate_privacy_gate(
         },
         index=combined.index,
     )
+    result.attrs["evidence_status"] = {
+        "thresholds_checked": checked_any,
+        "models": {
+            str(model): {
+                "status": result.loc[model, _STATUS_COL],
+                "violations": result.loc[model, _VIOLATIONS_COL],
+            }
+            for model in result.index
+        },
+    }
     for model in result.index[~result[_PASS_COL]]:
         logger.warning(
             "[privacy_gate] model %r FAILED the privacy gate: %s",

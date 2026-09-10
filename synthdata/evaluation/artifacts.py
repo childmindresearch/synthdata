@@ -23,6 +23,7 @@ from typing import Any
 import pandas as pd
 
 from synthdata.data import semantic_context_digest
+from synthdata.evaluation.catalog import CUSTOM_TASK12_MANIFEST, TASK12_EXPECTED_MANIFEST
 from synthdata.evaluation.metric_contracts import (
     CONTRACT_REGISTRY_VERSION,
     CONTRACT_SCHEMA_VERSION,
@@ -40,6 +41,7 @@ from synthdata.evaluation.metric_contracts import (
     MetricStatusRecord,
     MetricValidationResult,
     UnknownMetricContractError,
+    is_verified_task10_tstr,
 )
 from synthdata.evaluation.syntheval_eval import (
     _execution_payload_failed,
@@ -986,6 +988,11 @@ def _contract_registry_from_payload(
         "preprocessing_fit_role",
         "uncertainty_semantics",
         "sample_size_unit",
+        "normalization_method",
+        "required_support",
+        "release_transform_digest",
+        "seed",
+        "protocol_version",
     )
     for index, raw_contract in enumerate(contracts_payload):
         if not isinstance(raw_contract, Mapping):
@@ -1026,6 +1033,10 @@ def _contract_registry_from_payload(
             "preprocessing_fit_role",
             "uncertainty_semantics",
             "sample_size_unit",
+            "normalization_method",
+            "required_support",
+            "release_transform_digest",
+            "protocol_version",
         ):
             if raw_contract[field] is not None:
                 _non_empty_string(raw_contract[field], f"Metric contract {index} {field}")
@@ -1060,6 +1071,11 @@ def _contract_registry_from_payload(
                     preprocessing_fit_role=raw_contract["preprocessing_fit_role"],
                     uncertainty_semantics=raw_contract["uncertainty_semantics"],
                     sample_size_unit=raw_contract["sample_size_unit"],
+                    normalization_method=raw_contract["normalization_method"],
+                    required_support=raw_contract["required_support"],
+                    release_transform_digest=raw_contract["release_transform_digest"],
+                    seed=raw_contract["seed"],
+                    protocol_version=raw_contract["protocol_version"],
                 )
             )
         except (TypeError, ValueError) as exc:
@@ -1118,6 +1134,7 @@ def _metric_status_record_from_payload(
     framework: str,
     context: MetricEvaluationContext | None,
     registry: MetricContractRegistry | None,
+    allow_mixed_execution_pass: bool = False,
 ) -> MetricStatusRecord:
     if not isinstance(payload, Mapping):
         raise ValueError(f"{label} must be an object")
@@ -1207,6 +1224,12 @@ def _metric_status_record_from_payload(
         and source_metadata["result_metadata"] != result_metadata
     ):
         raise ValueError(f"{label}.result_metadata does not match source_metadata")
+    fit_roles = payload.get("fit_roles", ())
+    if not isinstance(fit_roles, list) or any(not isinstance(role, str) for role in fit_roles):
+        raise ValueError(f"{label}.fit_roles must be a list of strings")
+    provenance = payload.get("provenance", {})
+    if not isinstance(provenance, dict):
+        raise ValueError(f"{label}.provenance must be an object")
     for field in ("raw_value", "policy_value", "uncertainty"):
         _finite_or_none(payload[field], f"{label}.{field}")
     sample_size = payload["sample_size"]
@@ -1241,12 +1264,16 @@ def _metric_status_record_from_payload(
             error=error,
             source_metadata=source_metadata,
             result_metadata=result_metadata,
+            fit_roles=tuple(fit_roles),
+            support=payload.get("support"),
+            bandwidth=payload.get("bandwidth"),
+            provenance=provenance,
         )
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{label} is invalid: {exc}") from exc
 
     if context is not None:
-        if record.execution_pass != context.execution_pass:
+        if not allow_mixed_execution_pass and record.execution_pass != context.execution_pass:
             raise ValueError(f"{label}.execution_pass does not match its evaluation context")
         if record.population_unit != context.population_unit:
             raise ValueError(f"{label}.population_unit does not match its evaluation context")
@@ -1308,6 +1335,61 @@ def _metric_status_record_from_payload(
                     raise ValueError(f"{label} policy scalar succeeded without a policy value")
                 if contract.value_role == "diagnostic" and record.policy_value is not None:
                     raise ValueError(f"{label} diagnostic unexpectedly has a policy value")
+            for metadata_name, expected in (
+                ("protocol_version", contract.protocol_version),
+                ("seed", contract.seed),
+                ("release_transform_digest", contract.release_transform_digest),
+            ):
+                requires_observed = (
+                    record.status == "succeeded"
+                    and expected is not None
+                    and (metadata_name == "seed" or expected == "task12-evaluation-v1")
+                )
+                if requires_observed and (
+                    metadata_name not in record.provenance
+                    or record.provenance.get(metadata_name) != expected
+                ):
+                    raise ValueError(f"{label} {metadata_name} does not match its contract")
+            if contract.required_support is not None:
+                support = record.support
+                if isinstance(support, Mapping):
+                    support_contract = support.get("support_contract", support.get("contract"))
+                    if support_contract != contract.required_support:
+                        raise ValueError(f"{label} support does not match its contract")
+                    support_state = support.get("state", support.get("status"))
+                    if support_state in {
+                        "missing",
+                        "insufficient",
+                        "invalid",
+                        "blocked",
+                        "unsupported",
+                        "indeterminate",
+                    }:
+                        raise ValueError(f"{label} support is not valid")
+                    if record.status == "succeeded" and len(support) <= 1:
+                        raise ValueError(f"{label} support is empty or incomplete")
+                    if (
+                        record.status == "succeeded"
+                        and contract.required_support == "all_target_protected_cells"
+                    ):
+                        slices = support.get("slices")
+                        if not isinstance(slices, (list, tuple)) or not slices:
+                            raise ValueError(f"{label} equalized-odds support is incomplete")
+                        if any(
+                            not isinstance(cell, Mapping)
+                            or not {"protected_column", "target_class", "state"}.issubset(cell)
+                            or cell["state"] != "valid"
+                            for cell in slices
+                        ):
+                            raise ValueError(f"{label} equalized-odds support is incomplete")
+                    elif record.status == "succeeded" and not any(
+                        key not in {"support_contract", "contract", "state", "status"}
+                        for key in support
+                    ):
+                        raise ValueError(f"{label} support is incomplete")
+                elif support != contract.required_support:
+                    raise ValueError(f"{label} support does not match its contract")
+            _finite_or_none(record.bandwidth, f"{label}.bandwidth")
     return record
 
 
@@ -1318,6 +1400,7 @@ def _metric_validation_result_from_payload(
     model_name: str,
     framework: str,
     registry: MetricContractRegistry | None,
+    allow_mixed_execution_pass: bool = False,
 ) -> MetricValidationResult:
     if not isinstance(payload, Mapping):
         raise ValueError(f"{label} must be an object")
@@ -1368,6 +1451,7 @@ def _metric_validation_result_from_payload(
             framework=framework,
             context=context,
             registry=registry,
+            allow_mixed_execution_pass=allow_mixed_execution_pass,
         )
         for index, record in enumerate(record_payloads)
     )
@@ -2237,6 +2321,7 @@ def persist_evaluation_artifacts(
             "files": native_files,
         },
         "source_provenance": dict(source_provenance or {}),
+        "task12_metric_manifest": list(TASK12_EXPECTED_MANIFEST),
     }
     if role_context is not None:
         manifest["role_context"] = dict(role_context)
@@ -2431,6 +2516,12 @@ def validate_evaluation_bundle(
     from synthdata.evaluation.combine import load_combined_table
 
     combined = load_combined_table(combined_path, validate_artifact=False)
+
+    recorded_task12 = manifest.get("task12_metric_manifest")
+    if tuple(recorded_task12 or ()) != TASK12_EXPECTED_MANIFEST:
+        raise ValueError(
+            "Evaluation bundle Task 12 metric manifest must exactly match canonical identities"
+        )
 
     if expected_semantic_context_fingerprint is not None:
         recorded_semantic_fingerprint = manifest.get("semantic_context_fingerprint")
@@ -2874,6 +2965,86 @@ def _validate_final_holdout_evidence_payload(
                     label=f"Final-holdout custom model {model_name!r}",
                     execution_pass="main",
                 )
+        task12_validation = custom.get("task12_validation")
+        if state != "blocked" and not isinstance(task12_validation, Mapping):
+            raise ValueError("Non-blocked final-holdout evidence requires Task 12 validation")
+        if isinstance(task12_validation, Mapping):
+            for model_name, result_payload in task12_validation.items():
+                result = _metric_validation_result_from_payload(
+                    result_payload,
+                    label=f"Final-holdout Task 12 model {model_name!r}",
+                    model_name=model_name,
+                    framework="custom",
+                    registry=registry,
+                    allow_mixed_execution_pass=True,
+                )
+                if result.evaluation_context is None:
+                    raise ValueError(
+                        f"Final-holdout Task 12 model {model_name!r} must carry evaluation context"
+                    )
+                context = result.evaluation_context
+                if context.evaluation_role != "final_holdout":
+                    raise ValueError(
+                        f"Final-holdout Task 12 model {model_name!r} has the wrong evaluation role"
+                    )
+                expected_keys = tuple(CUSTOM_TASK12_MANIFEST)
+                observed_keys = tuple(
+                    record.expected_key
+                    for record in sorted(
+                        result.expected_records,
+                        key=lambda record: expected_keys.index(record.expected_key),
+                    )
+                )
+                if observed_keys != expected_keys:
+                    raise ValueError(
+                        f"Final-holdout Task 12 model {model_name!r} must contain canonical identities"
+                    )
+                if any(
+                    record.execution_pass
+                    != (
+                        "final_audit"
+                        if record.expected_key == "equalized_odds.final.v1"
+                        else "main"
+                    )
+                    for record in result.expected_records
+                ):
+                    raise ValueError(
+                        f"Final-holdout Task 12 model {model_name!r} has an invalid execution pass"
+                    )
+                recorded_hashes = payload.get("role_hashes", {}).get("custom_raw_evaluation", {})
+                if isinstance(recorded_hashes, Mapping) and dict(context.role_hashes) != dict(
+                    recorded_hashes
+                ):
+                    raise ValueError(
+                        f"Final-holdout Task 12 model {model_name!r} role hashes do not match evidence"
+                    )
+                for record in result.expected_records:
+                    if record.status == "succeeded":
+                        if record.fit_roles != ("train", "tuning"):
+                            raise ValueError(
+                                f"Final-holdout Task 12 {record.expected_key} has invalid fit_roles"
+                            )
+                        if not isinstance(record.support, Mapping):
+                            raise ValueError(
+                                f"Final-holdout Task 12 {record.expected_key} is missing support"
+                            )
+                        metadata = {
+                            **dict(record.source_metadata),
+                            **dict(record.result_metadata),
+                            **dict(record.provenance),
+                        }
+                        if metadata.get("protocol_version") != "task12-evaluation-v1":
+                            raise ValueError(
+                                f"Final-holdout Task 12 {record.expected_key} has invalid protocol_version"
+                            )
+                        if metadata.get("release_transform_digest") is None:
+                            raise ValueError(
+                                f"Final-holdout Task 12 {record.expected_key} is missing release transform digest"
+                            )
+                if state == "succeeded" and not result.complete:
+                    raise ValueError(
+                        "Succeeded final-holdout evidence has incomplete Task 12 validation"
+                    )
 
     syntheval = frameworks.get("syntheval")
     if isinstance(syntheval, Mapping):
@@ -2892,6 +3063,30 @@ def _validate_final_holdout_evidence_payload(
                         f"Final-holdout SynthEval pass {pass_identity!r} must map models to results"
                     )
                 for model_name, result_payload in model_results.items():
+                    if pass_identity == "syntheval:main":
+                        records = result_payload.get("records", [])
+                        for record in records:
+                            if record.get("expected_key") != "tstr_macro_f1.v1":
+                                continue
+                            verification_payload = {
+                                "result_metadata": {
+                                    **dict(record.get("source_metadata") or {}),
+                                    **dict(record.get("result_metadata") or {}),
+                                    **dict(record.get("provenance") or {}),
+                                }
+                            }
+                            metadata = verification_payload["result_metadata"]
+                            if isinstance(metadata.get("prediction_artifact"), Mapping):
+                                verification_payload["prediction_artifact"] = metadata[
+                                    "prediction_artifact"
+                                ]
+                            if record.get("status") == "succeeded" and not is_verified_task10_tstr(
+                                verification_payload
+                            ):
+                                raise ValueError(
+                                    f"Final-holdout SynthEval model {model_name!r} has an "
+                                    "unverified Task 10 TSTR artifact"
+                                )
                     validate_result(
                         result_payload,
                         model_name=model_name,

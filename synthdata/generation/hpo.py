@@ -30,7 +30,7 @@ import pandas as pd
 
 from synthdata.config import HPOConfig
 from synthdata.data import dataframe_fingerprint
-from synthdata.evaluation.catalog import emitted_keys_for_synthcity_metrics
+from synthdata.evaluation.catalog import TASK12_HPO_ALLOWLIST
 from synthdata.evaluation.metric_contracts import (
     DEFAULT_METRIC_CONTRACT_REGISTRY,
     MetricContractError,
@@ -883,14 +883,135 @@ def prepare_stage_a_screen(
     persist_stage_a_contract(Path(root) / study_name, contract)
 
 
-HPO_OBJECTIVE_METRICS = frozenset(
-    {
-        "sanity.nearest_syn_neighbor_distance",
-        "stats.wasserstein_dist",
-        "stats.inv_kl_divergence",
-        "performance.xgb",
-    }
-)
+HPO_OBJECTIVE_METRICS = frozenset(TASK12_HPO_ALLOWLIST)
+
+
+def _canonical_metric_framework(metric_key: str) -> str:
+    """Return owning framework for one approved HPO identity."""
+    if metric_key == "tstr_macro_f1.v1":
+        return "syntheval"
+    if metric_key in {"elastic_net_jsd.v1", "mixed_mmd.v1"}:
+        return "synthcity"
+    raise ValueError(f"Unsupported canonical HPO objective {metric_key!r}")
+
+
+def evaluate_canonical_hpo_metrics(
+    train_df: pd.DataFrame,
+    tuning_df: pd.DataFrame,
+    synthetic_df: pd.DataFrame,
+    *,
+    metric_config: Mapping[str, Sequence[str]],
+    target_column: str,
+    feature_types: Mapping[str, str] | None = None,
+    sensitive_features: Sequence[str] = (),
+    seed: int = 0,
+) -> pd.DataFrame:
+    """Evaluate approved HPO identities without native metric aliases.
+
+    Every row carries its producer, fit roles, and support/bandwidth
+    provenance. Unsupported release semantics are represented as an explicit
+    failed row rather than being replaced by a row-level approximation.
+    """
+    validate_hpo_metric_config(dict(metric_config))
+    keys = [str(key) for values in metric_config.values() for key in values]
+    rows: dict[str, dict[str, Any]] = {}
+    train_loader: Any = None
+    tuning_loader: Any = None
+    synthetic_loader: Any = None
+
+    for key in keys:
+        framework = _canonical_metric_framework(key)
+        metadata: dict[str, Any] = {
+            "producer": key,
+            "framework": framework,
+            "fit_roles": ["train"],
+            "evaluation_role": "tuning",
+            "provenance": {"fit_roles": ["train"], "evaluation_role": "tuning"},
+        }
+        try:
+            if key == "elastic_net_jsd.v1":
+                from synthcity.metrics.eval_statistical import FrozenSupportJSD
+                from synthcity.plugins.core.dataloader import GenericDataLoader
+
+                if train_loader is None:
+                    train_loader = GenericDataLoader(train_df)
+                    tuning_loader = GenericDataLoader(tuning_df)
+                    synthetic_loader = GenericDataLoader(synthetic_df)
+                evaluator = FrozenSupportJSD(
+                    feature_types=dict(feature_types or {}),
+                )
+                result = evaluator.evaluate_frozen_support(
+                    train_loader, tuning_loader, synthetic_loader
+                )
+                value = result["candidate"]
+                metadata.update(
+                    {
+                        "support": result["metadata"]["candidate"],
+                        "fit_roles": ["train"],
+                        "provenance": {
+                            "fit_roles": ["train"],
+                            "support_fit_roles": ["train"],
+                        },
+                    }
+                )
+            elif key == "mixed_mmd.v1":
+                from syntheval.metrics.utility.metric_max_mean_discrepancy import (
+                    mixed_rbf_mmd_v2,
+                )
+
+                continuous = [
+                    column for column, kind in (feature_types or {}).items() if kind == "continuous"
+                ]
+                ordinal = [
+                    column for column, kind in (feature_types or {}).items() if kind == "ordinal"
+                ]
+                nominal = [
+                    column
+                    for column, kind in (feature_types or {}).items()
+                    if kind == "categorical"
+                ]
+                result = mixed_rbf_mmd_v2(
+                    train_df,
+                    synthetic_df,
+                    continuous_columns=continuous,
+                    ordinal_columns=ordinal,
+                    nominal_columns=nominal,
+                )
+                value = result["b_mmd_clip"]
+                metadata.update(
+                    {
+                        "bandwidth": result["bandwidth"],
+                        "fit_roles": ["train"],
+                        "provenance": {
+                            "fit_roles": ["train"],
+                            "bandwidth_fit_roles": ["train"],
+                        },
+                    }
+                )
+            else:
+                # TSTR requires a verified release-form candidate. Never pass
+                # an ordinary HPO candidate through as a synthetic release.
+                raise ValueError(
+                    "tstr_macro_f1.v1 requires a verified release-form candidate; "
+                    "ordinary HPO candidates cannot use row-level fallback semantics"
+                )
+            rows[key] = {
+                "mean": float(value),
+                "direction": "maximize" if key == "tstr_macro_f1.v1" else "minimize",
+                **metadata,
+            }
+        except (ImportError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+            rows[key] = {
+                "mean": float("nan"),
+                "direction": "maximize" if key == "tstr_macro_f1.v1" else "minimize",
+                "errors": 1,
+                "error_messages": str(exc),
+                **metadata,
+            }
+    report = pd.DataFrame.from_dict(rows, orient="index")
+    report.attrs["canonical_hpo"] = True
+    report.attrs["canonical_hpo_keys"] = tuple(keys)
+    return report
 
 
 def validate_hpo_metric_config(
@@ -917,32 +1038,34 @@ def validate_hpo_metric_config(
     configured_keys = []
     for category, metric_names in metric_config.items():
         if not isinstance(metric_names, (list, tuple)):
-            raise ValueError(f"HPO metric_config[{category!r}] must be a list of metric names")
-        for metric_name in metric_names:
-            emitted_key = f"{category}.{metric_name}"
-            configured_keys.append(emitted_key)
-            try:
-                contract = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
-                    framework="synthcity", emitted_key=emitted_key
-                )
-            except MetricContractError as exc:
-                invalid.append(f"{emitted_key}: {exc}")
-                continue
-            if (
-                emitted_key not in HPO_OBJECTIVE_METRICS
-                or contract.lifecycle_state != "operational"
-                or contract.value_role != "policy_scalar"
-                or "hpo_objective" not in contract.allowed_uses
-            ):
-                invalid.append(
-                    f"{emitted_key}: state={contract.lifecycle_state}, "
-                    f"role={contract.value_role}, allowed={sorted(contract.allowed_uses)}"
-                )
-            elif group_mode == "patient_group" and contract.group_safety != "group_safe":
-                invalid.append(
-                    f"{emitted_key}: group_safety={contract.group_safety}; "
-                    "patient_group HPO requires group-safe metrics"
-                )
+            raise ValueError(
+                f"HPO metric_config[{category!r}] must be a list of canonical metric identities"
+            )
+        configured_keys.extend(str(metric_name) for metric_name in metric_names)
+
+    for emitted_key in configured_keys:
+        if emitted_key not in HPO_OBJECTIVE_METRICS:
+            invalid.append(f"{emitted_key}: not in canonical HPO allowlist")
+            continue
+        framework = "syntheval" if emitted_key == "tstr_macro_f1.v1" else "synthcity"
+        try:
+            contract = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
+                framework=framework, emitted_key=emitted_key
+            )
+        except MetricContractError as exc:
+            invalid.append(f"{emitted_key}: {exc}")
+            continue
+        if (
+            contract.lifecycle_state != "operational"
+            or "hpo_objective" not in contract.allowed_uses
+        ):
+            invalid.append(
+                f"{emitted_key}: state={contract.lifecycle_state}, allowed={sorted(contract.allowed_uses)}"
+            )
+        elif group_mode == "patient_group" and contract.group_safety != "group_safe":
+            invalid.append(
+                f"{emitted_key}: group_safety={contract.group_safety}; patient_group HPO requires group-safe metrics"
+            )
 
     if len(configured_keys) != len(set(configured_keys)):
         raise ValueError("HPO metric_config must not select duplicate metric keys")
@@ -993,11 +1116,11 @@ def build_hpo_context(
         "registry_digest": registry_digest or DEFAULT_METRIC_CONTRACT_REGISTRY.digest(),
         "stage_a_contract_digest": stage_a_contract_digest,
         "metric_config": resolved_metric_config,
-        "expected_emitted_keys": emitted_keys_for_synthcity_metrics(
-            resolved_metric_config,
-            variable_columns=variable_columns,
-            attack_target_types=attack_target_types,
-        ),
+        "expected_emitted_keys": [
+            str(metric_name)
+            for metric_names in resolved_metric_config.values()
+            for metric_name in metric_names
+        ],
         "group_context": dict(group_context) if group_context is not None else None,
         "role_context_fingerprint": role_context_fingerprint,
         "role_context": dict(role_context),
@@ -1038,6 +1161,21 @@ def hpo_score(
     if "mean" not in report_df.columns or "direction" not in report_df.columns:
         raise ValueError("HPO evaluation must emit mean and direction columns")
 
+    canonical_keys = set(report_df.attrs.get("canonical_hpo_keys", ()))
+    if not canonical_keys and expected_keys is not None:
+        canonical_keys = set(expected_keys) & HPO_OBJECTIVE_METRICS
+    if not canonical_keys and report_df.attrs.get("canonical_hpo") is True:
+        canonical_keys = set(HPO_OBJECTIVE_METRICS)
+    observed_canonical = {str(key) for key in report_df.index} & canonical_keys
+    if report_df.attrs.get("canonical_hpo") is True and (
+        not canonical_keys or observed_canonical != canonical_keys
+    ):
+        raise ValueError(
+            "HPO evaluation is not decision-eligible: incomplete metric set; "
+            "canonical utility objective requires the complete metric set: "
+            f"missing={sorted(canonical_keys - observed_canonical)}"
+        )
+
     if expected_keys is not None:
         required_keys = tuple(expected_keys)
         if len(required_keys) != len(set(required_keys)):
@@ -1065,8 +1203,9 @@ def hpo_score(
     for emitted_key, row in report_df.iterrows():
         emitted_key = str(emitted_key)
         try:
+            framework = "syntheval" if emitted_key == "tstr_macro_f1.v1" else "synthcity"
             contract = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
-                framework="synthcity", emitted_key=emitted_key
+                framework=framework, emitted_key=emitted_key
             )
         except MetricContractError as exc:
             invalid.append(f"{emitted_key}: {exc}")
@@ -1144,18 +1283,25 @@ def build_synthetic_eval_fn(
     semantic_context: Mapping[str, Any] | None = None,
     expected_emitted_keys: Sequence[str] | None = None,
 ) -> Callable[[pd.DataFrame], float]:
-    """Build a ``syn_df -> score`` function via synthcity's Metrics.evaluate.
+    """Build a ``syn_df -> score`` function for one HPO candidate.
 
     ``train_reference_df`` is the fit role and ``holdout_df`` is the tuning
     role. Builds a second independent synthetic draw (bootstrap resample) for
     DomiasMIA's reference set, and an augmented fit-role+synthetic set for
     augmentation metrics. No evaluator-internal split is used.
+
+    Canonical Task 12 identities are evaluated by their canonical producers;
+    they must never be translated to native SynthCity aliases.
     """
     validate_hpo_metric_config(metric_config, group_context=group_context)
     expected_keys = (
         list(expected_emitted_keys)
         if expected_emitted_keys is not None
-        else emitted_keys_for_synthcity_metrics(metric_config)
+        else [
+            str(metric_name)
+            for metric_names in metric_config.values()
+            for metric_name in metric_names
+        ]
     )
     if len(expected_keys) != len(set(expected_keys)):
         raise ValueError("HPO expected emitted metric keys must be unique")
@@ -1166,6 +1312,31 @@ def build_synthetic_eval_fn(
         raise ValueError(
             "Patient-group HPO objectives require group IDs for both train and tuning loaders"
         )
+
+    canonical_keys = {
+        "elastic_net_jsd.v1",
+        "mixed_mmd.v1",
+        "tstr_macro_f1.v1",
+    }
+    configured_keys = {
+        str(metric_name) for metric_names in metric_config.values() for metric_name in metric_names
+    }
+    if configured_keys.issubset(canonical_keys):
+
+        def canonical_eval_fn(syn_df: pd.DataFrame) -> float:
+            report = evaluate_canonical_hpo_metrics(
+                train_reference_df,
+                holdout_df,
+                syn_df,
+                metric_config=metric_config,
+                target_column=target_column,
+                feature_types=feature_types,
+                sensitive_features=sensitive_features,
+                seed=seed,
+            )
+            return hpo_score(report, expected_keys=expected_keys)
+
+        return canonical_eval_fn
 
     from synthcity.metrics import Metrics
     from synthcity.plugins.core.dataloader import GenericDataLoader

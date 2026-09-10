@@ -700,6 +700,55 @@ def test_contract_and_status_sidecars_round_trip(tmp_path):
     }
 
 
+def test_metric_status_artifact_round_trips_provenance_fields(tmp_path):
+    evaluation_dir = tmp_path / "evaluation"
+    evaluation_dir.mkdir()
+    _combined().to_csv(evaluation_dir / "combined_evaluation.csv")
+    contract = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
+        framework="synthcity", emitted_key="mixed_mmd.v1"
+    )
+    context = MetricEvaluationContext(role_hashes={"train": "train-hash", "tuning": "tuning-hash"})
+    validation = resolve_metric_observations(
+        registry=DEFAULT_METRIC_CONTRACT_REGISTRY,
+        model_name="model_a",
+        framework="synthcity",
+        expected_keys=["mixed_mmd.v1"],
+        observations=[
+            MetricObservation(
+                "model_a",
+                "synthcity",
+                "mixed_mmd.v1",
+                0.2,
+                direction=contract.direction,
+                role_hashes=dict(context.role_hashes),
+                fit_roles=("train",),
+                support={"support_contract": contract.required_support},
+                bandwidth=1.5,
+                provenance={
+                    "protocol_version": contract.protocol_version,
+                    "seed": contract.seed,
+                    "release_transform_digest": contract.release_transform_digest,
+                },
+            )
+        ],
+        context=context,
+        requested_use="hpo_objective",
+    )
+    persist_evaluation_artifacts(
+        evaluation_dir,
+        _combined(),
+        {},
+        native_syntheval_plot_dir=None,
+        synthcity_validation_results={"model_a": validation},
+        metric_contract_manifest=DEFAULT_METRIC_CONTRACT_REGISTRY.manifest(),
+    )
+    record = load_synthcity_metric_status(evaluation_dir)["models"]["model_a"]["records"][0]
+    assert record["fit_roles"] == ["train"]
+    assert record["support"] == {"support_contract": contract.required_support}
+    assert record["bandwidth"] == 1.5
+    assert record["provenance"]["protocol_version"] == contract.protocol_version
+
+
 def test_semantic_context_round_trips_and_tampering_is_rejected(tmp_path):
     evaluation_dir = tmp_path / "evaluation"
     evaluation_dir.mkdir()

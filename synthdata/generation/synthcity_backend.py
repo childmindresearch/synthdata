@@ -18,6 +18,7 @@ from synthdata.evaluation.catalog import emitted_keys_for_synthcity_metrics
 from synthdata.generation.hpo import (
     HPO_GENERATOR_METADATA_SCHEMA_VERSION,
     StageAScreenContract,
+    evaluate_canonical_hpo_metrics,
     hpo_score,
     persist_stage_a_trial_exception,
     prepare_stage_a_screen,
@@ -470,6 +471,10 @@ def build_synthcity_objective(
     study_name: str | None = None,
     group_context: dict | None = None,
     expected_emitted_keys: list[str] | None = None,
+    train_df: pd.DataFrame | None = None,
+    tuning_df: pd.DataFrame | None = None,
+    target_column: str | None = None,
+    feature_types: dict[str, str] | None = None,
 ):
     """Build an Optuna objective for a synthcity plugin's native hyperparameter space.
 
@@ -481,6 +486,14 @@ def build_synthcity_objective(
     call.
     """
     validate_hpo_metric_config(hpo_cfg.metric_config, group_context=group_context)
+    configured_keys = {
+        str(metric_name)
+        for metric_names in hpo_cfg.metric_config.values()
+        for metric_name in metric_names
+    }
+    canonical = configured_keys.issubset({"elastic_net_jsd.v1", "mixed_mmd.v1", "tstr_macro_f1.v1"})
+    if canonical and (train_df is None or tuning_df is None or target_column is None):
+        raise ValueError("Canonical SynthCity HPO requires train_df, tuning_df, and target_column")
     expected_keys = (
         list(expected_emitted_keys)
         if expected_emitted_keys is not None
@@ -506,8 +519,6 @@ def build_synthcity_objective(
             )
 
     from pathlib import Path
-
-    from synthcity.benchmark import Benchmarks
 
     plugin_cls = get_plugin_class(name)
     base_name = name.removesuffix("_hpo")
@@ -585,40 +596,66 @@ def build_synthcity_objective(
                 )
 
         try:
-            evaluate_kwargs = {
-                "X_test": tuning_loader,
-                "repeats": 1,
-                "metrics": hpo_cfg.metric_config,
-                "task_type": task_type,
-                "group_mode": group_mode,
-                "classification_score": classification_score,
-                "semantic_context": semantic_context,
-                "workspace": workspace_path,
-                "fit_on_X": True,
-            }
-            if synthetic_size is not None:
-                evaluate_kwargs["synthetic_size"] = synthetic_size
-            if candidate_screen is not None:
-                evaluate_kwargs["candidate_screen"] = candidate_screen
             set_trial_attr(
                 trial, "semantic_context", dict(semantic_context)
             ) if semantic_context is not None else None
             set_trial_attr(
                 trial, "semantic_context_digest", semantic_digest
             ) if semantic_digest is not None else None
-            report = Benchmarks.evaluate(
-                [(trial_id, name, params)], train_loader, **evaluate_kwargs
-            )
-            if not isinstance(report, dict):
-                raise TypeError(
-                    f"SynthCity benchmark returned {type(report).__name__}; expected a testcase mapping"
+            if canonical:
+                candidate_df, generator_metadata = fit_generate(
+                    name,
+                    params,
+                    train_loader,
+                    synthetic_size or len(train_loader),
+                    seed,
+                    workspace=workspace_path,
+                    device=trial_device,
                 )
-            if trial_id not in report:
-                raise RuntimeError(
-                    f"SynthCity benchmark did not return report for {trial_id!r}; "
-                    f"returned testcases={list(report)!r}"
+                if candidate_screen is not None:
+                    candidate_screen(candidate_df)
+                metric_report = evaluate_canonical_hpo_metrics(
+                    train_df,
+                    tuning_df,
+                    candidate_df,
+                    metric_config=hpo_cfg.metric_config,
+                    target_column=target_column,
+                    feature_types=feature_types,
+                    sensitive_features=(),
+                    seed=seed,
                 )
-            metric_report = report[trial_id]
+                metric_report.attrs["metric_metadata"] = {
+                    "producer": "synthdata.generation.hpo.evaluate_canonical_hpo_metrics",
+                    "fit_roles": ["train"],
+                    "evaluation_role": "tuning",
+                    "candidate_train_only": True,
+                }
+            else:
+                from synthcity.benchmark import Benchmarks
+
+                evaluate_kwargs = {
+                    "X_test": tuning_loader,
+                    "repeats": 1,
+                    "metrics": hpo_cfg.metric_config,
+                    "task_type": task_type,
+                    "group_mode": group_mode,
+                    "classification_score": classification_score,
+                    "semantic_context": semantic_context,
+                    "workspace": workspace_path,
+                    "fit_on_X": True,
+                }
+                if synthetic_size is not None:
+                    evaluate_kwargs["synthetic_size"] = synthetic_size
+                if candidate_screen is not None:
+                    evaluate_kwargs["candidate_screen"] = candidate_screen
+                report = Benchmarks.evaluate(
+                    [(trial_id, name, params)], train_loader, **evaluate_kwargs
+                )
+                if not isinstance(report, dict) or trial_id not in report:
+                    raise RuntimeError(
+                        f"SynthCity benchmark did not return report for {trial_id!r}"
+                    )
+                metric_report = report[trial_id]
             group_safety = getattr(metric_report, "attrs", {}).get("group_safety")
             if isinstance(group_safety, Mapping) and group_safety.get("status") == "group_unsafe":
                 reason = str(
@@ -645,13 +682,10 @@ def build_synthcity_objective(
             if metric_metadata:
                 set_trial_attr(trial, "metric_metadata", metric_metadata)
                 set_trial_attr(trial, "result_metadata", metric_metadata)
-            generator_metadata = build_hpo_generator_metadata(
-                base_name,
-                params,
-                synthetic_size,
-                seed,
-                metric_metadata,
-            )
+            if not canonical:
+                generator_metadata = build_hpo_generator_metadata(
+                    base_name, params, synthetic_size, seed, metric_metadata
+                )
             set_trial_attr(trial, "generator_metadata", generator_metadata)
             set_trial_attr(trial, "generator_metadata_state", "present")
             return hpo_score(metric_report, expected_keys=expected_keys)

@@ -431,6 +431,77 @@ class TestMergeBinaryTargetResults:
 
 
 class TestSynthEvalMetricValidation:
+    def test_native_cls_acc_cannot_satisfy_canonical_tstr(self):
+        results = pd.DataFrame(index=["model_a"])
+        results[("avg_macro_F1_diff_v2", "value")] = [0.2]
+        results.columns = pd.MultiIndex.from_tuples(results.columns)
+        ranks = pd.DataFrame({"avg_macro_F1_diff_v2": [0.8]}, index=["model_a"])
+
+        validations = validate_syntheval_results(
+            results,
+            ranks,
+            {"syntheval": ["tstr_macro_f1.v1"], "custom": []},
+            role_hashes={"train": "train-hash", "tuning": "tuning-hash"},
+            model_names=["model_a"],
+            requested_use="hpo_objective",
+        )
+
+        validation = validations[("syntheval", "main")]["model_a"]
+        assert validation.expected_records[0].status == "blocked"
+        assert validation.expected_records[0].lifecycle_state == "operational"
+
+    def test_canonical_tstr_requires_task10_producer_metadata(self):
+        executions = {
+            "model_a": {
+                "pass_id": "main",
+                "target_view": "native",
+                "metric_executions": [
+                    {
+                        "method": "tstr",
+                        "status": {"state": "succeeded", "failed_keys": []},
+                        "normalized_rows_v2": [
+                            {
+                                "metric": "macro_f1",
+                                "val": 0.8,
+                                "n_val": 0.8,
+                                "metadata": {"producer": "unrelated"},
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+        observations = _structured_observations(
+            executions, role_hashes={"train": "train-hash", "tuning": "tuning-hash"}
+        )["model_a"]
+        assert all(item.emitted_key != "tstr_macro_f1.v1" for item in observations)
+
+    def test_pre_labeled_canonical_tstr_row_is_not_trusted(self):
+        observations = _structured_observations(
+            {
+                "model_a": {
+                    "pass_id": "main",
+                    "target_view": "native",
+                    "metric_executions": [
+                        {
+                            "method": "tstr",
+                            "status": {"state": "succeeded", "failed_keys": []},
+                            "normalized_rows_v2": [
+                                {
+                                    "metric": "tstr_macro_f1.v1",
+                                    "val": 0.8,
+                                    "n_val": 0.8,
+                                    "result_metadata": {"producer": "task10_tstr"},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+            role_hashes={"train": "train-hash", "tuning": "tuning-hash"},
+        )["model_a"]
+        assert all(item.emitted_key != "tstr_macro_f1.v1" for item in observations)
+
     def test_failed_execution_payload_retain_expected_keys_as_failure_evidence(self):
         payload = _failed_execution_payload(
             model_name="model_a",

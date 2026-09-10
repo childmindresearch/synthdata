@@ -1,11 +1,14 @@
 """Focused orchestration tests for contract-aware evaluation outputs."""
 
+import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
+from synthdata.data import dataframe_fingerprint
 from synthdata.evaluation import (
     _generation_metadata,
     _select_policy_model,
@@ -16,7 +19,10 @@ from synthdata.evaluation import (
     run_evaluation,
     synthcity_eval,
     syntheval_eval,
+    task12_eval,
 )
+from synthdata.evaluation import tstr as tstr_module
+from synthdata.evaluation.release import transform_release_roles
 from synthdata.generation import pipeline as generation_pipeline
 
 pytestmark = pytest.mark.unit
@@ -59,11 +65,18 @@ def _fake_refit_metadata(synthetic, output_dir):
     }
 
 
+def _fake_refit_metadata_with_hash(synthetic, output_dir, refit_hash):
+    refit_frame, metadata = _fake_refit_metadata(synthetic, output_dir)
+    metadata["fit_frame_fingerprint"] = refit_hash
+    metadata["fit_frame_fingerprints"] = {"raw": refit_hash, "imputed": refit_hash}
+    return refit_frame, metadata
+
+
 def test_run_evaluation_validates_ranks_and_persists_status(
     make_config, make_canonical_dataset, monkeypatch
 ):
     cfg = make_config()
-    cfg.evaluation.syntheval.enabled = False
+    cfg.evaluation.syntheval.enabled = True
     cfg.evaluation.custom.enabled = False
     cfg.evaluation.save_per_model_syntheval_plots = False
     cfg.evaluation.generate_report = False
@@ -162,7 +175,7 @@ def test_run_evaluation_persists_generator_metadata_sidecars(
 ):
     cfg = make_config()
     cfg.evaluation.syntheval.enabled = False
-    cfg.evaluation.custom.enabled = False
+    cfg.evaluation.custom.enabled = True
     cfg.evaluation.save_per_model_syntheval_plots = False
     cfg.evaluation.generate_report = False
     cfg.evaluation.privacy_gate.enabled = False
@@ -311,7 +324,7 @@ def test_run_evaluation_propagates_patient_group_context(
     cfg = make_config()
     cfg.evaluation.group_mode = "patient_group"
     cfg.evaluation.group_column = "group"
-    cfg.evaluation.syntheval.enabled = False
+    cfg.evaluation.syntheval.enabled = True
     cfg.evaluation.custom.enabled = False
     cfg.evaluation.save_per_model_syntheval_plots = False
     cfg.evaluation.generate_report = False
@@ -377,7 +390,7 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
 ):
     cfg = make_config()
     cfg.evaluation.synthcity.metrics = ["identifiability_score"]
-    cfg.evaluation.syntheval.enabled = False
+    cfg.evaluation.syntheval.enabled = True
     cfg.evaluation.custom.enabled = False
     cfg.evaluation.binary_target.enabled = False
     cfg.evaluation.save_per_model_syntheval_plots = False
@@ -441,7 +454,7 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     pd.testing.assert_frame_equal(syntheval_fit_frames[1], expected_real_fit)
     assert "final_holdout_evidence" in extras
     evidence = artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)
-    assert evidence["state"] == "succeeded"
+    assert evidence["state"] == "failed"
     assert evidence["selected_model"] == "model_a"
     assert evidence["role_context"]["roles"].keys() == {
         "train",
@@ -456,6 +469,209 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     assert final_configuration["fit_frame_fingerprint"] != "refit-imputed"
     assert final_configuration["refit_fit_frame_fingerprint"] == "refit-imputed"
     assert list(combined.index) == ["model_a"]
+
+
+def test_run_evaluation_succeeds_with_authoritative_final_task10_evidence(
+    make_config, make_canonical_dataset, monkeypatch
+):
+    cfg = make_config()
+    cfg.evaluation.synthcity.metrics = ["identifiability_score"]
+    cfg.evaluation.syntheval.enabled = False
+    cfg.evaluation.custom.enabled = True
+    cfg.evaluation.binary_target.enabled = False
+    cfg.evaluation.save_per_model_syntheval_plots = False
+    cfg.evaluation.generate_report = False
+    cfg.evaluation.privacy_gate.enabled = False
+
+    dataset = make_canonical_dataset()
+    synthetic = dataset.role_frame("train", imputed=True).copy()
+    final_role_hashes = {
+        role: dataframe_fingerprint(dataset.role_frame(role, imputed=False))
+        for role in ("train", "tuning", "final_holdout")
+    }
+    refit_hash = hashlib.sha256(b"refit-raw").hexdigest()
+    final_role_hashes["refit_fit"] = refit_hash
+    synthcity_report = pd.DataFrame(
+        {"mean": [0.25] * 4, "direction": ["minimize"] * 4},
+        index=[
+            "privacy.identifiability_score.score",
+            "privacy.identifiability_score.score_OC",
+            "privacy.identifiability_score.score_entropy_weighted",
+            "privacy.identifiability_score.score_OC_entropy_weighted",
+        ],
+    )
+
+    monkeypatch.setattr(
+        synthcity_eval,
+        "run_synthcity_evaluation",
+        lambda *args, **kwargs: {"model_a": synthcity_report},
+    )
+    monkeypatch.setattr(
+        custom_eval,
+        "run_log_disparity_evaluation",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        generation_pipeline,
+        "refit_selected_model",
+        lambda *args, **kwargs: _fake_refit_metadata_with_hash(
+            synthetic, kwargs["output_dir"], refit_hash
+        ),
+    )
+    monkeypatch.setattr(
+        "synthdata.evaluation._select_policy_model", lambda _combined: ("model_a", None)
+    )
+
+    tstr_calls = []
+    real_run_tstr = tstr_module.run_tstr_evaluation
+
+    def run_authoritative_task10(*args, **kwargs):
+        tstr_calls.append(kwargs["evaluation_role"])
+        result = real_run_tstr(*args, **kwargs)
+        metadata = result.report["result_metadata"]
+        metadata["role_hashes"] = final_role_hashes
+        result.report["prediction_artifact"]["role_hashes"] = final_role_hashes
+        result.report["prediction_artifact"]["artifact_digest"] = tstr_module._artifact_digest(
+            result.report["prediction_artifact"]
+        )
+        result.envelope["result_metadata"] = metadata
+        result.envelope["report"] = result.report
+        return result
+
+    monkeypatch.setattr("synthdata.evaluation.run_tstr_evaluation", run_authoritative_task10)
+
+    def valid_release(*args, **kwargs):
+        synthetic_release, reference = args[:2]
+        provenance = synthetic_release.attrs["release_provenance"]
+        return {
+            "status": "succeeded",
+            "value": 0.0,
+            "producer": "task12_release_privacy",
+            "protocol_version": "task12-evaluation-v1",
+            "seed": kwargs["seed"],
+            "release_transform_digest": provenance["release_transform_digest"],
+            "common_protocol_digest": provenance["common_protocol_digest"],
+            "role_hashes": final_role_hashes,
+            "fit_roles": ["train", "tuning"],
+            "support": {
+                "state": "valid",
+                "support_contract": "declared_support_v1",
+                "roles": {
+                    "synthetic": {
+                        "population": 12,
+                        "population_floor": 1,
+                        "role_hash": final_role_hashes["refit_fit"],
+                    },
+                    "reference": {
+                        "population": 6,
+                        "population_floor": 1,
+                        "role_hash": final_role_hashes["final_holdout"],
+                    },
+                },
+                "role_population_floor": 1,
+            },
+            "population_identity": {"synthetic": "synthetic", "final_holdout": "holdout"},
+        }
+
+    def valid_representation(*args, **kwargs):
+        if kwargs.get("evaluation_role") != "final_holdout" or args[3].categories != []:
+            return {}
+        released, _roles, _metadata = transform_release_roles(
+            args[0]["model_a"],
+            {"final_holdout": args[1].role_frame("final_holdout", imputed=False)},
+            None,
+        )
+        provenance = released.attrs["release_provenance"]
+        return {
+            "model_a": {
+                "summary_stats": {"representation_safety": 0.0},
+                "result_metadata": {
+                    "producer": "task12_representation",
+                    "protocol_version": "task12-evaluation-v1",
+                    "seed": cfg.seed,
+                    "release_transform_digest": provenance["release_transform_digest"],
+                    "common_protocol_digest": provenance["common_protocol_digest"],
+                    "role_hashes": final_role_hashes,
+                    "support": {
+                        "support_contract": "declared_support_v1",
+                        "roles": {
+                            "synthetic": {
+                                "population": 12,
+                                "population_floor": 1,
+                                "role_hash": final_role_hashes["refit_fit"],
+                            },
+                            "reference": {
+                                "population": 6,
+                                "population_floor": 1,
+                                "role_hash": final_role_hashes["final_holdout"],
+                            },
+                        },
+                        "role_population_floor": 1,
+                        "protected_slices": {"state": "valid", "floor": 1},
+                    },
+                    "fit_roles": ["train", "tuning"],
+                },
+            }
+        }
+
+    monkeypatch.setattr(task12_eval, "release_privacy_evidence", valid_release)
+    monkeypatch.setattr(
+        task12_eval.custom_eval, "run_log_disparity_evaluation", valid_representation
+    )
+    real_task12_record = task12_eval._task12_record
+
+    def valid_task12_record(*args, **kwargs):
+        if args[1] == "equalized_odds.final.v1":
+            kwargs["metadata"] = {
+                **kwargs.get("metadata", {}),
+                "role_hashes": final_role_hashes,
+            }
+        record = real_task12_record(*args, **kwargs)
+        if record.emitted_key != "equalized_odds.final.v1":
+            support = dict(record.support or {})
+            support.update(
+                {
+                    "roles": {
+                        "synthetic": {
+                            "population": 12,
+                            "population_floor": 1,
+                            "role_hash": final_role_hashes["refit_fit"],
+                        },
+                        "reference": {
+                            "population": 6,
+                            "population_floor": 1,
+                            "role_hash": final_role_hashes["final_holdout"],
+                        },
+                    },
+                    "role_population_floor": 1,
+                    "protected_slices": {"state": "valid", "floor": 1},
+                }
+            )
+            record = replace(
+                record,
+                support=support,
+                source_metadata={**record.source_metadata, "support": support},
+                result_metadata={**record.result_metadata, "support": support},
+                provenance={**record.provenance, "support": support},
+            )
+        return record
+
+    monkeypatch.setattr(task12_eval, "_task12_record", valid_task12_record)
+
+    combined, extras = run_evaluation(cfg, dataset, {"model_a": synthetic})
+
+    evidence = artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)
+    assert evidence["state"] == "succeeded"
+    assert extras["final_holdout_evidence"]["state"] == "succeeded"
+    assert list(combined.index) == ["model_a"]
+    assert tstr_calls == ["final_holdout"]
+    task12_records = evidence["frameworks"]["custom"]["task12_validation"]["model_a"]["records"]
+    assert [record["expected_key"] for record in task12_records] == [
+        "release_privacy.v1",
+        "representation_evidence.v1",
+        "equalized_odds.final.v1",
+    ]
+    assert all(record["status"] == "succeeded" for record in task12_records)
 
 
 def test_run_evaluation_blocks_legacy_before_candidate_ranking(
@@ -506,7 +722,7 @@ def test_run_evaluation_persists_failed_final_framework_evidence(
     cfg.evaluation.synthcity.metrics = ["identifiability_score"]
     cfg.evaluation.syntheval.enabled = False
     cfg.evaluation.custom.enabled = False
-    cfg.evaluation.binary_target.enabled = False
+    cfg.evaluation.binary_target.enabled = True
     cfg.evaluation.save_per_model_syntheval_plots = False
     cfg.evaluation.generate_report = False
     cfg.evaluation.privacy_gate.enabled = False
@@ -518,6 +734,7 @@ def test_run_evaluation_persists_failed_final_framework_evidence(
         index=["privacy.identifiability_score.score_OC"],
     )
     failed_report = pd.DataFrame({"error": ["framework failed"], "error_type": ["RuntimeError"]})
+    disabled_syntheval_calls = []
 
     def fake_run_synthcity_evaluation(*args, **kwargs):
         if kwargs.get("evaluation_role") == "final_holdout":
@@ -525,13 +742,22 @@ def test_run_evaluation_persists_failed_final_framework_evidence(
         return {"model_a": synthcity_report}
 
     def fake_run_syntheval_evaluation(*args, **kwargs):
+        disabled_syntheval_calls.append("main")
         return None, None, {}
+
+    def fail_if_binary_syntheval_runs(*args, **kwargs):
+        raise AssertionError("disabled SynthEval must skip binary execution")
 
     def fake_refit_selected_model(*args, **kwargs):
         return _fake_refit_metadata(synthetic, kwargs["output_dir"])
 
     monkeypatch.setattr(synthcity_eval, "run_synthcity_evaluation", fake_run_synthcity_evaluation)
     monkeypatch.setattr(syntheval_eval, "run_syntheval_evaluation", fake_run_syntheval_evaluation)
+    monkeypatch.setattr(
+        syntheval_eval,
+        "run_binary_target_syntheval_evaluation",
+        fail_if_binary_syntheval_runs,
+    )
     monkeypatch.setattr(generation_pipeline, "refit_selected_model", fake_refit_selected_model)
     monkeypatch.setattr(
         "synthdata.evaluation._select_policy_model", lambda _combined: ("model_a", None)
@@ -559,9 +785,14 @@ def test_run_evaluation_persists_failed_final_framework_evidence(
                 "privacy.identifiability_score.score_entropy_weighted",
                 "privacy.identifiability_score.score_OC_entropy_weighted",
             ],
-        }
+        },
     ]
     assert artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)["state"] == "failed"
+    assert disabled_syntheval_calls == []
+    assert evidence["frameworks"]["syntheval"] == {
+        "validation": {},
+        "execution": {"main": {}, "binary_target": {}},
+    }
 
 
 def test_run_evaluation_persists_failed_final_syntheval_worker(
@@ -569,7 +800,7 @@ def test_run_evaluation_persists_failed_final_syntheval_worker(
 ):
     cfg = make_config()
     cfg.evaluation.synthcity.metrics = ["identifiability_score"]
-    cfg.evaluation.syntheval.enabled = False
+    cfg.evaluation.syntheval.enabled = True
     cfg.evaluation.custom.enabled = False
     cfg.evaluation.binary_target.enabled = False
     cfg.evaluation.save_per_model_syntheval_plots = False
@@ -611,6 +842,7 @@ def test_run_evaluation_persists_failed_final_syntheval_worker(
 
     evidence = artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)
     assert evidence["state"] == "failed"
+    assert evidence["frameworks"]["syntheval"]["validation"]
     assert any(
         reason["framework"] == "syntheval"
         and reason["execution_pass"] == "main"
@@ -627,7 +859,7 @@ def test_run_evaluation_passes_real_fit_to_final_binary_evidence(
 ):
     cfg = make_config()
     cfg.evaluation.synthcity.metrics = ["identifiability_score"]
-    cfg.evaluation.syntheval.enabled = False
+    cfg.evaluation.syntheval.enabled = True
     cfg.evaluation.custom.enabled = False
     cfg.evaluation.binary_target.enabled = True
     cfg.evaluation.binary_target.positive_classes = [1]
@@ -692,7 +924,7 @@ def test_run_evaluation_passes_real_fit_to_final_binary_evidence(
     pd.testing.assert_frame_equal(binary_calls[1]["fit_frame"], expected_real_fit)
     pd.testing.assert_frame_equal(binary_calls[1]["synthetic"], synthetic)
     assert binary_calls[1]["fit_roles"] == ("train", "tuning")
-    assert extras["final_holdout_evidence"]["state"] == "succeeded"
+    assert extras["final_holdout_evidence"]["state"] == "failed"
     assert artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)[
         "binary_target_mapping"
     ] == {

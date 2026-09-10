@@ -13,6 +13,7 @@ from synthdata.evaluation.release import (
     full_record_mia,
     k_anonymity,
     l_diversity,
+    release_privacy_evidence,
     transform_release,
     transform_release_roles,
 )
@@ -91,6 +92,49 @@ def test_role_transform_attaches_common_provenance():
         roles["train"].attrs["release_provenance"]["common_protocol_digest"]
         == metadata["common_protocol_digest"]
     )
+
+
+def test_release_privacy_emits_complete_supported_task12_envelope():
+    frame = pd.DataFrame(
+        {
+            "qi": ["a"] * 20,
+            "secret": ["x", "y"] * 10,
+        }
+    )
+    synthetic, roles, _ = transform_release_roles(frame, {"tuning": frame.copy()})
+    result = release_privacy_evidence(
+        synthetic,
+        roles["tuning"],
+        quasi_identifiers=["qi"],
+        sensitive_fields=["secret"],
+        role_population_floor=20,
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["protocol_version"] == "task12-evaluation-v1"
+    assert result["fit_roles"] == ["train"]
+    assert (
+        result["release_transform_digest"]
+        == synthetic.attrs["release_provenance"]["release_transform_digest"]
+    )
+    assert result["support"]["state"] == "valid"
+    assert set(result["role_hashes"]) == {"synthetic", "tuning"}
+    assert set(result["population_identity"]) == {"synthetic", "tuning"}
+
+
+def test_release_privacy_rejects_incomplete_support():
+    frame = pd.DataFrame({"qi": ["a"] * 2, "secret": ["x", "y"]})
+    synthetic, roles, _ = transform_release_roles(frame, {"tuning": frame.copy()})
+    result = release_privacy_evidence(
+        synthetic,
+        roles["tuning"],
+        quasi_identifiers=["qi"],
+        sensitive_fields=["secret"],
+        role_population_floor=20,
+    )
+
+    assert result["status"] == "indeterminate"
+    assert "support floor" in result["invalid_reasons"][0]
 
 
 def test_epsilon_frame_runner_draws_half_size_independently():

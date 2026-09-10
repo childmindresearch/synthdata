@@ -10,7 +10,6 @@ import pytest
 
 from synthdata.config import HPOConfig
 from synthdata.data import semantic_context_payload
-from synthdata.evaluation.catalog import emitted_keys_for_synthcity_metrics
 from synthdata.generation.hpo import (
     HPO_OBJECTIVE_METRICS,
     HPO_TRIAL_CHECKPOINT_SCHEMA_VERSION,
@@ -31,7 +30,7 @@ from synthdata.generation.hpo import (
     screen_stage_a_trial,
     validate_hpo_metric_config,
 )
-from synthdata.generation.synthcity_backend import build_synthcity_objective, make_loader
+from synthdata.generation.synthcity_backend import build_synthcity_objective
 from tests.unit.synthcity_emitted_key_fixtures import HPO_SYNTHCITY_EMITTED_KEY_FIXTURES
 
 pytestmark = pytest.mark.unit
@@ -40,7 +39,7 @@ pytestmark = pytest.mark.unit
 def _hpo_context(**overrides):
     context = build_hpo_context(
         task_type="classification",
-        metric_config={"stats": ["wasserstein_dist"]},
+        metric_config={"task12": ["mixed_mmd.v1"]},
         registry_digest="registry-a",
         stage_a_contract_digest="stage-a",
         group_context={"group_mode": "row"},
@@ -56,10 +55,19 @@ def test_default_hpo_objective_excludes_privacy_and_diagnostics():
 
     assert "privacy" not in config.metric_config
     validate_hpo_metric_config(config.metric_config)
+    assert "tstr_macro_f1.v1" not in config.metric_config["task12"]
+
+
+def test_canonical_hpo_partial_set_fails_closed():
+    report = pd.DataFrame({"mean": [0.2], "direction": ["minimize"]}, index=["mixed_mmd.v1"])
+    report.attrs["canonical_hpo"] = True
+    report.attrs["canonical_hpo_keys"] = ("mixed_mmd.v1", "elastic_net_jsd.v1")
+    with pytest.raises(ValueError, match="incomplete metric set"):
+        hpo_score(report, expected_keys=("mixed_mmd.v1", "elastic_net_jsd.v1"))
 
 
 def test_patient_group_hpo_rejects_row_only_objectives():
-    with pytest.raises(ValueError, match="patient_group HPO requires group-safe metrics"):
+    with pytest.raises(ValueError, match="not in canonical HPO allowlist"):
         build_hpo_context(
             task_type="classification",
             metric_config={"stats": ["wasserstein_dist"]},
@@ -74,7 +82,7 @@ def test_patient_group_hpo_rejects_row_only_objectives():
 def test_patient_group_hpo_accepts_group_safe_objective_contract():
     context = build_hpo_context(
         task_type="classification",
-        metric_config={"performance": ["xgb"]},
+        metric_config={"task12": ["mixed_mmd.v1"]},
         registry_digest="registry-a",
         stage_a_contract_digest="stage-a",
         group_context={"group_mode": "patient_group"},
@@ -82,13 +90,13 @@ def test_patient_group_hpo_accepts_group_safe_objective_contract():
         role_context={"roles": {"train": {"rows": 4}, "tuning": {"rows": 2}}},
     )
 
-    assert "performance.xgb.syn_id" in context["expected_emitted_keys"]
+    assert context["expected_emitted_keys"] == ["mixed_mmd.v1"]
 
 
 def test_hpo_context_uses_contextual_emitted_key_manifest():
     context = build_hpo_context(
         task_type="classification",
-        metric_config={"performance": ["xgb"]},
+        metric_config={"task12": ["tstr_macro_f1.v1"]},
         registry_digest="registry-a",
         stage_a_contract_digest="stage-a",
         group_context={"group_mode": "row"},
@@ -98,11 +106,7 @@ def test_hpo_context_uses_contextual_emitted_key_manifest():
         attack_target_types={"protected": "categorical"},
     )
 
-    assert context["expected_emitted_keys"] == emitted_keys_for_synthcity_metrics(
-        {"performance": ["xgb"]},
-        variable_columns=["feature", "target"],
-        attack_target_types={"protected": "categorical"},
-    )
+    assert context["expected_emitted_keys"] == ["tstr_macro_f1.v1"]
 
 
 def test_hpo_fixture_covers_every_operational_objective_metric():
@@ -140,290 +144,6 @@ def test_hpo_context_matches_literal_emitted_key_fixture(
     )
 
     assert context["expected_emitted_keys"] == list(expected_keys)
-
-
-def test_patient_group_tabpfgen_objective_requires_group_ids():
-    with pytest.raises(ValueError, match="require group IDs for both train and tuning loaders"):
-        build_synthetic_eval_fn(
-            pd.DataFrame({"feature": [0, 1], "target": [0, 1]}),
-            pd.DataFrame({"feature": [2, 3], "target": [0, 1]}),
-            target_column="target",
-            sensitive_features=[],
-            metric_config={"performance": ["xgb"]},
-            seed=0,
-            group_context={"group_mode": "patient_group"},
-        )
-
-
-def test_patient_group_tabpfgen_objective_groups_all_generated_populations(mocker):
-    train = pd.DataFrame({"feature": [0, 1, 2, 3], "target": [0, 1, 0, 1]})
-    tuning = pd.DataFrame({"feature": [4, 5, 6, 7], "target": [0, 1, 0, 1]})
-    candidate = pd.DataFrame({"feature": [8, 9], "target": [0, 1]})
-    captured = {}
-
-    def fake_evaluate(*args, **kwargs):
-        captured["loaders"] = args
-        captured["kwargs"] = kwargs
-        return pd.DataFrame(
-            {
-                "mean": [0.5, 0.5, 0.5],
-                "direction": ["maximize", "maximize", "maximize"],
-            },
-            index=[
-                "performance.xgb.gt",
-                "performance.xgb.syn_id",
-                "performance.xgb.syn_ood",
-            ],
-        )
-
-    mocker.patch("synthcity.metrics.Metrics.evaluate", staticmethod(fake_evaluate))
-    eval_fn = build_synthetic_eval_fn(
-        train,
-        tuning,
-        target_column="target",
-        sensitive_features=[],
-        metric_config={"performance": ["xgb"]},
-        seed=11,
-        group_context={"group_mode": "patient_group"},
-        quasi_identifier_columns=["feature"],
-        sensitive_target_types={"target": "categorical"},
-        semantic_context={
-            "schema_version": "semantic-context-v1",
-            "task_type": "classification",
-        },
-        train_group_ids=["train-a", "train-a", "train-b", "train-b"],
-        holdout_group_ids=["tuning-a", "tuning-a", "tuning-b", "tuning-b"],
-    )
-
-    assert eval_fn(candidate) == pytest.approx(-0.5)
-    loader_groups = [loader.group_ids.tolist() for loader in captured["loaders"]]
-    assert loader_groups[0] == ["tuning-a", "tuning-a", "tuning-b", "tuning-b"]
-    assert loader_groups[1] == [("hpo.synthetic", 0), ("hpo.synthetic", 1)]
-    assert loader_groups[2] == ["train-a", "train-a", "train-b", "train-b"]
-    assert loader_groups[3] == [
-        ("hpo.reference_synthetic", 0),
-        ("hpo.reference_synthetic", 1),
-    ]
-    assert loader_groups[4][:4] == ["train-a", "train-a", "train-b", "train-b"]
-    assert loader_groups[4][4:] == [("hpo.synthetic", 0), ("hpo.synthetic", 1)]
-    assert captured["kwargs"]["X_syn_group_ids"] == [
-        ("hpo.synthetic", 0),
-        ("hpo.synthetic", 1),
-    ]
-    assert captured["kwargs"]["X_ref_syn_group_ids"] == [
-        ("hpo.reference_synthetic", 0),
-        ("hpo.reference_synthetic", 1),
-    ]
-    assert captured["kwargs"]["quasi_identifier_columns"] == ["feature"]
-    assert captured["kwargs"]["sensitive_target_types"] == {"target": "categorical"}
-    assert captured["kwargs"]["semantic_context"] == {
-        "schema_version": "semantic-context-v1",
-        "task_type": "classification",
-    }
-
-
-def test_patient_group_synthcity_xgb_objective_uses_grouped_real_loaders(mocker):
-    train = pd.DataFrame({"feature": [0, 1, 2, 3], "target": [0, 1, 0, 1]})
-    tuning = pd.DataFrame({"feature": [4, 5, 6, 7], "target": [0, 1, 0, 1]})
-    train_loader = make_loader(
-        train,
-        "target",
-        [],
-        group_ids=["train-a", "train-a", "train-b", "train-b"],
-    )
-    tuning_loader = make_loader(
-        tuning,
-        "target",
-        [],
-        group_ids=["tuning-a", "tuning-a", "tuning-b", "tuning-b"],
-    )
-    hpo_config = HPOConfig(metric_config={"performance": ["xgb"]})
-    captured = {}
-
-    class FakePlugin:
-        @staticmethod
-        def sample_hyperparameters_optuna(trial):
-            return {}
-
-    def fake_evaluate(tests, fit_loader, **kwargs):
-        captured["tests"] = tests
-        captured["fit_loader"] = fit_loader
-        captured.update(kwargs)
-        report = pd.DataFrame(
-            {
-                "mean": [0.7, 0.8, 0.9],
-                "direction": ["maximize", "maximize", "maximize"],
-            },
-            index=[
-                "performance.xgb.gt",
-                "performance.xgb.syn_id",
-                "performance.xgb.syn_ood",
-            ],
-        )
-        report.attrs["metric_metadata"] = {
-            "generator.fake": {"accounting": {"effective_epsilon": 1.0}}
-        }
-        return {tests[0][0]: report}
-
-    mocker.patch("synthdata.generation.synthcity_backend.get_plugin_class", return_value=FakePlugin)
-    mocker.patch("synthdata.generation.synthcity_backend.plugin_accepts", return_value=False)
-    mocker.patch("synthcity.benchmark.Benchmarks.evaluate", side_effect=fake_evaluate)
-
-    objective = build_synthcity_objective(
-        "xgb",
-        train_loader,
-        hpo_config,
-        seed=0,
-        tuning_loader=tuning_loader,
-        task_type="classification",
-        classification_score="macro_f1",
-        semantic_context={
-            "schema_version": "semantic-context-v1",
-            "task_type": "classification",
-        },
-        synthetic_size=4,
-        group_context={"group_mode": "patient_group"},
-    )
-    study = optuna.create_study(direction="minimize")
-    trial = study.ask()
-    score = objective(trial)
-
-    assert score == pytest.approx(-0.85)
-    assert trial.user_attrs["metric_metadata"]["generator.fake"]["accounting"] == {
-        "effective_epsilon": 1.0
-    }
-    assert captured["fit_loader"] is train_loader
-    assert captured["X_test"] is tuning_loader
-    assert captured["fit_on_X"] is True
-    assert captured["classification_score"] == "macro_f1"
-    assert captured["semantic_context"] == {
-        "schema_version": "semantic-context-v1",
-        "task_type": "classification",
-    }
-    assert captured["fit_loader"].group_ids.tolist() == [
-        "train-a",
-        "train-a",
-        "train-b",
-        "train-b",
-    ]
-    assert captured["X_test"].group_ids.tolist() == [
-        "tuning-a",
-        "tuning-a",
-        "tuning-b",
-        "tuning-b",
-    ]
-
-
-def test_patient_group_synthcity_objective_reaches_native_group_contract(
-    mocker, monkeypatch, tmp_path
-):
-    from synthcity.metrics import Metrics
-    from synthcity.plugins import Plugins
-
-    train = pd.DataFrame({"feature": [0, 1, 2, 3], "target": [0, 1, 0, 1]})
-    tuning = pd.DataFrame({"feature": [4, 5], "target": [0, 1]})
-    train_loader = make_loader(
-        train,
-        "target",
-        [],
-        group_ids=["train-a", "train-a", "train-b", "train-b"],
-    )
-    tuning_loader = make_loader(
-        tuning,
-        "target",
-        [],
-        group_ids=["tuning-a", "tuning-b"],
-    )
-    hpo_config = HPOConfig(metric_config={"performance": ["xgb"]})
-    generated_lengths = {"synthetic": 3, "reference_synthetic": 2}
-    captured = {"namespaces": [], "loaders": None, "kwargs": None}
-
-    class FakePlugin:
-        @staticmethod
-        def sample_hyperparameters_optuna(trial):
-            del trial
-            return {}
-
-    class FakeGenerator:
-        def fit(self, _fit_loader):
-            return self
-
-        def generate(self, count=None, **kwargs):
-            del count
-            namespace = kwargs["_group_namespace"]
-            captured["namespaces"].append(namespace)
-            size = generated_lengths[namespace]
-            frame = pd.DataFrame(
-                {
-                    "feature": np.arange(size),
-                    "target": [index % 2 for index in range(size)],
-                }
-            )
-            return make_loader(
-                frame,
-                "target",
-                [],
-                group_ids=[f"__synthcity_generated__{namespace}__{index}" for index in range(size)],
-            )
-
-    def fake_get(_self, _name, **_kwargs):
-        return FakeGenerator()
-
-    def fake_metrics_evaluate(*args, **kwargs):
-        captured["loaders"] = args
-        captured["kwargs"] = kwargs
-        return pd.DataFrame(
-            {
-                "mean": [0.6, 0.7, 0.8],
-                "errors": [0.0, 0.0, 0.0],
-                "durations": [0.0, 0.0, 0.0],
-                "direction": ["maximize", "maximize", "maximize"],
-            },
-            index=[
-                "performance.xgb.gt",
-                "performance.xgb.syn_id",
-                "performance.xgb.syn_ood",
-            ],
-        )
-
-    mocker.patch(
-        "synthdata.generation.synthcity_backend.get_plugin_class",
-        return_value=FakePlugin,
-    )
-    mocker.patch(
-        "synthdata.generation.synthcity_backend.plugin_accepts",
-        return_value=False,
-    )
-    monkeypatch.setattr(Plugins, "get", fake_get)
-    monkeypatch.setattr(Metrics, "evaluate", staticmethod(fake_metrics_evaluate))
-
-    objective = build_synthcity_objective(
-        "fake",
-        train_loader,
-        hpo_config,
-        seed=0,
-        tuning_loader=tuning_loader,
-        task_type="classification",
-        synthetic_size=3,
-        group_context={"group_mode": "patient_group"},
-    )
-    study = optuna.create_study(direction="minimize")
-    score = objective(study.ask())
-
-    assert score == pytest.approx(-0.75)
-    assert captured["namespaces"] == ["synthetic", "reference_synthetic"]
-    assert [len(loader) for loader in captured["loaders"][:4]] == [2, 3, 4, 2]
-    assert captured["loaders"][0] is tuning_loader
-    assert captured["loaders"][2] is train_loader
-    assert all(
-        group_id.startswith("__synthcity_generated__synthetic__")
-        for group_id in captured["loaders"][1].group_ids
-    )
-    assert all(
-        group_id.startswith("__synthcity_generated__reference_synthetic__")
-        for group_id in captured["loaders"][3].group_ids
-    )
-    assert captured["kwargs"]["group_mode"] == "patient_group"
 
 
 def test_hpo_context_digest_and_study_name_change_with_objective_identity():
@@ -621,7 +341,7 @@ def test_stage_a_contract_persists_semantic_context():
         role_context_fingerprint="roles-a",
         role_context={"roles": {"train": {"rows": 4}}},
         group_context={"group_mode": "row"},
-        hpo_context={"metric_config": {"stats": ["wasserstein_dist"]}},
+        hpo_context={"metric_config": {"task12": ["mixed_mmd.v1"]}},
     )
 
     payload = contract.to_dict()
@@ -630,7 +350,7 @@ def test_stage_a_contract_persists_semantic_context():
     assert payload["role_context_fingerprint"] == "roles-a"
     assert payload["role_context"] == {"roles": {"train": {"rows": 4}}}
     assert payload["group_context"] == {"group_mode": "row"}
-    assert payload["hpo_context"] == {"metric_config": {"stats": ["wasserstein_dist"]}}
+    assert payload["hpo_context"] == {"metric_config": {"task12": ["mixed_mmd.v1"]}}
 
 
 def test_stage_a_trial_prune_and_persist_result(tmp_path):
@@ -885,227 +605,6 @@ def test_failed_hpo_checkpoint_persists_exception_context(tmp_path):
     }
 
 
-def test_pategan_hpo_checkpoint_persists_accounting_and_resumes(mocker, tmp_path):
-    params = {
-        "epsilon": 1.0,
-        "delta": 1e-6,
-        "alpha": 100,
-        "lamda": 0.1,
-    }
-    accounting = {
-        "schema_version": "pate-accounting-v1",
-        "privacy_claim_type": "formal_dp",
-        "accountant": "pate_moments_v1",
-        "requested_epsilon": 1.0,
-        "requested_delta": 1e-6,
-        "requested_alpha": 100,
-        "requested_lamda": 0.1,
-        "resolved_epsilon": 1.0,
-        "resolved_delta": 1e-6,
-        "resolved_alpha": 100,
-        "resolved_lamda": 0.1,
-        "effective_epsilon": 1.2,
-        "effective_delta": 1e-6,
-        "effective_alpha": 100,
-        "effective_lamda": 0.1,
-        "iterations": 2,
-        "max_iter": 10,
-        "stopping_state": "epsilon_reached",
-    }
-
-    class FakePATEGAN:
-        def __init__(
-            self,
-            epsilon=1.0,
-            delta=None,
-            alpha=100,
-            lamda=0.001,
-        ):
-            del epsilon, delta, alpha, lamda
-
-        @staticmethod
-        def sample_hyperparameters_optuna(_trial):
-            return dict(params)
-
-    def fake_evaluate(tests, _fit_loader, **_kwargs):
-        report = pd.DataFrame(
-            {"mean": [0.4], "direction": ["minimize"]},
-            index=["stats.wasserstein_dist.joint"],
-        )
-        report.attrs["metric_metadata"] = {
-            "generator.pategan": {
-                "schema_version": "generator-runtime-metadata-v2",
-                "plugin_name": "pategan",
-                "plugin_fqdn": "privacy.pategan",
-                "requested_parameters": {**params, "random_state": 0},
-                "n_samples": 4,
-                "random_state": 0,
-                "privacy_claim_type": "formal_dp",
-                "accounting": accounting,
-            }
-        }
-        return {tests[0][0]: report}
-
-    mocker.patch(
-        "synthdata.generation.synthcity_backend.get_plugin_class", return_value=FakePATEGAN
-    )
-    mocker.patch("synthdata.generation.synthcity_backend.plugin_accepts", return_value=False)
-    mocker.patch("synthcity.benchmark.Benchmarks.evaluate", side_effect=fake_evaluate)
-    objective = build_synthcity_objective(
-        "pategan",
-        object(),
-        HPOConfig(metric_config={"stats": ["wasserstein_dist"]}, n_trials=1),
-        seed=0,
-        tuning_loader=object(),
-        synthetic_size=4,
-    )
-
-    run_study(
-        "hpo_pategan_checkpoint",
-        objective,
-        HPOConfig(metric_config={"stats": ["wasserstein_dist"]}, n_trials=1),
-        tmp_path,
-        seed=0,
-        drop_keys=(),
-    )
-
-    checkpoint_path = (
-        tmp_path / "hpo_checkpoints" / "hpo_pategan_checkpoint" / "trial-0" / "checkpoint.json"
-    )
-    checkpoint = load_hpo_trial_checkpoint(checkpoint_path)
-    generator = checkpoint["metadata"]["generator"]
-    assert generator["state"] == "present"
-    assert generator["privacy_claim_type"] == "formal_dp"
-    assert generator["implementation_fingerprint"]
-    assert generator["metadata"]["schema_version"] == "generator-metadata-v2"
-    assert (
-        generator["metadata"]["implementation_fingerprint"]
-        == generator["implementation_fingerprint"]
-    )
-    assert generator["metadata"]["privacy_accounting"] == accounting
-    assert checkpoint["metadata"]["result_metadata"] == checkpoint["metadata"]["metric_metadata"]
-
-    def should_not_run(_trial):
-        pytest.fail("a completed PATE trial was recomputed during resume")
-
-    run_study(
-        "hpo_pategan_checkpoint",
-        should_not_run,
-        HPOConfig(metric_config={"stats": ["wasserstein_dist"]}, n_trials=1),
-        tmp_path,
-        seed=0,
-        drop_keys=(),
-    )
-    assert load_hpo_trial_checkpoint(checkpoint_path) == checkpoint
-
-
-def test_pategan_hpo_missing_accounting_fails_closed_with_checkpoint(mocker, tmp_path):
-    params = {"epsilon": 1.0, "delta": 1e-6, "alpha": 100, "lamda": 0.1}
-
-    class FakePATEGAN:
-        def __init__(self, epsilon=1.0, delta=None, alpha=100, lamda=0.001):
-            del epsilon, delta, alpha, lamda
-
-        @staticmethod
-        def sample_hyperparameters_optuna(_trial):
-            return dict(params)
-
-    def fake_evaluate(tests, _fit_loader, **_kwargs):
-        report = pd.DataFrame(
-            {"mean": [0.4], "direction": ["minimize"]},
-            index=["stats.wasserstein_dist.joint"],
-        )
-        return {tests[0][0]: report}
-
-    mocker.patch(
-        "synthdata.generation.synthcity_backend.get_plugin_class", return_value=FakePATEGAN
-    )
-    mocker.patch("synthdata.generation.synthcity_backend.plugin_accepts", return_value=False)
-    mocker.patch("synthcity.benchmark.Benchmarks.evaluate", side_effect=fake_evaluate)
-    objective = build_synthcity_objective(
-        "pategan",
-        object(),
-        HPOConfig(metric_config={"stats": ["wasserstein_dist"]}, n_trials=1),
-        seed=0,
-        tuning_loader=object(),
-        synthetic_size=4,
-    )
-
-    with pytest.raises(RuntimeError, match="produced no completed trials"):
-        run_study(
-            "hpo_pategan_missing_accounting",
-            objective,
-            HPOConfig(metric_config={"stats": ["wasserstein_dist"]}, n_trials=1),
-            tmp_path,
-            seed=0,
-            drop_keys=(),
-        )
-
-    checkpoint = load_hpo_trial_checkpoint(
-        tmp_path
-        / "hpo_checkpoints"
-        / "hpo_pategan_missing_accounting"
-        / "trial-0"
-        / "checkpoint.json"
-    )
-    assert checkpoint["state"] == "pruned"
-    assert checkpoint["metadata"]["generator"]["state"] == "missing"
-    assert checkpoint["metadata"]["generator"]["privacy_claim_type"] == "formal_dp"
-    assert checkpoint["metadata"]["outcome"]["state"] == "pruned"
-
-
-def test_pategan_hpo_incomplete_runtime_metadata_fails_closed(mocker, tmp_path):
-    params = {"epsilon": 1.0, "delta": 1e-6, "alpha": 100, "lamda": 0.1}
-
-    class FakePATEGAN:
-        def __init__(
-            self,
-            epsilon=1.0,
-            delta=None,
-            alpha=100,
-            lamda=0.001,
-        ):
-            del epsilon, delta, alpha, lamda
-
-        @staticmethod
-        def sample_hyperparameters_optuna(_trial):
-            return dict(params)
-
-    def fake_evaluate(tests, _fit_loader, **_kwargs):
-        report = pd.DataFrame(
-            {"mean": [0.4], "direction": ["minimize"]},
-            index=["stats.wasserstein_dist.joint"],
-        )
-        report.attrs["metric_metadata"] = {
-            "generator.pategan": {
-                "schema_version": "generator-runtime-metadata-v2",
-                "plugin_name": "pategan",
-                "plugin_fqdn": "privacy.pategan",
-                "requested_parameters": dict(params),
-                "privacy_claim_type": "formal_dp",
-                "accounting": {"effective_epsilon": 1.0},
-            }
-        }
-        return {tests[0][0]: report}
-
-    mocker.patch(
-        "synthdata.generation.synthcity_backend.get_plugin_class", return_value=FakePATEGAN
-    )
-    mocker.patch("synthdata.generation.synthcity_backend.plugin_accepts", return_value=False)
-    mocker.patch("synthcity.benchmark.Benchmarks.evaluate", side_effect=fake_evaluate)
-    objective = build_synthcity_objective(
-        "pategan",
-        object(),
-        HPOConfig(metric_config={"stats": ["wasserstein_dist"]}, n_trials=1),
-        seed=0,
-        tuning_loader=object(),
-        synthetic_size=4,
-    )
-
-    with pytest.raises(optuna.TrialPruned, match="incomplete PATE metadata"):
-        objective(optuna.create_study(direction="minimize").ask())
-
-
 def test_hpo_metric_config_rejects_calibrating_privacy_metric():
     with pytest.raises(ValueError, match="not approved operational objectives"):
         validate_hpo_metric_config({"privacy": ["identifiability_score"]})
@@ -1132,150 +631,6 @@ def test_hpo_builders_reject_unsafe_config_before_backend_execution():
         )
 
 
-def test_synthcity_candidate_construction_failure_persists_stage_a_result(mocker, tmp_path):
-    source = pd.DataFrame({"feature": [0.0, 1.0], "target": [0, 1]})
-    contract = build_stage_a_contract(
-        source,
-        expected_n_samples=2,
-        target_column="target",
-    )
-
-    class FakePlugin:
-        @staticmethod
-        def sample_hyperparameters_optuna(_trial):
-            raise ValueError("invalid plugin search space")
-
-    class FakeTrial:
-        number = 3
-
-        def __init__(self):
-            self.user_attrs = {}
-
-        def set_user_attr(self, key, value):
-            self.user_attrs[key] = value
-
-    mocker.patch("synthdata.generation.synthcity_backend.get_plugin_class", return_value=FakePlugin)
-    mocker.patch("synthdata.generation.synthcity_backend.plugin_accepts", return_value=False)
-    objective = build_synthcity_objective(
-        "ctgan",
-        object(),
-        HPOConfig(metric_config={"stats": ["wasserstein_dist"]}),
-        seed=0,
-        tuning_loader=object(),
-        stage_a_contract=contract,
-        stage_a_source_df=source,
-        stage_a_root=tmp_path,
-        study_name="hpo_construction_failure",
-    )
-
-    trial = FakeTrial()
-    with pytest.raises(optuna.TrialPruned, match="invalid plugin search space"):
-        objective(trial)
-
-    result_path = tmp_path / "hpo_construction_failure" / "trial-3" / "result.json"
-    payload = json.loads(result_path.read_text())
-    assert payload["checks"][0]["screen"] == "stage_a_exception"
-    assert payload["checks"][0]["observed"]["exception_type"] == "ValueError"
-    assert trial.user_attrs["stage_a_state"] == "pruned"
-
-
-def test_synthcity_empty_report_before_stage_a_persists_exception(mocker, tmp_path):
-    source = pd.DataFrame({"feature": [0.0, 1.0], "target": [0, 1]})
-    contract = build_stage_a_contract(
-        source,
-        expected_n_samples=2,
-        target_column="target",
-    )
-
-    class FakePlugin:
-        @staticmethod
-        def sample_hyperparameters_optuna(_trial):
-            return {}
-
-    class FakeTrial:
-        number = 4
-
-        def __init__(self):
-            self.user_attrs = {}
-
-        def set_user_attr(self, key, value):
-            self.user_attrs[key] = value
-
-    def fake_evaluate(tests, _fit_loader, **_kwargs):
-        return {tests[0][0]: pd.DataFrame()}
-
-    mocker.patch("synthdata.generation.synthcity_backend.get_plugin_class", return_value=FakePlugin)
-    mocker.patch("synthdata.generation.synthcity_backend.plugin_accepts", return_value=False)
-    mocker.patch("synthcity.benchmark.Benchmarks.evaluate", side_effect=fake_evaluate)
-    objective = build_synthcity_objective(
-        "ctgan",
-        object(),
-        HPOConfig(metric_config={"stats": ["wasserstein_dist"]}),
-        seed=0,
-        tuning_loader=object(),
-        stage_a_contract=contract,
-        stage_a_source_df=source,
-        stage_a_root=tmp_path,
-        study_name="hpo_empty_report",
-    )
-
-    trial = FakeTrial()
-    with pytest.raises(optuna.TrialPruned, match="no metric rows"):
-        objective(trial)
-
-    result_path = tmp_path / "hpo_empty_report" / "trial-4" / "result.json"
-    payload = json.loads(result_path.read_text())
-    assert payload["checks"][0]["screen"] == "stage_a_exception"
-    assert payload["checks"][0]["observed"]["exception_type"] == "ValueError"
-
-
-def test_synthcity_missing_report_before_stage_a_persists_exception(mocker, tmp_path):
-    source = pd.DataFrame({"feature": [0.0, 1.0], "target": [0, 1]})
-    contract = build_stage_a_contract(
-        source,
-        expected_n_samples=2,
-        target_column="target",
-    )
-
-    class FakePlugin:
-        @staticmethod
-        def sample_hyperparameters_optuna(_trial):
-            return {}
-
-    class FakeTrial:
-        number = 5
-
-        def __init__(self):
-            self.user_attrs = {}
-
-        def set_user_attr(self, key, value):
-            self.user_attrs[key] = value
-
-    mocker.patch("synthdata.generation.synthcity_backend.get_plugin_class", return_value=FakePlugin)
-    mocker.patch("synthdata.generation.synthcity_backend.plugin_accepts", return_value=False)
-    mocker.patch("synthcity.benchmark.Benchmarks.evaluate", return_value={})
-    objective = build_synthcity_objective(
-        "ctgan",
-        object(),
-        HPOConfig(metric_config={"stats": ["wasserstein_dist"]}),
-        seed=0,
-        tuning_loader=object(),
-        stage_a_contract=contract,
-        stage_a_source_df=source,
-        stage_a_root=tmp_path,
-        study_name="hpo_missing_report",
-    )
-
-    trial = FakeTrial()
-    with pytest.raises(optuna.TrialPruned, match="did not return report"):
-        objective(trial)
-
-    result_path = tmp_path / "hpo_missing_report" / "trial-5" / "result.json"
-    payload = json.loads(result_path.read_text())
-    assert payload["checks"][0]["screen"] == "stage_a_exception"
-    assert payload["checks"][0]["observed"]["exception_type"] == "RuntimeError"
-
-
 def test_hpo_score_rejects_diagnostic_or_failed_rows():
     diagnostic = pd.DataFrame(
         {"mean": [0.5], "direction": ["maximize"]},
@@ -1291,7 +646,7 @@ def test_hpo_score_rejects_diagnostic_or_failed_rows():
             "errors": [1],
             "error_types": ["ValueError"],
         },
-        index=["stats.wasserstein_dist"],
+        index=["mixed_mmd.v1"],
     )
     with pytest.raises(ValueError, match="not decision-eligible"):
         hpo_score(failed)
@@ -1303,21 +658,28 @@ def test_hpo_score_rejects_partial_static_metric_set():
             "mean": [0.25],
             "direction": ["minimize"],
         },
-        index=["stats.wasserstein_dist.joint"],
+        index=["mixed_mmd.v1"],
     )
 
     with pytest.raises(ValueError, match="incomplete metric set.*missing"):
         hpo_score(
             report,
             expected_keys=(
-                "stats.wasserstein_dist.joint",
-                "stats.inv_kl_divergence.marginal",
+                "mixed_mmd.v1",
+                "elastic_net_jsd.v1",
             ),
         )
 
 
+def test_canonical_hpo_partial_report_is_indeterminate():
+    report = pd.DataFrame({"mean": [0.25], "direction": ["minimize"]}, index=["mixed_mmd.v1"])
+    report.attrs["canonical_hpo"] = True
+    with pytest.raises(ValueError, match="incomplete metric set"):
+        hpo_score(report)
+
+
 def test_hpo_score_rejects_duplicate_static_metric_set():
-    metric_key = "stats.wasserstein_dist.joint"
+    metric_key = "mixed_mmd.v1"
     report = pd.DataFrame(
         {
             "mean": [0.25, 0.3],
@@ -1330,263 +692,16 @@ def test_hpo_score_rejects_duplicate_static_metric_set():
         hpo_score(report, expected_keys=(metric_key,))
 
 
-def test_synthcity_hpo_objective_prunes_partial_metric_set(mocker):
-    class FakePlugin:
-        @staticmethod
-        def sample_hyperparameters_optuna(trial):
-            return {}
-
-    def fake_evaluate(tests, fit_loader, **kwargs):
-        return {
-            tests[0][0]: pd.DataFrame(
-                {"mean": [0.25], "direction": ["minimize"]},
-                index=["stats.wasserstein_dist.joint"],
-            )
-        }
-
-    mocker.patch("synthdata.generation.synthcity_backend.get_plugin_class", return_value=FakePlugin)
-    mocker.patch("synthdata.generation.synthcity_backend.plugin_accepts", return_value=False)
-    mocker.patch("synthcity.benchmark.Benchmarks.evaluate", side_effect=fake_evaluate)
-
-    objective = build_synthcity_objective(
-        "ctgan",
-        object(),
-        HPOConfig(
-            metric_config={
-                "stats": ["wasserstein_dist", "inv_kl_divergence"],
-            }
-        ),
-        seed=7,
-        tuning_loader=object(),
-    )
-
-    with pytest.raises(optuna.TrialPruned, match="incomplete metric set"):
-        objective(type("Trial", (), {"number": 6})())
-
-
 def test_hpo_score_accepts_only_approved_operational_rows():
     report = pd.DataFrame(
         {
             "mean": [0.25, 0.75],
             "direction": ["minimize", "maximize"],
         },
-        index=["stats.wasserstein_dist.joint", "performance.xgb.mean"],
+        index=["mixed_mmd.v1", "tstr_macro_f1.v1"],
     )
 
     assert hpo_score(report) == pytest.approx(-0.25)
-
-
-def test_hpo_score_ignores_candidate_independent_performance_baseline():
-    report = pd.DataFrame(
-        {
-            "mean": [0.8, 0.6, 0.7],
-            "direction": ["maximize", "maximize", "maximize"],
-        },
-        index=[
-            "performance.xgb.gt",
-            "performance.xgb.syn_id",
-            "performance.xgb.syn_ood",
-        ],
-    )
-
-    assert hpo_score(report) == pytest.approx(-0.65)
-
-
-def test_hpo_score_does_not_double_count_legacy_performance_aggregate():
-    report = pd.DataFrame(
-        {
-            "mean": [0.6, 0.7, 0.9],
-            "direction": ["maximize", "maximize", "maximize"],
-        },
-        index=[
-            "performance.xgb.syn_id",
-            "performance.xgb.syn_ood",
-            "performance.xgb.mean",
-        ],
-    )
-
-    assert hpo_score(report) == pytest.approx(-0.65)
-
-
-def test_synthcity_hpo_objective_uses_explicit_train_and_tuning_loaders(mocker):
-    train_loader = object()
-    tuning_loader = object()
-    captured = {}
-
-    class FakePlugin:
-        @staticmethod
-        def sample_hyperparameters_optuna(trial):
-            return {}
-
-    def fake_evaluate(tests, fit_loader, **kwargs):
-        captured["tests"] = tests
-        captured["fit_loader"] = fit_loader
-        captured.update(kwargs)
-        return {
-            tests[0][0]: pd.DataFrame(
-                {"mean": [0.25], "direction": ["minimize"]},
-                index=["stats.wasserstein_dist.joint"],
-            )
-        }
-
-    mocker.patch("synthdata.generation.synthcity_backend.get_plugin_class", return_value=FakePlugin)
-    mocker.patch("synthdata.generation.synthcity_backend.plugin_accepts", return_value=False)
-    mocker.patch("synthcity.benchmark.Benchmarks.evaluate", side_effect=fake_evaluate)
-
-    objective = build_synthcity_objective(
-        "ctgan",
-        train_loader,
-        HPOConfig(metric_config={"stats": ["wasserstein_dist"]}),
-        seed=7,
-        tuning_loader=tuning_loader,
-    )
-
-    assert objective(type("Trial", (), {"number": 3})()) == pytest.approx(0.25)
-    assert captured["fit_loader"] is train_loader
-    assert captured["X_test"] is tuning_loader
-    assert captured["fit_on_X"] is True
-
-
-def test_synthcity_hpo_group_unsafe_trial_is_pruned_and_checkpointed(mocker, tmp_path):
-    frame = pd.DataFrame({"feature": [0.0, 1.0, 0.0, 1.0], "target": [0, 1, 0, 1]})
-    train_loader = make_loader(
-        frame,
-        "target",
-        [],
-        group_ids=["train-a", "train-a", "train-b", "train-b"],
-    )
-    tuning_loader = make_loader(
-        frame,
-        "target",
-        [],
-        group_ids=["tuning-a", "tuning-a", "tuning-b", "tuning-b"],
-    )
-    captured = {}
-
-    class FakePlugin:
-        @staticmethod
-        def sample_hyperparameters_optuna(trial):
-            del trial
-            return {}
-
-    def fake_evaluate(tests, fit_loader, **kwargs):
-        captured["fit_loader"] = fit_loader
-        captured.update(kwargs)
-        report = pd.DataFrame(
-            {
-                "mean": [float("nan")],
-                "errors": [1],
-                "durations": [0.0],
-                "direction": ["minimize"],
-            },
-            index=["performance.xgb.syn_id"],
-        )
-        report.attrs["group_safety"] = {
-            "schema_version": "group-safety-v1",
-            "status": "group_unsafe",
-            "group_mode": "patient_group",
-            "task_type": "classification",
-            "reason": "unsupported grouped modality",
-            "loader_types": {"X": "syn_seq"},
-            "metrics": ["performance.xgb.syn_id"],
-        }
-        return {tests[0][0]: report}
-
-    mocker.patch("synthdata.generation.synthcity_backend.get_plugin_class", return_value=FakePlugin)
-    mocker.patch("synthdata.generation.synthcity_backend.plugin_accepts", return_value=False)
-    mocker.patch("synthcity.benchmark.Benchmarks.evaluate", side_effect=fake_evaluate)
-
-    objective = build_synthcity_objective(
-        "ctgan",
-        train_loader,
-        HPOConfig(metric_config={"performance": ["xgb"]}, n_trials=1),
-        seed=7,
-        tuning_loader=tuning_loader,
-        synthetic_size=len(frame),
-        group_context={"group_mode": "patient_group"},
-    )
-
-    with pytest.raises(RuntimeError, match="produced no completed trials"):
-        run_study(
-            "hpo_group_unsafe",
-            objective,
-            HPOConfig(metric_config={"performance": ["xgb"]}, n_trials=1),
-            tmp_path,
-            seed=7,
-            drop_keys=(),
-        )
-
-    checkpoint = load_hpo_trial_checkpoint(
-        tmp_path / "hpo_checkpoints" / "hpo_group_unsafe" / "trial-0" / "checkpoint.json"
-    )
-    assert captured["fit_loader"] is train_loader
-    assert captured["X_test"] is tuning_loader
-    assert captured["group_mode"] == "patient_group"
-    assert checkpoint["state"] == "pruned"
-    assert checkpoint["objective_value"] is None
-    assert checkpoint["metadata"]["outcome"]["status"] == "group_unsafe"
-    assert checkpoint["metadata"]["outcome"]["group_safety"]["reason"] == (
-        "unsupported grouped modality"
-    )
-
-
-def test_synthcity_hpo_objective_screens_candidate_before_scoring(mocker, tmp_path):
-    source = pd.DataFrame({"feature": [0.0, 1.0, 0.0, 1.0], "target": [0, 1, 0, 1]})
-    candidate = pd.DataFrame({"feature": [0.25, 0.75, 0.25, 0.75], "target": [0, 1, 0, 1]})
-    contract = build_stage_a_contract(
-        source,
-        expected_n_samples=len(candidate),
-        target_column="target",
-    )
-    events = []
-
-    class FakePlugin:
-        @staticmethod
-        def sample_hyperparameters_optuna(trial):
-            return {}
-
-    class FakeTrial:
-        number = 4
-
-        def __init__(self):
-            self.user_attrs = {}
-
-        def set_user_attr(self, key, value):
-            self.user_attrs[key] = value
-
-    def fake_evaluate(tests, fit_loader, **kwargs):
-        events.append("before_screen")
-        kwargs["candidate_screen"](candidate)
-        events.append("after_screen")
-        return {
-            tests[0][0]: pd.DataFrame(
-                {"mean": [0.25], "direction": ["minimize"]},
-                index=["stats.wasserstein_dist.joint"],
-            )
-        }
-
-    mocker.patch("synthdata.generation.synthcity_backend.get_plugin_class", return_value=FakePlugin)
-    mocker.patch("synthdata.generation.synthcity_backend.plugin_accepts", return_value=False)
-    mocker.patch("synthcity.benchmark.Benchmarks.evaluate", side_effect=fake_evaluate)
-    objective = build_synthcity_objective(
-        "ctgan",
-        object(),
-        HPOConfig(metric_config={"stats": ["wasserstein_dist"]}),
-        seed=7,
-        tuning_loader=object(),
-        synthetic_size=len(candidate),
-        stage_a_contract=contract,
-        stage_a_source_df=source,
-        stage_a_root=tmp_path,
-        study_name="hpo_ctgan",
-    )
-    trial = FakeTrial()
-
-    assert objective(trial) == pytest.approx(0.25)
-    assert events == ["before_screen", "after_screen"]
-    assert trial.user_attrs["stage_a_state"] == "passed"
-    assert (tmp_path / "hpo_ctgan" / "contract.json").exists()
-    assert (tmp_path / "hpo_ctgan" / "trial-4" / "result.json").exists()
 
 
 def test_tabpfgen_hpo_objective_screens_candidate_before_eval(mocker, tmp_path):
@@ -2109,3 +1224,59 @@ def test_all_pruned_hpo_fails_without_default_fallback(tmp_path):
             seed=0,
             drop_keys=(),
         )
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [
+        "stats.wasserstein_dist",
+        "stats.inv_kl_divergence",
+        "sanity.nearest_syn_neighbor_distance",
+        "performance.xgb",
+    ],
+)
+def test_legacy_hpo_objectives_are_rejected(legacy):
+    category, metric = legacy.split(".", 1)
+    with pytest.raises(ValueError, match="canonical HPO allowlist"):
+        validate_hpo_metric_config({category: [metric]})
+
+
+def test_canonical_tstr_hpo_fails_closed():
+    from synthdata.generation.hpo import evaluate_canonical_hpo_metrics
+
+    report = evaluate_canonical_hpo_metrics(
+        pd.DataFrame({"target": [0, 1]}),
+        pd.DataFrame({"target": [0, 1]}),
+        pd.DataFrame({"target": [0, 1]}),
+        metric_config={"task12": ["tstr_macro_f1.v1"]},
+        target_column="target",
+    )
+    assert report.loc["tstr_macro_f1.v1", "errors"] == 1
+    assert "verified release-form" in report.loc["tstr_macro_f1.v1", "error_messages"]
+
+
+def test_canonical_tabpfgen_eval_uses_canonical_producer_not_native_metrics(mocker):
+    train = pd.DataFrame({"feature": [0.0, 1.0], "target": [0, 1]})
+    tuning = train.copy()
+    candidate = train.copy()
+    canonical = mocker.patch(
+        "synthdata.generation.hpo.evaluate_canonical_hpo_metrics",
+        return_value=pd.DataFrame(
+            {"mean": [0.25], "direction": ["minimize"]},
+            index=["mixed_mmd.v1"],
+        ),
+    )
+    native = mocker.patch("synthcity.metrics.Metrics.evaluate")
+
+    evaluate = build_synthetic_eval_fn(
+        train,
+        tuning,
+        "target",
+        [],
+        {"task12": ["mixed_mmd.v1"]},
+        seed=0,
+    )
+
+    assert evaluate(candidate) == pytest.approx(0.25)
+    canonical.assert_called_once()
+    native.assert_not_called()

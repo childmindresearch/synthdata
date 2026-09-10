@@ -1,10 +1,7 @@
 """Custom fairness evaluation: log disparity (Bhanot et al. 2021) summary metrics.
 
-The equalized_odds/equal_opportunity metrics (custom additions to this repo's
-SynthEval fork) are *computed* via :mod:`synthdata.evaluation.syntheval_eval`
-but re-tagged to framework="custom" downstream in
-:mod:`synthdata.evaluation.combine`; this module only covers log disparity,
-which has no SynthEval equivalent.
+This module owns log disparity, which has no SynthEval equivalent. Task 12
+custom evidence is implemented in :mod:`synthdata.evaluation.task12_eval`.
 """
 
 import hashlib

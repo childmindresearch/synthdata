@@ -362,9 +362,10 @@ class HPOConfig:
     #: may be used; privacy/calibration metrics fail closed at objective setup.
     metric_config: dict = dataclasses.field(
         default_factory=lambda: {
-            "stats": ["wasserstein_dist", "inv_kl_divergence"],
-            "sanity": ["nearest_syn_neighbor_distance"],
-            "performance": ["xgb"],
+            "task12": [
+                "elastic_net_jsd.v1",
+                "mixed_mmd.v1",
+            ],
         }
     )
     #: Deterministic candidate screens run before any objective metrics.
@@ -379,8 +380,11 @@ class HPOConfig:
     #: Fixed tuning objective policy; canonical profiles may not replace its metrics.
     utility_policy: dict = dataclasses.field(
         default_factory=lambda: {
-            "metrics": ["tstr_macro_f1", "mixed_mmd_score", "elastic_net_jsd_score"],
-            "weights": [1 / 3, 1 / 3, 1 / 3],
+            "metrics": [
+                "mixed_mmd.v1",
+                "elastic_net_jsd.v1",
+            ],
+            "weights": [0.5, 0.5],
         }
     )
     #: Provenance marker requiring Task 13 HPO code to consume this fixed policy.
@@ -409,6 +413,8 @@ class GenerationConfig:
 class FrameworkSelectionConfig:
     """Partial-selection controls for one evaluation framework.
 
+    ``enabled=False`` disables framework execution and validation entirely;
+    selection fields are ignored and no framework evidence is produced.
     ``metrics`` (explicit metric names) takes precedence over ``categories``
     (utility/privacy/... groupings) when both are given.
     """
@@ -540,6 +546,13 @@ class PrivacyGateConfig:
             "privacy.identifiability_score.score_OC": {"bound": "max", "value": 0.3},
             "privacy.k-anonymization.syn": {"bound": "min", "value": 5.0},
             "privacy.k-map.score": {"bound": "min", "value": 5.0},
+            "release_privacy.v1": {
+                "contract_id": "custom.release_privacy.v1",
+                "emitted_key": "release_privacy.v1",
+                "framework": "custom",
+                "bound": "max",
+                "value": 0.0,
+            },
         }
     )
 
@@ -613,6 +626,8 @@ class EvaluationConfig:
     #: (report.md, alongside combined_evaluation.csv) summarizing the ranked
     #: table, privacy gate results, and a recommended model.
     generate_report: bool = True
+    #: Final SynthEval is a mandatory audit pass, even when ordinary selection is disabled.
+    final_syntheval_mandatory: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -938,7 +953,11 @@ def _validate_policy_config(cfg: Any) -> None:
     if cfg.data.canonical:
         utility = cfg.generation.hpo.utility_policy
         if utility != {
-            "metrics": ["tstr_macro_f1", "mixed_mmd_score", "elastic_net_jsd_score"],
+            "metrics": [
+                "tstr_macro_f1.v1",
+                "mixed_mmd.v1",
+                "elastic_net_jsd.v1",
+            ],
             "weights": [1 / 3, 1 / 3, 1 / 3],
         }:
             raise ValueError(

@@ -25,6 +25,7 @@ from synthdata.evaluation import (
     report,
     synthcity_eval,
     syntheval_eval,
+    task12_eval,
 )
 from synthdata.evaluation.catalog import (
     syntheval_execution_keys_by_framework,
@@ -33,19 +34,110 @@ from synthdata.evaluation.catalog import (
 from synthdata.evaluation.metric_contracts import (
     DEFAULT_METRIC_CONTRACT_REGISTRY,
     MetricEvaluationContext,
+    is_verified_task10_tstr,
 )
+from synthdata.evaluation.release import transform_release_roles
+from synthdata.evaluation.tstr import run_tstr_evaluation
 from synthdata.utils import ensure_dir, get_logger
 
 logger = get_logger(__name__)
 
 
-def _candidate_role_frames(dataset: Dataset) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Return fit, tuning, and final-holdout frames for evaluation context."""
+def _authoritative_tstr_results(
+    executions: dict,
+    *,
+    trusted_role_hashes: dict[str, str] | None = None,
+) -> dict[str, dict]:
+    """Extract Task 10-owned TSTR records without calculating TSTR here."""
+    results = {}
+
+    def verified(report: object) -> bool:
+        if not isinstance(report, dict):
+            return False
+        return is_verified_task10_tstr(report, trusted_role_hashes=trusted_role_hashes)
+
+    def blocked(reason: str) -> dict:
+        return {
+            "state": "blocked",
+            "reason": reason,
+            "result_metadata": {"tstr_producer_available": False},
+        }
+
+    for model_name, payload in (executions or {}).items():
+        if not isinstance(payload, dict):
+            payload = getattr(payload, "report", {})
+        if not isinstance(payload, dict):
+            continue
+        for candidate in (payload.get("task10_tstr"), payload.get("tstr_result")):
+            if isinstance(candidate, dict):
+                if verified(candidate):
+                    results[model_name] = candidate
+                else:
+                    results[model_name] = blocked(
+                        "Task 10 TSTR producer metadata or artifact is unverified"
+                    )
+                break
+        if model_name in results:
+            continue
+        for item in payload.get("metric_executions", ()):
+            rows = item.get("results", item.get("rows"))
+            if rows is None:
+                rows = item.get("normalized_rows_v2", item.get("normalized_rows", ()))
+            if isinstance(rows, dict):
+                rows = rows.values()
+            for row in rows:
+                metadata = row.get("result_metadata", row.get("metadata", {}))
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                # Task 10 stores its durable fairness artifact either in row
+                # metadata or directly beside normalized metric values.
+                if "prediction_artifact" not in metadata and isinstance(
+                    row.get("prediction_artifact"), dict
+                ):
+                    metadata = {**metadata, "prediction_artifact": row["prediction_artifact"]}
+                if not isinstance(metadata, dict) or not verified(
+                    {**row, "result_metadata": metadata}
+                ):
+                    continue
+                if row.get("metric") not in {"macro_f1", "tstr_macro_f1"}:
+                    continue
+                results[model_name] = {
+                    "state": "complete"
+                    if row.get("raw_value", row.get("val")) is not None
+                    else "blocked",
+                    "macro_f1": row.get("raw_value", row.get("val")),
+                    "equalized_odds": metadata.get("equalized_odds"),
+                    "prediction_artifact": metadata.get("prediction_artifact"),
+                    "class_supports": metadata.get("class_supports", metadata.get("support", {})),
+                    "target_order": metadata.get("target_order", []),
+                    "result_metadata": metadata,
+                }
+        if model_name not in results:
+            results[model_name] = blocked("Task 10 TSTR producer result is unavailable or untagged")
+    return results
+
+
+def _candidate_role_frames(
+    dataset: Dataset,
+    *,
+    audit_only_legacy_adapter: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return fit, tuning, and final-holdout frames for evaluation context.
+
+    Legacy two-role data has no tuning role. Substituting its final holdout is
+    unsafe for candidate evaluation and is allowed only for an explicitly
+    requested audit-only adapter.
+    """
     train_frame = dataset.role_frame("train", imputed=True)
     tuning_frame = dataset.role_frame("tuning", imputed=True)
     final_holdout_frame = dataset.role_frame("final_holdout", imputed=True)
-    if tuning_frame is None and dataset.legacy_two_role:
+    if tuning_frame is None and dataset.legacy_two_role and audit_only_legacy_adapter:
         tuning_frame = final_holdout_frame
+    elif tuning_frame is None and dataset.legacy_two_role:
+        raise RuntimeError(
+            "Legacy two-role datasets cannot substitute final_holdout for tuning; "
+            "request the explicit audit-only legacy adapter"
+        )
     missing = [
         role
         for role, frame in (
@@ -59,6 +151,9 @@ def _candidate_role_frames(dataset: Dataset) -> tuple[pd.DataFrame, pd.DataFrame
         raise RuntimeError(
             "Evaluation requires populated imputed role frame(s): " + ", ".join(missing)
         )
+    assert train_frame is not None
+    assert tuning_frame is not None
+    assert final_holdout_frame is not None
     return train_frame, tuning_frame, final_holdout_frame
 
 
@@ -339,6 +434,23 @@ def _run_final_holdout_evidence(
         "final_holdout": dataframe_fingerprint(raw_final_holdout_frame),
         "refit_fit": refit_metadata["fit_frame_fingerprints"]["raw"],
     }
+    task10_results = {}
+    if eval_cfg.custom.enabled:
+        for model_name, frame in selected_dataset.items():
+            released_synthetic, released_roles, _ = transform_release_roles(
+                frame,
+                {"final_holdout": raw_final_holdout_frame},
+                eval_cfg.release_generalization.columns,
+            )
+            task10_results[model_name] = run_tstr_evaluation(
+                released_synthetic,
+                released_roles["final_holdout"],
+                target_column=dataset.target_column,
+                evaluation_role="final_holdout",
+                seed=cfg.seed,
+                protected_columns=list(dataset.protected_columns),
+                role_hashes=final_custom_role_hashes,
+            ).envelope
     group_configuration = {
         "group_context": final_group_context,
         "fit_roles": ["train", "tuning"],
@@ -388,46 +500,46 @@ def _run_final_holdout_evidence(
     )
 
     final_execution_failures = []
-    final_syntheval_output = None
-    try:
-        final_syntheval_output = syntheval_eval.run_syntheval_evaluation(
-            selected_dataset,
-            dataset,
-            eval_cfg.syntheval,
-            preset_dir=output_dir,
-            ranking_strategy=eval_cfg.ranking_strategy,
-            output_folder=output_dir / "syntheval_final_holdout",
-            plots_output_dir=None,
-            positive_class=eval_cfg.positive_class,
-            execution_cfg=eval_cfg.syntheval_execution,
-            return_execution=True,
-            group_context=final_group_context,
-            semantic_context=synthcity_semantics,
-            evaluation_role="final_holdout",
-            fit_frame=real_fit_frame,
-            fit_roles=("train", "tuning"),
-        )
-    except RuntimeError as exc:
-        checkpoint_root = output_dir / "syntheval_final_holdout"
-        logger.error(
-            "[final holdout] SynthEval main pass failed for selected model=%s; "
-            "checkpoint_root=%s: %s",
-            selected_model,
-            checkpoint_root,
-            exc,
-        )
-        final_execution_failures.append(
-            {
-                "framework": "syntheval",
-                "execution_pass": "main",
-                "model": selected_model,
-                "status": "failed",
-                "exception_type": type(exc).__name__,
-                "error": str(exc),
-                "checkpoint_root": str(checkpoint_root),
-            }
-        )
-        final_syntheval_output = (None, None, {})
+    final_syntheval_output = (None, None, {})
+    if eval_cfg.syntheval.enabled:
+        try:
+            final_syntheval_output = syntheval_eval.run_syntheval_evaluation(
+                selected_dataset,
+                dataset,
+                eval_cfg.syntheval,
+                preset_dir=output_dir,
+                ranking_strategy=eval_cfg.ranking_strategy,
+                output_folder=output_dir / "syntheval_final_holdout",
+                plots_output_dir=None,
+                positive_class=eval_cfg.positive_class,
+                execution_cfg=eval_cfg.syntheval_execution,
+                return_execution=True,
+                group_context=final_group_context,
+                semantic_context=synthcity_semantics,
+                evaluation_role="final_holdout",
+                fit_frame=real_fit_frame,
+                fit_roles=("train", "tuning"),
+            )
+        except RuntimeError as exc:
+            checkpoint_root = output_dir / "syntheval_final_holdout"
+            logger.error(
+                "[final holdout] SynthEval main pass failed for selected model=%s; checkpoint_root=%s: %s",
+                selected_model,
+                checkpoint_root,
+                exc,
+            )
+            final_execution_failures.append(
+                {
+                    "framework": "syntheval",
+                    "execution_pass": "main",
+                    "model": selected_model,
+                    "status": "failed",
+                    "exception_type": type(exc).__name__,
+                    "error": str(exc),
+                    "checkpoint_root": str(checkpoint_root),
+                }
+            )
+            final_syntheval_output = (None, None, {})
 
     if len(final_syntheval_output) == 3:
         final_benchmark_results, final_benchmark_ranks, final_syntheval_executions = (
@@ -436,40 +548,40 @@ def _run_final_holdout_evidence(
     else:
         final_benchmark_results, final_benchmark_ranks = final_syntheval_output
         final_syntheval_executions = {}
-    final_syntheval_preset = syntheval_eval.build_preset(
-        eval_cfg.syntheval,
-        positive_class=eval_cfg.positive_class,
-    )
-    final_syntheval_manifest = syntheval_execution_manifest(
-        final_syntheval_preset,
-        include_holdout_outputs=True,
-        target_columns=[dataset.target_column],
-        protected_columns=dataset.sensitive_columns,
-    )
-    final_syntheval_expected_keys = syntheval_eval.extend_syntheval_expected_diagnostics(
-        syntheval_execution_keys_by_framework(final_syntheval_manifest),
-        final_benchmark_results,
-        structured_executions=final_syntheval_executions,
-    )
-    final_syntheval_validations = syntheval_eval.validate_syntheval_results(
-        final_benchmark_results,
-        final_benchmark_ranks,
-        final_syntheval_expected_keys,
-        role_hashes=final_role_hashes,
-        model_names=[selected_model],
-        execution_pass="main",
-        target_view="native",
-        evaluation_role="final_holdout",
-        requested_use="audit",
-        structured_executions=final_syntheval_executions,
-        population_unit=population_unit,
-        group_mode=group_mode,
-        resolved_configuration=group_configuration,
-    )
+    final_syntheval_validations = {}
+    if eval_cfg.syntheval.enabled:
+        final_syntheval_preset = syntheval_eval.build_preset(
+            eval_cfg.syntheval, positive_class=eval_cfg.positive_class
+        )
+        final_syntheval_manifest = syntheval_execution_manifest(
+            final_syntheval_preset,
+            include_holdout_outputs=True,
+            target_columns=[dataset.target_column],
+            protected_columns=dataset.sensitive_columns,
+        )
+        final_syntheval_validations = syntheval_eval.validate_syntheval_results(
+            final_benchmark_results,
+            final_benchmark_ranks,
+            syntheval_eval.extend_syntheval_expected_diagnostics(
+                syntheval_execution_keys_by_framework(final_syntheval_manifest),
+                final_benchmark_results,
+                structured_executions=final_syntheval_executions,
+            ),
+            role_hashes=final_role_hashes,
+            model_names=[selected_model],
+            execution_pass="main",
+            target_view="native",
+            evaluation_role="final_holdout",
+            requested_use="audit",
+            structured_executions=final_syntheval_executions,
+            population_unit=population_unit,
+            group_mode=group_mode,
+            resolved_configuration=group_configuration,
+        )
 
     final_binary_executions = {}
     final_binary_validations = {}
-    if eval_cfg.binary_target.enabled:
+    if eval_cfg.syntheval.enabled and eval_cfg.binary_target.enabled:
         try:
             final_binary_output = syntheval_eval.run_binary_target_syntheval_evaluation(
                 selected_dataset,
@@ -548,6 +660,9 @@ def _run_final_holdout_evidence(
             },
         )
         final_syntheval_validations.update(final_binary_validations)
+    final_syntheval_validations = {
+        key: value for key, value in final_syntheval_validations.items() if key[0] == "syntheval"
+    }
 
     final_custom_reports = custom_eval.run_log_disparity_evaluation(
         selected_dataset,
@@ -570,6 +685,26 @@ def _run_final_holdout_evidence(
         if final_custom_reports
         else {}
     )
+    final_task12_observations = task12_eval.run_task12_custom_evaluation(
+        selected_dataset,
+        dataset,
+        evaluation_role="final_holdout",
+        generalization=eval_cfg.release_generalization.columns,
+        quasi_identifiers=list(dataset.quasi_identifier_columns),
+        sensitive_fields=list(dataset.sensitive_columns),
+        protected_columns=list(dataset.protected_columns),
+        role_hashes=final_custom_role_hashes,
+        tstr_results=task10_results,
+        seed=cfg.seed,
+    )
+    final_task12_validations = task12_eval.validate_task12_custom_results(
+        final_task12_observations,
+        role_hashes=final_custom_role_hashes,
+        evaluation_role="final_holdout",
+        population_unit=population_unit,
+        group_mode=group_mode,
+        requested_use="audit",
+    )
 
     binary_target_mapping = None
     if eval_cfg.binary_target.enabled:
@@ -591,6 +726,10 @@ def _run_final_holdout_evidence(
     final_validation_failures.extend(
         _incomplete_validation_records("custom", final_custom_validations)
     )
+    if eval_cfg.custom.enabled:
+        final_validation_failures.extend(
+            _incomplete_validation_records("custom", final_task12_validations)
+        )
 
     rank_value = combined.loc[selected_model, ("__all__", "overall", "rank")]
     selection = {
@@ -625,6 +764,7 @@ def _run_final_holdout_evidence(
             },
             "custom": {
                 "validation": _single_framework_validation_payload(final_custom_validations),
+                "task12_validation": _single_framework_validation_payload(final_task12_validations),
                 "summary": {
                     name: report.get("summary_stats", report)
                     for name, report in final_custom_reports.items()
@@ -652,6 +792,7 @@ def _run_blocked_legacy_evaluation(
     legacy_semantic_context = semantic_context_payload(
         dataset,
         classification_score=eval_cfg.synthcity.classification_score,
+        roles=("train", "final_holdout"),
     )
     logger.warning(
         "[evaluation] legacy_two_role dataset=%s cannot support candidate evaluation or "
@@ -742,8 +883,18 @@ def _run_blocked_legacy_evaluation(
         "artifact_manifest": str(artifact_manifest),
     }
     if eval_cfg.generate_report:
-        report_path = report.save_evaluation_report(cfg, dataset, combined, extras, experiment)
-        extras["report_path"] = str(report_path)
+        try:
+            report_path = report.save_evaluation_report(cfg, dataset, combined, extras, experiment)
+        except ValueError as exc:
+            # Legacy bundles intentionally lack canonical tuning provenance;
+            # retain durable blocked artifacts instead of inventing report context.
+            logger.warning("[evaluation] blocked legacy report omitted: %s", exc)
+            (output_dir / "report.md").write_text(
+                "# Evaluation report\n\nStatus: blocked\n\n"
+                "Legacy two-role dataset has no canonical tuning evidence.\n"
+            )
+        else:
+            extras["report_path"] = str(report_path)
     return combined, extras
 
 
@@ -834,6 +985,7 @@ def run_evaluation(
             group_mode=group_mode,
             resolved_configuration={
                 "metric_config": synthcity_metric_config,
+                "fit_roles": ["train"],
                 "quasi_identifier_columns": synthcity_semantics["quasi_identifier_columns"],
                 "sensitive_target_types": synthcity_semantics["sensitive_target_types"],
                 "feature_types": synthcity_semantics["feature_types"],
@@ -864,55 +1016,59 @@ def run_evaluation(
         if want_syntheval_plots
         else None
     )
-    syntheval_output = syntheval_eval.run_syntheval_evaluation(
-        selected_datasets,
-        dataset,
-        eval_cfg.syntheval,
-        preset_dir=output_dir,
-        ranking_strategy=eval_cfg.ranking_strategy,
-        output_folder=output_dir / "syntheval_benchmark",
-        plots_output_dir=plots_output_dir,
-        positive_class=eval_cfg.positive_class,
-        execution_cfg=eval_cfg.syntheval_execution,
-        return_execution=True,
-        group_context=group_context,
-        semantic_context=synthcity_semantics,
-    )
+    syntheval_output = (None, None, {})
+    if eval_cfg.syntheval.enabled:
+        syntheval_output = syntheval_eval.run_syntheval_evaluation(
+            selected_datasets,
+            dataset,
+            eval_cfg.syntheval,
+            preset_dir=output_dir,
+            ranking_strategy=eval_cfg.ranking_strategy,
+            output_folder=output_dir / "syntheval_benchmark",
+            plots_output_dir=plots_output_dir,
+            positive_class=eval_cfg.positive_class,
+            execution_cfg=eval_cfg.syntheval_execution,
+            return_execution=True,
+            group_context=group_context,
+            semantic_context=synthcity_semantics,
+        )
     if len(syntheval_output) == 3:
         benchmark_results, benchmark_ranks, syntheval_executions = syntheval_output
     else:
         benchmark_results, benchmark_ranks = syntheval_output
         syntheval_executions = {}
-    syntheval_preset = syntheval_eval.build_preset(
-        eval_cfg.syntheval,
-        positive_class=eval_cfg.positive_class,
-    )
-    syntheval_manifest = syntheval_execution_manifest(
-        syntheval_preset,
-        include_holdout_outputs=tuning_frame is not None,
-        target_columns=[dataset.target_column],
-        protected_columns=dataset.sensitive_columns,
-    )
-    syntheval_expected_keys = syntheval_eval.extend_syntheval_expected_diagnostics(
-        syntheval_execution_keys_by_framework(syntheval_manifest),
-        benchmark_results,
-        structured_executions=syntheval_executions,
-    )
-    syntheval_validations = syntheval_eval.validate_syntheval_results(
-        benchmark_results,
-        benchmark_ranks,
-        syntheval_expected_keys,
-        role_hashes=candidate_role_hashes,
-        model_names=model_names,
-        requested_use="audit",
-        structured_executions=syntheval_executions,
-        population_unit=population_unit,
-        group_mode=group_mode,
-        resolved_configuration=group_configuration,
-    )
+    syntheval_validations = {}
+    if eval_cfg.syntheval.enabled:
+        syntheval_preset = syntheval_eval.build_preset(
+            eval_cfg.syntheval,
+            positive_class=eval_cfg.positive_class,
+        )
+        syntheval_manifest = syntheval_execution_manifest(
+            syntheval_preset,
+            include_holdout_outputs=tuning_frame is not None,
+            target_columns=[dataset.target_column],
+            protected_columns=dataset.sensitive_columns,
+        )
+        syntheval_expected_keys = syntheval_eval.extend_syntheval_expected_diagnostics(
+            syntheval_execution_keys_by_framework(syntheval_manifest),
+            benchmark_results,
+            structured_executions=syntheval_executions,
+        )
+        syntheval_validations = syntheval_eval.validate_syntheval_results(
+            benchmark_results,
+            benchmark_ranks,
+            syntheval_expected_keys,
+            role_hashes=candidate_role_hashes,
+            model_names=model_names,
+            requested_use="audit",
+            structured_executions=syntheval_executions,
+            population_unit=population_unit,
+            group_mode=group_mode,
+            resolved_configuration=group_configuration,
+        )
 
     binary_executions = {}
-    if eval_cfg.binary_target.enabled:
+    if eval_cfg.syntheval.enabled and eval_cfg.binary_target.enabled:
         binary_output = syntheval_eval.run_binary_target_syntheval_evaluation(
             selected_datasets,
             dataset,
@@ -970,12 +1126,16 @@ def run_evaluation(
             benchmark_results, benchmark_ranks, binary_results, binary_ranks
         )
 
-    log_disparity_reports = custom_eval.run_log_disparity_evaluation(
-        selected_datasets,
-        dataset,
-        eval_cfg.log_disparity,
-        eval_cfg.custom,
-        evaluation_role="tuning",
+    log_disparity_reports = (
+        custom_eval.run_log_disparity_evaluation(
+            selected_datasets,
+            dataset,
+            eval_cfg.log_disparity,
+            eval_cfg.custom,
+            evaluation_role="tuning",
+        )
+        if eval_cfg.custom.enabled
+        else {}
     )
     raw_candidate_role_hashes = {
         "train": dataframe_fingerprint(dataset.role_frame("train", imputed=False)),
@@ -997,6 +1157,48 @@ def run_evaluation(
         if log_disparity_reports
         else None
     )
+    task12_observations = {}
+    if eval_cfg.custom.enabled:
+        task12_observations = task12_eval.run_task12_custom_evaluation(
+            selected_datasets,
+            dataset,
+            evaluation_role="tuning",
+            generalization=eval_cfg.release_generalization.columns,
+            quasi_identifiers=list(dataset.quasi_identifier_columns),
+            sensitive_fields=list(dataset.sensitive_columns),
+            protected_columns=list(dataset.protected_columns),
+            role_hashes=raw_candidate_role_hashes,
+            seed=cfg.seed,
+        )
+    candidate_release_digest = None
+    if task12_observations:
+        first_observations = next(iter(task12_observations.values()), ())
+        for observation in first_observations:
+            if observation.emitted_key == "release_privacy.v1":
+                candidate_release_digest = observation.result_metadata.get(
+                    "release_transform_digest"
+                )
+                break
+    task12_validations = {}
+    if eval_cfg.custom.enabled:
+        task12_validations = task12_eval.validate_task12_custom_results(
+            task12_observations,
+            role_hashes=raw_candidate_role_hashes,
+            evaluation_role="tuning",
+            population_unit=population_unit,
+            group_mode=group_mode,
+            requested_use="audit",
+        )
+    if candidate_release_digest is not None:
+        raw_candidate_role_hashes["__release_transform_digest__"] = candidate_release_digest
+        task12_validations = task12_eval.validate_task12_custom_results(
+            task12_observations,
+            role_hashes=raw_candidate_role_hashes,
+            evaluation_role="tuning",
+            population_unit=population_unit,
+            group_mode=group_mode,
+            requested_use="audit",
+        )
     metric_execution_passes = syntheval_eval.build_metric_execution_passes(syntheval_validations)
 
     combined = combine.build_combined_table(
@@ -1010,6 +1212,7 @@ def run_evaluation(
         syntheval_validations=syntheval_validations,
         metric_execution_passes=metric_execution_passes,
         custom_validations=custom_validations,
+        task12_validations=task12_validations,
     )
 
     gate_validation_results = {
@@ -1018,6 +1221,8 @@ def run_evaluation(
     }
     if custom_validations is not None:
         gate_validation_results[("custom", "main")] = custom_validations
+    if task12_validations:
+        gate_validation_results[("custom", "main")] = task12_validations
     gate_result = privacy_gate.evaluate_privacy_gate(
         combined,
         eval_cfg.privacy_gate,
@@ -1108,6 +1313,9 @@ def run_evaluation(
         },
         "custom_validation": {
             name: validation.to_dict() for name, validation in (custom_validations or {}).items()
+        },
+        "task12_validation": {
+            name: validation.to_dict() for name, validation in task12_validations.items()
         },
         "syntheval_benchmark_results": benchmark_results,
         "syntheval_benchmark_ranks": benchmark_ranks,
