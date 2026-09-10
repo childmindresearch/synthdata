@@ -17,6 +17,7 @@ from synthdata.log_disparity.metric_log_disparity import (
     benjamini_hochberg_correction,
     classify_equity_outcome,
     compare_population_proportion,
+    compute_log_disparity_report,
     generate_bin_labels,
     log_disparate_impact,
     prepare_data_for_analysis,
@@ -256,3 +257,41 @@ class TestPrepareDataForAnalysis:
             df, "outcome", ["age"], protected_bins=[[0, 30, 60]]
         )
         assert "OutOfRange" in prepared["age__GROUP"].tolist()
+
+
+class TestRepresentationEvidence:
+    def test_practical_floor_is_inclusive_and_worst_value_is_separate(self):
+        real = pd.DataFrame({"group": ["A"] * 10 + ["B"] * 10, "target": [0] * 10 + [1] * 10})
+        synth = pd.DataFrame({"group": ["A"] * 8 + ["B"] * 2, "target": [0] * 8 + [1] * 2})
+        report = compute_log_disparity_report(real, synth, "target", ["group"])
+        stats = report["summary_stats"]
+        valid_values = (
+            report["leaf_results"]
+            .loc[report["leaf_results"]["valid_applicable"], "EquityValue"]
+            .abs()
+        )
+        assert stats["worst_abs_log_disparity"] == pytest.approx(
+            valid_values.max() if not valid_values.empty else float("nan"), nan_ok=True
+        )
+        assert "material_disparity" in report["leaf_results"]
+        assert "invalid_reason" in report["leaf_results"]
+
+    def test_real_supported_synthetic_empty_leaf_is_material_and_retained(self):
+        real = pd.DataFrame({"group": ["A"] * 10 + ["B"] * 10, "target": [0] * 20})
+        synth = pd.DataFrame({"group": ["A"] * 10, "target": [0] * 10})
+        report = compute_log_disparity_report(real, synth, "target", ["group"])
+        empty = report["leaf_results"].query("group__GROUP == 'B'")
+        assert not empty.empty
+        assert (empty["invalid_reason"] == "synthetic_empty").any()
+        assert empty["valid_applicable"].all()
+        assert empty["material_disparity"].all()
+
+    def test_synthetic_empty_p_values_join_bh_family(self):
+        real = pd.DataFrame({"group": ["A"] * 10 + ["B"] * 10, "target": [0] * 20})
+        synth = pd.DataFrame({"group": ["A"] * 10, "target": [0] * 10})
+        report = compute_log_disparity_report(real, synth, "target", ["group"])
+        leaves = report["leaf_results"]
+        empty = leaves.query("group__GROUP == 'B'")
+        assert empty["pValue"].eq(0).all()
+        assert empty["BH_p"].eq(0).all()
+        assert leaves["test_family"].nunique() == 1

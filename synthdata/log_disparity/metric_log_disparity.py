@@ -63,6 +63,9 @@ SIG_THRESHOLD: float = 0.05
 # Based on log(0.9) and log(0.8) from original R implementation
 TOLERANCE_1: float = -math.log(0.9)  # ~0.10536 (moderate threshold)
 TOLERANCE_2: float = -math.log(0.8)  # ~0.22314 (extreme threshold)
+# Practical floor for a materially meaningful representation disparity.
+PRACTICAL_LOG_DISPARITY_FLOOR: float = 0.22314355131
+MIN_VALID_APPLICABLE_SHARE: float = 0.80
 
 # Sentinel values for special cases
 SENTINEL_NO_INFO: int = -9999999  # Both rates are zero
@@ -731,12 +734,23 @@ def compute_log_disparity_report(
     )
 
     # Compute summary statistics
-    valid_mask = ~leaf["EquityValue"].isin(
-        [SENTINEL_NO_INFO, SENTINEL_NO_BASE, SENTINEL_INSUFFICIENT]
-    ) & ~np.isinf(leaf["EquityValue"])
+    valid_mask = leaf["valid_applicable"]
     valid_values = leaf.loc[valid_mask, "EquityValue"]
+    denominator = int(valid_mask.sum())
+    excluded_reasons = {
+        "not_applicable_real_zero_support",
+        "insufficient_support",
+        "sentinel_or_untestable",
+    }
+    applicable_mask = ~leaf["invalid_reason"].isin(excluded_reasons)
+    applicable_leaves = int(applicable_mask.sum())
+    materially_significant = int(leaf["material_disparity"].sum())
+    valid_share = denominator / applicable_leaves if applicable_leaves else np.nan
+    representation_safety = 1.0 - materially_significant / denominator if denominator else np.nan
+    if pd.notna(valid_share) and valid_share < MIN_VALID_APPLICABLE_SHARE:
+        representation_safety = np.nan
     sig_share = (
-        leaf["BH_p"].between(0, SIG_THRESHOLD, inclusive="both").mean() if len(leaf) else np.nan
+        float(leaf.loc[valid_mask, "BH_p"].le(SIG_THRESHOLD).mean()) if denominator else np.nan
     )
 
     summary_stats = {
@@ -747,6 +761,27 @@ def compute_log_disparity_report(
         if len(valid_values)
         else np.nan,
         "share_significant_bh": float(sig_share) if pd.notna(sig_share) else np.nan,
+        "valid_applicable_leaves": denominator,
+        "applicable_leaves": applicable_leaves,
+        "not_applicable_leaves": int((~applicable_mask).sum()),
+        "invalid_reason_counts": {
+            reason: int(leaf["invalid_reason"].eq(reason).sum())
+            for reason in (
+                "synthetic_empty",
+                "insufficient_support",
+                "sentinel_or_untestable",
+                "not_applicable_real_zero_support",
+            )
+        },
+        "materially_significant_valid_leaves": materially_significant,
+        "valid_applicable_share": float(valid_share) if pd.notna(valid_share) else np.nan,
+        "representation_safety": representation_safety,
+        "representation_evidence_state": (
+            "indeterminate" if pd.isna(representation_safety) else "determinate"
+        ),
+        "worst_abs_log_disparity": (
+            float(valid_values.abs().max()) if len(valid_values) else np.nan
+        ),
     }
 
     label_counts = (
@@ -825,8 +860,11 @@ def _attach_disparity_metrics(
         axis=1,
     )
 
-    # Apply BH correction
-    out["BH_p"] = benjamini_hochberg_correction(out["pValue"])
+    # Absent synthetic support is an applicable, maximally discrepant leaf.
+    # Put its deterministic p=0 into the family before BH adjustment so it
+    # contributes to (and is affected by) the family size.
+    synthetic_empty = (out["background_n"] > 0) & (out["user_n"] == 0)
+    out.loc[synthetic_empty, "pValue"] = 0.0
 
     # Compute equity metrics
     out["EquityValue"] = out.apply(
@@ -834,6 +872,47 @@ def _attach_disparity_metrics(
             float(r["Background_Rate"]), float(r["Observed_Rate"]), for_plot=False
         ),
         axis=1,
+    )
+
+    # Preserve every leaf. Real-supported/synthetic-empty leaves are
+    # applicable absence evidence; only real-zero support is non-applicable.
+    def invalid_reason(row: pd.Series) -> str | None:
+        if int(row["background_n"]) == 0:
+            return "not_applicable_real_zero_support"
+        if int(row["user_n"]) == 0:
+            return "synthetic_empty"
+        if row["pValue"] == SENTINEL_INSUFFICIENT:
+            return "insufficient_support"
+        if row["pValue"] in (SENTINEL_NO_INFO, SENTINEL_NO_BASE) or not np.isfinite(
+            float(row["EquityValue"])
+        ):
+            return "sentinel_or_untestable"
+        return None
+
+    out["invalid_reason"] = out.apply(invalid_reason, axis=1)
+    # Only applicable, testable leaves belong to declared BH family. Synthetic
+    # absence is explicitly testable evidence and already has raw p=0.
+    bh_eligible = ~out["invalid_reason"].isin(
+        {
+            "not_applicable_real_zero_support",
+            "insufficient_support",
+            "sentinel_or_untestable",
+        }
+    )
+    out["BH_p"] = np.nan
+    out.loc[bh_eligible, "BH_p"] = benjamini_hochberg_correction(out.loc[bh_eligible, "pValue"])
+    out["valid_applicable"] = ~out["invalid_reason"].isin(
+        {
+            "not_applicable_real_zero_support",
+            "insufficient_support",
+            "sentinel_or_untestable",
+        }
+    )
+    out["test_family"] = "representation::target_by_protected_leaf"
+    out["material_disparity"] = (
+        out["valid_applicable"]
+        & out["BH_p"].le(SIG_THRESHOLD)
+        & out["EquityValue"].abs().ge(PRACTICAL_LOG_DISPARITY_FLOOR)
     )
 
     out["EquityLabel"] = out.apply(

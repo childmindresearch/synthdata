@@ -1,0 +1,270 @@
+from hashlib import sha256
+
+import pandas as pd
+import pytest
+
+from synthdata.evaluation.release import transform_release_roles
+from synthdata.evaluation.tstr import compute_equalized_odds, run_tstr_evaluation
+
+
+def _frame(rows, role, source, release=False):
+    frame = pd.DataFrame(rows)
+    frame.attrs["release_provenance"] = {
+        "release_form": release,
+        "role": role,
+        "source_role": source,
+        "protocol_version": "test",
+        "digest": "test-digest",
+        "role_hash": "test-role-hash",
+        "common_protocol_digest": "test-common",
+    }
+    return frame
+
+
+def test_rejects_non_release_synthetic_input():
+    synthetic = _frame([{"x": 0, "y": 0}], "train", "synthetic")
+    real = _frame([{"x": 0, "y": 0}], "tuning", "tuning")
+    with pytest.raises(ValueError, match="release-form"):
+        run_tstr_evaluation(synthetic, real, target_column="y")
+
+
+def test_missing_class_preserves_real_support():
+    synthetic, roles, _ = transform_release_roles(
+        pd.DataFrame([{"x": 0, "y": 0}, {"x": 1, "y": 0}]),
+        {"tuning": pd.DataFrame([{"x": 0, "y": 0}, {"x": 1, "y": 1}])},
+    )
+    real = roles["tuning"]
+    result = run_tstr_evaluation(synthetic, real, target_column="y")
+    assert result.report["state"] == "indeterminate"
+    assert result.report["class_supports"] == {"0": 1, "1": 1}
+
+
+def test_unexpected_classes_are_stably_ordered():
+    synthetic, roles, _ = transform_release_roles(
+        pd.DataFrame(
+            [
+                {"x": 0, "y": "known"},
+                {"x": 1, "y": "zebra"},
+                {"x": 2, "y": "ant"},
+                {"x": 3, "y": "middle"},
+            ]
+        ),
+        {"tuning": pd.DataFrame([{"x": 0, "y": "known"}])},
+    )
+    real = roles["tuning"]
+
+    reports = [run_tstr_evaluation(synthetic, real, target_column="y").report for _ in range(5)]
+
+    assert all(
+        report["unexpected_synthetic_classes"] == ["ant", "middle", "zebra"] for report in reports
+    )
+
+
+def test_equalized_odds_known_ovr_fixture():
+    y_true = [0, 0, 1, 1, 0, 0, 1, 1]
+    y_pred = [0, 1, 1, 1, 0, 0, 0, 1]
+    protected = pd.DataFrame({"group": ["a", "a", "a", "a", "b", "b", "b", "b"]})
+    result = compute_equalized_odds(
+        y_true,
+        y_pred,
+        protected,
+        target_classes=[0, 1],
+        prediction_artifact=_artifact(y_pred, y_true, protected),
+    )
+    assert result["state"] == "complete"
+    assert result["macro_valid_slice_score"] == pytest.approx(0.5)
+    assert result["worst_valid_gap"] == pytest.approx(0.5)
+
+
+def test_equalized_odds_nested_multiclass_multigroup_aggregation():
+    y_true = [0, 1, 2, 0, 0, 1, 2, 1, 0, 1, 0, 1]
+    y_pred = [0, 1, 2, 1, 0, 0, 1, 1, 0, 0, 1, 1]
+    protected = pd.DataFrame(
+        {"group": ["a", "a", "a", "a", "b", "b", "b", "b", "c", "c", "c", "c"]}
+    )
+
+    result = compute_equalized_odds(
+        y_true,
+        y_pred,
+        protected,
+        target_classes=[0, 1, 2],
+        prediction_artifact=_artifact(y_pred, y_true, protected),
+    )
+
+    assert result["state"] == "complete"
+    assert result["macro_valid_slice_score"] == pytest.approx(4 / 9)
+    assert result["worst_valid_gap"] == pytest.approx(0.5)
+    assert result["aggregation"] == (
+        "macro valid protected slices within target class, then macro valid target classes"
+    )
+    assert [item["state"] for item in result["slices"]] == ["valid", "valid", "valid"]
+    assert [item["valid_group_count"] for item in result["slices"]] == [3, 3, 2]
+    assert result["slices"][2]["valid_group_count"] == 2
+    assert [item["group"] for item in result["slices"][0]["group_rates"]] == ["a", "b", "c"]
+    assert [item["tpr"] for item in result["slices"][0]["group_rates"]] == pytest.approx(
+        [0.5, 1.0, 0.5]
+    )
+
+
+def test_equalized_odds_invalid_slice_is_not_zero():
+    y_true = [0, 1]
+    protected = pd.DataFrame({"group": ["a", "a"]})
+    result = compute_equalized_odds(
+        y_true,
+        [0, 1],
+        protected,
+        min_support=2,
+        prediction_artifact=_artifact([0, 1], y_true, protected),
+    )
+    assert result["state"] == "indeterminate"
+    assert result["macro_valid_slice_score"] is None
+    assert result["slices"][0]["state"] == "invalid"
+    assert result["slices"][0]["invalid_groups"][0]["group"] == "a"
+    assert result["slices"][0]["invalid_groups"][0]["positive_support"] == 1
+
+
+def _artifact(predictions, y_true, protected):
+    columns = list(protected.columns)
+    values = protected.astype(object).where(protected.notna(), "<missing>")
+    payload = {
+        "target": list(y_true),
+        "protected_columns": columns,
+        "protected": values.to_dict("records"),
+    }
+    return {
+        "source_role": "final_holdout",
+        "prediction_source": "tstr_model",
+        "verified": True,
+        "prediction_length": len(predictions),
+        "prediction_identity": sha256(repr(list(predictions)).encode()).hexdigest(),
+        "population_role": "final_holdout",
+        "population_length": len(y_true),
+        "target_column": "y",
+        "protected_columns": columns,
+        "population_identity": sha256(repr(payload).encode()).hexdigest(),
+    }
+
+
+def test_equalized_odds_rejects_tuning_and_unbound_predictions():
+    with pytest.raises(ValueError, match="final_holdout"):
+        compute_equalized_odds(
+            [0, 1],
+            [0, 1],
+            pd.DataFrame({"group": ["a", "b"]}),
+            prediction_artifact={"source_role": "tuning", "verified": True},
+        )
+    protected = pd.DataFrame({"group": ["a", "b"]})
+    with pytest.raises(ValueError, match="bound"):
+        compute_equalized_odds(
+            [0, 1], [1, 1], protected, prediction_artifact=_artifact([0, 1], [0, 1], protected)
+        )
+
+
+def test_equalized_odds_rejects_same_length_unbound_population():
+    y_true = [0, 1]
+    protected = pd.DataFrame({"group": ["a", "b"]})
+    with pytest.raises(ValueError, match="population"):
+        compute_equalized_odds(
+            [1, 0], [0, 1], protected, prediction_artifact=_artifact([0, 1], y_true, protected)
+        )
+
+
+def test_equalized_odds_rejects_common_digest_mismatch():
+    synthetic, roles, _ = transform_release_roles(
+        pd.DataFrame([{"x": 0, "y": 0}, {"x": 1, "y": 1}]),
+        {"final_holdout": pd.DataFrame([{"x": 0, "y": 0}, {"x": 1, "y": 1}])},
+    )
+    synthetic.attrs["release_provenance"]["common_protocol_digest"] = "synthetic"
+    real = roles["final_holdout"]
+    real.attrs["release_provenance"]["common_protocol_digest"] = "real"
+    with pytest.raises(ValueError, match="share release provenance"):
+        run_tstr_evaluation(synthetic, real, target_column="y", evaluation_role="final_holdout")
+
+
+@pytest.mark.parametrize(
+    ("evaluation_role", "source_role", "expected_role"),
+    [
+        ("tuning", "final_holdout", "tuning"),
+        ("final_holdout", "tuning", "final_holdout"),
+    ],
+)
+def test_run_rejects_real_frame_from_other_evaluation_role(
+    evaluation_role, source_role, expected_role
+):
+    synthetic, roles, _ = transform_release_roles(
+        pd.DataFrame([{"x": 0, "y": 0}, {"x": 1, "y": 1}]),
+        {
+            "tuning": pd.DataFrame([{"x": 0, "y": 0}, {"x": 1, "y": 1}]),
+            "final_holdout": pd.DataFrame([{"x": 0, "y": 0}, {"x": 1, "y": 1}]),
+        },
+    )
+
+    with pytest.raises(ValueError, match=f"{expected_role} provenance"):
+        run_tstr_evaluation(
+            synthetic,
+            roles[source_role],
+            target_column="y",
+            evaluation_role=evaluation_role,
+        )
+
+
+def test_run_is_deterministic_and_uses_synthetic_schema(monkeypatch):
+    synthetic, roles, _ = transform_release_roles(
+        pd.DataFrame([{"x": 0, "category": "a", "y": "no"}, {"x": 1, "category": "b", "y": "yes"}]),
+        {
+            "tuning": pd.DataFrame(
+                [{"x": 0, "extra": 9, "y": "no"}, {"x": 1, "extra": 8, "y": "yes"}]
+            )
+        },
+    )
+    real = roles["tuning"]
+    synthetic.attrs["release_provenance"]["common_protocol_digest"] = "same"
+    real.attrs["release_provenance"]["common_protocol_digest"] = "same"
+    seen = []
+
+    class Model:
+        def fit(self, x, y):
+            seen.append((len(x), tuple(x.columns), tuple(y)))
+            return self
+
+        def predict_proba(self, x):
+            return pd.DataFrame([[1.0, 0.0], [0.0, 1.0]]).to_numpy()
+
+        def predict(self, x):
+            return pd.Series([0, 1]).to_numpy()
+
+    monkeypatch.setattr("synthdata.evaluation.tstr._xgb", lambda seed, classes: Model())
+    first = run_tstr_evaluation(synthetic, real, target_column="y")
+    second = run_tstr_evaluation(synthetic, real, target_column="y")
+    assert first.report == second.report
+    assert seen == [(2, ("x", "category_a", "category_b", "category_nan"), (0, 1))] * 2
+
+
+def test_final_holdout_eo_uses_raw_non_numeric_labels():
+    synthetic, roles, _ = transform_release_roles(
+        pd.DataFrame([{"x": 0, "y": "cat"}, {"x": 1, "y": "dog"}]),
+        {
+            "final_holdout": pd.DataFrame(
+                [{"x": 0, "group": "a", "y": "cat"}, {"x": 1, "group": "b", "y": "dog"}]
+            )
+        },
+    )
+    real = roles["final_holdout"]
+    result = run_tstr_evaluation(
+        synthetic,
+        real,
+        target_column="y",
+        evaluation_role="final_holdout",
+        protected_columns=["group"],
+    )
+    assert result.report["state"] == "complete"
+
+
+def test_tuning_does_not_compute_equalized_odds():
+    synthetic, roles, _ = transform_release_roles(
+        pd.DataFrame([{"x": 0, "group": "a", "y": 0}, {"x": 1, "group": "b", "y": 1}]),
+        {"tuning": pd.DataFrame([{"x": 0, "group": "a", "y": 0}, {"x": 1, "group": "b", "y": 1}])},
+    )
+    real = roles["tuning"]
+    result = run_tstr_evaluation(synthetic, real, target_column="y", protected_columns=["group"])
+    assert "equalized_odds" not in result.report
