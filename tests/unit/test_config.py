@@ -607,6 +607,235 @@ class TestValidate:
 
 
 class TestLoadConfig:
+    @staticmethod
+    def _canonical_fixture() -> Config:
+        """Build canonical config with all fixed policy metadata populated."""
+        data = DataConfig(
+            source="csv",
+            path="x.csv",
+            target_column="target",
+            canonical=True,
+            patient_id_column="patient_id",
+            split=DataSplitConfig(mode="patient_group"),
+        )
+        cfg = Config(data=data)
+        cfg.imputation.method = "hyperimpute"
+        cfg.generation.hpo.utility_policy_provenance = "Task 13 consumes fixed utility_policy."
+        cfg.evaluation.release_generalization.columns = {
+            "Age": {
+                "intervals": [
+                    {"label": "<18", "lower": None, "upper": 18},
+                    {"label": ">=18", "lower": 18, "upper": None},
+                ]
+            }
+        }
+        return cfg
+
+    def test_loris_canonical_policy_loads(self):
+        cfg = load_config(Path(__file__).parents[2] / "configs" / "config_loris.yaml")
+        assert cfg.data.patient_id_column == "patient_id"
+        assert cfg.data.quasi_identifier_columns == [
+            "Age",
+            "Sex",
+            "region",
+            "PreInt_Demos_Fam__Child_Ethnicity",
+        ]
+        assert cfg.evaluation.privacy_policy.k_required == 5
+        assert cfg.evaluation.privacy_policy.mia_epsilon_repetitions == 10
+        assert cfg.data.split.patient_id_column is None
+        assert cfg.generation.hpo.utility_policy_provenance.startswith("Task 13")
+
+    def test_canonical_requires_direct_patient_id(self):
+        cfg = Config(data=DataConfig(source="csv", path="x.csv", canonical=True))
+        with pytest.raises(ValueError, match="patient_id_column"):
+            _validate(cfg)
+
+    @pytest.mark.parametrize("overlap", ["sensitive", "target", "patient"])
+    def test_canonical_forbids_qi_role_overlap(self, overlap):
+        cfg = self._canonical_fixture()
+        data = cfg.data
+        data.quasi_identifier_columns = {
+            "sensitive": ["secret"],
+            "target": ["target"],
+            "patient": ["patient_id"],
+        }[overlap]
+        if overlap == "sensitive":
+            data.sensitive_columns = ["secret"]
+        with pytest.raises(ValueError, match="(quasi_identifier_columns|target_column)"):
+            _validate(cfg)
+
+    def test_canonical_qi_protected_overlap_is_allowed(self):
+        cfg = self._canonical_fixture()
+        cfg.data.quasi_identifier_columns = ["age"]
+        cfg.data.protected_columns = ["age"]
+        _validate(cfg)
+
+    def test_canonical_rejects_malformed_release_intervals(self):
+        cfg = self._canonical_fixture()
+        cfg.evaluation.release_generalization.columns = {
+            "Age": {"intervals": [{"label": "bad", "lower": 2, "upper": 1}]}
+        }
+        with pytest.raises(ValueError, match="lower >= upper"):
+            _validate(cfg)
+
+    @pytest.mark.parametrize(
+        "intervals",
+        [
+            [
+                {"label": "<18", "lower": None, "upper": None},
+                {"label": ">60", "lower": 61, "upper": None},
+            ],
+            [
+                {"label": "<18", "lower": None, "upper": 18},
+                {"label": "middle", "lower": 18, "upper": None},
+                {"label": ">60", "lower": 61, "upper": None},
+            ],
+        ],
+    )
+    def test_canonical_rejects_misordered_open_ended_release_intervals(self, intervals):
+        cfg = self._canonical_fixture()
+        cfg.evaluation.release_generalization.columns = {"Age": {"intervals": intervals}}
+
+        with pytest.raises(ValueError, match="unbounded|contiguous"):
+            _validate(cfg)
+
+    def test_canonical_invalid_support_setting_is_rejected(self):
+        cfg = self._canonical_fixture()
+        cfg.evaluation.privacy_policy.k_required = 0
+        with pytest.raises(ValueError, match="k_required"):
+            _validate(cfg)
+
+    def test_canonical_missing_anchor_is_rejected(self):
+        cfg = self._canonical_fixture()
+        cfg.evaluation.scoring_policy.bh_alpha = None
+        with pytest.raises(ValueError, match="bh_alpha"):
+            _validate(cfg)
+
+    def test_legacy_profile_cannot_declare_canonical_patient_id(self):
+        cfg = Config(data=DataConfig(source="csv", path="x.csv", patient_id_column="subject_id"))
+        with pytest.raises(ValueError, match="canonical"):
+            _validate(cfg)
+
+    @pytest.mark.parametrize(
+        "mutator, message",
+        [
+            (lambda c: setattr(c.data.split, "identity_mapping_path", "map.csv"), "mapping"),
+            (lambda c: setattr(c.data.split, "one_row_per_patient", True), "one_row_per_patient"),
+            (lambda c: setattr(c.data.split, "mode", "row"), "identity settings"),
+            (lambda c: setattr(c.evaluation, "group_mode", "patient_group"), "group_mode"),
+            (lambda c: setattr(c.evaluation, "group_column", "patient_id"), "group_column"),
+        ],
+    )
+    def test_canonical_forbids_legacy_identity_settings(self, mutator, message):
+        cfg = load_config(Path(__file__).parents[2] / "configs" / "config_loris.yaml")
+        mutator(cfg)
+        with pytest.raises(ValueError, match=message):
+            _validate(cfg)
+
+    def test_canonical_nested_identity_is_rejected_at_load(self, tmp_path):
+        source = Path(__file__).parents[2] / "configs" / "config_loris.yaml"
+        raw = yaml.safe_load(source.read_text())
+        raw["data"]["split"]["patient_id_column"] = "patient_id"
+        path = tmp_path / "nested.yaml"
+        path.write_text(yaml.safe_dump(raw))
+        with pytest.raises(ValueError, match="nested split"):
+            load_config(path)
+
+    def test_canonical_nested_identity_is_rejected_directly(self):
+        cfg = self._canonical_fixture()
+        cfg.data.split.patient_id_column = "patient_id"
+        with pytest.raises(ValueError, match="nested split identity"):
+            _validate(cfg)
+
+    @pytest.mark.parametrize(
+        "path_parts",
+        [
+            ("evaluation", "privacy_policy"),
+            ("evaluation", "scoring_policy"),
+            ("evaluation", "release_generalization"),
+            ("generation", "hpo", "utility_policy"),
+            ("generation", "hpo", "utility_policy_provenance"),
+        ],
+    )
+    def test_canonical_omitted_required_policy_fields_fail_closed(self, tmp_path, path_parts):
+        source = Path(__file__).parents[2] / "configs" / "config_loris.yaml"
+        raw = yaml.safe_load(source.read_text())
+        value = raw
+        for key in path_parts[:-1]:
+            value = value[key]
+        del value[path_parts[-1]]
+        path = tmp_path / ("missing-" + "-".join(path_parts) + ".yaml")
+        path.write_text(yaml.safe_dump(raw))
+        with pytest.raises(ValueError, match=path_parts[-1]):
+            load_config(path)
+
+    @pytest.mark.parametrize(
+        "block, field",
+        [
+            ("privacy_policy", "k_required"),
+            ("privacy_policy", "l_required"),
+            ("privacy_policy", "role_population_floor"),
+            ("privacy_policy", "protected_slice_floor"),
+            ("privacy_policy", "mia_epsilon_repetitions"),
+            ("privacy_policy", "epsilon_excess_anchor"),
+            ("privacy_policy", "mia_advantage_anchor"),
+            ("privacy_policy", "attribute_disclosure_anchor"),
+            ("scoring_policy", "equalized_odds_gap_anchor"),
+            ("scoring_policy", "worst_absolute_log_disparity_anchor"),
+            ("scoring_policy", "bh_alpha"),
+            ("scoring_policy", "practical_log_disparity_floor"),
+            ("scoring_policy", "valid_comparison_fraction"),
+        ],
+    )
+    def test_canonical_omitted_policy_value_fails_closed(self, tmp_path, block, field):
+        source = Path(__file__).parents[2] / "configs" / "config_loris.yaml"
+        raw = yaml.safe_load(source.read_text())
+        del raw["evaluation"][block][field]
+        path = tmp_path / f"missing-{block}-{field}.yaml"
+        path.write_text(yaml.safe_dump(raw))
+        with pytest.raises(ValueError, match=field):
+            load_config(path)
+
+    @pytest.mark.parametrize(
+        "config_name",
+        [
+            "config_hepatitis.yaml",
+            "config_loris_refidiff_reference.yaml",
+            "config_loris_refidiff_hpo.yaml",
+        ],
+    )
+    def test_legacy_profiles_are_explicitly_noncanonical(self, config_name):
+        root = Path(__file__).parents[2]
+        cfg = load_config(root / "configs" / config_name)
+        assert cfg.data.canonical is False
+
+    @pytest.mark.parametrize(
+        "config_name",
+        [
+            "config_hepatitis.yaml",
+            "config_loris_refidiff_reference.yaml",
+            "config_loris_refidiff_hpo.yaml",
+        ],
+    )
+    def test_legacy_profiles_marked_canonical_fail_actionably(self, tmp_path, config_name):
+        root = Path(__file__).parents[2]
+        raw = yaml.safe_load((root / "configs" / config_name).read_text())
+        raw["data"]["canonical"] = True
+        path = tmp_path / config_name
+        path.write_text(yaml.safe_dump(raw))
+
+        with pytest.raises(ValueError, match="Canonical evaluation (requires|rejects)"):
+            load_config(path)
+
+    def test_canonical_omitted_policy_block_fails_closed(self, tmp_path):
+        source = Path(__file__).parents[2] / "configs" / "config_loris.yaml"
+        raw = yaml.safe_load(source.read_text())
+        del raw["evaluation"]["privacy_policy"]
+        path = tmp_path / "missing-policy.yaml"
+        path.write_text(yaml.safe_dump(raw))
+        with pytest.raises(ValueError, match="privacy_policy"):
+            load_config(path)
+
     def test_missing_file_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             load_config(tmp_path / "does_not_exist.yaml")

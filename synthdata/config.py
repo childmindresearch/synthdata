@@ -77,6 +77,10 @@ class DataConfig:
     uci_id: int | None = None
     #: Path to a local CSV or Parquet file (only used when source == "csv"/"parquet").
     path: str | None = None
+    #: Direct source-column patient identity required for canonical evaluation.
+    patient_id_column: str | None = None
+    #: Marks profile as subject to canonical leakage-safe policy validation.
+    canonical: bool = False
 
     #: Freeform dataset version label (e.g. "v1", "2024-06-01"). If set, cached
     #: raw/imputed/split CSVs are nested under `data_dir/data_v_<version>/` and every
@@ -371,6 +375,15 @@ class HPOConfig:
     best_params_path: str | None = None
     #: Override n_iter for the final "optimized" build of iterative models (None = no override).
     final_n_iter_override: int | None = None
+    #: Fixed tuning objective policy; canonical profiles may not replace its metrics.
+    utility_policy: dict = dataclasses.field(
+        default_factory=lambda: {
+            "metrics": ["tstr_macro_f1", "mixed_mmd_score", "elastic_net_jsd_score"],
+            "weights": [1 / 3, 1 / 3, 1 / 3],
+        }
+    )
+    #: Provenance marker requiring Task 13 HPO code to consume this fixed policy.
+    utility_policy_provenance: str | None = None
 
 
 @dataclasses.dataclass
@@ -422,6 +435,38 @@ class LogDisparityConfig:
     target_map: dict | None = None
     protected_map: list | None = None
     protected_bins: list | None = None
+
+
+@dataclasses.dataclass
+class PrivacyPolicyConfig:
+    """Fixed release privacy thresholds and support requirements."""
+
+    k_required: int = 5
+    l_required: int = 2
+    role_population_floor: int = 20
+    protected_slice_floor: int = 5
+    mia_epsilon_repetitions: int = 10
+    epsilon_excess_anchor: float = 0.10
+    mia_advantage_anchor: float = 0.10
+    attribute_disclosure_anchor: float = 0.20
+
+
+@dataclasses.dataclass
+class ScoringPolicyConfig:
+    """Fixed fairness/scoring anchors and validity thresholds."""
+
+    equalized_odds_gap_anchor: float = 0.10
+    worst_absolute_log_disparity_anchor: float = 0.69314718056
+    bh_alpha: float = 0.05
+    practical_log_disparity_floor: float = 0.22314355131
+    valid_comparison_fraction: float = 0.80
+
+
+@dataclasses.dataclass
+class ReleaseGeneralizationConfig:
+    """Named, deterministic release-form column transformations."""
+
+    columns: dict = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -558,6 +603,11 @@ class EvaluationConfig:
         default_factory=lambda: {"utility": 1.0, "privacy": 1.0, "fairness": 1.0}
     )
     privacy_gate: PrivacyGateConfig = dataclasses.field(default_factory=PrivacyGateConfig)
+    release_generalization: ReleaseGeneralizationConfig = dataclasses.field(
+        default_factory=ReleaseGeneralizationConfig
+    )
+    privacy_policy: PrivacyPolicyConfig = dataclasses.field(default_factory=PrivacyPolicyConfig)
+    scoring_policy: ScoringPolicyConfig = dataclasses.field(default_factory=ScoringPolicyConfig)
     #: Whether to generate a human-readable Markdown evaluation report
     #: (report.md, alongside combined_evaluation.csv) summarizing the ranked
     #: table, privacy gate results, and a recommended model.
@@ -685,6 +735,9 @@ _NESTED_DATACLASSES = {
     (EvaluationConfig, "binary_target"): BinaryTargetConfig,
     (EvaluationConfig, "syntheval_execution"): SynthEvalExecutionConfig,
     (EvaluationConfig, "privacy_gate"): PrivacyGateConfig,
+    (EvaluationConfig, "release_generalization"): ReleaseGeneralizationConfig,
+    (EvaluationConfig, "privacy_policy"): PrivacyPolicyConfig,
+    (EvaluationConfig, "scoring_policy"): ScoringPolicyConfig,
     (DataConfig, "split"): DataSplitConfig,
 }
 
@@ -700,8 +753,34 @@ def load_config(path: str | Path) -> Config:
 
     cfg = _from_dict(Config, raw)
     cfg.config_path = config_path
+    cfg._provided_paths = _provided_paths(raw)
+    if (
+        cfg.data.canonical
+        and cfg.data.split is not None
+        and "data.split.patient_id_column" in cfg._provided_paths
+    ):
+        raise ValueError(
+            "Canonical evaluation rejects nested split identity via data.split.patient_id_column; declare only "
+            "data.patient_id_column"
+        )
     _validate(cfg)
     return cfg
+
+
+def _provided_paths(raw: dict) -> set[str]:
+    """Return dotted YAML paths, allowing canonical validation to fail closed."""
+    paths: set[str] = set()
+
+    def visit(value: Any, prefix: str = "") -> None:
+        if not isinstance(value, dict):
+            return
+        for key, child in value.items():
+            path = f"{prefix}.{key}" if prefix else key
+            paths.add(path)
+            visit(child, path)
+
+    visit(raw)
+    return paths
 
 
 def _validate_nonnegative_integer(value: Any, field_name: str) -> None:
@@ -717,6 +796,153 @@ def _validate_support_override_map(value: Any, field_name: str, depth: int) -> N
             _validate_nonnegative_integer(nested, f"{field_name}[{key!r}]")
         else:
             _validate_support_override_map(nested, f"{field_name}[{key!r}]", depth - 1)
+
+
+def _validate_policy_config(cfg: Any) -> None:
+    """Validate canonical policy values and named release transformations."""
+    privacy = cfg.evaluation.privacy_policy
+    scoring = cfg.evaluation.scoring_policy
+    if cfg.data.canonical:
+        provided = getattr(cfg, "_provided_paths", None)
+        if provided is None:
+            # Directly constructed dataclasses have no YAML omission information;
+            # retain legacy unit-test ergonomics while load_config remains fail-closed.
+            provided = None
+        if provided is None:
+            required = set()
+        else:
+            required = {
+                "evaluation.privacy_policy",
+                "evaluation.scoring_policy",
+                "evaluation.release_generalization",
+                "evaluation.release_generalization.columns",
+                "generation.hpo.utility_policy",
+                "generation.hpo.utility_policy_provenance",
+            }
+            required.update(
+                f"evaluation.privacy_policy.{name}"
+                for name in (
+                    "k_required",
+                    "l_required",
+                    "role_population_floor",
+                    "protected_slice_floor",
+                    "mia_epsilon_repetitions",
+                    "epsilon_excess_anchor",
+                    "mia_advantage_anchor",
+                    "attribute_disclosure_anchor",
+                )
+            )
+            required.update(
+                f"evaluation.scoring_policy.{name}"
+                for name in (
+                    "equalized_odds_gap_anchor",
+                    "worst_absolute_log_disparity_anchor",
+                    "bh_alpha",
+                    "practical_log_disparity_floor",
+                    "valid_comparison_fraction",
+                )
+            )
+            missing = sorted(path for path in required if path not in (provided or set()))
+            if missing:
+                raise ValueError(
+                    "Canonical policy is incomplete; explicitly configure: " + ", ".join(missing)
+                )
+        if (
+            not isinstance(cfg.generation.hpo.utility_policy_provenance, str)
+            or not cfg.generation.hpo.utility_policy_provenance.strip()
+        ):
+            raise ValueError(
+                "generation.hpo.utility_policy_provenance must state that Task 13 consumes "
+                "fixed utility_policy; HPO execution is not wired by config validation"
+            )
+    if cfg.data.canonical and cfg.evaluation.log_disparity.protected_bins is not None:
+        raise ValueError(
+            "Canonical evaluation rejects positional evaluation.log_disparity.protected_bins; "
+            "declare named column-based release_generalization instead"
+        )
+    for name in (
+        "k_required",
+        "l_required",
+        "role_population_floor",
+        "protected_slice_floor",
+        "mia_epsilon_repetitions",
+    ):
+        value = getattr(privacy, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"evaluation.privacy_policy.{name} must be a positive integer")
+    for name in (
+        "epsilon_excess_anchor",
+        "mia_advantage_anchor",
+        "attribute_disclosure_anchor",
+        "equalized_odds_gap_anchor",
+        "worst_absolute_log_disparity_anchor",
+        "practical_log_disparity_floor",
+    ):
+        value = getattr(privacy, name, None)
+        if value is None:
+            value = getattr(scoring, name, None)
+        if not isinstance(value, (int, float)) or value < 0:
+            owner = "privacy_policy" if hasattr(privacy, name) else "scoring_policy"
+            raise ValueError(f"evaluation.{owner}.{name} must be a non-negative number")
+    if not isinstance(scoring.bh_alpha, (int, float)) or not 0 < scoring.bh_alpha <= 1:
+        raise ValueError("evaluation.scoring_policy.bh_alpha must be in (0, 1]")
+    if (
+        not isinstance(scoring.valid_comparison_fraction, (int, float))
+        or not 0 < scoring.valid_comparison_fraction <= 1
+    ):
+        raise ValueError("evaluation.scoring_policy.valid_comparison_fraction must be in (0, 1]")
+    generalization = cfg.evaluation.release_generalization.columns
+    if not isinstance(generalization, dict):
+        raise ValueError("evaluation.release_generalization.columns must be a mapping")
+    for column, spec in generalization.items():
+        if not isinstance(column, str) or not column.strip() or not isinstance(spec, dict):
+            raise ValueError("evaluation.release_generalization.columns must map names to mappings")
+        intervals = spec.get("intervals")
+        if not isinstance(intervals, list) or not intervals:
+            raise ValueError(f"release generalization for {column!r} requires non-empty intervals")
+        previous_upper = None
+        for index, interval in enumerate(intervals):
+            if not isinstance(interval, dict) or not isinstance(interval.get("label"), str):
+                raise ValueError(f"release generalization interval for {column!r} is malformed")
+            lower, upper = interval.get("lower"), interval.get("upper")
+            if lower is not None and not isinstance(lower, (int, float)):
+                raise ValueError(
+                    f"release generalization lower bound for {column!r} must be numeric/null"
+                )
+            if upper is not None and not isinstance(upper, (int, float)):
+                raise ValueError(
+                    f"release generalization upper bound for {column!r} must be numeric/null"
+                )
+            if lower is not None and upper is not None and lower >= upper:
+                raise ValueError(
+                    f"release generalization interval for {column!r} has lower >= upper"
+                )
+            if lower is None and index != 0:
+                raise ValueError(
+                    f"release generalization lower-unbounded interval for {column!r} must be first"
+                )
+            if upper is None and index != len(intervals) - 1:
+                raise ValueError(
+                    f"release generalization upper-unbounded interval for {column!r} must be last"
+                )
+            if index > 0 and previous_upper is None:
+                raise ValueError(
+                    f"release generalization intervals for {column!r} have an upper-unbounded interval before later intervals"
+                )
+            if index > 0 and lower != previous_upper:
+                raise ValueError(
+                    f"release generalization intervals for {column!r} must be contiguous"
+                )
+            previous_upper = upper
+    if cfg.data.canonical:
+        utility = cfg.generation.hpo.utility_policy
+        if utility != {
+            "metrics": ["tstr_macro_f1", "mixed_mmd_score", "elastic_net_jsd_score"],
+            "weights": [1 / 3, 1 / 3, 1 / 3],
+        }:
+            raise ValueError(
+                "Canonical HPO utility_policy is fixed to equal thirds of TSTR, MMD, and JSD"
+            )
 
 
 def _validate_data_split_config(cfg: DataConfig) -> None:
@@ -772,7 +998,7 @@ def _validate_data_split_config(cfg: DataConfig) -> None:
         value is not None and value != ""
         for value in (split.patient_id_column, split.identity_mapping_path)
     ) + int(split.one_row_per_patient)
-    if split.mode == "patient_group" and identity_sources != 1:
+    if split.mode == "patient_group" and identity_sources not in (0, 1):
         raise ValueError(
             "data.split patient_group mode requires exactly one of patient_id_column, "
             "identity_mapping_path, or one_row_per_patient=true"
@@ -850,24 +1076,63 @@ def _validate(cfg: Config) -> None:
             raise ValueError(f"data.{field_name} must be a list of column names, got {value!r}")
         if len(value) != len(set(value)):
             raise ValueError(f"data.{field_name} must not contain duplicate columns")
-    if (
-        cfg.data.protected_columns
-        and cfg.data.sensitive_columns
-        and (cfg.data.protected_columns != cfg.data.sensitive_columns)
-    ):
-        raise ValueError(
-            "data.protected_columns and legacy data.sensitive_columns disagree; provide one "
-            "protected-attribute declaration"
-        )
-    if cfg.data.target_column in (
+    declared_roles = (
         set(cfg.data.protected_columns)
         | set(cfg.data.sensitive_columns)
         | set(cfg.data.quasi_identifier_columns)
-    ):
+    )
+    if cfg.data.target_column in declared_roles:
         raise ValueError(
             "data.target_column must not be declared as a protected attribute or quasi-identifier"
         )
     _validate_data_split_config(cfg.data)
+    if cfg.data.canonical:
+        if (
+            not isinstance(cfg.data.patient_id_column, str)
+            or not cfg.data.patient_id_column.strip()
+        ):
+            raise ValueError(
+                "Canonical evaluation requires data.patient_id_column as a direct source column; "
+                "mapping sidecars and one_row_per_patient are not accepted"
+            )
+        if cfg.data.split is None:
+            raise ValueError("Canonical evaluation requires data.split with patient_group mode")
+        if cfg.data.split.mode != "patient_group":
+            raise ValueError(
+                "Canonical evaluation rejects row split mode and legacy identity settings; "
+                "use patient_group"
+            )
+        split_identity = cfg.data.split
+        if (
+            split_identity.identity_mapping_path is not None
+            or split_identity.one_row_per_patient
+            or split_identity.patient_id_column is not None
+            or split_identity.mapping_row_key_column is not None
+            or split_identity.mapping_patient_key_column is not None
+        ):
+            raise ValueError(
+                "Canonical evaluation rejects nested split identity, mapping sidecars, and "
+                "one_row_per_patient; use direct data.patient_id_column"
+            )
+        if cfg.evaluation.group_mode != "row" or cfg.evaluation.group_column is not None:
+            raise ValueError(
+                "Canonical evaluation rejects evaluation.group_mode/group_column; patient "
+                "identity is configured only by data.patient_id_column"
+            )
+        qi = set(cfg.data.quasi_identifier_columns)
+        forbidden_qi = qi & (
+            set(cfg.data.sensitive_columns) | {cfg.data.target_column, cfg.data.patient_id_column}
+        )
+        if forbidden_qi:
+            raise ValueError(
+                "data.quasi_identifier_columns must not overlap sensitive_columns, target, or "
+                f"patient ID: {sorted(forbidden_qi)}"
+            )
+    elif cfg.data.patient_id_column is not None:
+        raise ValueError(
+            "data.patient_id_column is reserved for canonical profiles; set data.canonical=true "
+            "or remove it from this legacy/noncanonical profile"
+        )
     drop_columns = cfg.data.drop_columns or []
     if not isinstance(drop_columns, list) or any(
         not isinstance(column, str) for column in drop_columns
@@ -889,6 +1154,8 @@ def _validate(cfg: Config) -> None:
         if split is not None
         else set()
     )
+    if cfg.data.patient_id_column is not None:
+        identity_columns.add(cfg.data.patient_id_column)
     declared_columns = (
         set(cfg.data.protected_columns)
         | set(cfg.data.sensitive_columns)
@@ -921,9 +1188,9 @@ def _validate(cfg: Config) -> None:
         )
     if cfg.device not in ("auto", "cpu", "cuda", "mps"):
         raise ValueError(f"device must be one of auto/cpu/cuda/mps, got {cfg.device!r}")
-    if cfg.imputation.method not in ("tabimpute", "refidiff"):
+    if cfg.imputation.method not in ("tabimpute", "refidiff", "hyperimpute"):
         raise ValueError(
-            f"imputation.method must be 'tabimpute' or 'refidiff', got {cfg.imputation.method!r}"
+            f"imputation.method must be 'tabimpute', 'refidiff', or 'hyperimpute', got {cfg.imputation.method!r}"
         )
     if cfg.imputation.refidiff.denoiser not in ("auto", "mamba", "mlp"):
         raise ValueError(
@@ -1060,6 +1327,12 @@ def _validate(cfg: Config) -> None:
         raise ValueError(
             "evaluation.group_column must not be listed in data.drop_columns; the identifier "
             "is required to validate patient/group evaluation"
+        )
+    _validate_policy_config(cfg)
+    if cfg.data.canonical and cfg.imputation.method != "hyperimpute":
+        raise ValueError(
+            "Canonical profiles require imputation.method='hyperimpute'; refidiff is legacy "
+            "and unsupported for canonical evaluation"
         )
     execution = cfg.evaluation.syntheval_execution
     if execution.model_workers != "auto" and (

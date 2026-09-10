@@ -6,6 +6,7 @@ seed: 42
 device: auto
 
 data:
+  canonical: false # Deferred benchmark profile; canonical validation fails closed until direct identity/policy are defined.
   source: csv
   path: data/loris/loris_combined.csv
   version: "1.2"

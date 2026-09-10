@@ -10,6 +10,7 @@ experiment:
 
 data:
   # Source and schema
+  canonical: false # Deferred legacy profile; canonical validation fails closed until direct patient identity/policy are defined.
   source: uci
   uci_id: 46
   path: null # Required for csv/parquet sources.

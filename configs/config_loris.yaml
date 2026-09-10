@@ -12,13 +12,17 @@ experiment:
 data:
   # Source and schema
   source: csv
-  path: data/loris/loris_combined.csv
+  path: data/loris/loris_v2_664_features_us_id.csv # Input file; canonical load stage; invalid/missing path fails closed.
   version: "1.2"
   variable_schema_path: data/loris/variable_schema.csv
 
   # Modeling columns
-  target_column: CGAS_class # 0 severe, 1 moderate, 2 typical
-  sensitive_columns: [Sex, Age, PreInt_Demos_Fam__Child_Race]
+  target_column: CGAS_class # Outcome; modeling/evaluation stage; missing target fails closed.
+  canonical: true # Enables strict leakage-safe policy; validation failures abort loading.
+  patient_id_column: patient_id # Direct patient identity; split stage only; missing/indirect identity fails closed.
+  quasi_identifier_columns: [Age, Sex, region, PreInt_Demos_Fam__Child_Ethnicity] # Release QIs; privacy stage; absent/overlapping QIs fail closed.
+  sensitive_columns: [Income, PreInt_TxHx__suicide, Diagnosis_Cat__Anxiety_Disorders] # Disclosure targets; privacy stage; invalid role declarations fail closed.
+  protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Ethnicity] # Fairness slices; fairness stage; invalid role declarations fail closed.
   drop_rows_missing_target: true
   drop_columns:
     - subject_id
@@ -44,13 +48,11 @@ data:
   remap_binary_one_two: false
   outlier_zscore_threshold: null # Set only with confirmed corrupt/sentinel columns.
   outlier_columns: null
-  # This curated wide table has one row per participant and no identity column.
   split:
     mode: patient_group
     train_fraction: 0.60
     tuning_fraction: 0.20
     final_holdout_fraction: 0.20
-    one_row_per_patient: true
     candidate_count: 32
 
   # Local derived-data storage
@@ -59,7 +61,7 @@ data:
 
 imputation:
   enabled: true
-  method: refidiff # Avoids TabImpute one-hot expansion on this wide dataset.
+  method: hyperimpute # Canonical imputation backend; Task 6 runtime support; unsupported methods fail closed.
   device: auto
   cache: true
   validation_margin: 0.2
@@ -131,6 +133,11 @@ generation:
     storage: null
     best_params_path: null
     final_n_iter_override: null
+    utility_policy:
+      # Fixed equal-thirds utility policy; Task 13 HPO stage must consume this metadata; mismatches fail closed.
+      metrics: [tstr_macro_f1, mixed_mmd_score, elastic_net_jsd_score]
+      weights: [0.3333333333333333, 0.3333333333333333, 0.3333333333333333]
+    utility_policy_provenance: "Task 13 must consume generation.hpo.utility_policy; current HPO execution is not wired by Task 3."
 
 evaluation:
   output_dir: output/loris/evaluation
@@ -154,10 +161,41 @@ evaluation:
   custom: { enabled: true, categories: null, metrics: null }
 
   log_disparity:
-    protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Race]
+    protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Ethnicity]
     target_map: { 0: severe, 1: moderate, 2: typical }
     protected_map: [{ 0: male, 1: female }, null, null]
-    protected_bins: [null, [5, 8, 11, 14, 17, 22], null]
+    protected_bins: null
+
+  # Named release transformation; privacy stage; malformed/non-contiguous intervals fail closed.
+  release_generalization:
+    columns:
+      Age:
+        # Bounds are years; lower inclusive and upper exclusive except open ends.
+        intervals:
+          - {label: "<18", lower: null, upper: 18}
+          - {label: "18-30", lower: 18, upper: 31}
+          - {label: "31-45", lower: 31, upper: 46}
+          - {label: "46-60", lower: 46, upper: 61}
+          - {label: ">60", lower: 61, upper: null}
+
+  # Formal release thresholds; privacy stage; invalid values fail closed.
+  privacy_policy:
+    k_required: 5 # Equivalence-class rows; release privacy; lower values fail closed.
+    l_required: 2 # Distinct sensitive values; release privacy; lower values fail closed.
+    role_population_floor: 20 # Rows per role; support validation; undersized roles fail closed.
+    protected_slice_floor: 5 # Rows per protected slice; fairness/privacy; undersized slices fail closed.
+    mia_epsilon_repetitions: 10 # Fixed repetitions; privacy attack; fewer repetitions fail closed.
+    epsilon_excess_anchor: 0.10 # Excess-risk anchor; [0,1]; final scoring; invalid values fail closed.
+    mia_advantage_anchor: 0.10 # MIA advantage anchor; [0,1]; final scoring; invalid values fail closed.
+    attribute_disclosure_anchor: 0.20 # Disclosure-risk anchor; [0,1]; final scoring; invalid values fail closed.
+
+  # Fixed fairness anchors; final scoring stage; invalid values fail closed.
+  scoring_policy:
+    equalized_odds_gap_anchor: 0.10 # Gap anchor; [0,1]; final scoring; invalid values fail closed.
+    worst_absolute_log_disparity_anchor: 0.69314718056 # Log-gap anchor; non-negative; final scoring; invalid values fail closed.
+    bh_alpha: 0.05 # BH familywise threshold; (0,1]; representation stage; invalid values fail closed.
+    practical_log_disparity_floor: 0.22314355131 # Material log-gap floor; non-negative; representation stage; invalid values fail closed.
+    valid_comparison_fraction: 0.80 # Required valid-leaf fraction; (0,1]; representation stage; invalid values fail closed.
 
   # Separate binary SynthEval pass: severe/moderate versus typical.
   binary_target:
