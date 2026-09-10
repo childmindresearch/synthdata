@@ -12,6 +12,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from numbers import Real
 from typing import Any
@@ -19,7 +20,9 @@ from typing import Any
 CONTRACT_SCHEMA_VERSION = 1
 CONTRACT_REGISTRY_VERSION = "metric-contracts-v1"
 
-METRIC_USES = frozenset({"audit", "hpo_screen", "hpo_objective", "gate", "policy_rank"})
+METRIC_USES = frozenset(
+    {"audit", "hpo_screen", "hpo_objective", "gate", "policy_rank", "final_audit_score"}
+)
 CONTRACT_STATES = frozenset({"operational", "calibrating", "audit_only", "blocked"})
 VALUE_ROLES = frozenset({"policy_scalar", "diagnostic"})
 DIRECTIONS = frozenset({"maximize", "minimize"})
@@ -163,6 +166,11 @@ class MetricContract:
     preprocessing_fit_role: str | None = "train"
     uncertainty_semantics: str | None = None
     sample_size_unit: str | None = None
+    normalization_method: str = "none"
+    required_support: str | None = None
+    release_transform_digest: str | None = None
+    seed: int | None = None
+    protocol_version: str = "evaluation-protocol-v1"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "allowed_uses", frozenset(self.allowed_uses))
@@ -202,6 +210,10 @@ class MetricContract:
             ("uncertainty_semantics", self.uncertainty_semantics),
             ("sample_size_unit", self.sample_size_unit),
             ("classification_score_policy", self.classification_score_policy),
+            ("normalization_method", self.normalization_method),
+            ("required_support", self.required_support),
+            ("release_transform_digest", self.release_transform_digest),
+            ("protocol_version", self.protocol_version),
         ):
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ValueError(f"Metric contract {self.contract_id!r} has an invalid {name}")
@@ -211,6 +223,10 @@ class MetricContract:
             raise ValueError(
                 f"Metric contract {self.contract_id!r} needs a reason for state "
                 f"{self.lifecycle_state!r}"
+            )
+        if self.seed is not None and not isinstance(self.seed, int):
+            raise ValueError(
+                f"Metric contract {self.contract_id!r} seed must be an integer or None"
             )
         if self.lifecycle_state != "operational" and self.allowed_uses & {
             "hpo_objective",
@@ -286,6 +302,11 @@ class MetricContract:
             "preprocessing_fit_role": self.preprocessing_fit_role,
             "uncertainty_semantics": self.uncertainty_semantics,
             "sample_size_unit": self.sample_size_unit,
+            "normalization_method": self.normalization_method,
+            "required_support": self.required_support,
+            "release_transform_digest": self.release_transform_digest,
+            "seed": self.seed,
+            "protocol_version": self.protocol_version,
         }
 
 
@@ -423,7 +444,14 @@ class MetricEvaluationContext:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "role_hashes", dict(self.role_hashes))
-        object.__setattr__(self, "resolved_configuration", dict(self.resolved_configuration))
+        configuration = dict(self.resolved_configuration)
+        # Reserved role metadata carries the release transform trust anchor through
+        # legacy Task 12 validators which construct this context themselves.
+        if "release_transform_digest" not in configuration:
+            digest = self.role_hashes.get("__release_transform_digest__")
+            if digest is not None:
+                configuration["release_transform_digest"] = digest
+        object.__setattr__(self, "resolved_configuration", configuration)
         if self.evaluation_role not in {"tuning", "final_holdout"}:
             raise ValueError(f"Unknown evaluation role: {self.evaluation_role!r}")
         if self.group_mode not in {"row", "patient_group"}:
@@ -449,11 +477,117 @@ class MetricObservation:
     role_hashes: Mapping[str, str] = dataclasses.field(default_factory=dict)
     source_metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     result_metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    fit_roles: tuple[str, ...] = ()
+    support: Any = None
+    bandwidth: Any = None
+    provenance: Mapping[str, Any] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "role_hashes", dict(self.role_hashes))
         object.__setattr__(self, "source_metadata", dict(self.source_metadata))
         object.__setattr__(self, "result_metadata", dict(self.result_metadata))
+        object.__setattr__(self, "fit_roles", tuple(self.fit_roles))
+        object.__setattr__(self, "provenance", dict(self.provenance))
+
+
+_SHA256_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+
+
+def is_verified_task10_tstr(
+    payload: Mapping[str, object],
+    *,
+    trusted_final_holdout_hash: str | None = None,
+    trusted_role_hashes: Mapping[str, str] | None = None,
+    trusted_release_transform_digest: str | None = None,
+) -> bool:
+    """Check complete producer-owned final-holdout TSTR provenance.
+
+    Optional trust anchors are supplied by the current evaluation context. They
+    prevent a well-formed producer envelope from becoming evidence for a
+    different final-holdout population.
+    """
+    metadata = payload.get("result_metadata", payload.get("metadata", {}))
+    if not isinstance(metadata, Mapping):
+        return False
+    artifact = payload.get("prediction_artifact")
+    if not isinstance(artifact, Mapping):
+        artifact = metadata.get("prediction_artifact")
+    artifact_valid = isinstance(artifact, Mapping) and artifact.get(
+        "artifact_digest"
+    ) == _tstr_artifact_digest(artifact)
+    role_hashes = metadata.get("role_hashes")
+    artifact_roles = artifact.get("role_hashes") if isinstance(artifact, Mapping) else None
+    if not isinstance(role_hashes, Mapping) or not isinstance(artifact_roles, Mapping):
+        return False
+    digests = [
+        metadata.get("common_protocol_digest"),
+        metadata.get("release_transform_digest"),
+        artifact.get("population_digest") if isinstance(artifact, Mapping) else None,
+        artifact.get("population_identity") if isinstance(artifact, Mapping) else None,
+        artifact.get("prediction_identity") if isinstance(artifact, Mapping) else None,
+        artifact.get("artifact_digest") if isinstance(artifact, Mapping) else None,
+        *role_hashes.values(),
+    ]
+    if any(
+        not isinstance(value, str) or _SHA256_DIGEST.fullmatch(value) is None for value in digests
+    ):
+        return False
+    if (
+        trusted_final_holdout_hash is not None
+        and artifact_roles.get("final_holdout") != trusted_final_holdout_hash
+    ):
+        return False
+    if trusted_role_hashes is not None:
+        expected = trusted_role_hashes.get("final_holdout")
+        if expected is not None and artifact_roles.get("final_holdout") != expected:
+            return False
+    if (
+        trusted_release_transform_digest is not None
+        and metadata.get("release_transform_digest") != trusted_release_transform_digest
+    ):
+        return False
+    return (
+        metadata.get("producer") == "task10_tstr"
+        and metadata.get("protocol_version") == "tstr-v1"
+        and isinstance(metadata.get("seed"), int)
+        and not isinstance(metadata.get("seed"), bool)
+        and metadata.get("evaluation_role") == "final_holdout"
+        and metadata.get("source_role") == "synthetic"
+        and metadata.get("release_form") is True
+        and isinstance(metadata.get("common_protocol_digest"), str)
+        and isinstance(metadata.get("release_transform_digest"), str)
+        and tuple(metadata.get("fit_roles", ())) == ("train", "tuning")
+        and isinstance(artifact, Mapping)
+        and artifact.get("producer") == "task10_tstr"
+        and artifact.get("protocol_version") == "tstr-v1"
+        and isinstance(artifact.get("seed"), int)
+        and not isinstance(artifact.get("seed"), bool)
+        and artifact.get("verified") is True
+        and artifact.get("source_role") == "final_holdout"
+        and artifact.get("population_role") == "final_holdout"
+        and artifact.get("prediction_source") == "tstr_model"
+        and isinstance(artifact.get("population_digest"), str)
+        and isinstance(artifact.get("population_identity"), str)
+        and isinstance(artifact.get("prediction_identity"), str)
+        and artifact.get("prediction_length") == artifact.get("population_length")
+        and artifact.get("common_protocol_digest") == metadata.get("common_protocol_digest")
+        and artifact.get("seed") == metadata.get("seed")
+        and artifact_valid
+        and artifact_roles == role_hashes
+        and artifact.get("release_transform_digest") == metadata.get("release_transform_digest")
+        and artifact.get("target_identity") == metadata.get("target_identity")
+        and artifact.get("protected_identity") == metadata.get("protected_identity")
+    )
+
+
+def _tstr_artifact_digest(artifact: Mapping[str, object]) -> str:
+    """Recompute immutable Task 10 prediction-artifact identity."""
+    import hashlib
+
+    payload = {key: value for key, value in artifact.items() if key != "artifact_digest"}
+    return hashlib.sha256(
+        repr(sorted(payload.items(), key=lambda item: item[0])).encode("utf-8")
+    ).hexdigest()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -486,6 +620,10 @@ class MetricStatusRecord:
     error: str | None = None
     source_metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     result_metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    fit_roles: tuple[str, ...] = ()
+    support: Any = None
+    bandwidth: Any = None
+    provenance: Mapping[str, Any] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.status not in RESULT_STATUSES:
@@ -496,6 +634,8 @@ class MetricStatusRecord:
         object.__setattr__(self, "qualifiers", tuple(self.qualifiers))
         object.__setattr__(self, "source_metadata", dict(self.source_metadata))
         object.__setattr__(self, "result_metadata", dict(self.result_metadata))
+        object.__setattr__(self, "fit_roles", tuple(self.fit_roles))
+        object.__setattr__(self, "provenance", dict(self.provenance))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -525,6 +665,10 @@ class MetricStatusRecord:
             "error": self.error,
             "source_metadata": dict(self.source_metadata),
             "result_metadata": dict(self.result_metadata),
+            "fit_roles": list(self.fit_roles),
+            "support": self.support,
+            "bandwidth": self.bandwidth,
+            "provenance": dict(self.provenance),
         }
 
 
@@ -595,7 +739,7 @@ class MetricValidationResult:
     def decision_eligible(self) -> bool:
         if not self.complete:
             return False
-        if self.requested_use in {"hpo_objective", "gate", "policy_rank"}:
+        if self.requested_use in {"hpo_objective", "gate", "policy_rank", "final_audit_score"}:
             policy_records = tuple(
                 record
                 for record in self.expected_records
@@ -751,6 +895,10 @@ def _status_record(
         error=error,
         source_metadata=observation.source_metadata if observation else {},
         result_metadata=observation.result_metadata if observation else {},
+        fit_roles=observation.fit_roles if observation else (),
+        support=observation.support if observation else None,
+        bandwidth=observation.bandwidth if observation else None,
+        provenance=observation.provenance if observation else {},
     )
 
 
@@ -761,7 +909,15 @@ def _validate_observation(
     context: MetricEvaluationContext,
     requested_use: str,
 ) -> tuple[str, str | None, float | None, float | None]:
+    def metadata_value(name: str) -> Any:
+        return observation.provenance.get(
+            name,
+            observation.result_metadata.get(name, observation.source_metadata.get(name)),
+        )
+
     group_safety = observation.source_metadata.get("group_safety")
+    if observation.provenance.get("tstr_producer_available") is False:
+        return "blocked", "TSTR producer result/provenance is unavailable", None, None
     if isinstance(group_safety, Mapping) and group_safety.get("status") == "group_unsafe":
         return (
             "group_unsafe",
@@ -770,8 +926,8 @@ def _validate_observation(
                     "reason", "Metric path is not group-safe for the requested evaluation"
                 )
             ),
-            None,
-            None,
+            17,
+            17,
         )
     if observation.error:
         return "failed", observation.error, None, None
@@ -790,7 +946,7 @@ def _validate_observation(
         return (
             "group_unsafe",
             "Contract is not group-safe for patient_group evaluation",
-            None,
+            17,
             None,
         )
     if contract.population_unit == "patient_group" and context.population_unit != "patient_group":
@@ -800,6 +956,237 @@ def _validate_observation(
             None,
             None,
         )
+    expected_fit_roles = tuple(
+        context.resolved_configuration.get(
+            "fit_roles",
+            ("train", "tuning") if context.evaluation_role == "final_holdout" else ("train",),
+        )
+    )
+    observed_fit_roles = observation.fit_roles or observation.result_metadata.get(
+        "fit_roles", observation.source_metadata.get("fit_roles")
+    )
+    if observed_fit_roles is not None and tuple(observed_fit_roles) != expected_fit_roles:
+        return (
+            "wrong_role",
+            f"Observed preprocessing fit roles {observed_fit_roles!r} do not match "
+            f"expected {expected_fit_roles!r}",
+            None,
+            None,
+        )
+    bandwidth_fit_roles = metadata_value("bandwidth_fit_roles")
+    if bandwidth_fit_roles is not None and tuple(bandwidth_fit_roles) != expected_fit_roles:
+        return (
+            "wrong_role",
+            f"Observed bandwidth fit roles {bandwidth_fit_roles!r} do not match "
+            f"expected {expected_fit_roles!r}",
+            None,
+            None,
+        )
+    if contract.preprocessing_fit_role == "train" and "train" not in expected_fit_roles:
+        return "wrong_role", "Contract requires train-fitted preprocessing", None, None
+    required_support = contract.required_support
+    if required_support is not None:
+        support = observation.support
+        if support is None:
+            support = observation.result_metadata.get("support")
+        if support is None:
+            support = observation.source_metadata.get("support")
+        if contract.emitted_key_pattern == "release_privacy.v1" and isinstance(
+            observation.provenance.get("release_support"), Mapping
+        ):
+            support = observation.provenance["release_support"]
+        if support is None:
+            return "missing", f"Required support {required_support!r} was not recorded", None, None
+        if isinstance(support, Mapping):
+            support_contract = support.get("support_contract", support.get("contract"))
+            if support_contract != required_support:
+                return (
+                    "blocked",
+                    "Recorded support contract does not match metric contract",
+                    None,
+                    None,
+                )
+            support_state = support.get("state", support.get("status"))
+            if support_state in {
+                "missing",
+                "insufficient",
+                "invalid",
+                "blocked",
+                "unsupported",
+                "indeterminate",
+            }:
+                return "blocked", f"Required support is not valid: {support_state}", None, None
+            if len(support) <= 1:
+                return "blocked", "Required support is empty or incomplete", None, None
+            if required_support == "declared_support_v1":
+                roles = support.get("roles")
+                if not isinstance(roles, Mapping) or set(roles) != {"synthetic", "reference"}:
+                    return (
+                        "blocked",
+                        "Release support must declare synthetic and reference roles",
+                        None,
+                        None,
+                    )
+                for role_name, role_support in roles.items():
+                    if not isinstance(role_support, Mapping):
+                        return (
+                            "blocked",
+                            f"Release support role {role_name!r} is incomplete",
+                            None,
+                            None,
+                        )
+                    population = role_support.get("population")
+                    floor = role_support.get(
+                        "population_floor", support.get("role_population_floor")
+                    )
+                    if (
+                        isinstance(population, bool)
+                        or not isinstance(population, int)
+                        or population < 1
+                        or isinstance(floor, bool)
+                        or not isinstance(floor, int)
+                        or floor < 1
+                        or population < floor
+                    ):
+                        return (
+                            "blocked",
+                            f"Release support role {role_name!r} is below its population floor",
+                            None,
+                            None,
+                        )
+                    if (
+                        not isinstance(role_support.get("role_hash"), str)
+                        or not role_support["role_hash"]
+                    ):
+                        return (
+                            "blocked",
+                            f"Release support role {role_name!r} has no role hash",
+                            None,
+                            None,
+                        )
+                protected = support.get("protected_slices")
+                if not isinstance(protected, Mapping) or protected.get("state") not in {
+                    "valid",
+                    "not_applicable",
+                }:
+                    return (
+                        "blocked",
+                        "Release support protected-slice state is missing or invalid",
+                        None,
+                        None,
+                    )
+            if required_support == "all_target_protected_cells":
+                slices = support.get("slices")
+                if not isinstance(slices, (list, tuple)) or not slices:
+                    return (
+                        "blocked",
+                        "Equalized-odds support does not declare target/protected cells",
+                        None,
+                        None,
+                    )
+                target_classes = support.get("target_classes")
+                protected_domains = support.get("protected_domains")
+                if not isinstance(target_classes, (list, tuple)) or not target_classes:
+                    return (
+                        "blocked",
+                        "Equalized-odds support does not declare target classes",
+                        None,
+                        None,
+                    )
+                if not isinstance(protected_domains, Mapping) or not protected_domains:
+                    return (
+                        "blocked",
+                        "Equalized-odds support does not declare protected domains",
+                        None,
+                        None,
+                    )
+                expected_cells = {
+                    (column, target)
+                    for column, groups in protected_domains.items()
+                    if isinstance(groups, (list, tuple, set))
+                    for target in target_classes
+                }
+                if any(
+                    not isinstance(groups, (list, tuple, set))
+                    for groups in protected_domains.values()
+                ):
+                    return "blocked", "Equalized-odds protected domains are invalid", None, None
+                observed_cells = []
+                for cell in slices:
+                    if not isinstance(cell, Mapping) or not {
+                        "protected_column",
+                        "target_class",
+                        "state",
+                    }.issubset(cell):
+                        return "blocked", "Equalized-odds support has incomplete cells", None, None
+                    if cell["state"] != "valid":
+                        return (
+                            "blocked",
+                            "Equalized-odds support contains invalid cells",
+                            None,
+                            None,
+                        )
+                    observed_cells.append((cell["protected_column"], cell["target_class"]))
+                if len(observed_cells) != len(set(observed_cells)):
+                    return "blocked", "Equalized-odds support contains duplicate cells", None, None
+                observed = set(observed_cells)
+                if observed != expected_cells:
+                    return (
+                        "blocked",
+                        "Equalized-odds support does not match declared Cartesian coverage",
+                        None,
+                        None,
+                    )
+            elif not any(
+                key not in {"support_contract", "contract", "state", "status"} for key in support
+            ):
+                return "blocked", "Required support is incomplete", None, None
+        elif isinstance(support, str) and support != required_support:
+            return "blocked", "Recorded support does not match metric contract", None, None
+        else:
+            return "blocked", "Required support must be a complete mapping", None, None
+    observed_release_digest = observation.provenance.get(
+        "release_transform_digest",
+        observation.result_metadata.get(
+            "release_transform_digest",
+            observation.source_metadata.get("release_transform_digest"),
+        ),
+    )
+    if contract.protocol_version == "task12-evaluation-v1" and (
+        not isinstance(observed_release_digest, str)
+        or _SHA256_DIGEST.fullmatch(observed_release_digest) is None
+    ):
+        return "wrong_role", "Task 12 release-transform digest is missing or invalid", None, None
+    trusted_release_digest = context.resolved_configuration.get("release_transform_digest")
+    if trusted_release_digest is not None and observed_release_digest != trusted_release_digest:
+        return (
+            "wrong_role",
+            "Release-transform provenance digest does not match context",
+            None,
+            None,
+        )
+    if contract.release_transform_digest is not None:
+        observed_digest = observed_release_digest
+        if observed_digest != contract.release_transform_digest:
+            return (
+                "wrong_role",
+                "Release-transform provenance digest does not match contract",
+                None,
+                None,
+            )
+    for field, expected in (
+        ("protocol_version", contract.protocol_version),
+        ("seed", contract.seed),
+    ):
+        observed = metadata_value(field)
+        requires_observed = expected is not None and (
+            field == "seed" or expected == "task12-evaluation-v1"
+        )
+        if requires_observed and (observed is None or observed != expected):
+            return "wrong_role", f"Observation {field} does not match contract", None, None
+    for field, value in (("support", observation.support), ("bandwidth", observation.bandwidth)):
+        if isinstance(value, Real) and (isinstance(value, bool) or not math.isfinite(float(value))):
+            return "non_finite", f"Observation {field} is non-finite", None, None
     if requested_use not in contract.allowed_uses:
         return (
             "blocked",
@@ -1039,11 +1426,12 @@ def _audit_contract(
     framework: str,
     emitted_key_pattern: str,
     semantic_family: str,
-    direction: str,
+    direction: str | None,
     value_role: str = "policy_scalar",
     lifecycle_state: str = "audit_only",
     execution_pass: str = "main",
     target_view: str = "native",
+    population_unit: str = "row",
     required_roles: tuple[str, ...] = ("train", "tuning"),
     group_safety: str = "row_only",
     qualifiers: tuple[str, ...] = (),
@@ -1060,8 +1448,14 @@ def _audit_contract(
     preprocessing_fit_role: str | None = "train",
     uncertainty_semantics: str | None = None,
     sample_size_unit: str | None = None,
+    status_reason: str | None = None,
+    normalization_method: str = "none",
+    required_support: str | None = None,
+    release_transform_digest: str | None = None,
+    seed: int | None = None,
+    protocol_version: str = "evaluation-protocol-v1",
 ) -> MetricContract:
-    reason = (
+    reason = status_reason or (
         "Operational use is deferred until role-safe evaluation, framework semantics, "
         "and calibration are validated."
     )
@@ -1117,7 +1511,7 @@ def _audit_contract(
         allowed_uses=allowed_uses or frozenset({"audit"}),
         execution_pass=execution_pass,
         target_view=target_view,
-        population_unit="row",
+        population_unit=population_unit,
         group_safety=group_safety,
         required_roles=required_roles,
         raw_range=raw_range,
@@ -1134,6 +1528,11 @@ def _audit_contract(
         preprocessing_fit_role=preprocessing_fit_role,
         uncertainty_semantics=uncertainty_semantics,
         sample_size_unit=sample_size_unit,
+        normalization_method=normalization_method,
+        required_support=required_support,
+        release_transform_digest=release_transform_digest,
+        seed=seed,
+        protocol_version=protocol_version,
     )
 
 
@@ -1160,12 +1559,9 @@ def _build_default_contracts() -> tuple[MetricContract, ...]:
         "prdc",
         "alpha_precision",
     }
-    hpo_objective_synthcity = {
-        "sanity.nearest_syn_neighbor_distance",
-        "stats.wasserstein_dist",
-        "stats.inv_kl_divergence",
-        "performance.xgb",
-    }
+    # Legacy framework metrics are never HPO objectives.  Task 12 objectives
+    # below are the only identities granted ``hpo_objective``.
+    hpo_objective_synthcity = set()
     for category, metric_names in SYNTHCITY_METRIC_CONFIG.items():
         for metric_name in metric_names:
             metric_key = f"{category}.{metric_name}"
@@ -1815,7 +2211,7 @@ def _build_default_contracts() -> tuple[MetricContract, ...]:
     ):
         contracts.append(
             _audit_contract(
-                contract_id=f"custom.{key}",
+                contract_id=f"{framework}.{key}",
                 framework="custom",
                 emitted_key_pattern=key,
                 semantic_family="fairness",
@@ -1825,6 +2221,155 @@ def _build_default_contracts() -> tuple[MetricContract, ...]:
                 qualifiers=("subgroup",) if value_role == "diagnostic" else (),
             )
         )
+
+    # Explicit durable records for legacy paths. They remain audit-visible,
+    # but cannot become candidate, gate, or ranking evidence.
+    legacy_specs = (
+        ("synthcity.privacy.k-anonymization.v1", "privacy"),
+        ("synthcity.privacy.k-map.v1", "privacy"),
+        ("synthcity.privacy.distinct-l-diversity.v1", "privacy"),
+        ("syntheval.median_DCR.legacy", "privacy"),
+        ("syntheval.eps_identif_risk.legacy", "privacy"),
+        ("syntheval.mia_recall.legacy", "privacy"),
+        ("syntheval.att_discl_risk.legacy", "privacy"),
+        ("synthcity.performance.hidden_split.legacy", "utility"),
+        ("custom.fairness.synthetic_cv.legacy", "fairness"),
+        ("syntheval.avg_macro_F1_diff_v2.legacy", "utility"),
+        ("syntheval.avg_F1_diff.legacy", "utility"),
+    )
+    from synthdata.evaluation.catalog import LEGACY_AUDIT_MANIFEST
+
+    if tuple(key for key, _ in legacy_specs) != LEGACY_AUDIT_MANIFEST:
+        raise RuntimeError("Legacy metric registry order must match catalog manifest")
+    for key, family in legacy_specs:
+        contracts.append(
+            _audit_contract(
+                contract_id=key,
+                framework=key.split(".", 1)[0],
+                emitted_key_pattern=key,
+                semantic_family=family,
+                direction="minimize",
+                lifecycle_state="blocked",
+                allowed_uses=frozenset({"audit"}),
+                required_roles=("train", "tuning"),
+                status_reason="Legacy metric path is retained only as an explicit blocked audit record.",
+                qualifiers=("legacy", "blocked"),
+                protocol_version="task12-evaluation-v1",
+            )
+        )
+
+    task12_specs = (
+        (
+            "synthcity",
+            "elastic_net_jsd.v1",
+            "minimize",
+            "hpo_objective",
+            ("train", "tuning"),
+            "row",
+            "elastic-net-jsd-v1",
+            MetricAnchors(ideal=0.0, bad=1.0),
+            None,
+        ),
+        (
+            "synthcity",
+            "mixed_mmd.v1",
+            "minimize",
+            "hpo_objective",
+            ("train", "tuning"),
+            "row",
+            "mixed-mmd-v1",
+            MetricAnchors(ideal=0.0, bad=1.0),
+            None,
+        ),
+        (
+            "syntheval",
+            "tstr_macro_f1.v1",
+            "maximize",
+            "hpo_objective",
+            ("train", "tuning"),
+            "row",
+            "tstr-macro-f1-v1",
+            MetricAnchors(ideal=1.0, chance=0.5, bad=0.0),
+            None,
+        ),
+        (
+            "custom",
+            "release_privacy.v1",
+            "minimize",
+            "gate",
+            ("train", "tuning"),
+            "row",
+            "task12-evaluation-v1",
+            MetricAnchors(ideal=0.0, bad=1.0),
+            None,
+        ),
+        (
+            "custom",
+            "representation_evidence.v1",
+            "minimize",
+            "final_audit_score",
+            ("train", "tuning"),
+            "row",
+            "representation-evidence-v1",
+            MetricAnchors(ideal=0.0, bad=1.0),
+            None,
+        ),
+    )
+    for (
+        framework,
+        key,
+        direction,
+        use,
+        required_roles,
+        population_unit,
+        _transform_digest,
+        anchors,
+        seed,
+    ) in task12_specs:
+        contracts.append(
+            _audit_contract(
+                contract_id=f"{framework}.{key}",
+                framework=framework,
+                emitted_key_pattern=key,
+                semantic_family="privacy" if key.startswith("release") else "fairness",
+                direction=direction,
+                lifecycle_state="operational"
+                if use in {"hpo_objective", "gate", "final_audit_score"}
+                else "audit_only",
+                allowed_uses=frozenset({"audit", use}),
+                required_roles=required_roles,
+                group_safety="group_safe",
+                population_unit=population_unit,
+                raw_range=(0.0, 1.0),
+                anchors=anchors,
+                normalization_method="versioned_release_transform",
+                required_support="declared_support_v1",
+                release_transform_digest=None,
+                seed=seed,
+                protocol_version="task12-evaluation-v1",
+                preprocessing_fit_role="train",
+            )
+        )
+    contracts.append(
+        _audit_contract(
+            contract_id="custom.equalized_odds.final.v1",
+            framework="custom",
+            emitted_key_pattern="equalized_odds.final.v1",
+            semantic_family="fairness",
+            direction="minimize",
+            lifecycle_state="operational",
+            execution_pass="final_audit",
+            target_view="native",
+            required_roles=("train", "final_holdout"),
+            group_safety="group_safe",
+            allowed_uses=frozenset({"audit", "final_audit_score"}),
+            raw_range=(0.0, 1.0),
+            normalization_method="identity",
+            required_support="all_target_protected_cells",
+            release_transform_digest=None,
+            protocol_version="task12-evaluation-v1",
+        )
+    )
 
     binary_contracts = []
     for contract in contracts:

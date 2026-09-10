@@ -14,6 +14,7 @@ import re
 import uuid
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import cast
 
 import pandas as pd
 
@@ -27,6 +28,7 @@ from synthdata.data import (
     semantic_context_payload,
 )
 from synthdata.evaluation.metric_contracts import DEFAULT_METRIC_CONTRACT_REGISTRY
+from synthdata.evaluation.release import PROTOCOL_VERSION, _release_transform_digest
 from synthdata.generation import hpo as hpo_mod
 from synthdata.generation import synthcity_backend as sc
 from synthdata.generation import tabpfn_backend as tpfn
@@ -124,6 +126,15 @@ def _role_frame(dataset: Dataset, role: str, *, imputed: bool) -> pd.DataFrame |
                 "final_holdout is never a tuning or fit role"
             )
     return None
+
+
+def _required_role_frame(dataset: Dataset, role: str, *, imputed: bool) -> pd.DataFrame:
+    """Return populated canonical role required for HPO provenance."""
+    frame = _role_frame(dataset, role, imputed=imputed)
+    if frame is None:
+        representation = "imputed" if imputed else "raw"
+        raise RuntimeError(f"HPO provenance requires a populated {representation} {role} role")
+    return frame
 
 
 def _combine_canonical_roles(dataset: Dataset, *, imputed: bool) -> pd.DataFrame:
@@ -256,6 +267,30 @@ def _build_hpo_context(
             classification_score=cfg.evaluation.synthcity.classification_score,
         )
     )
+    release_transform_digest = _release_transform_digest(
+        PROTOCOL_VERSION, dataset.release_generalization
+    )
+    role_hashes = {
+        role: dataframe_fingerprint(_required_role_frame(dataset, role, imputed=False))
+        for role in ("train", "tuning")
+    }
+    contracts = {
+        "fit_roles": ["train"],
+        "comparison_role": "tuning",
+        "excluded_roles": ["final_holdout"],
+        "privacy": False,
+        "fairness": False,
+    }
+    support_provenance = {
+        "fit_roles": ["train"],
+        "support_contract": "train_frozen_v1",
+    }
+    bandwidth_provenance = {
+        "fit_roles": ["train"],
+        "comparison_role": "tuning",
+        "contract": "train_frozen_v1",
+    }
+    objective_version = hpo_mod.TUNING_OBJECTIVE_VERSION
     context = hpo_mod.build_hpo_context(
         task_type=task_type,
         metric_config=gen_cfg.hpo.metric_config,
@@ -265,8 +300,18 @@ def _build_hpo_context(
         role_context_fingerprint=role_context_digest,
         role_context=role_context,
         variable_columns=list(dataset.full_df.columns),
-        attack_target_types=resolved_semantic_context.get("sensitive_target_types", {}),
+        attack_target_types=cast(
+            Mapping[str, str], resolved_semantic_context.get("sensitive_target_types", {})
+        ),
+        utility_policy=gen_cfg.hpo.utility_policy,
+        release_transform_digest=release_transform_digest,
+        role_hashes=role_hashes,
+        contracts=contracts,
+        support_provenance=support_provenance,
+        bandwidth_provenance=bandwidth_provenance,
+        objective_version=objective_version,
     )
+    resolved_policy = hpo_mod._resolve_utility_policy(gen_cfg.hpo.utility_policy)
     context["objective_context"] = {
         "n_samples": gen_cfg.n_samples,
         "n_iter_cap": gen_cfg.hpo.n_iter_cap,
@@ -274,7 +319,16 @@ def _build_hpo_context(
         "sgld_step_cap": gen_cfg.hpo.sgld_step_cap,
         "seed": cfg.seed,
         "device": device,
+        "utility_policy": resolved_policy,
+        "objective_version": objective_version,
+        "release_transform_digest": release_transform_digest,
+        "role_hashes": role_hashes,
+        "contracts": contracts,
+        "support_provenance": support_provenance,
+        "bandwidth_provenance": bandwidth_provenance,
+        "metric_contract_manifest": DEFAULT_METRIC_CONTRACT_REGISTRY.manifest(),
     }
+    context["metric_contract_manifest"] = context["objective_context"]["metric_contract_manifest"]
     context["semantic_context"] = resolved_semantic_context
     context["semantic_context_digest"] = semantic_context_digest(resolved_semantic_context)
     return context
@@ -345,11 +399,11 @@ def refit_selected_model(
         semantic_context=refit_semantic_context,
     )
     raw_role_hashes = {
-        role: dataframe_fingerprint(dataset.role_frame(role, imputed=False))
+        role: dataframe_fingerprint(_required_role_frame(dataset, role, imputed=False))
         for role in ("train", "tuning")
     }
     imputed_role_hashes = {
-        role: dataframe_fingerprint(dataset.role_frame(role, imputed=True))
+        role: dataframe_fingerprint(_required_role_frame(dataset, role, imputed=True))
         for role in ("train", "tuning")
     }
 
@@ -376,13 +430,10 @@ def refit_selected_model(
             gen_cfg.output_dir
         )
         if hpo_context is None:
-            cache = hpo_mod.BestParamsCache(
-                best_params_path,
-                role_context_fingerprint=candidate_context_digest,
-                role_context=candidate_context,
+            raise RuntimeError(
+                "Cannot load selected HPO parameters without a complete canonical hpo_context"
             )
-        else:
-            cache = hpo_mod.BestParamsCache(best_params_path, hpo_context=hpo_context)
+        cache = hpo_mod.BestParamsCache(best_params_path, hpo_context=hpo_context)
         if not cache.has(family, cache_name):
             raise RuntimeError(
                 f"Cannot refit selected HPO candidate {model_name!r}: best parameters for "
@@ -781,6 +832,8 @@ def run_generation(
         if fit_imputed_df is None:
             raise RuntimeError("Stage A HPO screening requires an imputed train role")
         stage_a_contract = _build_stage_a_contract(cfg, dataset, fit_imputed_df)
+        if stage_a_contract is None:
+            raise RuntimeError("Stage A HPO screening did not produce a contract")
         stage_a_root = output_dir / "hpo_stage_a"
         logger.info(
             "[stage_a] resolved HPO screen contract digest=%s source_role=train shape=%s",
@@ -824,15 +877,17 @@ def run_generation(
         _atomic_json(hpo_context_path, hpo_context_payload)
     hpo_group_context = hpo_context.get("group_context") if hpo_context else None
     best_params_path = gen_cfg.hpo.best_params_path or hpo_mod.default_best_params_path(output_dir)
-    if hpo_context is None:
-        best_params = hpo_mod.BestParamsCache(
-            best_params_path,
-            role_context_fingerprint=generation_role_context_fingerprint,
-            role_context=generation_role_context,
-            allow_unverified_legacy=dataset.legacy_two_role,
-        )
-    else:
-        best_params = hpo_mod.BestParamsCache(best_params_path, hpo_context=hpo_context)
+    best_params = (
+        hpo_mod.BestParamsCache(best_params_path, hpo_context=hpo_context)
+        if hpo_context is not None
+        else None
+    )
+
+    def _require_best_params_cache() -> hpo_mod.BestParamsCache:
+        """Return validated HPO cache, failing closed if HPO context is absent."""
+        if best_params is None:
+            raise RuntimeError("HPO generation requires a complete canonical hpo_context")
+        return best_params
 
     synthetic_datasets: dict[str, pd.DataFrame] = {}
 
@@ -1053,7 +1108,8 @@ def run_generation(
             )
 
             if gen_cfg.hpo.enabled:
-                if not best_params.has("synthcity", name):
+                cache = _require_best_params_cache()
+                if not cache.has("synthcity", name):
                     objective = sc.build_synthcity_objective(
                         name,
                         train_loader,
@@ -1079,6 +1135,7 @@ def run_generation(
                             column: entry["kind"]
                             for column, entry in dataset.variable_schema.items()
                         },
+                        release_generalization=dataset.release_generalization,
                     )
                     params = hpo_mod.run_study(
                         f"hpo_{name}",
@@ -1093,8 +1150,8 @@ def run_generation(
                             name
                         ),
                     )
-                    best_params.set("synthcity", name, params)
-                params = dict(best_params.get("synthcity", name))
+                    cache.set("synthcity", name, params)
+                params = dict(cache.get("synthcity", name))
 
                 override = gen_cfg.hpo.final_n_iter_override
                 if override and sc.plugin_accepts(name, "n_iter"):
@@ -1201,6 +1258,8 @@ def run_generation(
                 train_group_ids=dataset.role_groups.get("train"),
                 holdout_group_ids=dataset.role_groups.get("tuning"),
                 expected_emitted_keys=hpo_context["expected_emitted_keys"],
+                release_generalization=dataset.release_generalization,
+                utility_policy=gen_cfg.hpo.utility_policy,
             )
 
         if "standard" in gen_cfg.tabpfgen.variants:
@@ -1222,7 +1281,8 @@ def run_generation(
             )
 
             if gen_cfg.hpo.enabled:
-                if not best_params.has("tabpfgen", "tabpfgen_standard"):
+                cache = _require_best_params_cache()
+                if not cache.has("tabpfgen", "tabpfgen_standard"):
                     objective = tpfgen.build_tabpfgen_standard_objective(
                         fit_imputed_df,
                         dataset.feature_columns,
@@ -1254,8 +1314,8 @@ def run_generation(
                             "tabpfgen_standard"
                         ),
                     )
-                    best_params.set("tabpfgen", "tabpfgen_standard", params)
-                params = best_params.get("tabpfgen", "tabpfgen_standard")
+                    cache.set("tabpfgen", "tabpfgen_standard", params)
+                params = cache.get("tabpfgen", "tabpfgen_standard")
 
                 _cached_or_build(
                     "tabpfgen_standard_hpo",
@@ -1295,7 +1355,8 @@ def run_generation(
             )
 
             if gen_cfg.hpo.enabled:
-                if not best_params.has("tabpfgen", "tabpfgen_custom"):
+                cache = _require_best_params_cache()
+                if not cache.has("tabpfgen", "tabpfgen_custom"):
                     objective = tpfgen.build_tabpfgen_custom_objective(
                         fit_imputed_df,
                         dataset.feature_columns,
@@ -1327,8 +1388,8 @@ def run_generation(
                             "tabpfgen_custom"
                         ),
                     )
-                    best_params.set("tabpfgen", "tabpfgen_custom", params)
-                params = best_params.get("tabpfgen", "tabpfgen_custom")
+                    cache.set("tabpfgen", "tabpfgen_custom", params)
+                params = cache.get("tabpfgen", "tabpfgen_custom")
 
                 _cached_or_build(
                     "tabpfgen_custom_hpo",

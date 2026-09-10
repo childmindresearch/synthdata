@@ -25,6 +25,7 @@ from numbers import Real
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import optuna
 import pandas as pd
 
@@ -43,7 +44,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 STAGE_A_SCREEN_SCHEMA_VERSION = "hpo-stage-a-v1"
-HPO_CONTEXT_SCHEMA_VERSION = "hpo-context-v1"
+HPO_CONTEXT_SCHEMA_VERSION = "hpo-context-v2"
 HPO_TRIAL_CHECKPOINT_SCHEMA_VERSION = "hpo-trial-checkpoint-v1"
 LEGACY_GENERATOR_METADATA_SCHEMA_VERSION = "generator-metadata-v1"
 HPO_GENERATOR_METADATA_SCHEMA_VERSION = "generator-metadata-v2"
@@ -884,6 +885,87 @@ def prepare_stage_a_screen(
 
 
 HPO_OBJECTIVE_METRICS = frozenset(TASK12_HPO_ALLOWLIST)
+TUNING_UTILITY_METRICS = (
+    "tstr_macro_f1.v1",
+    "mixed_mmd.v1",
+    "elastic_net_jsd.v1",
+)
+TUNING_UTILITY_WEIGHTS = (1 / 3, 1 / 3, 1 / 3)
+TUNING_OBJECTIVE_VERSION = "release-utility-v1"
+
+
+def _evaluate_train_frozen_mmd(
+    train: pd.DataFrame,
+    tuning: pd.DataFrame,
+    candidate: pd.DataFrame,
+    *,
+    continuous_columns: Sequence[str],
+    ordinal_columns: Sequence[str],
+    nominal_columns: Sequence[str],
+) -> dict[str, Any]:
+    """Evaluate MMD with preprocessing and bandwidth frozen on train only."""
+    from syntheval.metrics.utility.metric_max_mean_discrepancy import _mixed_kernel
+    from syntheval.utils.preprocessing import MixedSchemaPreprocessor
+
+    preprocessor = MixedSchemaPreprocessor.fit(
+        train, list(continuous_columns), list(ordinal_columns), list(nominal_columns), None
+    )
+    train_values = preprocessor.transform(train, role="train")
+    tuning_values = preprocessor.transform(tuning, role="tuning")
+    candidate_values = preprocessor.transform(candidate, role="candidate")
+    active = [role for role, values in train_values.items() if values.shape[1]]
+    weights = {
+        role: (1.0 / len(active) if role in active else 0.0)
+        for role in ("continuous", "ordinal", "nominal")
+    }
+    fit_kernel = _mixed_kernel(train_values, train_values, 1.0, weights)
+    fit_distances = -2.0 * np.log(
+        np.maximum(fit_kernel[np.triu_indices(len(fit_kernel), 1)], 1e-300)
+    )
+    positive = fit_distances[fit_distances > 0]
+    bandwidth = float(np.sqrt(np.median(positive))) if positive.size else 1.0
+    bandwidth = max(bandwidth, np.finfo(float).eps)
+    kxx = _mixed_kernel(tuning_values, tuning_values, bandwidth, weights)
+    kyy = _mixed_kernel(candidate_values, candidate_values, bandwidth, weights)
+    kxy = _mixed_kernel(tuning_values, candidate_values, bandwidth, weights)
+    raw_biased = float(kxx.mean() + kyy.mean() - 2.0 * kxy.mean())
+    biased = max(raw_biased, 0.0)
+    return {
+        "b_mmd_clip": biased,
+        "bandwidth": bandwidth,
+        "weights": weights,
+        "preprocessing": preprocessor.metadata(),
+        "fit_role": "train",
+        "comparison_role": "tuning",
+    }
+
+
+def _resolve_utility_policy(policy: Mapping[str, Any] | None = None) -> dict[str, list]:
+    """Resolve fixed release utility policy, rejecting unsafe substitutions."""
+    expected = list(TUNING_UTILITY_METRICS)
+    expected_weights = list(TUNING_UTILITY_WEIGHTS)
+    if policy is None:
+        return {"metrics": expected, "weights": expected_weights}
+    if not isinstance(policy, Mapping):
+        raise ValueError("HPO utility_policy must be a mapping")
+    metrics = policy.get("metrics")
+    weights = policy.get("weights")
+    if not isinstance(metrics, Sequence) or isinstance(metrics, (str, bytes)):
+        raise ValueError("HPO utility_policy.metrics must be a sequence")
+    if not isinstance(weights, Sequence) or isinstance(weights, (str, bytes)):
+        raise ValueError("HPO utility_policy.weights must be a sequence")
+    metrics = [str(metric) for metric in metrics]
+    weights = list(weights)
+    if metrics != expected or weights != expected_weights:
+        raise ValueError("HPO utility_policy is fixed to equal thirds of TSTR, MMD, and JSD")
+    if len(metrics) != len(set(metrics)):
+        raise ValueError("HPO utility_policy.metrics must not contain duplicates")
+    if any(
+        isinstance(weight, bool) or not isinstance(weight, Real) or not math.isfinite(float(weight))
+        for weight in weights
+    ):
+        raise ValueError("HPO utility_policy.weights must be finite real numbers")
+    return {"metrics": metrics, "weights": [float(weight) for weight in weights]}
 
 
 def _canonical_metric_framework(metric_key: str) -> str:
@@ -905,6 +987,8 @@ def evaluate_canonical_hpo_metrics(
     feature_types: Mapping[str, str] | None = None,
     sensitive_features: Sequence[str] = (),
     seed: int = 0,
+    release_generalization: Mapping[str, Any] | None = None,
+    utility_policy: Mapping[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Evaluate approved HPO identities without native metric aliases.
 
@@ -913,11 +997,117 @@ def evaluate_canonical_hpo_metrics(
     failed row rather than being replaced by a row-level approximation.
     """
     validate_hpo_metric_config(dict(metric_config))
-    keys = [str(key) for values in metric_config.values() for key in values]
+
+    def _validate_release_generalization(value: Mapping[str, Any] | None) -> None:
+        """Reject release metadata that can alter HPO population semantics."""
+        if value is None:
+            return
+        if not isinstance(value, Mapping):
+            raise TypeError("release_generalization must be a mapping or None")
+        forbidden_key_tokens = (
+            "final_holdout",
+            "hidden",
+            "privacy",
+            "fairness",
+            "split",
+            "population",
+            "evaluation",
+        )
+        forbidden_roles = {"final_holdout", "hidden", "privacy", "fairness", "split"}
+
+        def walk(current: Any, key: str | None = None) -> None:
+            key_lower = key.lower() if key is not None else ""
+            if any(token in key_lower for token in forbidden_key_tokens):
+                raise ValueError(
+                    f"Canonical HPO release_generalization contains forbidden metadata key: {key!r}"
+                )
+            if isinstance(current, str):
+                normalized = current.strip().lower().replace("-", "_")
+                if normalized in forbidden_roles:
+                    raise ValueError(
+                        f"Canonical HPO release_generalization contains forbidden role: {current!r}"
+                    )
+                return
+            if isinstance(current, Mapping):
+                for child_key, child_value in current.items():
+                    walk(child_value, str(child_key))
+            elif isinstance(current, (list, tuple, set)):
+                for child_value in current:
+                    walk(child_value, key)
+
+        walk(value)
+
+    _validate_release_generalization(release_generalization)
+
+    def _validate_input_provenance(role: str, frame: pd.DataFrame) -> None:
+        """Reject release metadata that can smuggle non-HPO populations in."""
+        forbidden_roles = {"final_holdout", "hidden", "privacy", "fairness", "split"}
+        allowed_roles = {
+            "train": {"train"},
+            "tuning": {"tuning"},
+            "synthetic": {"synthetic", "release"},
+        }[role]
+
+        def walk(value: Any, key: str | None = None) -> None:
+            key_lower = key.lower() if key is not None else ""
+            if any(
+                token in key_lower
+                for token in ("final_holdout", "hidden", "privacy", "fairness", "split")
+            ):
+                raise ValueError(
+                    f"Canonical HPO {role} input contains forbidden objective metadata: {key!r}"
+                )
+            if isinstance(value, str):
+                normalized = value.strip().lower().replace("-", "_")
+                if normalized in forbidden_roles:
+                    raise ValueError(
+                        f"Canonical HPO {role} input contains forbidden provenance role: {value!r}"
+                    )
+                if (
+                    key_lower.endswith("role") or key_lower == "roles"
+                ) and normalized not in allowed_roles:
+                    raise ValueError(
+                        f"Canonical HPO {role} input contains unsupported provenance role: {value!r}"
+                    )
+                return
+            if isinstance(value, Mapping):
+                for child_key, child_value in value.items():
+                    walk(child_value, str(child_key))
+            elif isinstance(value, (list, tuple, set)):
+                for child_value in value:
+                    walk(child_value, key)
+
+        for attr_key, attr_value in frame.attrs.items():
+            walk(attr_value, str(attr_key))
+
+    for role, frame in (
+        ("train", train_df),
+        ("tuning", tuning_df),
+        ("synthetic", synthetic_df),
+    ):
+        _validate_input_provenance(role, frame)
+
+    policy = _resolve_utility_policy(utility_policy)
+    keys = list(policy["metrics"])
     rows: dict[str, dict[str, Any]] = {}
     train_loader: Any = None
     tuning_loader: Any = None
     synthetic_loader: Any = None
+
+    def _release_provenance(release_meta: Mapping[str, Any]) -> dict[str, Any]:
+        """Return complete, role-addressable provenance for one evaluation."""
+        role_hashes = {
+            "synthetic": release_meta["synthetic"]["role_hash"],
+            **{role: value["role_hash"] for role, value in release_meta["roles"].items()},
+        }
+        return {
+            "release_transform_digest": release_meta["synthetic"].get(
+                "release_transform_digest",
+                release_meta["common_protocol_digest"],
+            ),
+            "common_protocol_digest": release_meta["common_protocol_digest"],
+            "role_hashes": role_hashes,
+        }
 
     for key in keys:
         framework = _canonical_metric_framework(key)
@@ -926,17 +1116,40 @@ def evaluate_canonical_hpo_metrics(
             "framework": framework,
             "fit_roles": ["train"],
             "evaluation_role": "tuning",
-            "provenance": {"fit_roles": ["train"], "evaluation_role": "tuning"},
+            "objective_version": TUNING_OBJECTIVE_VERSION,
+            "orientation": ("maximize_score" if key == "tstr_macro_f1.v1" else "minimize_distance"),
+            "contracts": {
+                "fit_roles": ["train"],
+                "comparison_role": "tuning",
+                "excluded_roles": ["final_holdout"],
+                "privacy": False,
+                "fairness": False,
+            },
+            "provenance": {
+                "fit_roles": ["train"],
+                "evaluation_role": "tuning",
+                "comparison_role": "tuning",
+                "excluded_roles": ["final_holdout"],
+                "privacy": False,
+                "fairness": False,
+            },
         }
         try:
             if key == "elastic_net_jsd.v1":
                 from synthcity.metrics.eval_statistical import FrozenSupportJSD
                 from synthcity.plugins.core.dataloader import GenericDataLoader
 
+                from synthdata.evaluation.release import transform_release_roles
+
+                released_synthetic, released_roles, release_meta = transform_release_roles(
+                    synthetic_df,
+                    {"train": train_df, "tuning": tuning_df},
+                    release_generalization or {},
+                )
                 if train_loader is None:
-                    train_loader = GenericDataLoader(train_df)
-                    tuning_loader = GenericDataLoader(tuning_df)
-                    synthetic_loader = GenericDataLoader(synthetic_df)
+                    train_loader = GenericDataLoader(released_roles["train"])
+                    tuning_loader = GenericDataLoader(released_roles["tuning"])
+                    synthetic_loader = GenericDataLoader(released_synthetic)
                 evaluator = FrozenSupportJSD(
                     feature_types=dict(feature_types or {}),
                 )
@@ -947,18 +1160,21 @@ def evaluate_canonical_hpo_metrics(
                 metadata.update(
                     {
                         "support": result["metadata"]["candidate"],
+                        "release_transform_digest": release_meta["synthetic"].get(
+                            "release_transform_digest", release_meta["common_protocol_digest"]
+                        ),
                         "fit_roles": ["train"],
+                        **_release_provenance(release_meta),
+                        "orientation": "minimize_distance",
                         "provenance": {
                             "fit_roles": ["train"],
                             "support_fit_roles": ["train"],
+                            "comparison_role": "tuning",
+                            **_release_provenance(release_meta),
                         },
                     }
                 )
             elif key == "mixed_mmd.v1":
-                from syntheval.metrics.utility.metric_max_mean_discrepancy import (
-                    mixed_rbf_mmd_v2,
-                )
-
                 continuous = [
                     column for column, kind in (feature_types or {}).items() if kind == "continuous"
                 ]
@@ -970,9 +1186,17 @@ def evaluate_canonical_hpo_metrics(
                     for column, kind in (feature_types or {}).items()
                     if kind == "categorical"
                 ]
-                result = mixed_rbf_mmd_v2(
-                    train_df,
+                from synthdata.evaluation.release import transform_release_roles
+
+                released_synthetic, released_roles, release_meta = transform_release_roles(
                     synthetic_df,
+                    {"train": train_df, "tuning": tuning_df},
+                    release_generalization or {},
+                )
+                result = _evaluate_train_frozen_mmd(
+                    released_roles["train"],
+                    released_roles["tuning"],
+                    released_synthetic,
                     continuous_columns=continuous,
                     ordinal_columns=ordinal,
                     nominal_columns=nominal,
@@ -982,19 +1206,42 @@ def evaluate_canonical_hpo_metrics(
                     {
                         "bandwidth": result["bandwidth"],
                         "fit_roles": ["train"],
+                        "evaluation_role": "tuning",
                         "provenance": {
                             "fit_roles": ["train"],
                             "bandwidth_fit_roles": ["train"],
+                            "comparison_role": "tuning",
+                            **_release_provenance(release_meta),
                         },
+                        "orientation": "minimize_distance",
                     }
                 )
+                metadata["provenance"].update(_release_provenance(release_meta))
             else:
-                # TSTR requires a verified release-form candidate. Never pass
-                # an ordinary HPO candidate through as a synthetic release.
-                raise ValueError(
-                    "tstr_macro_f1.v1 requires a verified release-form candidate; "
-                    "ordinary HPO candidates cannot use row-level fallback semantics"
+                from synthdata.evaluation.release import transform_release_roles
+                from synthdata.evaluation.tstr import run_tstr_evaluation
+
+                released_synthetic, released_roles, release_meta = transform_release_roles(
+                    synthetic_df,
+                    {"train": train_df, "tuning": tuning_df},
+                    release_generalization or {},
                 )
+                tstr = run_tstr_evaluation(
+                    released_synthetic,
+                    released_roles["tuning"],
+                    target_column=target_column,
+                    evaluation_role="tuning",
+                    seed=seed,
+                )
+                value = tstr.report["macro_f1"]
+                metadata.update(
+                    {
+                        **_release_provenance(release_meta),
+                        **tstr.report,
+                    }
+                )
+                metadata["provenance"].update(_release_provenance(release_meta))
+                metadata["orientation"] = "maximize_score"
             rows[key] = {
                 "mean": float(value),
                 "direction": "maximize" if key == "tstr_macro_f1.v1" else "minimize",
@@ -1011,6 +1258,36 @@ def evaluate_canonical_hpo_metrics(
     report = pd.DataFrame.from_dict(rows, orient="index")
     report.attrs["canonical_hpo"] = True
     report.attrs["canonical_hpo_keys"] = tuple(keys)
+    first_provenance = next(
+        (
+            row.get("provenance")
+            for row in rows.values()
+            if isinstance(row.get("provenance"), Mapping)
+        ),
+        None,
+    )
+    if isinstance(first_provenance, Mapping):
+        report.attrs["hpo_provenance"] = {
+            "fit_roles": ["train"],
+            "comparison_role": "tuning",
+            "release_transform_digest": first_provenance.get("release_transform_digest"),
+            "role_hashes": first_provenance.get("role_hashes"),
+            "contracts": dict(rows[keys[0]].get("contracts", {})),
+            "support_provenance": {
+                "fit_roles": ["train"],
+                "support_contract": "train_frozen_v1",
+                "support": rows.get("elastic_net_jsd.v1", {}).get("support"),
+            },
+            "bandwidth_provenance": {
+                "fit_roles": ["train"],
+                "comparison_role": "tuning",
+                "contract": "train_frozen_v1",
+                "bandwidth": rows.get("mixed_mmd.v1", {}).get("bandwidth"),
+            },
+            "objective_version": TUNING_OBJECTIVE_VERSION,
+        }
+        report.attrs["metric_metadata"] = {key: dict(row) for key, row in rows.items()}
+        report.attrs["result_metadata"] = dict(report.attrs["metric_metadata"])
     return report
 
 
@@ -1078,9 +1355,150 @@ def validate_hpo_metric_config(
 
 def hpo_context_digest(context: Mapping[str, Any]) -> str:
     """Hash the complete context that determines an HPO objective."""
+
+    _require_hpo_provenance(context, label="HPO context")
+
+    def _objective_context(value: Any, key: str | None = None) -> Any:
+        if key is not None and ("final_holdout" in key.lower() or key.lower() == "holdout"):
+            return None
+        if isinstance(value, Mapping):
+            return {
+                str(child_key): _objective_context(child_value, str(child_key))
+                for child_key, child_value in value.items()
+                if not (
+                    "final_holdout" in str(child_key).lower() or str(child_key).lower() == "holdout"
+                )
+            }
+        if isinstance(value, (list, tuple)):
+            normalised = [_objective_context(item) for item in value]
+            return sorted(
+                normalised,
+                key=lambda item: json.dumps(
+                    item, sort_keys=True, default=str, separators=(",", ":")
+                ),
+            )
+        return value
+
     return hashlib.sha256(
-        json.dumps(dict(context), sort_keys=True, default=str, separators=(",", ":")).encode()
+        json.dumps(
+            _objective_context(context), sort_keys=True, default=str, separators=(",", ":")
+        ).encode()
     ).hexdigest()
+
+
+_HPO_PROVENANCE_FIELDS = (
+    "release_transform_digest",
+    "role_hashes",
+    "contracts",
+    "support_provenance",
+    "bandwidth_provenance",
+    "objective_version",
+)
+
+
+def _provenance_value(context: Mapping[str, Any], field: str) -> Any:
+    """Resolve provenance fields from hardened canonical contexts."""
+    return context.get(field)
+
+
+def _has_provenance_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (Mapping, Sequence)):
+        return bool(value)
+    return True
+
+
+def _contains_blank_string(value: Any) -> bool:
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, Mapping):
+        return any(_contains_blank_string(child) for item in value.items() for child in item)
+    if isinstance(value, (Sequence, set)):
+        return any(_contains_blank_string(child) for child in value)
+    return False
+
+
+def _require_hpo_provenance(context: Mapping[str, Any], *, label: str) -> dict[str, Any]:
+    """Return required objective provenance or fail closed."""
+    if not isinstance(context, Mapping):
+        raise TypeError(f"{label} must be a mapping")
+    missing = [
+        field
+        for field in _HPO_PROVENANCE_FIELDS
+        if not _has_provenance_value(_provenance_value(context, field))
+    ]
+    if missing:
+        raise ValueError(f"{label} is missing required provenance: {missing}")
+    role_hashes = _provenance_value(context, "role_hashes")
+    if (
+        not isinstance(role_hashes, Mapping)
+        or any(
+            not isinstance(role_hash, str) or not role_hash.strip()
+            for role_hash in role_hashes.values()
+        )
+        or any(role not in role_hashes for role in ("train", "tuning"))
+    ):
+        raise ValueError(f"{label}.role_hashes must contain non-empty train and tuning hashes")
+    for field in _HPO_PROVENANCE_FIELDS:
+        if _contains_blank_string(_provenance_value(context, field)):
+            raise ValueError(f"{label}.{field} must not contain blank strings")
+    contracts = _provenance_value(context, "contracts")
+    if not isinstance(contracts, Mapping):
+        raise ValueError(f"{label}.contracts must be an object")
+    if (
+        contracts.get("fit_roles") != ["train"]
+        or contracts.get("comparison_role") != "tuning"
+        or contracts.get("excluded_roles") != ["final_holdout"]
+        or contracts.get("privacy") is not False
+        or contracts.get("fairness") is not False
+    ):
+        raise ValueError(
+            f"{label}.contracts must declare train fit, tuning comparison, exactly "
+            "final_holdout exclusion, and disable privacy/fairness"
+        )
+    support = _provenance_value(context, "support_provenance")
+    bandwidth = _provenance_value(context, "bandwidth_provenance")
+    if not isinstance(support, Mapping):
+        raise ValueError(f"{label}.support_provenance must be an object")
+    if (
+        support.get("fit_roles") != ["train"]
+        or support.get("support_contract") != "train_frozen_v1"
+    ):
+        raise ValueError(
+            f"{label}.support_provenance must declare train-frozen support fit on train"
+        )
+    if not isinstance(bandwidth, Mapping):
+        raise ValueError(f"{label}.bandwidth_provenance must be an object")
+    if (
+        bandwidth.get("fit_roles") != ["train"]
+        or bandwidth.get("comparison_role") != "tuning"
+        or bandwidth.get("contract") != "train_frozen_v1"
+    ):
+        raise ValueError(
+            f"{label}.bandwidth_provenance must declare train-frozen fit on train and tuning comparison"
+        )
+    if (
+        not isinstance(_provenance_value(context, "objective_version"), str)
+        or not _provenance_value(context, "objective_version").strip()
+    ):
+        raise ValueError(f"{label}.objective_version must be a non-empty string")
+    return {field: _provenance_value(context, field) for field in _HPO_PROVENANCE_FIELDS}
+
+
+def _require_validated_hpo_context(context: Any, *, label: str) -> dict[str, Any]:
+    """Require canonical context before reading or writing durable HPO state."""
+    if not isinstance(context, Mapping):
+        raise ValueError(f"{label} must be a canonical hpo_context")
+    if context.get("schema_version") != HPO_CONTEXT_SCHEMA_VERSION:
+        raise ValueError(f"{label} has an unsupported schema")
+    fingerprint = context.get("role_context_fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint.strip():
+        raise ValueError(f"{label}.role_context_fingerprint must be a non-empty string")
+    _require_hpo_provenance(context, label=label)
+    return dict(context)
 
 
 def build_hpo_context(
@@ -1094,11 +1512,18 @@ def build_hpo_context(
     role_context: Mapping[str, Any],
     variable_columns: Sequence[str] | None = None,
     attack_target_types: Mapping[str, str] | None = None,
+    utility_policy: Mapping[str, Any] | None = None,
+    release_transform_digest: str | None = None,
+    role_hashes: Mapping[str, str] | None = None,
+    contracts: Mapping[str, Any] | None = None,
+    support_provenance: Mapping[str, Any] | None = None,
+    bandwidth_provenance: Mapping[str, Any] | None = None,
+    objective_version: str | None = None,
 ) -> dict[str, Any]:
     """Build the durable identity for one generation HPO objective."""
     if task_type not in {"classification", "regression"}:
         raise ValueError(f"Unsupported HPO task_type {task_type!r}")
-    if not isinstance(role_context_fingerprint, str) or not role_context_fingerprint:
+    if not isinstance(role_context_fingerprint, str) or not role_context_fingerprint.strip():
         raise ValueError("HPO role_context_fingerprint must be a non-empty string")
     if not isinstance(role_context, Mapping):
         raise TypeError("HPO role_context must be a mapping")
@@ -1110,21 +1535,37 @@ def build_hpo_context(
         for category, metric_names in metric_config.items()
     }
     validate_hpo_metric_config(resolved_metric_config, group_context=group_context)
-    return {
+    policy = _resolve_utility_policy(utility_policy)
+    context = {
         "schema_version": HPO_CONTEXT_SCHEMA_VERSION,
         "task_type": task_type,
         "registry_digest": registry_digest or DEFAULT_METRIC_CONTRACT_REGISTRY.digest(),
         "stage_a_contract_digest": stage_a_contract_digest,
         "metric_config": resolved_metric_config,
-        "expected_emitted_keys": [
-            str(metric_name)
-            for metric_names in resolved_metric_config.values()
-            for metric_name in metric_names
-        ],
+        "expected_emitted_keys": list(policy["metrics"]),
+        "utility_expected_emitted_keys": list(policy["metrics"]),
         "group_context": dict(group_context) if group_context is not None else None,
         "role_context_fingerprint": role_context_fingerprint,
         "role_context": dict(role_context),
+        "objective_version": objective_version,
+        "utility_policy": policy,
     }
+    context.update(
+        {
+            "release_transform_digest": release_transform_digest,
+            "role_hashes": dict(role_hashes) if role_hashes is not None else None,
+            "contracts": dict(contracts) if contracts is not None else None,
+            "support_provenance": dict(support_provenance)
+            if support_provenance is not None
+            else None,
+            "bandwidth_provenance": dict(bandwidth_provenance)
+            if bandwidth_provenance is not None
+            else None,
+            "objective_version": objective_version,
+        }
+    )
+    _require_hpo_provenance(context, label="HPO context")
+    return context
 
 
 def _hpo_row_error(row: pd.Series) -> str | None:
@@ -1147,6 +1588,7 @@ def hpo_score(
     report_df: pd.DataFrame,
     *,
     expected_keys: Sequence[str] | None = None,
+    utility_policy: Mapping[str, Any] | None = None,
 ) -> float:
     """Direction-aware composite score: orient metrics so higher=better, negate mean.
 
@@ -1156,6 +1598,11 @@ def hpo_score(
     every statically declared emitted identity before any score is calculated.
     The result is suitable as an Optuna objective under ``direction="minimize"``.
     """
+    provenance = report_df.attrs.get("hpo_provenance")
+    if provenance is None:
+        raise ValueError("HPO evaluation report is missing required hpo_provenance")
+    _require_hpo_provenance(provenance, label="HPO evaluation provenance")
+    policy = _resolve_utility_policy(utility_policy)
     if report_df.empty:
         raise ValueError("HPO evaluation emitted no metric rows")
     if "mean" not in report_df.columns or "direction" not in report_df.columns:
@@ -1260,7 +1707,76 @@ def hpo_score(
         scores.append(oriented_value)
     if not scores:
         raise ValueError("HPO evaluation emitted no eligible objective rows")
-    return -sum(scores) / len(scores)
+    required_utility_keys = tuple(policy["metrics"])
+    observed_keys = [str(key) for key in report_df.index]
+    if len(observed_keys) != len(set(observed_keys)):
+        raise ValueError("HPO evaluation emitted duplicate utility evidence")
+    missing_utility_keys = set(required_utility_keys) - set(observed_keys)
+    unexpected_utility_keys = set(observed_keys) - set(required_utility_keys)
+    if missing_utility_keys or unexpected_utility_keys:
+        raise ValueError(
+            "HPO evaluation must emit exactly fixed release utility metrics: "
+            f"missing={sorted(missing_utility_keys)}, "
+            f"unexpected={sorted(unexpected_utility_keys)}"
+        )
+    utility = []
+    for key in required_utility_keys:
+        row = report_df.loc[key]
+        value = float(row["mean"])
+        if key in {"elastic_net_jsd.v1", "mixed_mmd.v1"}:
+            value = 1.0 - value
+        utility.append(value)
+    if not all(math.isfinite(value) for value in utility):
+        raise ValueError("HPO evaluation emitted non-finite utility evidence")
+    return -sum(weight * value for weight, value in zip(policy["weights"], utility, strict=True))
+
+
+def _validate_aligned_group_ids(
+    frame: pd.DataFrame,
+    group_ids: Any,
+    role: str,
+) -> list[Any]:
+    """Resolve group IDs by stable row identity and reject positional ambiguity."""
+    if not frame.index.is_unique:
+        raise ValueError(f"Patient-group HPO requires unique {role} row identities")
+    if isinstance(group_ids, Mapping):
+        values = pd.Series(group_ids, dtype=object)
+        if not values.index.is_unique:
+            raise ValueError(
+                f"Patient-group HPO group IDs for {role} contain duplicate row identities"
+            )
+        missing = frame.index.difference(values.index)
+        extra = values.index.difference(frame.index)
+        if len(missing) or len(extra):
+            raise ValueError(
+                f"Patient-group HPO group IDs for {role} do not align with DataFrame rows"
+            )
+        values = values.reindex(frame.index)
+    elif isinstance(group_ids, (pd.Series, pd.Index)):
+        values = pd.Series(group_ids.to_numpy(copy=False), index=group_ids.index, dtype=object)
+    else:
+        try:
+            values = pd.Series(group_ids, dtype=object)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Patient-group HPO group IDs for {role} are not row-aligned") from exc
+        if not isinstance(frame.index, pd.RangeIndex) or frame.index != pd.RangeIndex(len(frame)):
+            raise ValueError(
+                f"Patient-group HPO group IDs for {role} require stable row identities, "
+                "not positional values"
+            )
+    if (
+        len(values) != len(frame)
+        or not values.index.is_unique
+        or not values.index.equals(frame.index)
+    ):
+        raise ValueError(f"Patient-group HPO group IDs for {role} do not align with DataFrame rows")
+    if values.isna().any():
+        raise ValueError(f"Patient-group HPO group IDs for {role} contain missing values")
+    try:
+        values.map(hash)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Patient-group HPO group IDs for {role} are not hashable") from exc
+    return values.tolist()
 
 
 def build_synthetic_eval_fn(
@@ -1282,6 +1798,8 @@ def build_synthetic_eval_fn(
     holdout_group_ids: Any | None = None,
     semantic_context: Mapping[str, Any] | None = None,
     expected_emitted_keys: Sequence[str] | None = None,
+    release_generalization: Mapping[str, Any] | None = None,
+    utility_policy: Mapping[str, Any] | None = None,
 ) -> Callable[[pd.DataFrame], float]:
     """Build a ``syn_df -> score`` function for one HPO candidate.
 
@@ -1294,15 +1812,17 @@ def build_synthetic_eval_fn(
     they must never be translated to native SynthCity aliases.
     """
     validate_hpo_metric_config(metric_config, group_context=group_context)
-    expected_keys = (
-        list(expected_emitted_keys)
-        if expected_emitted_keys is not None
-        else [
-            str(metric_name)
-            for metric_names in metric_config.values()
-            for metric_name in metric_names
-        ]
-    )
+    configured_keys = {
+        str(metric_name) for values in metric_config.values() for metric_name in values
+    }
+    policy = _resolve_utility_policy(utility_policy)
+    expected_keys = list(policy["metrics"])
+    if expected_emitted_keys is not None:
+        supplied_keys = [str(key) for key in expected_emitted_keys]
+        if supplied_keys != expected_keys:
+            raise ValueError(
+                "HPO expected emitted metric keys are fixed to the release utility policy"
+            )
     if len(expected_keys) != len(set(expected_keys)):
         raise ValueError("HPO expected emitted metric keys must be unique")
     group_mode = group_context.get("group_mode", "row") if group_context else "row"
@@ -1312,6 +1832,9 @@ def build_synthetic_eval_fn(
         raise ValueError(
             "Patient-group HPO objectives require group IDs for both train and tuning loaders"
         )
+    if group_mode == "patient_group":
+        train_group_ids = _validate_aligned_group_ids(train_reference_df, train_group_ids, "train")
+        holdout_group_ids = _validate_aligned_group_ids(holdout_df, holdout_group_ids, "tuning")
 
     canonical_keys = {
         "elastic_net_jsd.v1",
@@ -1333,8 +1856,10 @@ def build_synthetic_eval_fn(
                 feature_types=feature_types,
                 sensitive_features=sensitive_features,
                 seed=seed,
+                release_generalization=release_generalization,
+                utility_policy=policy,
             )
-            return hpo_score(report, expected_keys=expected_keys)
+            return hpo_score(report, expected_keys=expected_keys, utility_policy=policy)
 
         return canonical_eval_fn
 
@@ -1411,7 +1936,7 @@ def build_synthetic_eval_fn(
             X_ref_syn_group_ids=reference_synthetic_group_ids,
             X_augmented_group_ids=augmented_group_ids,
         )
-        return hpo_score(report, expected_keys=expected_keys)
+        return hpo_score(report, expected_keys=expected_keys, utility_policy=policy)
 
     return eval_fn
 
@@ -1426,9 +1951,8 @@ def contextual_study_name(study_name: str, hpo_context: Mapping[str, Any] | None
     """Return a stable, context-specific Optuna study name."""
     if not isinstance(study_name, str) or not study_name:
         raise ValueError("study_name must be a non-empty string")
-    if hpo_context is None:
-        return study_name
-    return f"{study_name}-{hpo_context_digest(hpo_context)[:16]}"
+    context = _require_validated_hpo_context(hpo_context, label="HPO context")
+    return f"{study_name}-{hpo_context_digest(context)[:16]}"
 
 
 def default_best_params_path(output_dir: str | Path) -> Path:
@@ -1557,8 +2081,9 @@ def create_study(
     *,
     hpo_context: Mapping[str, Any] | None = None,
 ) -> optuna.Study:
+    context_payload = _require_validated_hpo_context(hpo_context, label="HPO study context")
     storage = hpo_cfg.storage or default_storage_url(output_dir)
-    contextual_name = contextual_study_name(study_name, hpo_context)
+    contextual_name = contextual_study_name(study_name, context_payload)
     study = optuna.create_study(
         study_name=contextual_name,
         direction="minimize",
@@ -1566,25 +2091,23 @@ def create_study(
         storage=storage,
         load_if_exists=True,
     )
-    if hpo_context is not None:
-        context_payload = dict(hpo_context)
-        context_digest = hpo_context_digest(context_payload)
-        stored_digest = study.user_attrs.get("hpo_context_digest")
-        stored_context = study.user_attrs.get("hpo_context")
-        if stored_digest is None:
-            if study.trials:
-                raise RuntimeError(
-                    f"HPO study {study.study_name!r} has trials but no {HPO_CONTEXT_SCHEMA_VERSION} "
-                    "context metadata; refusing to reuse unverified evidence"
-                )
-            study.set_user_attr("hpo_context_schema_version", HPO_CONTEXT_SCHEMA_VERSION)
-            study.set_user_attr("hpo_context_digest", context_digest)
-            study.set_user_attr("hpo_context", context_payload)
-        elif stored_digest != context_digest or stored_context != context_payload:
+    context_digest = hpo_context_digest(context_payload)
+    stored_digest = study.user_attrs.get("hpo_context_digest")
+    stored_context = study.user_attrs.get("hpo_context")
+    if stored_digest is None:
+        if study.trials:
             raise RuntimeError(
-                f"HPO study {study.study_name!r} context metadata does not match the current "
-                f"{HPO_CONTEXT_SCHEMA_VERSION} payload"
+                f"HPO study {study.study_name!r} has trials but no {HPO_CONTEXT_SCHEMA_VERSION} "
+                "context metadata; refusing to reuse unverified evidence"
             )
+        study.set_user_attr("hpo_context_schema_version", HPO_CONTEXT_SCHEMA_VERSION)
+        study.set_user_attr("hpo_context_digest", context_digest)
+        study.set_user_attr("hpo_context", context_payload)
+    elif stored_digest != context_digest or stored_context != context_payload:
+        raise RuntimeError(
+            f"HPO study {study.study_name!r} context metadata does not match the current "
+            f"{HPO_CONTEXT_SCHEMA_VERSION} payload"
+        )
     return study
 
 
@@ -1634,10 +2157,7 @@ def _validate_hpo_generator_metadata(payload: Any, label: str) -> None:
     if missing:
         raise RuntimeError(f"{label} is incomplete; missing {missing}")
     schema_version = payload["schema_version"]
-    if schema_version not in {
-        LEGACY_GENERATOR_METADATA_SCHEMA_VERSION,
-        HPO_GENERATOR_METADATA_SCHEMA_VERSION,
-    }:
+    if schema_version != HPO_GENERATOR_METADATA_SCHEMA_VERSION:
         raise RuntimeError(f"{label} has an unsupported schema")
     implementation_fingerprint = payload.get("implementation_fingerprint")
     if schema_version == HPO_GENERATOR_METADATA_SCHEMA_VERSION and (
@@ -1797,13 +2317,18 @@ def _validate_hpo_trial_checkpoint(
     context = payload.get("hpo_context")
     context_digest = payload.get("hpo_context_digest")
     if context is None:
-        if context_digest is not None:
-            raise RuntimeError("HPO trial checkpoint has a context digest without context")
-    elif not isinstance(context, Mapping):
-        raise RuntimeError("HPO trial checkpoint hpo_context must be an object or null")
-    elif context_digest != hpo_context_digest(context):
+        raise RuntimeError("HPO trial checkpoint requires canonical hpo_context")
+    try:
+        validated_context = _require_validated_hpo_context(
+            context, label="HPO trial checkpoint hpo_context"
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(str(exc)) from exc
+    if context_digest != hpo_context_digest(validated_context):
         raise RuntimeError("HPO trial checkpoint context digest does not match its context")
-    if expected_context_digest is not None and context_digest != expected_context_digest:
+    if expected_context_digest is None:
+        raise RuntimeError("HPO trial checkpoint requires expected context digest")
+    if context_digest != expected_context_digest:
         raise RuntimeError("HPO trial checkpoint context does not match the current study")
 
     metadata = payload.get("metadata")
@@ -1857,7 +2382,9 @@ def persist_hpo_trial_checkpoint(
             f"Cannot persist HPO trial {trial_number}: unsupported Optuna state {state_name!r}"
         )
 
-    context = _json_document(dict(hpo_context)) if hpo_context is not None else None
+    context = _json_document(
+        _require_validated_hpo_context(hpo_context, label="HPO checkpoint context")
+    )
     attrs = getattr(trial, "user_attrs", {}) or {}
     metric_metadata = attrs.get("metric_metadata")
     result_metadata = attrs.get("result_metadata", metric_metadata)
@@ -1896,7 +2423,7 @@ def persist_hpo_trial_checkpoint(
     _validate_hpo_trial_checkpoint(
         payload,
         expected_study_name=study_name,
-        expected_context_digest=(hpo_context_digest(context) if context is not None else None),
+        expected_context_digest=hpo_context_digest(context),
         expected_implementation_fingerprint=expected_implementation_fingerprint,
     )
     path = Path(root) / study_name / f"trial-{trial_number}" / "checkpoint.json"
@@ -1908,7 +2435,7 @@ def persist_hpo_trial_checkpoint(
         _validate_hpo_trial_checkpoint(
             cached,
             expected_study_name=study_name,
-            expected_context_digest=(hpo_context_digest(context) if context is not None else None),
+            expected_context_digest=hpo_context_digest(context),
             expected_implementation_fingerprint=expected_implementation_fingerprint,
         )
         if cached != payload:
@@ -1921,6 +2448,7 @@ def persist_hpo_trial_checkpoint(
 def load_hpo_trial_checkpoint(
     path: str | Path,
     *,
+    hpo_context: Mapping[str, Any] | None = None,
     expected_implementation_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Load and validate a durable HPO trial checkpoint."""
@@ -1929,8 +2457,10 @@ def load_hpo_trial_checkpoint(
         payload = load_json(checkpoint_path)
     except (OSError, ValueError) as exc:
         raise RuntimeError(f"HPO trial checkpoint at {checkpoint_path} is unreadable") from exc
+    context = _require_validated_hpo_context(hpo_context, label="HPO checkpoint context")
     return _validate_hpo_trial_checkpoint(
         payload,
+        expected_context_digest=hpo_context_digest(context),
         expected_implementation_fingerprint=expected_implementation_fingerprint,
     )
 
@@ -1976,6 +2506,7 @@ def run_study(
     with a running trial or no completed trial retain every cache so an active
     or unsuccessful run remains recoverable.
     """
+    context_payload = _require_validated_hpo_context(hpo_context, label="HPO study context")
     if (checkpoint_workspace is None) != (checkpoint_plugin is None):
         raise ValueError("checkpoint_workspace and checkpoint_plugin must be provided together")
     if checkpoint_implementation_fingerprint is not None and (
@@ -1989,7 +2520,7 @@ def run_study(
         hpo_cfg,
         output_dir,
         seed,
-        hpo_context=hpo_context,
+        hpo_context=context_payload,
     )
     if checkpoint_implementation_fingerprint is not None:
         checkpoint_dir = Path(output_dir) / "hpo_checkpoints" / study.study_name
@@ -1997,6 +2528,7 @@ def run_study(
         for checkpoint_path in existing_checkpoints:
             load_hpo_trial_checkpoint(
                 checkpoint_path,
+                hpo_context=context_payload,
                 expected_implementation_fingerprint=checkpoint_implementation_fingerprint,
             )
         if existing_checkpoints:
@@ -2045,7 +2577,7 @@ def run_study(
             Path(output_dir) / "hpo_checkpoints",
             current_study.study_name,
             trial,
-            hpo_context=hpo_context,
+            hpo_context=context_payload,
             expected_implementation_fingerprint=checkpoint_implementation_fingerprint,
         )
 
@@ -2077,7 +2609,7 @@ def run_study(
         _persist_hpo_trial_checkpoints(
             output_dir,
             study,
-            hpo_context=hpo_context,
+            hpo_context=context_payload,
             expected_implementation_fingerprint=checkpoint_implementation_fingerprint,
         )
 
@@ -2116,7 +2648,7 @@ def run_study(
 
 
 class BestParamsCache:
-    """JSON-backed cache of best hyperparameters with optional role provenance."""
+    """JSON-backed cache of best hyperparameters scoped to verified HPO context."""
 
     def __init__(
         self,
@@ -2129,51 +2661,20 @@ class BestParamsCache:
     ):
         self.path = Path(path)
         cached_data = load_json(self.path, default={})
-        self._context = None
-        if hpo_context is not None:
-            if role_context_fingerprint is not None or role_context is not None:
-                raise ValueError(
-                    "hpo_context cannot be combined with legacy role-context cache arguments"
-                )
-            context_payload = dict(hpo_context)
-            self._context = {
-                "schema_version": HPO_CONTEXT_SCHEMA_VERSION,
-                "hpo_context_digest": hpo_context_digest(context_payload),
-                "hpo_context": context_payload,
-            }
-            cached_context = cached_data.get("_metadata")
-            if cached_context == self._context:
-                self._data = cached_data
-            else:
-                logger.info(
-                    "[hpo cache] ignoring stale or unverified cache at %s for hpo_context=%s",
-                    self.path,
-                    self._context["hpo_context_digest"][:16],
-                )
-                self._data = {}
-        elif role_context_fingerprint is None:
-            self._data = cached_data
-        else:
-            self._context = {
-                "schema_version": "hpo-cache-v1",
-                "role_context_fingerprint": role_context_fingerprint,
-                "role_context": role_context,
-            }
-            cached_context = cached_data.get("_metadata")
-            context_matches = (
-                isinstance(cached_context, dict)
-                and cached_context.get("schema_version") == "hpo-cache-v1"
-                and cached_context.get("role_context_fingerprint") == role_context_fingerprint
+        if hpo_context is None:
+            raise ValueError("HPO cache requires a verified hpo_context")
+        if role_context_fingerprint is not None or role_context is not None:
+            raise ValueError(
+                "hpo_context cannot be combined with legacy role-context cache arguments"
             )
-            if context_matches or allow_unverified_legacy and "_metadata" not in cached_data:
-                self._data = cached_data
-            else:
-                logger.info(
-                    "[hpo cache] ignoring stale or unverified cache at %s for role_context=%s",
-                    self.path,
-                    role_context_fingerprint[:16],
-                )
-                self._data = {}
+        context_payload = _require_validated_hpo_context(hpo_context, label="HPO cache context")
+        self._context = {
+            "schema_version": HPO_CONTEXT_SCHEMA_VERSION,
+            "hpo_context_digest": hpo_context_digest(context_payload),
+            "hpo_context": context_payload,
+        }
+        cached_context = cached_data.get("_metadata")
+        self._data = cached_data if cached_context == self._context else {}
 
     def get(self, family: str, model_name: str) -> dict:
         return self._data.get(family, {}).get(model_name, {})

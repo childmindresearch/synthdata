@@ -18,6 +18,7 @@ from synthdata.evaluation.catalog import emitted_keys_for_synthcity_metrics
 from synthdata.generation.hpo import (
     HPO_GENERATOR_METADATA_SCHEMA_VERSION,
     StageAScreenContract,
+    _resolve_utility_policy,
     evaluate_canonical_hpo_metrics,
     hpo_score,
     persist_stage_a_trial_exception,
@@ -64,6 +65,7 @@ def make_loader(
     group_ids=None,
     important_features: list | None = None,
     feature_types: dict[str, str] | None = None,
+    release_generalization: dict | None = None,
     source_table: dict[str, str] | None = None,
 ):
     from synthcity.plugins.core.dataloader import GenericDataLoader
@@ -475,6 +477,7 @@ def build_synthcity_objective(
     tuning_df: pd.DataFrame | None = None,
     target_column: str | None = None,
     feature_types: dict[str, str] | None = None,
+    release_generalization: dict | None = None,
 ):
     """Build an Optuna objective for a synthcity plugin's native hyperparameter space.
 
@@ -494,9 +497,12 @@ def build_synthcity_objective(
     canonical = configured_keys.issubset({"elastic_net_jsd.v1", "mixed_mmd.v1", "tstr_macro_f1.v1"})
     if canonical and (train_df is None or tuning_df is None or target_column is None):
         raise ValueError("Canonical SynthCity HPO requires train_df, tuning_df, and target_column")
+    utility_policy = _resolve_utility_policy(hpo_cfg.utility_policy) if canonical else None
     expected_keys = (
         list(expected_emitted_keys)
         if expected_emitted_keys is not None
+        else list(utility_policy["metrics"])
+        if canonical
         else emitted_keys_for_synthcity_metrics(hpo_cfg.metric_config)
     )
     if len(expected_keys) != len(set(expected_keys)):
@@ -623,6 +629,8 @@ def build_synthcity_objective(
                     feature_types=feature_types,
                     sensitive_features=(),
                     seed=seed,
+                    release_generalization=release_generalization,
+                    utility_policy=utility_policy,
                 )
                 metric_report.attrs["metric_metadata"] = {
                     "producer": "synthdata.generation.hpo.evaluate_canonical_hpo_metrics",
@@ -688,7 +696,11 @@ def build_synthcity_objective(
                 )
             set_trial_attr(trial, "generator_metadata", generator_metadata)
             set_trial_attr(trial, "generator_metadata_state", "present")
-            return hpo_score(metric_report, expected_keys=expected_keys)
+            return hpo_score(
+                metric_report,
+                expected_keys=expected_keys,
+                utility_policy=utility_policy,
+            )
         except optuna.TrialPruned:
             if getattr(trial, "user_attrs", {}).get("generator_metadata_state") != "present":
                 set_trial_attr(trial, "generator_metadata_state", "missing")

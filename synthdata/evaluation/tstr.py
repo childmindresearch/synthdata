@@ -47,6 +47,13 @@ def _prediction_identity(predictions: np.ndarray) -> str:
     return sha256(repr(values).encode("utf-8")).hexdigest()
 
 
+def _artifact_digest(artifact: Mapping[str, object]) -> str:
+    payload = {key: value for key, value in artifact.items() if key != "artifact_digest"}
+    return sha256(
+        repr(sorted(payload.items(), key=lambda item: item[0])).encode("utf-8")
+    ).hexdigest()
+
+
 def _population_identity(
     actual: np.ndarray, protected: pd.DataFrame, columns: Sequence[str]
 ) -> str:
@@ -88,6 +95,7 @@ class TSTRResult:
     model: object | None = None
     predictions: np.ndarray | None = None
     probabilities: np.ndarray | None = None
+    envelope: dict | None = None
 
     def as_dict(self) -> dict:
         return self.report
@@ -101,6 +109,7 @@ def run_tstr_evaluation(
     evaluation_role: str = "tuning",
     seed: int = 17,
     protected_columns: Sequence[str] = (),
+    role_hashes: Mapping[str, str] | None = None,
 ) -> TSTRResult:
     """Fit only release synthetic rows and evaluate one model on real rows.
 
@@ -129,15 +138,31 @@ def run_tstr_evaluation(
     missing = [value for value in classes if value not in synthetic_classes]
     extra = sorted((value for value in synthetic_classes if value not in set(classes)), key=str)
     metadata = {
+        "producer": "task10_tstr",
         "protocol_version": PROTOCOL_VERSION,
+        "producer_protocol_version": PROTOCOL_VERSION,
         "evaluation_role": evaluation_role,
-        "fit_roles": ["release"],
+        "fit_roles": ["train"] if evaluation_role == "tuning" else ["train", "tuning"],
         "source_role": "synthetic",
         "release_form": True,
         "seed": seed,
+        "common_protocol_digest": synthetic_provenance["common_protocol_digest"],
         "target_column": target_column,
         "protected_columns": list(protected_columns),
+        "release_transform_digest": synthetic_provenance.get("release_transform_digest"),
+        "role_hashes": {
+            "synthetic": synthetic_provenance.get("role_hash"),
+            expected_source: real_provenance.get("role_hash"),
+        },
+        "target_identity": sha256(repr(real_data[target_column].tolist()).encode()).hexdigest(),
+        "protected_identity": sha256(
+            repr(real_data[list(protected_columns)].to_dict("records")).encode()
+        ).hexdigest(),
     }
+    if role_hashes is not None:
+        metadata["role_hashes"] = dict(role_hashes)
+    metadata["target_population_identity"] = metadata["target_identity"]
+    metadata["protected_population_identity"] = metadata["protected_identity"]
     supports = {str(c): int((real_data[target_column] == c).sum()) for c in classes}
     if (
         missing
@@ -161,7 +186,15 @@ def run_tstr_evaluation(
             "primary_metric": "macro_f1",
             "result_metadata": metadata,
         }
-        return TSTRResult(report)
+        return TSTRResult(
+            report,
+            envelope={
+                "producer": "task10_tstr",
+                "protocol_version": PROTOCOL_VERSION,
+                "result_metadata": metadata,
+                "report": report,
+            },
+        )
     x_train, x_test = _features(synthetic_release, real_data, {target_column, *protected_columns})
     model = _xgb(seed, len(classes))
     # Label encoding is deterministic and independent of XGBoost's category handling.
@@ -199,6 +232,10 @@ def run_tstr_evaluation(
     if protected_columns and evaluation_role == "final_holdout":
         fairness_predictions = np.asarray(classes, dtype=object)[predictions]
         prediction_artifact = {
+            "producer": "task10_tstr",
+            "protocol_version": PROTOCOL_VERSION,
+            "producer_protocol_version": PROTOCOL_VERSION,
+            "seed": seed,
             "verified": True,
             "source_role": "final_holdout",
             "prediction_source": "tstr_model",
@@ -214,6 +251,13 @@ def run_tstr_evaluation(
                 real_data[target_column].to_numpy(), real_data, protected_columns
             ),
         }
+        prediction_artifact["release_transform_digest"] = synthetic_provenance.get(
+            "release_transform_digest"
+        )
+        prediction_artifact["role_hashes"] = metadata["role_hashes"]
+        prediction_artifact["target_identity"] = metadata["target_identity"]
+        prediction_artifact["protected_identity"] = metadata["protected_identity"]
+        prediction_artifact["artifact_digest"] = _artifact_digest(prediction_artifact)
         fairness = compute_equalized_odds(
             real_data[target_column],
             fairness_predictions,
@@ -223,7 +267,15 @@ def run_tstr_evaluation(
             prediction_artifact=prediction_artifact,
         )
         report["equalized_odds"] = fairness
-    return TSTRResult(report, model, predictions, probabilities)
+        report["prediction_artifact"] = prediction_artifact
+    envelope = {
+        "producer": "task10_tstr",
+        "protocol_version": PROTOCOL_VERSION,
+        "result_metadata": metadata,
+        "report": report,
+        "prediction_artifact": report.get("prediction_artifact"),
+    }
+    return TSTRResult(report, model, predictions, probabilities, envelope)
 
 
 def run_tstr(*args, **kwargs) -> TSTRResult:
@@ -251,6 +303,10 @@ def compute_equalized_odds(
         or artifact.get("verified") is not True
     ):
         raise ValueError("equalized-odds predictions require verified final_holdout model output")
+    if "artifact_digest" in artifact and artifact.get("artifact_digest") != _artifact_digest(
+        artifact
+    ):
+        raise ValueError("prediction artifact immutable content binding is invalid")
     actual = np.asarray(list(y_true))
     predicted = np.asarray(list(y_pred))
     if len(actual) != len(predicted) or len(actual) != len(protected):

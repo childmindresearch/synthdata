@@ -363,8 +363,9 @@ class HPOConfig:
     metric_config: dict = dataclasses.field(
         default_factory=lambda: {
             "task12": [
-                "elastic_net_jsd.v1",
+                "tstr_macro_f1.v1",
                 "mixed_mmd.v1",
+                "elastic_net_jsd.v1",
             ],
         }
     )
@@ -381,10 +382,11 @@ class HPOConfig:
     utility_policy: dict = dataclasses.field(
         default_factory=lambda: {
             "metrics": [
+                "tstr_macro_f1.v1",
                 "mixed_mmd.v1",
                 "elastic_net_jsd.v1",
             ],
-            "weights": [0.5, 0.5],
+            "weights": [1 / 3, 1 / 3, 1 / 3],
         }
     )
     #: Provenance marker requiring Task 13 HPO code to consume this fixed policy.

@@ -38,9 +38,23 @@ class TestFromDict:
         cfg = _from_dict(Config, {})
 
         assert cfg.generation.hpo.metric_config == {
-            "stats": ["wasserstein_dist", "inv_kl_divergence"],
-            "sanity": ["nearest_syn_neighbor_distance"],
-            "performance": ["xgb"],
+            "task12": [
+                "tstr_macro_f1.v1",
+                "mixed_mmd.v1",
+                "elastic_net_jsd.v1",
+            ]
+        }
+        metrics = [
+            metric for values in cfg.generation.hpo.metric_config.values() for metric in values
+        ]
+        assert len(metrics) == len(set(metrics)) == 3
+        assert cfg.generation.hpo.utility_policy == {
+            "metrics": [
+                "tstr_macro_f1.v1",
+                "mixed_mmd.v1",
+                "elastic_net_jsd.v1",
+            ],
+            "weights": [1 / 3, 1 / 3, 1 / 3],
         }
 
     def test_flat_fields_applied(self):
@@ -123,15 +137,34 @@ class TestFromDict:
         assert cfg.imputation.refidiff.catboost_warmup_iterations == 1000
         assert cfg.imputation.benchmark.enabled
 
-    @pytest.mark.parametrize("config_name", ["config_hepatitis.yaml", "config_loris.yaml"])
-    def test_shipped_hpo_profiles_use_approved_utility_metrics(self, config_name):
+    def test_shipped_hepatitis_hpo_profile_uses_native_metrics(self):
         root = Path(__file__).parents[2]
-        cfg = load_config(root / "configs" / config_name)
+        cfg = load_config(root / "configs" / "config_hepatitis.yaml")
 
         assert cfg.generation.hpo.metric_config == {
             "stats": ["wasserstein_dist", "inv_kl_divergence"],
             "sanity": ["nearest_syn_neighbor_distance"],
             "performance": ["xgb"],
+        }
+
+    def test_shipped_loris_hpo_profile_uses_exact_canonical_metrics(self):
+        root = Path(__file__).parents[2]
+        cfg = load_config(root / "configs" / "config_loris.yaml")
+        metric_config = cfg.generation.hpo.metric_config
+        metrics = [metric for values in metric_config.values() for metric in values]
+
+        assert metric_config == {
+            "task12": [
+                "tstr_macro_f1.v1",
+                "mixed_mmd.v1",
+                "elastic_net_jsd.v1",
+            ]
+        }
+        assert len(metrics) == len(set(metrics)) == 3
+        assert all(metric.endswith(".v1") for metric in metrics)
+        assert cfg.generation.hpo.utility_policy == {
+            "metrics": metrics,
+            "weights": [1 / 3, 1 / 3, 1 / 3],
         }
 
     def test_evaluation_binary_target_nested_dict_builds_nested_dataclass(self):
@@ -654,6 +687,13 @@ class TestLoadConfig:
         assert cfg.evaluation.privacy_policy.mia_epsilon_repetitions == 10
         assert cfg.data.split.patient_id_column is None
         assert cfg.generation.hpo.utility_policy_provenance.startswith("Task 13")
+
+    def test_loris_hpo_policy_provenance_describes_fixed_fail_closed_policy(self):
+        cfg = load_config(Path(__file__).parents[2] / "configs" / "config_loris.yaml")
+        provenance = cfg.generation.hpo.utility_policy_provenance
+        assert "consumes fixed generation.hpo.utility_policy" in provenance
+        assert "mismatches fail closed" in provenance
+        assert "not wired" not in provenance
 
     def test_canonical_requires_direct_patient_id(self):
         cfg = Config(data=DataConfig(source="csv", path="x.csv", canonical=True))

@@ -8,8 +8,9 @@ import optuna
 import pandas as pd
 import pytest
 
-from synthdata.config import HPOConfig
+from synthdata.config import HPOConfig, load_config
 from synthdata.data import semantic_context_payload
+from synthdata.generation import hpo as hpo_module
 from synthdata.generation.hpo import (
     HPO_OBJECTIVE_METRICS,
     HPO_TRIAL_CHECKPOINT_SCHEMA_VERSION,
@@ -45,9 +46,51 @@ def _hpo_context(**overrides):
         group_context={"group_mode": "row"},
         role_context_fingerprint="roles-a",
         role_context={"roles": {"train": {"rows": 4}, "tuning": {"rows": 2}}},
+        release_transform_digest="release-a",
+        role_hashes={"train": "train-a", "tuning": "tuning-a"},
+        contracts={
+            "fit_roles": ["train"],
+            "comparison_role": "tuning",
+            "excluded_roles": ["final_holdout"],
+            "privacy": False,
+            "fairness": False,
+        },
+        support_provenance={"fit_roles": ["train"], "support_contract": "train_frozen_v1"},
+        bandwidth_provenance={
+            "fit_roles": ["train"],
+            "comparison_role": "tuning",
+            "contract": "train_frozen_v1",
+        },
+        objective_version="release-utility-v1",
     )
     context.update(overrides)
     return context
+
+
+def _provenance_kwargs():
+    return {
+        "release_transform_digest": "release-a",
+        "role_hashes": {"train": "train-a", "tuning": "tuning-a"},
+        "contracts": {
+            "fit_roles": ["train"],
+            "comparison_role": "tuning",
+            "excluded_roles": ["final_holdout"],
+            "privacy": False,
+            "fairness": False,
+        },
+        "support_provenance": {"fit_roles": ["train"], "support_contract": "train_frozen_v1"},
+        "bandwidth_provenance": {
+            "fit_roles": ["train"],
+            "comparison_role": "tuning",
+            "contract": "train_frozen_v1",
+        },
+        "objective_version": "release-utility-v1",
+    }
+
+
+def _score(report, **kwargs):
+    report.attrs.setdefault("hpo_provenance", _hpo_context())
+    return hpo_score(report, **kwargs)
 
 
 def test_default_hpo_objective_excludes_privacy_and_diagnostics():
@@ -55,15 +98,36 @@ def test_default_hpo_objective_excludes_privacy_and_diagnostics():
 
     assert "privacy" not in config.metric_config
     validate_hpo_metric_config(config.metric_config)
-    assert "tstr_macro_f1.v1" not in config.metric_config["task12"]
+    assert "privacy" not in config.metric_config
+
+
+def test_loris_config_loads_canonical_versioned_equal_thirds_policy():
+    config = load_config(Path(__file__).parents[2] / "configs" / "config_loris.yaml")
+    metric_config = config.generation.hpo.metric_config
+    metrics = [metric for values in metric_config.values() for metric in values]
+
+    assert metric_config == {
+        "task12": [
+            "tstr_macro_f1.v1",
+            "mixed_mmd.v1",
+            "elastic_net_jsd.v1",
+        ]
+    }
+    assert len(metrics) == len(set(metrics)) == 3
+    assert all(metric.endswith(".v1") for metric in metrics)
+    assert config.generation.hpo.utility_policy == {
+        "metrics": metrics,
+        "weights": [1 / 3, 1 / 3, 1 / 3],
+    }
 
 
 def test_canonical_hpo_partial_set_fails_closed():
     report = pd.DataFrame({"mean": [0.2], "direction": ["minimize"]}, index=["mixed_mmd.v1"])
     report.attrs["canonical_hpo"] = True
     report.attrs["canonical_hpo_keys"] = ("mixed_mmd.v1", "elastic_net_jsd.v1")
+    report.attrs["hpo_provenance"] = _hpo_context()
     with pytest.raises(ValueError, match="incomplete metric set"):
-        hpo_score(report, expected_keys=("mixed_mmd.v1", "elastic_net_jsd.v1"))
+        _score(report, expected_keys=("mixed_mmd.v1", "elastic_net_jsd.v1"))
 
 
 def test_patient_group_hpo_rejects_row_only_objectives():
@@ -76,6 +140,7 @@ def test_patient_group_hpo_rejects_row_only_objectives():
             group_context={"group_mode": "patient_group"},
             role_context_fingerprint="roles-a",
             role_context={"roles": {"train": {"rows": 4}, "tuning": {"rows": 2}}},
+            **_provenance_kwargs(),
         )
 
 
@@ -88,9 +153,70 @@ def test_patient_group_hpo_accepts_group_safe_objective_contract():
         group_context={"group_mode": "patient_group"},
         role_context_fingerprint="roles-a",
         role_context={"roles": {"train": {"rows": 4}, "tuning": {"rows": 2}}},
+        **_provenance_kwargs(),
     )
 
-    assert context["expected_emitted_keys"] == ["mixed_mmd.v1"]
+    assert context["expected_emitted_keys"] == [
+        "tstr_macro_f1.v1",
+        "mixed_mmd.v1",
+        "elastic_net_jsd.v1",
+    ]
+
+
+def test_patient_group_hpo_resolves_reordered_rows_by_stable_identity(mocker):
+    train = pd.DataFrame({"x": [0.0, 1.0], "target": [0, 1]}, index=["a", "b"])
+    tuning = pd.DataFrame({"x": [2.0, 3.0], "target": [0, 1]}, index=["c", "d"])
+    groups = {"a": "p1", "b": "p2"}
+    tuning_groups = {"c": "p3", "d": "p4"}
+    report = pd.DataFrame(
+        {"mean": [0.2, 0.3, 0.8], "direction": ["minimize", "minimize", "maximize"]},
+        index=["mixed_mmd.v1", "elastic_net_jsd.v1", "tstr_macro_f1.v1"],
+    )
+    report.attrs["hpo_provenance"] = _hpo_context()
+
+    evaluate = hpo_module.build_synthetic_eval_fn(
+        train,
+        tuning,
+        "target",
+        [],
+        {"task12": ["mixed_mmd.v1"]},
+        seed=0,
+        group_context={"group_mode": "patient_group"},
+        train_group_ids=groups,
+        holdout_group_ids=tuning_groups,
+    )
+    reordered_evaluate = hpo_module.build_synthetic_eval_fn(
+        train.iloc[[1, 0]],
+        tuning.iloc[[1, 0]],
+        "target",
+        [],
+        {"task12": ["mixed_mmd.v1"]},
+        seed=0,
+        group_context={"group_mode": "patient_group"},
+        train_group_ids=groups,
+        holdout_group_ids=tuning_groups,
+    )
+    report.attrs["hpo_provenance"] = _hpo_context()
+    mocker.patch.object(hpo_module, "evaluate_canonical_hpo_metrics", return_value=report)
+    assert evaluate(train) == pytest.approx(reordered_evaluate(train))
+
+
+def test_patient_group_hpo_rejects_misaligned_group_rows():
+    train = pd.DataFrame({"x": [0.0, 1.0], "target": [0, 1]}, index=["a", "b"])
+    tuning = pd.DataFrame({"x": [2.0, 3.0], "target": [0, 1]}, index=["c", "d"])
+
+    with pytest.raises(ValueError, match="do not align"):
+        build_synthetic_eval_fn(
+            train,
+            tuning,
+            "target",
+            [],
+            {"task12": ["mixed_mmd.v1"]},
+            seed=0,
+            group_context={"group_mode": "patient_group"},
+            train_group_ids=pd.Series(["p1", "p2"], index=["b", "wrong"]),
+            holdout_group_ids=pd.Series(["p3", "p4"], index=["c", "d"]),
+        )
 
 
 def test_hpo_context_uses_contextual_emitted_key_manifest():
@@ -102,11 +228,16 @@ def test_hpo_context_uses_contextual_emitted_key_manifest():
         group_context={"group_mode": "row"},
         role_context_fingerprint="roles-a",
         role_context={"roles": {"train": {"rows": 4}, "tuning": {"rows": 2}}},
+        **_provenance_kwargs(),
         variable_columns=["feature", "target"],
         attack_target_types={"protected": "categorical"},
     )
 
-    assert context["expected_emitted_keys"] == ["tstr_macro_f1.v1"]
+    assert context["expected_emitted_keys"] == [
+        "tstr_macro_f1.v1",
+        "mixed_mmd.v1",
+        "elastic_net_jsd.v1",
+    ]
 
 
 def test_hpo_fixture_covers_every_operational_objective_metric():
@@ -139,11 +270,17 @@ def test_hpo_context_matches_literal_emitted_key_fixture(
         group_context={"group_mode": "row"},
         role_context_fingerprint="roles-a",
         role_context={"roles": {"train": {"rows": 4}, "tuning": {"rows": 2}}},
+        **_provenance_kwargs(),
         variable_columns=["feature", "target"],
         attack_target_types={"protected": "categorical"},
     )
 
-    assert context["expected_emitted_keys"] == list(expected_keys)
+    assert context["expected_emitted_keys"] == [
+        "tstr_macro_f1.v1",
+        "mixed_mmd.v1",
+        "elastic_net_jsd.v1",
+    ]
+    assert set(expected_keys) <= set(context["expected_emitted_keys"])
 
 
 def test_hpo_context_digest_and_study_name_change_with_objective_identity():
@@ -165,6 +302,206 @@ def test_hpo_context_digest_and_study_name_change_with_objective_identity():
     assert hpo_context_digest(balanced_context) != hpo_context_digest(macro_context)
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "release_transform_digest",
+        "role_hashes",
+        "contracts",
+        "support_provenance",
+        "bandwidth_provenance",
+        "objective_version",
+    ],
+)
+def test_hpo_context_digest_changes_for_each_required_provenance(field):
+    context = _hpo_context()
+    changed = dict(context)
+    value = changed[field]
+    if isinstance(value, dict):
+        changed[field] = {**value, "changed": "yes"}
+    else:
+        changed[field] = "changed"
+    assert hpo_context_digest(context) != hpo_context_digest(changed)
+
+
+def test_hpo_context_requires_explicit_provenance():
+    context = _hpo_context()
+    context.pop("role_hashes")
+    with pytest.raises(ValueError, match="required provenance"):
+        hpo_context_digest(context)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (
+            "contracts",
+            {
+                "fit_roles": ["train", "tuning"],
+                "comparison_role": "tuning",
+                "excluded_roles": ["final_holdout"],
+                "privacy": False,
+                "fairness": False,
+            },
+        ),
+        (
+            "contracts",
+            {
+                "fit_roles": ["train"],
+                "comparison_role": "tuning",
+                "excluded_roles": ["final_holdout", "hidden"],
+                "privacy": False,
+                "fairness": False,
+            },
+        ),
+        (
+            "contracts",
+            {
+                "fit_roles": ["train"],
+                "comparison_role": "tuning",
+                "excluded_roles": ["final_holdout"],
+                "privacy": True,
+                "fairness": False,
+            },
+        ),
+        (
+            "contracts",
+            {
+                "fit_roles": ["train"],
+                "comparison_role": "tuning",
+                "excluded_roles": ["final_holdout"],
+                "privacy": False,
+                "fairness": True,
+            },
+        ),
+        ("support_provenance", {"fit_roles": ["tuning"], "support_contract": "train_frozen_v1"}),
+        ("support_provenance", {"fit_roles": ["train"], "support_contract": "mutable_v1"}),
+        (
+            "bandwidth_provenance",
+            {"fit_roles": ["train"], "comparison_role": "train", "contract": "train_frozen_v1"},
+        ),
+        (
+            "bandwidth_provenance",
+            {"fit_roles": ["train"], "comparison_role": "tuning", "contract": "mutable_v1"},
+        ),
+    ],
+)
+def test_hpo_context_rejects_noncanonical_provenance_contract_at_construction(field, value):
+    kwargs = _provenance_kwargs()
+    kwargs[field] = value
+    with pytest.raises(ValueError, match="contracts|support_provenance|bandwidth_provenance"):
+        build_hpo_context(
+            task_type="classification",
+            metric_config={"task12": ["mixed_mmd.v1"]},
+            registry_digest="registry-a",
+            stage_a_contract_digest="stage-a",
+            group_context={"group_mode": "row"},
+            role_context_fingerprint="roles-a",
+            role_context={"roles": {"train": {"rows": 4}, "tuning": {"rows": 2}}},
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    "field_value",
+    [
+        (
+            "contracts",
+            {
+                "fit_roles": ["train", "tuning"],
+                "comparison_role": "tuning",
+                "excluded_roles": ["final_holdout"],
+                "privacy": False,
+                "fairness": False,
+            },
+        ),
+        (
+            "contracts",
+            {
+                "fit_roles": ["train"],
+                "comparison_role": "tuning",
+                "excluded_roles": [],
+                "privacy": False,
+                "fairness": False,
+            },
+        ),
+        (
+            "contracts",
+            {
+                "fit_roles": ["train"],
+                "comparison_role": "tuning",
+                "excluded_roles": ["final_holdout"],
+                "privacy": True,
+                "fairness": False,
+            },
+        ),
+        (
+            "contracts",
+            {
+                "fit_roles": ["train"],
+                "comparison_role": "tuning",
+                "excluded_roles": ["final_holdout"],
+                "privacy": False,
+                "fairness": True,
+            },
+        ),
+        ("support_provenance", {"fit_roles": ["tuning"], "support_contract": "train_frozen_v1"}),
+        ("support_provenance", {"fit_roles": ["train"], "support_contract": "mutable_v1"}),
+        (
+            "bandwidth_provenance",
+            {"fit_roles": ["train"], "comparison_role": "train", "contract": "train_frozen_v1"},
+        ),
+        (
+            "bandwidth_provenance",
+            {"fit_roles": ["train"], "comparison_role": "tuning", "contract": "mutable_v1"},
+        ),
+    ],
+)
+def test_hpo_cache_rejects_noncanonical_provenance_contract(tmp_path, field_value):
+    field, value = field_value
+    with pytest.raises(ValueError):
+        BestParamsCache(tmp_path / "cache.json", hpo_context=_hpo_context(**{field: value}))
+
+
+def test_hpo_score_rejects_provenance_free_report():
+    report = pd.DataFrame({"mean": [0.2], "direction": ["minimize"]}, index=["mixed_mmd.v1"])
+    with pytest.raises(ValueError, match="missing required hpo_provenance"):
+        hpo_score(report)
+
+
+def test_canonical_score_retains_provenance_metadata(mocker):
+    provenance = {
+        "fit_roles": ["train"],
+        "comparison_role": "tuning",
+        "release_transform_digest": "release-a",
+        "role_hashes": {"train": "train-a", "tuning": "tuning-a"},
+        "contracts": {
+            "fit_roles": ["train"],
+            "comparison_role": "tuning",
+            "excluded_roles": ["final_holdout"],
+            "privacy": False,
+            "fairness": False,
+        },
+        "support_provenance": {"fit_roles": ["train"], "support_contract": "train_frozen_v1"},
+        "bandwidth_provenance": {
+            "fit_roles": ["train"],
+            "comparison_role": "tuning",
+            "contract": "train_frozen_v1",
+        },
+        "objective_version": "release-utility-v1",
+    }
+    report = pd.DataFrame(
+        {
+            "mean": [0.2, 0.3, 0.8],
+            "direction": ["minimize", "minimize", "maximize"],
+        },
+        index=["mixed_mmd.v1", "elastic_net_jsd.v1", "tstr_macro_f1.v1"],
+    )
+    report.attrs["hpo_provenance"] = provenance
+    assert _score(report) == pytest.approx(-((0.8 + 0.7 + 0.8) / 3))
+    assert report.attrs["hpo_provenance"] == provenance
+
+
 def test_best_params_cache_rejects_mismatched_hpo_context(tmp_path):
     path = tmp_path / "hpo_best_params.json"
     context = _hpo_context()
@@ -175,6 +512,70 @@ def test_best_params_cache_rejects_mismatched_hpo_context(tmp_path):
         path,
         hpo_context={**context, "registry_digest": "registry-b"},
     ).has("synthcity", "ctgan")
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error_field"),
+    [
+        ("release_transform_digest", "   ", "release_transform_digest"),
+        ("role_context_fingerprint", "\t\n", "role_context_fingerprint"),
+        (
+            "role_hashes",
+            {"train": "train-a", "tuning": "tuning-a", "synthetic": " "},
+            "role_hashes",
+        ),
+        ("support_provenance", {"fit_roles": [" "]}, "support_provenance"),
+        (
+            "bandwidth_provenance",
+            {"nested": {"comparison_role": "\t"}},
+            "bandwidth_provenance",
+        ),
+        (
+            "contracts",
+            {"fit_roles": ["train"], "comparison_role": "tuning", "nested": [" "]},
+            "contracts",
+        ),
+    ],
+)
+def test_hpo_context_rejects_blank_provenance_strings(field, value, error_field):
+    if field == "role_context_fingerprint":
+        with pytest.raises(ValueError, match=error_field):
+            build_hpo_context(
+                task_type="classification",
+                metric_config={"task12": ["mixed_mmd.v1"]},
+                registry_digest="registry-a",
+                stage_a_contract_digest="stage-a",
+                group_context={"group_mode": "row"},
+                role_context_fingerprint=value,
+                role_context={},
+                **_provenance_kwargs(),
+            )
+    else:
+        context = _hpo_context(**{field: value})
+        with pytest.raises(ValueError, match=error_field):
+            hpo_context_digest(context)
+
+
+def test_cache_rejects_legacy_payload_even_when_allowed(tmp_path):
+    path = tmp_path / "cache.json"
+    path.write_text(json.dumps({"synthcity": {"ctgan": {"n_iter": 3}}}))
+    with pytest.raises(ValueError, match="verified hpo_context"):
+        BestParamsCache(path, role_context_fingerprint="roles-a", allow_unverified_legacy=True)
+
+
+def test_checkpoint_persist_and_load_require_context(tmp_path):
+    study = optuna.create_study(direction="minimize")
+    study.optimize(lambda _trial: 0.1, n_trials=1)
+    with pytest.raises(ValueError, match="canonical hpo_context"):
+        persist_hpo_trial_checkpoint(tmp_path, "study", study.trials[0])
+    with pytest.raises(ValueError, match="canonical hpo_context"):
+        load_hpo_trial_checkpoint(tmp_path / "missing.json")
+
+
+def test_run_study_and_resume_require_context(tmp_path):
+    config = HPOConfig(n_trials=1, timeout_seconds=None)
+    with pytest.raises(ValueError, match="canonical hpo_context"):
+        run_study("context_required", lambda _trial: 1.0, config, tmp_path, seed=0, drop_keys=())
 
 
 def test_contextual_hpo_studies_are_separate_and_resumeable(tmp_path):
@@ -454,14 +855,19 @@ def test_resumed_study_counts_pruned_trials_without_rerunning_them(tmp_path):
         raise optuna.TrialPruned("screen failed")
 
     config = HPOConfig(n_trials=1, timeout_seconds=None)
+    context = _hpo_context()
     with pytest.raises(RuntimeError, match="produced no completed trials"):
-        run_study("hpo_restart", objective, config, tmp_path, seed=0, drop_keys=())
+        run_study(
+            "hpo_restart", objective, config, tmp_path, seed=0, drop_keys=(), hpo_context=context
+        )
     with pytest.raises(RuntimeError, match="produced no completed trials"):
-        run_study("hpo_restart", objective, config, tmp_path, seed=0, drop_keys=())
+        run_study(
+            "hpo_restart", objective, config, tmp_path, seed=0, drop_keys=(), hpo_context=context
+        )
 
     assert len(calls) == 1
     study = optuna.load_study(
-        study_name="hpo_restart",
+        study_name=contextual_study_name("hpo_restart", context),
         storage=default_storage_url(tmp_path),
     )
     assert len(study.trials) == 1
@@ -476,12 +882,19 @@ def test_completed_hpo_checkpoint_is_durable_and_resume_skips_terminal_trial(tmp
         return 0.25
 
     config = HPOConfig(n_trials=1, timeout_seconds=None)
-    run_study("hpo_checkpoint", objective, config, tmp_path, seed=0, drop_keys=())
+    context = _hpo_context()
+    run_study(
+        "hpo_checkpoint", objective, config, tmp_path, seed=0, drop_keys=(), hpo_context=context
+    )
 
     checkpoint_path = (
-        tmp_path / "hpo_checkpoints" / "hpo_checkpoint" / "trial-0" / "checkpoint.json"
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name("hpo_checkpoint", context)
+        / "trial-0"
+        / "checkpoint.json"
     )
-    checkpoint = load_hpo_trial_checkpoint(checkpoint_path)
+    checkpoint = load_hpo_trial_checkpoint(checkpoint_path, hpo_context=context)
     assert checkpoint["schema_version"] == HPO_TRIAL_CHECKPOINT_SCHEMA_VERSION
     assert checkpoint["state"] == "complete"
     assert checkpoint["objective_value"] == pytest.approx(0.25)
@@ -489,10 +902,18 @@ def test_completed_hpo_checkpoint_is_durable_and_resume_skips_terminal_trial(tmp
     def should_not_run(_trial):
         pytest.fail("a completed HPO trial was recomputed during resume")
 
-    run_study("hpo_checkpoint", should_not_run, config, tmp_path, seed=0, drop_keys=())
+    run_study(
+        "hpo_checkpoint",
+        should_not_run,
+        config,
+        tmp_path,
+        seed=0,
+        drop_keys=(),
+        hpo_context=context,
+    )
 
     assert calls == [True]
-    assert load_hpo_trial_checkpoint(checkpoint_path) == checkpoint
+    assert load_hpo_trial_checkpoint(checkpoint_path, hpo_context=context) == checkpoint
 
 
 def test_hpo_checkpoint_resume_rejects_changed_implementation_fingerprint(tmp_path):
@@ -507,6 +928,7 @@ def test_hpo_checkpoint_resume_rejects_changed_implementation_fingerprint(tmp_pa
         return 0.25
 
     config = HPOConfig(n_trials=1, timeout_seconds=None)
+    context = _hpo_context()
     run_study(
         "hpo_fingerprint_checkpoint",
         objective,
@@ -515,13 +937,19 @@ def test_hpo_checkpoint_resume_rejects_changed_implementation_fingerprint(tmp_pa
         seed=0,
         drop_keys=(),
         checkpoint_implementation_fingerprint="implementation-a",
+        hpo_context=context,
     )
 
     checkpoint_path = (
-        tmp_path / "hpo_checkpoints" / "hpo_fingerprint_checkpoint" / "trial-0" / "checkpoint.json"
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name("hpo_fingerprint_checkpoint", context)
+        / "trial-0"
+        / "checkpoint.json"
     )
     checkpoint = load_hpo_trial_checkpoint(
         checkpoint_path,
+        hpo_context=context,
         expected_implementation_fingerprint="implementation-a",
     )
     assert checkpoint["metadata"]["generator"]["implementation_fingerprint"] == "implementation-a"
@@ -529,6 +957,7 @@ def test_hpo_checkpoint_resume_rejects_changed_implementation_fingerprint(tmp_pa
     with pytest.raises(RuntimeError, match="does not match the current implementation"):
         load_hpo_trial_checkpoint(
             checkpoint_path,
+            hpo_context=context,
             expected_implementation_fingerprint="implementation-b",
         )
 
@@ -544,11 +973,12 @@ def test_hpo_checkpoint_resume_rejects_changed_implementation_fingerprint(tmp_pa
             seed=0,
             drop_keys=(),
             checkpoint_implementation_fingerprint="implementation-b",
+            hpo_context=context,
         )
     assert calls == [True]
 
 
-def test_legacy_hpo_generator_metadata_is_readable_but_not_current_evidence(tmp_path):
+def test_legacy_hpo_generator_metadata_is_rejected_as_current_evidence(tmp_path):
     legacy_metadata = {
         "schema_version": "generator-metadata-v1",
         "generator_context": {"privacy_claim_type": "none"},
@@ -566,22 +996,57 @@ def test_legacy_hpo_generator_metadata_is_readable_but_not_current_evidence(tmp_
         trial.set_user_attr("generator_privacy_claim_type", "none")
         trial.set_user_attr("generator_metadata_state", "present")
         trial.set_user_attr("generator_metadata", legacy_metadata)
+        trial.set_user_attr("generator_implementation_fingerprint", "implementation-a")
         return 0.25
 
     study.optimize(objective, n_trials=1)
-    checkpoint_path = persist_hpo_trial_checkpoint(
-        tmp_path / "legacy_checkpoints",
-        "legacy_hpo",
-        study.trials[0],
-    )
+    context = _hpo_context()
+    with pytest.raises(RuntimeError, match="unsupported schema"):
+        persist_hpo_trial_checkpoint(
+            tmp_path / "legacy_checkpoints",
+            "legacy_hpo",
+            study.trials[0],
+            hpo_context=context,
+            expected_implementation_fingerprint="implementation-a",
+        )
 
-    loaded = load_hpo_trial_checkpoint(checkpoint_path)
-    assert loaded["metadata"]["generator"]["metadata"]["schema_version"] == (
-        "generator-metadata-v1"
-    )
-    with pytest.raises(RuntimeError, match="does not match the current implementation"):
-        load_hpo_trial_checkpoint(
-            checkpoint_path,
+
+def test_durable_checkpoint_rejects_legacy_metadata_with_valid_context():
+    context = _hpo_context()
+    payload = {
+        "schema_version": HPO_TRIAL_CHECKPOINT_SCHEMA_VERSION,
+        "study_name": "legacy_hpo",
+        "trial_number": 0,
+        "state": "complete",
+        "objective_value": 0.25,
+        "params": {},
+        "hpo_context": context,
+        "hpo_context_digest": hpo_context_digest(context),
+        "metadata": {
+            "generator": {
+                "state": "present",
+                "plugin_name": "test_generator",
+                "privacy_claim_type": "none",
+                "implementation_fingerprint": "implementation-a",
+                "metadata": {
+                    "schema_version": "generator-metadata-v1",
+                    "generator_context": {"privacy_claim_type": "none"},
+                    "plugin_name": "test_generator",
+                    "plugin_fqdn": "test.generator",
+                    "requested_parameters": {},
+                    "n_samples": 1,
+                    "random_state": 0,
+                    "privacy_accounting": None,
+                },
+            },
+            "stage_a": {},
+        },
+    }
+    with pytest.raises(RuntimeError, match="unsupported schema"):
+        hpo_module._validate_hpo_trial_checkpoint(
+            payload,
+            expected_study_name="legacy_hpo",
+            expected_context_digest=hpo_context_digest(context),
             expected_implementation_fingerprint="implementation-a",
         )
 
@@ -591,11 +1056,25 @@ def test_failed_hpo_checkpoint_persists_exception_context(tmp_path):
         raise RuntimeError("generator fit failed")
 
     config = HPOConfig(n_trials=1, timeout_seconds=None)
+    context = _hpo_context()
     with pytest.raises(RuntimeError, match="generator fit failed"):
-        run_study("hpo_failed_checkpoint", objective, config, tmp_path, seed=0, drop_keys=())
+        run_study(
+            "hpo_failed_checkpoint",
+            objective,
+            config,
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+        )
 
     checkpoint = load_hpo_trial_checkpoint(
-        tmp_path / "hpo_checkpoints" / "hpo_failed_checkpoint" / "trial-0" / "checkpoint.json"
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name("hpo_failed_checkpoint", context)
+        / "trial-0"
+        / "checkpoint.json",
+        hpo_context=context,
     )
     assert checkpoint["state"] == "failed"
     assert checkpoint["metadata"]["outcome"] == {
@@ -637,7 +1116,7 @@ def test_hpo_score_rejects_diagnostic_or_failed_rows():
         index=["stats.prdc"],
     )
     with pytest.raises(ValueError, match="not decision-eligible"):
-        hpo_score(diagnostic)
+        _score(diagnostic)
 
     failed = pd.DataFrame(
         {
@@ -649,7 +1128,7 @@ def test_hpo_score_rejects_diagnostic_or_failed_rows():
         index=["mixed_mmd.v1"],
     )
     with pytest.raises(ValueError, match="not decision-eligible"):
-        hpo_score(failed)
+        _score(failed)
 
 
 def test_hpo_score_rejects_partial_static_metric_set():
@@ -662,7 +1141,7 @@ def test_hpo_score_rejects_partial_static_metric_set():
     )
 
     with pytest.raises(ValueError, match="incomplete metric set.*missing"):
-        hpo_score(
+        _score(
             report,
             expected_keys=(
                 "mixed_mmd.v1",
@@ -675,7 +1154,7 @@ def test_canonical_hpo_partial_report_is_indeterminate():
     report = pd.DataFrame({"mean": [0.25], "direction": ["minimize"]}, index=["mixed_mmd.v1"])
     report.attrs["canonical_hpo"] = True
     with pytest.raises(ValueError, match="incomplete metric set"):
-        hpo_score(report)
+        _score(report)
 
 
 def test_hpo_score_rejects_duplicate_static_metric_set():
@@ -689,19 +1168,307 @@ def test_hpo_score_rejects_duplicate_static_metric_set():
     )
 
     with pytest.raises(ValueError, match="incomplete metric set.*duplicate"):
-        hpo_score(report, expected_keys=(metric_key,))
+        _score(report, expected_keys=(metric_key,))
 
 
 def test_hpo_score_accepts_only_approved_operational_rows():
     report = pd.DataFrame(
         {
-            "mean": [0.25, 0.75],
-            "direction": ["minimize", "maximize"],
+            "mean": [0.25, 0.75, 0.5],
+            "direction": ["minimize", "maximize", "minimize"],
         },
-        index=["mixed_mmd.v1", "tstr_macro_f1.v1"],
+        index=["mixed_mmd.v1", "tstr_macro_f1.v1", "elastic_net_jsd.v1"],
     )
 
-    assert hpo_score(report) == pytest.approx(-0.25)
+    assert _score(report) == pytest.approx(-(0.75 + 0.75 + 0.5) / 3)
+
+
+def test_hpo_score_rejects_extra_metric_rows_without_expected_keys():
+    report = pd.DataFrame(
+        {
+            "mean": [0.25, 0.75, 0.5, 0.1],
+            "direction": ["minimize", "maximize", "minimize", "minimize"],
+        },
+        index=[
+            "mixed_mmd.v1",
+            "tstr_macro_f1.v1",
+            "elastic_net_jsd.v1",
+            "unexpected.v1",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="not decision-eligible"):
+        _score(report)
+
+
+def test_hpo_score_uses_fixed_release_formula_and_jsd_safety_orientation():
+    report = pd.DataFrame(
+        {
+            "mean": [0.8, 0.2, 0.4],
+            "direction": ["maximize", "minimize", "minimize"],
+        },
+        index=["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"],
+    )
+    assert _score(report) == pytest.approx(-((0.8 + 0.8 + 0.6) / 3))
+    with pytest.raises(ValueError, match="fixed to equal thirds"):
+        _score(report, utility_policy={"metrics": ["mixed_mmd.v1"], "weights": [1.0]})
+
+
+def test_hpo_score_rejects_legacy_two_metric_utility_policy():
+    report = pd.DataFrame(
+        {
+            "mean": [0.8, 0.2, 0.4],
+            "direction": ["maximize", "minimize", "minimize"],
+        },
+        index=["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"],
+    )
+
+    with pytest.raises(ValueError, match="fixed to equal thirds"):
+        _score(
+            report,
+            utility_policy={
+                "metrics": ["mixed_mmd.v1", "elastic_net_jsd.v1"],
+                "weights": [0.5, 0.5],
+            },
+        )
+
+
+def test_hpo_score_accepts_canonical_equal_thirds_utility_policy():
+    report = pd.DataFrame(
+        {
+            "mean": [0.8, 0.2, 0.4],
+            "direction": ["maximize", "minimize", "minimize"],
+        },
+        index=["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"],
+    )
+
+    assert _score(
+        report,
+        utility_policy={
+            "metrics": ["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"],
+            "weights": [1 / 3, 1 / 3, 1 / 3],
+        },
+    ) == pytest.approx(-((0.8 + 0.8 + 0.6) / 3))
+
+
+def test_hpo_score_is_invariant_to_candidate_metric_order():
+    report = pd.DataFrame(
+        {
+            "mean": [0.4, 0.8, 0.2],
+            "direction": ["minimize", "maximize", "minimize"],
+        },
+        index=[
+            "elastic_net_jsd.v1",
+            "tstr_macro_f1.v1",
+            "mixed_mmd.v1",
+        ],
+    )
+    reordered = report.iloc[[2, 1, 0]]
+
+    assert _score(report) == pytest.approx(-((0.6 + 0.8 + 0.8) / 3))
+    assert _score(reordered) == pytest.approx(_score(report))
+
+
+def test_train_frozen_mmd_uses_train_for_fit_and_tuning_for_comparison():
+    train = pd.DataFrame({"x": [0.0, 1.0, 2.0]})
+    tuning = pd.DataFrame({"x": [100.0, 101.0, 102.0]})
+    candidate = pd.DataFrame({"x": [100.0, 101.0, 102.0]})
+    result = hpo_module._evaluate_train_frozen_mmd(
+        train,
+        tuning,
+        candidate,
+        continuous_columns=["x"],
+        ordinal_columns=[],
+        nominal_columns=[],
+    )
+    assert result["fit_role"] == "train"
+    assert result["comparison_role"] == "tuning"
+    assert result["bandwidth"] == pytest.approx(0.5)
+    changed_tuning = tuning.assign(x=[200.0, 201.0, 202.0])
+    changed = hpo_module._evaluate_train_frozen_mmd(
+        train,
+        changed_tuning,
+        candidate,
+        continuous_columns=["x"],
+        ordinal_columns=[],
+        nominal_columns=[],
+    )
+    assert changed["bandwidth"] == pytest.approx(result["bandwidth"])
+    assert changed["b_mmd_clip"] != pytest.approx(result["b_mmd_clip"])
+
+
+def test_hpo_context_is_invariant_to_candidate_order_and_excludes_holdout():
+    context = _hpo_context(
+        objective_context={
+            "role_hashes": {"train": "train", "tuning": "tuning"},
+            "excluded_roles": ["final_holdout"],
+        }
+    )
+    reordered = {
+        **context,
+        "role_context": {"roles": {"tuning": {"rows": 2}, "train": {"rows": 4}}},
+    }
+    assert hpo_context_digest(context) == hpo_context_digest(reordered)
+
+
+def test_canonical_hpo_rejects_final_holdout_at_input_boundary():
+    train = pd.DataFrame({"x": [0.0, 1.0], "target": [0, 1]})
+    tuning = pd.DataFrame({"x": [0.0, 1.0], "target": [0, 1]})
+    synthetic = pd.DataFrame({"x": [0.2, 0.8], "target": [0, 1]})
+    tuning.attrs["source_role"] = "final_holdout"
+
+    with pytest.raises(ValueError, match="final_holdout"):
+        hpo_module.evaluate_canonical_hpo_metrics(
+            train,
+            tuning,
+            synthetic,
+            metric_config={"task12": ["mixed_mmd.v1"]},
+            target_column="target",
+            feature_types={"x": "continuous", "target": "categorical"},
+        )
+
+
+def test_canonical_hpo_rejects_tampered_release_generalization_metadata():
+    frames = [pd.DataFrame({"x": [0.0, 1.0], "target": [0, 1]}) for _ in range(3)]
+
+    with pytest.raises(ValueError, match="forbidden"):
+        hpo_module.evaluate_canonical_hpo_metrics(
+            *frames,
+            metric_config={"task12": ["mixed_mmd.v1"]},
+            target_column="target",
+            feature_types={"x": "continuous", "target": "categorical"},
+            release_generalization={
+                "columns": {"x": {"nested": {"evaluation": {"role": "tuning"}}}}
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        {"release_provenance": {"source_role": "final_holdout"}},
+        {"release_provenance": {"evaluation": {"role": "hidden"}}},
+        {"release_provenance": {"privacy": {"enabled": True}}},
+        {"release_provenance": {"fairness": {"role": "tuning"}}},
+        {"release_provenance": {"split": {"role": "tuning"}}},
+    ],
+)
+def test_canonical_hpo_rejects_nested_release_provenance(provenance):
+    frames = [pd.DataFrame({"x": [0.0, 1.0], "target": [0, 1]}) for _ in range(3)]
+    frames[1].attrs.update(provenance)
+
+    with pytest.raises(ValueError, match="forbidden|unsupported"):
+        hpo_module.evaluate_canonical_hpo_metrics(
+            *frames,
+            metric_config={"task12": ["mixed_mmd.v1"]},
+            target_column="target",
+            feature_types={"x": "continuous", "target": "categorical"},
+        )
+
+
+def test_hpo_context_digest_is_invariant_to_input_order_and_holdout_contents():
+    context = _hpo_context(
+        role_context={"roles": {"train": {"rows": 4}, "tuning": {"rows": 2}}},
+        objective_context={
+            "role_hashes": ["train", "tuning"],
+            "excluded_roles": ["final_holdout"],
+            "holdout": {"rows": [1, 2, 3]},
+        },
+    )
+    reordered = {
+        **context,
+        "objective_context": {
+            "role_hashes": ["tuning", "train"],
+            "excluded_roles": ["final_holdout"],
+            "holdout": {"rows": [999]},
+        },
+    }
+    assert hpo_context_digest(context) == hpo_context_digest(reordered)
+
+
+def test_train_frozen_mmd_is_invariant_to_row_order():
+    train = pd.DataFrame({"x": [0.0, 1.0, 2.0]})
+    tuning = pd.DataFrame({"x": [100.0, 101.0, 102.0]})
+    candidate = pd.DataFrame({"x": [100.0, 101.0, 102.0]})
+    reordered = hpo_module._evaluate_train_frozen_mmd(
+        train.iloc[[2, 0, 1]],
+        tuning.iloc[[1, 2, 0]],
+        candidate.iloc[[2, 1, 0]],
+        continuous_columns=["x"],
+        ordinal_columns=[],
+        nominal_columns=[],
+    )
+    original = hpo_module._evaluate_train_frozen_mmd(
+        train,
+        tuning,
+        candidate,
+        continuous_columns=["x"],
+        ordinal_columns=[],
+        nominal_columns=[],
+    )
+    assert reordered["bandwidth"] == pytest.approx(original["bandwidth"])
+    assert reordered["b_mmd_clip"] == pytest.approx(original["b_mmd_clip"])
+
+
+def test_canonical_hpo_rejects_empty_or_privacy_metric_config():
+    frames = [pd.DataFrame({"x": [0.0], "target": [0]})] * 3
+    for metric_config in ({}, {"privacy": ["identifiability_score"]}):
+        with pytest.raises(ValueError):
+            hpo_module.evaluate_canonical_hpo_metrics(
+                *frames,
+                metric_config=metric_config,
+                target_column="target",
+            )
+
+
+def test_canonical_metric_report_contains_protocol_and_orientation_provenance():
+    train = pd.DataFrame({"x": [0.0, 1.0], "target": [0, 1]})
+    tuning = train.copy()
+    synthetic = pd.DataFrame({"x": [0.2, 0.8], "target": [0, 1]})
+    report = hpo_module.evaluate_canonical_hpo_metrics(
+        train,
+        tuning,
+        synthetic,
+        metric_config={"task12": ["mixed_mmd.v1"]},
+        target_column="target",
+        feature_types={"x": "continuous", "target": "categorical"},
+    )
+    assert report.loc["mixed_mmd.v1", "orientation"] == "minimize_distance"
+    provenance = report.loc["mixed_mmd.v1", "provenance"]
+    assert provenance["fit_roles"] == ["train"]
+    assert provenance["comparison_role"] == "tuning"
+    assert provenance["release_transform_digest"]
+    assert provenance["common_protocol_digest"]
+    assert set(provenance["role_hashes"]) == {"synthetic", "train", "tuning"}
+    assert report.loc["mixed_mmd.v1", "objective_version"]
+
+
+def test_default_canonical_report_scores_with_complete_role_provenance():
+    train = pd.DataFrame({"x": np.arange(20, dtype=float), "target": [0, 1] * 10})
+    tuning = pd.DataFrame({"x": np.arange(20, 40, dtype=float), "target": [0, 1] * 10})
+    synthetic = train.copy()
+    report = hpo_module.evaluate_canonical_hpo_metrics(
+        train,
+        tuning,
+        synthetic,
+        metric_config={
+            "task12": [
+                "tstr_macro_f1.v1",
+                "mixed_mmd.v1",
+                "elastic_net_jsd.v1",
+            ]
+        },
+        target_column="target",
+        feature_types={"x": "continuous", "target": "categorical"},
+    )
+
+    provenance = report.attrs["hpo_provenance"]
+    assert set(provenance["role_hashes"]) == {"synthetic", "train", "tuning"}
+    assert provenance["role_hashes"]["train"]
+    assert provenance["role_hashes"]["tuning"]
+    assert provenance["contracts"]["fit_roles"] == ["train"]
+    assert provenance["contracts"]["comparison_role"] == "tuning"
+    assert np.isfinite(hpo_score(report))
 
 
 def test_tabpfgen_hpo_objective_screens_candidate_before_eval(mocker, tmp_path):
@@ -960,6 +1727,7 @@ def test_tabpfgen_hpo_checkpoint_metadata_is_durable(mocker, tmp_path):
         target_is_categorical=True,
     )
     config = HPOConfig(n_trials=1, timeout_seconds=None)
+    context = _hpo_context()
 
     run_study(
         "hpo_tabpfgen_checkpoint_metadata",
@@ -968,16 +1736,17 @@ def test_tabpfgen_hpo_checkpoint_metadata_is_durable(mocker, tmp_path):
         tmp_path,
         seed=13,
         drop_keys=(),
+        hpo_context=context,
     )
 
     checkpoint_path = (
         tmp_path
         / "hpo_checkpoints"
-        / "hpo_tabpfgen_checkpoint_metadata"
+        / contextual_study_name("hpo_tabpfgen_checkpoint_metadata", context)
         / "trial-0"
         / "checkpoint.json"
     )
-    checkpoint = load_hpo_trial_checkpoint(checkpoint_path)
+    checkpoint = load_hpo_trial_checkpoint(checkpoint_path, hpo_context=context)
     generator = checkpoint["metadata"]["generator"]
     assert generator["state"] == "present"
     assert generator["plugin_name"] == "tabpfgen_standard"
@@ -1002,9 +1771,10 @@ def test_tabpfgen_hpo_checkpoint_metadata_is_durable(mocker, tmp_path):
         tmp_path,
         seed=13,
         drop_keys=(),
+        hpo_context=context,
     )
     assert len(calls) == 1
-    assert load_hpo_trial_checkpoint(checkpoint_path) == checkpoint
+    assert load_hpo_trial_checkpoint(checkpoint_path, hpo_context=context) == checkpoint
 
 
 def test_tabpfgen_custom_hpo_records_generator_metadata(mocker):
@@ -1174,6 +1944,7 @@ def test_completed_hpo_keeps_best_and_latest_generator_checkpoints(tmp_path):
         drop_keys=(),
         checkpoint_workspace=workspace,
         checkpoint_plugin="tvae",
+        hpo_context=_hpo_context(),
     )
 
     assert (workspace / "data_trial_1_tvae_base_cache_3.11.15_generator_0.bkp").exists()
@@ -1204,6 +1975,7 @@ def test_partial_hpo_keeps_best_and_latest_generator_checkpoints(tmp_path):
         drop_keys=(),
         checkpoint_workspace=workspace,
         checkpoint_plugin="tvae",
+        hpo_context=_hpo_context(),
     )
 
     assert (workspace / "data_trial_0_tvae_cache_3.11.15_generator_0.bkp").exists()
@@ -1223,6 +1995,7 @@ def test_all_pruned_hpo_fails_without_default_fallback(tmp_path):
             tmp_path / "output",
             seed=0,
             drop_keys=(),
+            hpo_context=_hpo_context(),
         )
 
 
@@ -1251,8 +2024,12 @@ def test_canonical_tstr_hpo_fails_closed():
         metric_config={"task12": ["tstr_macro_f1.v1"]},
         target_column="target",
     )
+    assert set(report.index) == {
+        "tstr_macro_f1.v1",
+        "mixed_mmd.v1",
+        "elastic_net_jsd.v1",
+    }
     assert report.loc["tstr_macro_f1.v1", "errors"] == 1
-    assert "verified release-form" in report.loc["tstr_macro_f1.v1", "error_messages"]
 
 
 def test_canonical_tabpfgen_eval_uses_canonical_producer_not_native_metrics(mocker):
@@ -1262,10 +2039,11 @@ def test_canonical_tabpfgen_eval_uses_canonical_producer_not_native_metrics(mock
     canonical = mocker.patch(
         "synthdata.generation.hpo.evaluate_canonical_hpo_metrics",
         return_value=pd.DataFrame(
-            {"mean": [0.25], "direction": ["minimize"]},
-            index=["mixed_mmd.v1"],
+            {"mean": [0.25, 0.5, 0.75], "direction": ["minimize", "minimize", "maximize"]},
+            index=["mixed_mmd.v1", "elastic_net_jsd.v1", "tstr_macro_f1.v1"],
         ),
     )
+    canonical.return_value.attrs["hpo_provenance"] = _hpo_context()
     native = mocker.patch("synthcity.metrics.Metrics.evaluate")
 
     evaluate = build_synthetic_eval_fn(
@@ -1277,6 +2055,6 @@ def test_canonical_tabpfgen_eval_uses_canonical_producer_not_native_metrics(mock
         seed=0,
     )
 
-    assert evaluate(candidate) == pytest.approx(0.25)
+    assert evaluate(candidate) == pytest.approx(-(0.75 + 0.5 + 0.75) / 3)
     canonical.assert_called_once()
     native.assert_not_called()

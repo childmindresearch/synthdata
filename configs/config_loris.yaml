@@ -122,9 +122,7 @@ generation:
     model_iter_caps: { pategan: 30 }
     sgld_step_cap: 2000
     metric_config:
-      stats: [wasserstein_dist, inv_kl_divergence]
-      sanity: [nearest_syn_neighbor_distance]
-      performance: [xgb]
+      task12: [tstr_macro_f1.v1, mixed_mmd.v1, elastic_net_jsd.v1]
     stage_a:
       minimum_class_count: 1
       minimum_protected_group_count: 1
@@ -135,9 +133,9 @@ generation:
     final_n_iter_override: null
     utility_policy:
       # Fixed equal-thirds utility policy; Task 13 HPO stage must consume this metadata; mismatches fail closed.
-      metrics: [tstr_macro_f1, mixed_mmd_score, elastic_net_jsd_score]
+      metrics: [tstr_macro_f1.v1, mixed_mmd.v1, elastic_net_jsd.v1]
       weights: [0.3333333333333333, 0.3333333333333333, 0.3333333333333333]
-    utility_policy_provenance: "Task 13 must consume generation.hpo.utility_policy; current HPO execution is not wired by Task 3."
+    utility_policy_provenance: "Task 13 consumes fixed generation.hpo.utility_policy; mismatches fail closed."
 
 evaluation:
   output_dir: output/loris/evaluation
