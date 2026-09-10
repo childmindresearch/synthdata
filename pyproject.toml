@@ -21,11 +21,13 @@ dependencies = [
     "scipy",
     "matplotlib",
     "plotly",
+    "hyperimpute",
     "syntheval",
     "synthcity",
     "tqdm",
     "ucimlrepo",
     "optuna",
+    "xgboost",
     "torch>=2.7.1",
     "torchvision>=0.22.1",
 ]
@@ -74,7 +76,6 @@ tabpfn = [
 # the already-installed torch (see [tool.uv] no-build-isolation-package
 # below), not a fresh isolated build environment.
 refidiff = [
-    "xgboost",
     "catboost",
     "mamba-ssm==2.3.1",
     "causal-conv1d==1.6.2.post1",
@@ -87,6 +88,7 @@ dev = [
     "pytest-mock",
     "ruff",
     "pre-commit",
+    "ty>=0.0.78",
 ]
 
 [tool.uv]
@@ -115,6 +117,7 @@ conflicts = [
 no-build-isolation-package = ["mamba-ssm", "causal-conv1d"]
 
 [tool.uv.sources]
+hyperimpute = { git = "https://github.com/vanderschaarlab/hyperimpute" }
 syntheval = { path = "submodules/syntheval", editable = true }
 synthcity = { path = "submodules/synthcity", editable = true }
 tabpfn-extensions = { git = "https://github.com/PriorLabs/tabpfn-extensions", branch = "main" }

@@ -1901,6 +1901,30 @@ wheels = [
 ]
 
 [[package]]
+name = "hyperimpute"
+version = "0.1.17"
+source = { git = "https://github.com/vanderschaarlab/hyperimpute#e9506c7b3a1f5089f00797534e0460fd28f9730c" }
+dependencies = [
+    { name = "catboost" },
+    { name = "cloudpickle" },
+    { name = "geomloss" },
+    { name = "jupyter" },
+    { name = "lightgbm" },
+    { name = "loguru" },
+    { name = "miracle-imputation" },
+    { name = "notebook" },
+    { name = "numpy" },
+    { name = "optuna" },
+    { name = "pandas" },
+    { name = "pydantic" },
+    { name = "redis" },
+    { name = "scikit-learn" },
+    { name = "torch", version = "2.7.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata') or (sys_platform != 'linux' and extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
+    { name = "xgboost" },
+]
+
+[[package]]
 name = "identify"
 version = "2.6.19"
 source = { registry = "https://pypi.org/simple" }
@@ -2812,6 +2836,22 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d6/54/cfe61301667036ec958cb99bd3efefba235e65cdeb9c84d24a8293ba1d90/mdurl-0.1.2.tar.gz", hash = "sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba", size = 8729, upload-time = "2022-08-14T12:40:10.846Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b3/38/89ba8ad64ae25be8de66a6d463314cf1eb366222074cfda9ee839c56a4b4/mdurl-0.1.2-py3-none-any.whl", hash = "sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8", size = 9979, upload-time = "2022-08-14T12:40:09.779Z" },
+]
+
+[[package]]
+name = "miracle-imputation"
+version = "0.1.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "loguru" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "scikit-learn" },
+    { name = "tensorflow" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d3/16/0b6316f99290b748fbde5858ec1e264bcad0119a61574ca27be3e8e64c09/miracle_imputation-0.1.6-py3-none-any.whl", hash = "sha256:a8ab1f22949d6e904c2de314911a1bb4973f03fc7a8301023247151ae9f3049f", size = 15256, upload-time = "2024-04-24T19:11:26.653Z" },
+    { url = "https://files.pythonhosted.org/packages/a1/64/1017e119a9e1cfffc99d1a42126ab6dfd93b3e10eefd5ac0b6222a7b0d03/miracle_imputation-0.1.6-py3-none-macosx_10_14_x86_64.whl", hash = "sha256:c2098c5852795de63826734a6f8a1974529ee3deba7258166e7a3d052e880336", size = 15119, upload-time = "2024-04-24T19:10:59.477Z" },
 ]
 
 [[package]]
@@ -5487,10 +5527,11 @@ provides-extras = ["testing", "goggle", "all"]
 
 [[package]]
 name = "synthdata"
-version = "0.7.4"
+version = "0.8.0"
 source = { editable = "." }
 dependencies = [
     { name = "altair" },
+    { name = "hyperimpute" },
     { name = "jupyter" },
     { name = "marimo" },
     { name = "matplotlib" },
@@ -5511,6 +5552,7 @@ dependencies = [
     { name = "torchvision", version = "0.28.0", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform != 'linux' or (extra == 'extra-9-synthdata-tabpfn' and extra == 'extra-9-synthdata-ydata')" },
     { name = "tqdm" },
     { name = "ucimlrepo" },
+    { name = "xgboost" },
 ]
 
 [package.optional-dependencies]
@@ -5527,7 +5569,6 @@ refidiff = [
     { name = "catboost" },
     { name = "causal-conv1d" },
     { name = "mamba-ssm" },
-    { name = "xgboost" },
 ]
 tabpfn = [
     { name = "tabimpute" },
@@ -5551,6 +5592,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-mock" },
     { name = "ruff" },
+    { name = "ty" },
 ]
 
 [package.metadata]
@@ -5559,6 +5601,7 @@ requires-dist = [
     { name = "catboost", marker = "extra == 'refidiff'" },
     { name = "causal-conv1d", marker = "extra == 'refidiff'", specifier = "==1.6.2.post1" },
     { name = "flair", marker = "extra == 'presidio'" },
+    { name = "hyperimpute", git = "https://github.com/vanderschaarlab/hyperimpute" },
     { name = "jupyter" },
     { name = "mamba-ssm", marker = "extra == 'refidiff'", specifier = "==2.3.1" },
     { name = "marimo" },
@@ -5595,7 +5638,7 @@ requires-dist = [
     { name = "torchvision", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=0.22.1", index = "https://download.pytorch.org/whl/cu128" },
     { name = "tqdm" },
     { name = "ucimlrepo" },
-    { name = "xgboost", marker = "extra == 'refidiff'" },
+    { name = "xgboost" },
     { name = "ydata-synthetic", marker = "extra == 'ydata'", specifier = "==1.4.0" },
 ]
 provides-extras = ["presidio", "ydata", "tabpfn", "refidiff"]
@@ -5607,6 +5650,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-mock" },
     { name = "ruff" },
+    { name = "ty", specifier = ">=0.0.78" },
 ]
 
 [[package]]
@@ -6341,6 +6385,31 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/08/0b/58ebbc12e8b50b925fbaabc37fdd6b56b793f78b0c3df3daf5bad60a6c58/tsai-1.0.1.tar.gz", hash = "sha256:7ef31c7de6bf5ff551a5e3f0fbae8ee92a2cc550b1381e82485be7cd724bc012", size = 281464, upload-time = "2026-05-27T08:26:39.218Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ca/3c/5cd6859cc7e474d9dfc772934a5f14a026ebf56c470ea83c479bfbcfad4b/tsai-1.0.1-py3-none-any.whl", hash = "sha256:ad12b6b9cdef99cb041fbf0f4b4ebd7b566b10ed5c6ce7ddd99d38452d103977", size = 332087, upload-time = "2026-05-27T08:26:37.696Z" },
+]
+
+[[package]]
+name = "ty"
+version = "0.0.78"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d8/c7/2ba0861384c5b5097ac354383abb98188112cb330208c21d5197e98a29e5/ty-0.0.78.tar.gz", hash = "sha256:770b45854f85fa11595208f08c0f28df80943164d10a2832d86be6ac29f135b2", size = 7050609, upload-time = "2026-09-02T22:41:33.92Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ea/ed/f34cfc06a9ba72979df219e48dae1a0b6a6c74a340763ccd30a547edf913/ty-0.0.78-py3-none-linux_armv6l.whl", hash = "sha256:122700b98f9d45785c1ce91a9418154562e7f64f4bf34679f6f7b38c5b97453f", size = 13304624, upload-time = "2026-09-02T22:40:56.649Z" },
+    { url = "https://files.pythonhosted.org/packages/1c/28/5576e2a08b57676d9b2a736d528f077a6c6e32c3d1de2d75dbbe28346966/ty-0.0.78-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:cbe7e3709ccf29ef3d9f58f5914cc30ec36fb647008a5a4ff8483abe401bfe8d", size = 12928383, upload-time = "2026-09-02T22:40:59.162Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/e0/027d49c3da5235e634da3d3fc52c4874ec89f50830388c9c259f8fb71e0e/ty-0.0.78-py3-none-macosx_11_0_arm64.whl", hash = "sha256:c3528897b3ab9d3589561bc2b5e61a4d5d686de527a4400bb09a439b922a6c70", size = 12730058, upload-time = "2026-09-02T22:41:01.235Z" },
+    { url = "https://files.pythonhosted.org/packages/bb/bc/6bf8ffefd8063730a70ae889cf85def72bc155fd1453135ebf8a09c2f1c2/ty-0.0.78-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:8bfba4c44a06484093f527b8ef43a317abcf91395b49396170266629eedf74aa", size = 12813321, upload-time = "2026-09-02T22:41:03.251Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/c0/b3cdf26f82108908d92fdb7ddb741019c446ceb666cf204d4dbf611bde33/ty-0.0.78-py3-none-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:5f903c06fdee17baf8373173039ab28f1bce28e66b1c734929a5f50b37eb54d9", size = 13072219, upload-time = "2026-09-02T22:41:05.225Z" },
+    { url = "https://files.pythonhosted.org/packages/4d/36/16bfb0abdd178dae11dbc4b57b9a86c2b62642a18c1103fd2c2930aa5879/ty-0.0.78-py3-none-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:dd83e5fe3f07291d1bd4e591f8d2607c204f3eab53bcb1b8060c40e876e1aa61", size = 13903958, upload-time = "2026-09-02T22:41:07.333Z" },
+    { url = "https://files.pythonhosted.org/packages/0f/0c/74d3b1f0344b13156c719dd68a7edf7e48c2051718c9f326ba3cbf45ea53/ty-0.0.78-py3-none-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:325285377319cf7168a2b8b771ae5027f411530e3c7eab1faf4583cdd72fd7c9", size = 14355581, upload-time = "2026-09-02T22:41:09.56Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/d7/7ca0359e1e61b15b8b02328c8d120db3c507876b9b7c6bd9f26935353e0e/ty-0.0.78-py3-none-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:54b7846a404da6492697b524a769755ee9bee157d67674063ecd9c5f69dc52ff", size = 14044749, upload-time = "2026-09-02T22:41:11.678Z" },
+    { url = "https://files.pythonhosted.org/packages/3b/6a/731f16ff42c5fc96e742c2f4e0a6915356bae114ae02ae4af6f33502175f/ty-0.0.78-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:169d3b9d134c0b48fe1af8a844142d374655552054a9d6c15a4b6e51bb0382ea", size = 13391647, upload-time = "2026-09-02T22:41:13.928Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/af/250cc29daf310e837188509ea4d78460c495d8a74c4fb84b4152d9ef2d4f/ty-0.0.78-py3-none-manylinux_2_31_riscv64.whl", hash = "sha256:6108cb3b2d28dac5981d4e25008a0a5547d8c877a67f6da9e8c38e7e946be44f", size = 13945020, upload-time = "2026-09-02T22:41:15.968Z" },
+    { url = "https://files.pythonhosted.org/packages/b8/f9/96aab1dee4535e66554e8dc7657c69f6c61c181d8e70b9c3527908e93ef4/ty-0.0.78-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:589ad03608d9d2975ef4b23c41c4f847e325bcc7686f51d4c66066b8dbc18a2a", size = 12851149, upload-time = "2026-09-02T22:41:18.06Z" },
+    { url = "https://files.pythonhosted.org/packages/85/b0/53d8fe9a847534ef5fe2165c7d5292cb853b29dfd7011cbfb1cdb90a8012/ty-0.0.78-py3-none-musllinux_1_2_armv7l.whl", hash = "sha256:b3fa0786edc1af06030f872d83499c0cea7c261dbbb651e0aee8306bf2c8a869", size = 13091464, upload-time = "2026-09-02T22:41:20.227Z" },
+    { url = "https://files.pythonhosted.org/packages/21/65/94a4e5a02de559f6c6c0ee7a14b88660b4eee058ec6fec5c0ff6ecfbf5cc/ty-0.0.78-py3-none-musllinux_1_2_i686.whl", hash = "sha256:92c5639befc577578c8abd4e5a7fccf98d828db98b09e8d4dd81605dc0e54aef", size = 13389389, upload-time = "2026-09-02T22:41:22.27Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/b6/d0c7fe6be64ca5a15100c4b1f0e39c19660d53bc544f609fa117b346e661/ty-0.0.78-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:0dce70bc51652b2775debd1d1e422fb0179f5207c73deb4d5d0aca37e5f61695", size = 13691928, upload-time = "2026-09-02T22:41:24.292Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/5d/36081205611ba3fa802efc4ad63e4b1e949bda2f7bb37b34ac9bb6c00db0/ty-0.0.78-py3-none-win32.whl", hash = "sha256:1c80976ca9185d7a9d1baab1fb57240331b8dac58d3b11e46200284086a6de8d", size = 12647346, upload-time = "2026-09-02T22:41:26.699Z" },
+    { url = "https://files.pythonhosted.org/packages/f1/89/b925fe1ea1bc56fc7f11d2496e29072fdd2ceb7b389884fc7b2d07cf0c41/ty-0.0.78-py3-none-win_amd64.whl", hash = "sha256:32e82b704471eab34f67b51c151660ca8a00815977b28278905d76fba54f7415", size = 13241810, upload-time = "2026-09-02T22:41:28.857Z" },
+    { url = "https://files.pythonhosted.org/packages/91/f1/090ef7b52355bcedfbfbff6ce70fa81ba5bd5f6ed3f8d99ae05e6f2fe75b/ty-0.0.78-py3-none-win_arm64.whl", hash = "sha256:3a14d641a3c04fa9a80f2a46be1531d915f60d4fb79d4b894627bbe46bb35d64", size = 13077433, upload-time = "2026-09-02T22:41:31.525Z" },
 ]
 
 [[package]]
