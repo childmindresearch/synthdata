@@ -146,6 +146,14 @@ def _release_score_section(extras: dict) -> str:
     )
     lines.append("")
     lines.append(f"- Status: `{score.get('status', 'unknown')}`")
+    for field in (
+        "evidence_execution_state",
+        "metric_completeness_state",
+        "score_completeness_state",
+        "audit_outcome_state",
+    ):
+        if field in evidence:
+            lines.append(f"- {field.replace('_', ' ').capitalize()}: `{evidence[field]}`")
     lines.append(f"- R_final: `{_fmt_metric(score.get('score'))}`")
     dimensions = score.get("dimensions") or {}
     for name in ("utility", "privacy", "fairness"):

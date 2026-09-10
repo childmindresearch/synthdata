@@ -118,6 +118,8 @@ def run_task12_custom_evaluation(
     l_required: int = 2,
     tstr_results: Mapping[str, object] | None = None,
     seed: int = 0,
+    release_form_inputs: tuple[pd.DataFrame, Mapping[str, pd.DataFrame], Mapping[str, object]]
+    | None = None,
 ) -> dict[str, list[MetricObservation]]:
     """Produce canonical release, representation, and final fairness observations.
 
@@ -133,11 +135,16 @@ def run_task12_custom_evaluation(
     for name, frame in synthetic_datasets.items():
         observations: list[MetricObservation] = []
         try:
-            released_synthetic, released, _metadata = transform_release_roles(
-                frame,
-                released_roles,
-                generalization,
-            )
+            if release_form_inputs is None:
+                released_synthetic, released, _metadata = transform_release_roles(
+                    frame,
+                    released_roles,
+                    generalization,
+                )
+            else:
+                prepared_synthetic, prepared_roles, _metadata = release_form_inputs
+                released_synthetic = prepared_synthetic
+                released = prepared_roles
             release = release_privacy_evidence(
                 released_synthetic,
                 released[evaluation_role],

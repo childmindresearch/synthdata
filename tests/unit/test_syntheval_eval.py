@@ -48,6 +48,7 @@ from synthdata.evaluation.syntheval_eval import (
     extend_syntheval_expected_diagnostics,
     merge_binary_target_results,
     resolve_model_workers,
+    run_binary_target_syntheval_evaluation,
     run_syntheval_evaluation,
     validate_syntheval_results,
 )
@@ -138,6 +139,69 @@ class TestBuildPreset:
 
 
 class TestEvaluationRoleContext:
+    def test_main_final_holdout_requires_both_released_inputs(
+        self, make_canonical_dataset, tmp_path
+    ):
+        dataset = make_canonical_dataset()
+        with pytest.raises(ValueError, match="requires both released_synthetic_datasets"):
+            run_syntheval_evaluation(
+                {"model_a": dataset.role_frame("train", imputed=True)},
+                dataset,
+                FrameworkSelectionConfig(),
+                preset_dir=tmp_path,
+                evaluation_role="final_holdout",
+            )
+
+    def test_binary_final_holdout_requires_both_released_inputs(
+        self, make_canonical_dataset, tmp_path
+    ):
+        dataset = make_canonical_dataset()
+        with pytest.raises(ValueError, match="requires both released_synthetic_datasets"):
+            run_binary_target_syntheval_evaluation(
+                {"model_a": dataset.role_frame("train", imputed=True)},
+                dataset,
+                FrameworkSelectionConfig(),
+                SimpleNamespace(column="target", positive_classes=[1], negative_classes=[0]),
+                preset_dir=tmp_path,
+                evaluation_role="final_holdout",
+            )
+
+    @pytest.mark.parametrize(
+        "released_argument", ["released_synthetic_datasets", "released_final_holdout_frame"]
+    )
+    def test_main_released_inputs_must_be_paired(
+        self, released_argument, make_canonical_dataset, tmp_path
+    ):
+        dataset = make_canonical_dataset()
+        released = {
+            "released_synthetic_datasets": {"model_a": dataset.role_frame("train", imputed=True)},
+            "released_final_holdout_frame": dataset.role_frame("final_holdout", imputed=True),
+        }
+        released.pop(released_argument)
+
+        with pytest.raises(ValueError, match="must be provided together"):
+            run_syntheval_evaluation(
+                {"model_a": dataset.role_frame("train", imputed=True)},
+                dataset,
+                FrameworkSelectionConfig(),
+                preset_dir=tmp_path,
+                evaluation_role="final_holdout",
+                **released,
+            )
+
+    def test_binary_released_inputs_must_be_paired(self, make_canonical_dataset, tmp_path):
+        dataset = make_canonical_dataset()
+        with pytest.raises(ValueError, match="must be provided together"):
+            run_binary_target_syntheval_evaluation(
+                {"model_a": dataset.role_frame("train", imputed=True)},
+                dataset,
+                FrameworkSelectionConfig(),
+                SimpleNamespace(column="target", positive_classes=[1], negative_classes=[0]),
+                preset_dir=tmp_path,
+                evaluation_role="final_holdout",
+                released_final_holdout_frame=dataset.role_frame("final_holdout", imputed=True),
+            )
+
     def test_final_holdout_has_a_distinct_evidence_context(self, make_canonical_dataset):
         dataset = make_canonical_dataset()
         train_for_tuning, tuning = _evaluation_role_frames(dataset, "tuning")

@@ -52,6 +52,18 @@ def _combined() -> pd.DataFrame:
     return frame
 
 
+def _complete_final_evidence_fields() -> dict:
+    return {
+        "evidence_execution_state": "succeeded",
+        "metric_completeness_state": "complete",
+        "score_completeness_state": "complete",
+        "audit_outcome_state": "complete",
+        "provenance_inventory": {
+            field: {"evidence": field} for field in artifacts._PROVENANCE_INVENTORY_FIELDS
+        },
+    }
+
+
 def _contract_manifest() -> dict:
     return MetricContractRegistry(()).manifest()
 
@@ -407,6 +419,7 @@ def _persist_current_final_refit_bundle(tmp_path):
         },
         semantic_context=semantic_context,
         final_holdout_evidence={
+            **_complete_final_evidence_fields(),
             "evaluation_role": "final_holdout",
             "state": "succeeded",
             "selected_model": "model_a",
@@ -483,6 +496,56 @@ def test_current_final_refit_envelope_round_trips_strictly(tmp_path):
     assert evidence["final_refit"]["cache_metadata"]["schema_version"] == "final-refit-v2"
     assert evidence["final_refit"]["cache_metadata"]["target_view"] == "native"
     assert evidence["final_refit"]["cache_metadata"]["fit_roles"] == ["train", "tuning"]
+
+
+def test_legacy_final_holdout_marker_migrates_to_complete_shape(tmp_path):
+    evaluation_dir, _refit = _persist_current_final_refit_bundle(tmp_path)
+    evidence_path = artifact_bundle_dir(evaluation_dir) / "final_holdout_evidence.json"
+    payload = json.loads(evidence_path.read_text())
+    for field in (
+        "evidence_execution_state",
+        "metric_completeness_state",
+        "score_completeness_state",
+        "audit_outcome_state",
+        "provenance_inventory",
+    ):
+        payload.pop(field)
+    payload["legacy_schema_version"] = "final-holdout-evidence-legacy-v1"
+    evidence_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    _refresh_manifest_digest(evaluation_dir, "final_holdout_evidence")
+
+    migrated = load_final_holdout_evidence(evaluation_dir)
+
+    assert migrated["schema_version"] == "final-holdout-evidence-v1"
+    assert migrated["provenance_inventory_legacy_migrated"] is True
+    assert migrated["evidence_execution_state"] == "succeeded"
+    assert set(migrated["provenance_inventory"]) == set(artifacts._PROVENANCE_INVENTORY_FIELDS)
+    assert migrated["provenance_inventory"]["selected_model_provenance"]["model"] == "model_a"
+
+
+@pytest.mark.parametrize("marker", ["final-holdout-evidence-v2", "", "legacy-v1", None])
+def test_final_holdout_loader_rejects_unknown_or_unmarked_legacy_marker(tmp_path, marker):
+    evaluation_dir, _refit = _persist_current_final_refit_bundle(tmp_path)
+    evidence_path = artifact_bundle_dir(evaluation_dir) / "final_holdout_evidence.json"
+    payload = json.loads(evidence_path.read_text())
+    if marker is None:
+        for field in (
+            "evidence_execution_state",
+            "metric_completeness_state",
+            "score_completeness_state",
+            "audit_outcome_state",
+            "provenance_inventory",
+        ):
+            payload.pop(field)
+    else:
+        payload["legacy_schema_version"] = marker
+    evidence_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    _refresh_manifest_digest(evaluation_dir, "final_holdout_evidence")
+
+    with pytest.raises(
+        ValueError, match="(unsupported legacy_schema_version|state|provenance_inventory)"
+    ):
+        load_final_holdout_evidence(evaluation_dir)
 
 
 def test_current_final_refit_sidecar_tampering_fails_after_hash_refresh(tmp_path):
@@ -1306,6 +1369,7 @@ def test_final_holdout_evidence_round_trip(tmp_path):
         {},
         native_syntheval_plot_dir=None,
         final_holdout_evidence={
+            **_complete_final_evidence_fields(),
             "evaluation_role": "final_holdout",
             "state": "succeeded",
             "selected_model": "model_a",
@@ -1394,6 +1458,7 @@ def test_final_holdout_loader_rejects_hash_consistent_semantic_tampering(tmp_pat
         {},
         native_syntheval_plot_dir=None,
         final_holdout_evidence={
+            **_complete_final_evidence_fields(),
             "evaluation_role": "final_holdout",
             "state": "succeeded",
             "selected_model": "model_a",
@@ -1418,7 +1483,29 @@ def test_final_holdout_loader_rejects_hash_consistent_semantic_tampering(tmp_pat
     evidence_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
     _refresh_manifest_digest(evaluation_dir, "final_holdout_evidence")
 
-    with pytest.raises(ValueError, match="state does not match"):
+    with pytest.raises(ValueError, match="contradictory state dimensions"):
+        load_final_holdout_evidence(evaluation_dir)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "evidence_execution_state",
+        "metric_completeness_state",
+        "score_completeness_state",
+        "audit_outcome_state",
+        "provenance_inventory",
+    ],
+)
+def test_final_holdout_loader_rejects_omitted_task15_fields(tmp_path, field):
+    evaluation_dir, _refit = _persist_current_final_refit_bundle(tmp_path)
+    evidence_path = artifact_bundle_dir(evaluation_dir) / "final_holdout_evidence.json"
+    payload = json.loads(evidence_path.read_text())
+    payload.pop(field)
+    evidence_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    _refresh_manifest_digest(evaluation_dir, "final_holdout_evidence")
+
+    with pytest.raises(ValueError, match="(state|provenance_inventory)"):
         load_final_holdout_evidence(evaluation_dir)
 
 
@@ -1435,6 +1522,7 @@ def test_final_holdout_loader_rejects_manifest_semantic_context_mismatch(tmp_pat
         native_syntheval_plot_dir=None,
         semantic_context=semantic_context,
         final_holdout_evidence={
+            **_complete_final_evidence_fields(),
             "evaluation_role": "final_holdout",
             "state": "succeeded",
             "selected_model": "model_a",

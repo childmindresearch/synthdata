@@ -452,6 +452,20 @@ def _incomplete_validation_records(
     return failures
 
 
+def _final_holdout_state_dimensions(
+    validation_failures: list[dict], release_score: dict
+) -> tuple[str, str, str, str]:
+    """Derive final-holdout state dimensions without overstating evidence."""
+    metric_state = "incomplete" if validation_failures else "complete"
+    score_succeeded = release_score.get("status") == "succeeded"
+    score_state = "complete" if score_succeeded and not validation_failures else "indeterminate"
+    audit_state = (
+        "failed" if validation_failures else "complete" if score_succeeded else "indeterminate"
+    )
+    evidence_state = "succeeded" if metric_state == "complete" and score_succeeded else "failed"
+    return evidence_state, metric_state, score_state, audit_state
+
+
 def _run_final_holdout_evidence(
     cfg: Config,
     dataset: Dataset,
@@ -471,22 +485,51 @@ def _run_final_holdout_evidence(
         "fit_roles": ["train", "tuning"],
         "evidence_role": "final_holdout",
     }
-    if not dataset.has_canonical_roles:
+
+    def blocked_evidence(reason: str) -> dict:
+        """Build auditable evidence when final-holdout evaluation cannot start."""
         return {
             **base_evidence,
             "state": "blocked",
+            "evidence_execution_state": "blocked",
+            "metric_completeness_state": "not_applicable",
+            "score_completeness_state": "not_applicable",
+            "audit_outcome_state": "blocked",
+            "provenance_inventory": {
+                field: {}
+                for field in (
+                    "raw_values",
+                    "normalized_values",
+                    "formulas",
+                    "anchors",
+                    "role_hashes",
+                    "release_transform_digest",
+                    "attack_protocol",
+                    "seeds",
+                    "supports",
+                    "intervals",
+                )
+            }
+            | {
+                "invalid_reasons": {"final_holdout": reason},
+                "selected_model_provenance": {
+                    "model": None,
+                    "status": "not_selected",
+                    "reason": reason,
+                },
+            },
             "selected_model": None,
-            "reason": ("legacy_two_role dataset cannot provide distinct final-holdout evidence"),
+            "reason": reason,
         }
+
+    if not dataset.has_canonical_roles:
+        return blocked_evidence(
+            "legacy_two_role dataset cannot provide distinct final-holdout evidence"
+        )
 
     selected_model, selection_error = _select_policy_model(combined)
     if selection_error is not None:
-        return {
-            **base_evidence,
-            "state": "blocked",
-            "selected_model": None,
-            "reason": selection_error,
-        }
+        return blocked_evidence(selection_error)
     if selected_model not in selected_datasets:
         raise RuntimeError(
             f"Candidate ranking selected unknown model {selected_model!r}; "
@@ -541,17 +584,23 @@ def _run_final_holdout_evidence(
         "final_holdout": dataframe_fingerprint(raw_final_holdout_frame),
         "refit_fit": refit_metadata["fit_frame_fingerprints"]["raw"],
     }
+    released_final_synthetic, released_final_roles, release_transform_metadata = (
+        transform_release_roles(
+            refit_frame,
+            {"final_holdout": raw_final_holdout_frame},
+            eval_cfg.release_generalization.columns,
+        )
+    )
+    released_final_dataset = {selected_model: released_final_synthetic}
+    # All final evidence consumers share this exact release-form object.  Do not
+    # let individual metric adapters transform or normalize independent copies.
+    selected_dataset = released_final_dataset
     task10_results = {}
     if eval_cfg.custom.enabled:
-        for model_name, frame in selected_dataset.items():
-            released_synthetic, released_roles, _ = transform_release_roles(
-                frame,
-                {"final_holdout": raw_final_holdout_frame},
-                eval_cfg.release_generalization.columns,
-            )
+        for model_name in selected_dataset:
             task10_results[model_name] = run_tstr_evaluation(
-                released_synthetic,
-                released_roles["final_holdout"],
+                released_final_dataset[model_name],
+                released_final_roles["final_holdout"],
                 target_column=dataset.target_column,
                 evaluation_role="final_holdout",
                 seed=cfg.seed,
@@ -588,6 +637,8 @@ def _run_final_holdout_evidence(
         classification_score=synthcity_semantics["classification_score"],
         group_mode=group_mode,
         evaluation_role="final_holdout",
+        released_synthetic_datasets=released_final_dataset,
+        released_reference_frame=released_final_roles["final_holdout"],
     )
     final_synthcity_metric_config = synthcity_eval.resolve_metric_config(eval_cfg.synthcity)
     final_synthcity_validations = synthcity_eval.validate_synthcity_results(
@@ -626,6 +677,8 @@ def _run_final_holdout_evidence(
                 evaluation_role="final_holdout",
                 fit_frame=real_fit_frame,
                 fit_roles=("train", "tuning"),
+                released_final_holdout_frame=released_final_roles["final_holdout"],
+                released_synthetic_datasets=released_final_dataset,
             )
         except RuntimeError as exc:
             checkpoint_root = output_dir / "syntheval_final_holdout"
@@ -705,6 +758,8 @@ def _run_final_holdout_evidence(
                 evaluation_role="final_holdout",
                 fit_frame=real_fit_frame,
                 fit_roles=("train", "tuning"),
+                released_final_holdout_frame=released_final_roles["final_holdout"],
+                released_synthetic_datasets=released_final_dataset,
             )
         except RuntimeError as exc:
             checkpoint_root = output_dir / "syntheval_final_holdout"
@@ -803,6 +858,11 @@ def _run_final_holdout_evidence(
         role_hashes=final_custom_role_hashes,
         tstr_results=task10_results,
         seed=cfg.seed,
+        release_form_inputs=(
+            released_final_synthetic,
+            released_final_roles,
+            release_transform_metadata,
+        ),
     )
     final_task12_validations = task12_eval.validate_task12_custom_results(
         final_task12_observations,
@@ -866,12 +926,65 @@ def _run_final_holdout_evidence(
         fairness=fairness_evidence,
         provenance={"model": selected_model, "evaluation_role": "final_holdout"},
     )
+    (
+        evidence_state,
+        metric_completeness_state,
+        score_completeness_state,
+        audit_outcome_state,
+    ) = _final_holdout_state_dimensions(final_validation_failures, release_score)
     evidence = {
         **base_evidence,
-        "state": "failed" if final_validation_failures else "succeeded",
+        "state": evidence_state,
         "selected_model": selected_model,
         "candidate_selection": selection,
         "release_score": release_score,
+        "evidence_execution_state": "failed" if final_execution_failures else "succeeded",
+        "metric_completeness_state": metric_completeness_state,
+        "score_completeness_state": score_completeness_state,
+        "audit_outcome_state": audit_outcome_state,
+        "provenance_inventory": {
+            "raw_values": {
+                "frameworks": {
+                    str(key): {model: validation.to_dict() for model, validation in value.items()}
+                    for key, value in final_score_validations.items()
+                },
+            },
+            "normalized_values": {
+                "release_score": release_score,
+            },
+            "formulas": {
+                "U_tuning": "(S_TSTR + S_MMD + S_JSD) / 3",
+                "R_final": "0.45*U + 0.30*P + 0.25*F",
+            },
+            "anchors": {
+                "source": "metric contract and release-score configuration",
+                "release_score_status": release_score.get("status"),
+                "required_components": release_score.get("required_components", []),
+            },
+            "role_hashes": {
+                "imputed_evaluation": final_role_hashes,
+                "custom_raw_evaluation": final_custom_role_hashes,
+            },
+            "release_transform_digest": release_transform_metadata["common_protocol_digest"],
+            "attack_protocol": {
+                "evaluation_role": "final_holdout",
+                "privacy": "release-form final audit",
+            },
+            "seeds": {"evaluation": cfg.seed},
+            "supports": {
+                "synthetic_rows": len(released_final_synthetic),
+                "final_holdout_rows": len(released_final_roles["final_holdout"]),
+                "release_transform": release_transform_metadata,
+            },
+            "intervals": dict(eval_cfg.release_generalization.columns),
+            "invalid_reasons": final_validation_failures,
+            "selected_model_provenance": {
+                "model": selected_model,
+                "selection": selection,
+                "fit_roles": ["train", "tuning"],
+                "refit": refit_metadata,
+            },
+        },
         "final_refit": refit_metadata,
         "role_hashes": {
             "imputed_evaluation": final_role_hashes,

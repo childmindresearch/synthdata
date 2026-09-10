@@ -10,6 +10,7 @@ import pytest
 
 from synthdata.data import dataframe_fingerprint
 from synthdata.evaluation import (
+    _final_holdout_state_dimensions,
     _generation_metadata,
     _release_score_inputs,
     _select_policy_model,
@@ -28,6 +29,15 @@ from synthdata.evaluation.release_score import compute_release_score
 from synthdata.generation import pipeline as generation_pipeline
 
 pytestmark = pytest.mark.unit
+
+
+def test_metric_validation_failure_keeps_finite_release_score_indeterminate():
+    state = _final_holdout_state_dimensions(
+        [{"framework": "syntheval", "model": "model_a"}],
+        {"status": "succeeded", "R_final": 0.42},
+    )
+
+    assert state == ("failed", "incomplete", "indeterminate", "failed")
 
 
 def _fake_refit_metadata(synthetic, output_dir):
@@ -326,6 +336,41 @@ def test_selection_requires_complete_finite_tuning_utility():
     assert error == "no candidate has complete finite U_tuning"
 
 
+def test_selection_failure_persists_auditable_blocked_final_evidence(
+    make_config, make_canonical_dataset, monkeypatch
+):
+    cfg = make_config()
+    cfg.evaluation.generate_report = False
+    dataset = make_canonical_dataset()
+    synthetic = dataset.role_frame("train", imputed=True).copy()
+    combined = pd.DataFrame(
+        {
+            ("__all__", "overall", "rank"): [1.0],
+            ("__all__", "utility", "U_tuning"): [float("nan")],
+        },
+        index=["model_a"],
+    )
+    combined.columns = pd.MultiIndex.from_tuples(combined.columns)
+
+    monkeypatch.setattr(
+        "synthdata.evaluation.combine.build_combined_table", lambda *args, **kwargs: combined
+    )
+    monkeypatch.setattr(custom_eval, "run_log_disparity_evaluation", lambda *args, **kwargs: {})
+    _result, extras = run_evaluation(cfg, dataset, {"model_a": synthetic})
+
+    evidence = artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)
+    assert extras["final_holdout_evidence"]["state"] == "blocked"
+    assert (
+        evidence["evidence_execution_state"],
+        evidence["metric_completeness_state"],
+        evidence["score_completeness_state"],
+        evidence["audit_outcome_state"],
+    ) == ("blocked", "not_applicable", "not_applicable", "blocked")
+    assert evidence["selected_model"] is None
+    assert evidence["provenance_inventory"]["invalid_reasons"]
+    assert evidence["provenance_inventory"]["selected_model_provenance"]["status"] == "not_selected"
+
+
 def test_multi_model_selection_does_not_rerank_on_final_holdout_evidence():
     combined = pd.DataFrame(
         {
@@ -547,6 +592,8 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     syntheval_calls = []
     syntheval_fit_roles = []
     syntheval_fit_frames = []
+    syntheval_released_datasets = []
+    syntheval_released_references = []
     synthcity_report = pd.DataFrame(
         {"mean": [0.25] * 4, "direction": ["minimize"] * 4},
         index=[
@@ -567,6 +614,8 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
         syntheval_calls.append(kwargs.get("evaluation_role", "tuning"))
         syntheval_fit_roles.append(kwargs.get("fit_roles"))
         syntheval_fit_frames.append(kwargs.get("fit_frame"))
+        syntheval_released_datasets.append(kwargs.get("released_synthetic_datasets"))
+        syntheval_released_references.append(kwargs.get("released_final_holdout_frame"))
         return None, None, {}
 
     def fake_refit_selected_model(*args, **kwargs):
@@ -594,6 +643,9 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     assert syntheval_calls == ["tuning", "final_holdout"]
     assert syntheval_fit_roles == [None, ("train", "tuning")]
     pd.testing.assert_frame_equal(syntheval_fit_frames[1], expected_real_fit)
+    assert syntheval_released_datasets[0] is None
+    assert syntheval_released_datasets[1] is not None
+    assert syntheval_released_references[1] is not None
     assert "final_holdout_evidence" in extras
     evidence = artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)
     assert evidence["state"] == "failed"
@@ -700,8 +752,9 @@ def test_run_evaluation_keeps_multi_model_selection_outside_final_holdout(
     assert release_score["selected_model"] == "model_a"
 
 
-def test_run_evaluation_succeeds_with_authoritative_final_task10_evidence(
-    make_config, make_canonical_dataset, monkeypatch
+@pytest.mark.parametrize("finite_final_score", [False, True])
+def test_run_evaluation_records_authoritative_final_task10_evidence(
+    make_config, make_canonical_dataset, monkeypatch, finite_final_score
 ):
     cfg = make_config()
     cfg.evaluation.synthcity.metrics = ["identifiability_score"]
@@ -886,13 +939,35 @@ def test_run_evaluation_succeeds_with_authoritative_final_task10_evidence(
         return record
 
     monkeypatch.setattr(task12_eval, "_task12_record", valid_task12_record)
+    if finite_final_score:
+        monkeypatch.setattr(
+            "synthdata.evaluation.compute_release_score",
+            lambda **kwargs: {
+                "status": "succeeded",
+                "R_final": 0.42,
+                "audit_only": True,
+                "dimensions": {"utility": 0.4, "privacy": 0.4, "fairness": 0.5},
+            },
+        )
 
     combined, extras = run_evaluation(cfg, dataset, {"model_a": synthetic})
 
     evidence = artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)
-    assert evidence["state"] == "succeeded"
-    assert extras["final_holdout_evidence"]["state"] == "succeeded"
-    assert evidence["release_score"]["audit_only"] is True
+    expected_state = "succeeded" if finite_final_score else "failed"
+    assert evidence["state"] == expected_state
+    assert extras["final_holdout_evidence"]["state"] == expected_state
+    assert evidence["evidence_execution_state"] == "succeeded"
+    assert evidence["metric_completeness_state"] == "complete"
+    expected_score_state = "complete" if finite_final_score else "indeterminate"
+    expected_audit_state = "complete" if finite_final_score else "indeterminate"
+    assert evidence["score_completeness_state"] == expected_score_state
+    assert evidence["audit_outcome_state"] == expected_audit_state
+    assert evidence["release_score"]["status"] == (
+        "succeeded" if finite_final_score else "indeterminate"
+    )
+    if finite_final_score:
+        assert evidence["release_score"]["R_final"] == 0.42
+        assert evidence["release_score"]["audit_only"] is True
     assert "dimensions" in evidence["release_score"]
     release_score_evidence = artifacts.load_release_score_evidence(cfg.evaluation.output_dir)
     assert release_score_evidence["models"]["model_a"] == evidence["release_score"]
@@ -1113,11 +1188,14 @@ def test_run_evaluation_passes_real_fit_to_final_binary_evidence(
         ],
     )
     binary_calls = []
+    main_calls = []
 
     def fake_run_synthcity_evaluation(*args, **kwargs):
         return {"model_a": synthcity_report}
 
     def fake_run_syntheval_evaluation(*args, **kwargs):
+        if kwargs.get("evaluation_role") == "final_holdout":
+            main_calls.append(kwargs)
         return None, None, {}
 
     def fake_run_binary_target_syntheval_evaluation(*args, **kwargs):
@@ -1128,6 +1206,8 @@ def test_run_evaluation_passes_real_fit_to_final_binary_evidence(
                 "synthetic": args[0]["model_a"].copy(),
                 "fit_frame": fit_frame.copy() if fit_frame is not None else None,
                 "fit_roles": kwargs.get("fit_roles"),
+                "released_datasets": kwargs.get("released_synthetic_datasets"),
+                "released_reference": kwargs.get("released_final_holdout_frame"),
             }
         )
         return None, None, {}
@@ -1157,6 +1237,8 @@ def test_run_evaluation_passes_real_fit_to_final_binary_evidence(
     pd.testing.assert_frame_equal(binary_calls[1]["fit_frame"], expected_real_fit)
     pd.testing.assert_frame_equal(binary_calls[1]["synthetic"], synthetic)
     assert binary_calls[1]["fit_roles"] == ("train", "tuning")
+    assert main_calls[0]["released_synthetic_datasets"] is binary_calls[1]["released_datasets"]
+    assert main_calls[0]["released_final_holdout_frame"] is binary_calls[1]["released_reference"]
     assert extras["final_holdout_evidence"]["state"] == "failed"
     assert artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)[
         "binary_target_mapping"

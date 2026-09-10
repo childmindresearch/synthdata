@@ -568,6 +568,8 @@ def run_synthcity_metrics(
     evaluation_role: str = "tuning",
     group_mode: str = "row",
     semantic_context: Mapping[str, Any] | None = None,
+    released_synthetic_df: pd.DataFrame | None = None,
+    released_reference_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Evaluate a cached synthetic DataFrame with synthcity's Metrics.evaluate.
 
@@ -595,14 +597,17 @@ def run_synthcity_metrics(
             "Patient-group SynthCity evaluation requires group IDs for real reference and train roles"
         )
 
+    released_synthetic_df = synthetic_df if released_synthetic_df is None else released_synthetic_df
+    released_reference_df = (
+        x_real_reference if released_reference_df is None else released_reference_df
+    )
     adapter = _ExternalGeneratorAdapter(
-        PregeneratedSyntheticModel(synthetic_df), random_state=random_state
+        PregeneratedSyntheticModel(released_synthetic_df), random_state=random_state
     )
     adapter.fit(x_real_train)
 
-    x_syn_generated = adapter.generate(n_samples, random_state=random_state)[
-        x_real_reference.columns
-    ]
+    x_real_reference = released_reference_df
+    x_syn_generated = released_synthetic_df.copy()[x_real_reference.columns]
     reference_group_ids = _validated_group_ids(
         real_reference_group_ids, len(x_real_reference), "real reference"
     )
@@ -619,8 +624,7 @@ def run_synthcity_metrics(
     schema_mismatch_score = _schema_mismatch_score(x_real_reference, x_syn_generated)
     x_syn_raw = _align_dtypes(x_syn_generated, x_real_reference)
     x_ref_syn_raw = _align_dtypes(
-        adapter.generate(n_samples, random_state=random_state + 1)[x_real_reference.columns],
-        x_real_reference,
+        released_synthetic_df.copy()[x_real_reference.columns], x_real_reference
     )
     x_augmented_raw = pd.concat([x_real_train, x_syn_raw], ignore_index=True)
     reference_synthetic_group_ids = (
@@ -749,6 +753,8 @@ def run_synthcity_evaluation(
     evaluation_role: str = "tuning",
     group_mode: str = "row",
     semantic_context: Mapping[str, Any] | None = None,
+    released_synthetic_datasets: Mapping[str, pd.DataFrame] | None = None,
+    released_reference_frame: pd.DataFrame | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Run synthcity Metrics on every cached synthetic dataset.
 
@@ -802,6 +808,12 @@ def run_synthcity_evaluation(
                 structural_n_clusters=selection_cfg.structural_n_clusters,
                 structural_min_rows_per_cluster=selection_cfg.structural_min_rows_per_cluster,
                 evaluation_role=evaluation_role,
+                released_synthetic_df=(
+                    released_synthetic_datasets.get(name)
+                    if released_synthetic_datasets is not None
+                    else None
+                ),
+                released_reference_df=released_reference_frame,
             )
         except (TypeError, ValueError, RuntimeError) as exc:
             logger.warning("[synthcity] evaluation failed for %s: %s", name, exc)

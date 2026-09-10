@@ -106,6 +106,87 @@ _CACHE_ENVELOPE_DYNAMIC_FIELDS = frozenset(
     {"cache_key", "row_count", "synthetic_data_sha256", "generator_metadata"}
 )
 
+# These dimensions are intentionally independent.  ``state`` remains the
+# historical coarse result for consumers which have not migrated yet.
+EVIDENCE_EXECUTION_STATES = frozenset({"not_started", "succeeded", "failed", "blocked"})
+METRIC_COMPLETENESS_STATES = frozenset({"complete", "incomplete", "not_applicable"})
+SCORE_COMPLETENESS_STATES = frozenset({"complete", "indeterminate", "not_applicable"})
+AUDIT_OUTCOME_STATES = frozenset({"complete", "failed", "blocked", "indeterminate"})
+_PROVENANCE_INVENTORY_FIELDS = (
+    "raw_values",
+    "normalized_values",
+    "formulas",
+    "anchors",
+    "role_hashes",
+    "release_transform_digest",
+    "attack_protocol",
+    "seeds",
+    "supports",
+    "intervals",
+    "invalid_reasons",
+    "selected_model_provenance",
+)
+_LEGACY_FINAL_EVIDENCE_SCHEMA = "final-holdout-evidence-legacy-v1"
+
+
+def _final_evidence_state_defaults(evidence: Mapping[str, Any]) -> dict[str, str]:
+    """Return explicit state dimensions while retaining legacy ``state`` semantics."""
+    state = evidence.get("state")
+    if state == "succeeded":
+        return {
+            "evidence_execution_state": "succeeded",
+            "metric_completeness_state": "complete",
+            "score_completeness_state": "complete",
+            "audit_outcome_state": "complete",
+        }
+    if state == "blocked":
+        return {
+            "evidence_execution_state": "blocked",
+            "metric_completeness_state": "not_applicable",
+            "score_completeness_state": "not_applicable",
+            "audit_outcome_state": "blocked",
+        }
+    if state == "failed":
+        return {
+            "evidence_execution_state": "failed",
+            "metric_completeness_state": "incomplete",
+            "score_completeness_state": "indeterminate",
+            "audit_outcome_state": "failed",
+        }
+    return {
+        "evidence_execution_state": "not_started",
+        "metric_completeness_state": "not_applicable",
+        "score_completeness_state": "not_applicable",
+        "audit_outcome_state": "blocked",
+    }
+
+
+def _normalize_final_provenance_inventory(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    """Create complete, JSON-safe provenance inventory for explicit migration."""
+    supplied = evidence.get("provenance_inventory")
+    if supplied is not None and not isinstance(supplied, Mapping):
+        raise ValueError("Final-holdout provenance_inventory must be an object")
+    inventory = (
+        {
+            field: (
+                dict(supplied[field])
+                if isinstance(supplied.get(field), Mapping)
+                else supplied.get(field, {})
+            )
+            for field in _PROVENANCE_INVENTORY_FIELDS
+        }
+        if isinstance(supplied, Mapping)
+        else {field: {} for field in _PROVENANCE_INVENTORY_FIELDS}
+    )
+    if inventory["role_hashes"] == {} and isinstance(evidence.get("role_hashes"), Mapping):
+        inventory["role_hashes"] = dict(evidence["role_hashes"])
+    selected_model_provenance = inventory["selected_model_provenance"]
+    if isinstance(selected_model_provenance, Mapping) and selected_model_provenance:
+        inventory["selected_model_provenance"] = dict(selected_model_provenance)
+    else:
+        inventory["selected_model_provenance"] = {"model": evidence.get("selected_model")}
+    return inventory
+
 
 def artifact_bundle_dir(evaluation_dir: str | Path) -> Path:
     """Return the versioned artifact bundle directory for an evaluation."""
@@ -1717,6 +1798,16 @@ def _load_contract_registry_if_present(
 def _enrich_final_refit_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and digest refit files referenced by final-holdout evidence."""
     enriched = dict(evidence)
+    legacy_marker = evidence.get("legacy_schema_version")
+    if legacy_marker == _LEGACY_FINAL_EVIDENCE_SCHEMA:
+        inventory_supplied = isinstance(evidence.get("provenance_inventory"), Mapping)
+        for name, value in _final_evidence_state_defaults(enriched).items():
+            enriched.setdefault(name, value)
+        enriched.setdefault("provenance_inventory", _normalize_final_provenance_inventory(enriched))
+        enriched.setdefault("provenance_inventory_supplied", inventory_supplied)
+        enriched["provenance_inventory_legacy_migrated"] = True
+    elif legacy_marker is not None:
+        raise ValueError("Final-holdout evidence has an unsupported legacy_schema_version")
     state = enriched.get("state")
     if state != "succeeded" and state != "failed":
         return enriched
@@ -2878,6 +2969,73 @@ def _validate_final_holdout_evidence_payload(
     state = _non_empty_string(payload.get("state"), "Final-holdout evidence state")
     if state not in {"blocked", "failed", "succeeded"}:
         raise ValueError(f"Final-holdout evidence has an invalid state {state!r} at {path}")
+    state_sets = {
+        "evidence_execution_state": EVIDENCE_EXECUTION_STATES,
+        "metric_completeness_state": METRIC_COMPLETENESS_STATES,
+        "score_completeness_state": SCORE_COMPLETENESS_STATES,
+        "audit_outcome_state": AUDIT_OUTCOME_STATES,
+    }
+    for field, allowed in state_sets.items():
+        value = _non_empty_string(payload.get(field), f"Final-holdout {field}")
+        if value not in allowed:
+            raise ValueError(f"Final-holdout {field} has invalid value {value!r} at {path}")
+    execution_state = payload["evidence_execution_state"]
+    metric_state = payload["metric_completeness_state"]
+    score_state = payload["score_completeness_state"]
+    audit_state = payload["audit_outcome_state"]
+    state_tuple = (execution_state, metric_state, score_state, audit_state)
+    valid_state_tuples = {
+        "blocked": {
+            ("blocked", "not_applicable", "not_applicable", "blocked"),
+            ("not_started", "not_applicable", "not_applicable", "blocked"),
+        },
+        "succeeded": {("succeeded", "complete", "complete", "complete")},
+        "failed": {
+            ("failed", "incomplete", "indeterminate", "failed"),
+            ("succeeded", "incomplete", "indeterminate", "failed"),
+            ("succeeded", "complete", "indeterminate", "indeterminate"),
+        },
+    }
+    if state_tuple not in valid_state_tuples[state]:
+        raise ValueError(
+            f"Final-holdout state {state!r} has contradictory state dimensions: {state_tuple!r}"
+        )
+    if execution_state == "not_started" and audit_state != "blocked":
+        raise ValueError("Not-started final-holdout evidence must have blocked audit outcome")
+    if execution_state == "blocked" and audit_state != "blocked":
+        raise ValueError("Blocked final-holdout evidence must have blocked audit outcome")
+    if metric_state == "complete" and execution_state in {"not_started", "blocked"}:
+        raise ValueError("Blocked or not-started evidence cannot have complete metrics")
+    if score_state == "complete" and metric_state != "complete":
+        raise ValueError("Complete final-holdout score requires complete metrics")
+    if audit_state == "complete" and score_state != "complete":
+        raise ValueError("Complete final-holdout audit requires complete score")
+    inventory = payload.get("provenance_inventory")
+    if not isinstance(inventory, Mapping):
+        raise ValueError("Final-holdout provenance_inventory must be an object")
+    missing_inventory = [field for field in _PROVENANCE_INVENTORY_FIELDS if field not in inventory]
+    if missing_inventory:
+        raise ValueError(
+            f"Final-holdout provenance_inventory is incomplete; missing {missing_inventory}"
+        )
+    if state != "blocked" and not payload.get("provenance_inventory_legacy_migrated", False):
+        empty_inventory = [
+            field
+            for field in _PROVENANCE_INVENTORY_FIELDS
+            if field not in {"intervals", "invalid_reasons"}
+            and inventory[field] in ({}, [], None, "")
+        ]
+        if empty_inventory:
+            raise ValueError(
+                f"Final-holdout provenance_inventory contains empty evidence: {empty_inventory}"
+            )
+    score_payload = payload.get("release_score")
+    if (
+        payload["audit_outcome_state"] == "complete"
+        and score_payload is not None
+        and (not isinstance(score_payload, Mapping) or score_payload.get("audit_only") is not True)
+    ):
+        raise ValueError("Completed final-holdout evidence must carry audit-only release score")
     semantic_context = payload.get("semantic_context")
     semantic_fingerprint = payload.get("semantic_context_fingerprint")
     manifest_semantic_fingerprint = manifest.get("semantic_context_fingerprint")

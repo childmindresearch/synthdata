@@ -1768,6 +1768,8 @@ def run_syntheval_evaluation(
     fit_frame: pd.DataFrame | None = None,
     fit_roles: tuple[str, ...] = ("train",),
     semantic_context: Mapping[str, Any] | None = None,
+    released_final_holdout_frame: pd.DataFrame | None = None,
+    released_synthetic_datasets: dict[str, pd.DataFrame] | None = None,
 ) -> (
     tuple[pd.DataFrame | None, pd.DataFrame | None]
     | tuple[pd.DataFrame | None, pd.DataFrame | None, dict[str, dict]]
@@ -1788,6 +1790,13 @@ def run_syntheval_evaluation(
     ``positive_class`` (from ``cfg.evaluation.positive_class``) is forwarded to
     :func:`build_preset` for the 3 fairness metrics -- see its docstring.
     """
+    if evaluation_role == "final_holdout" and (
+        released_synthetic_datasets is None or released_final_holdout_frame is None
+    ):
+        raise ValueError(
+            "final_holdout evaluation requires both released_synthetic_datasets and "
+            "released_final_holdout_frame; both must be provided together"
+        )
     if not selection_cfg.enabled:
         logger.info("[syntheval] disabled; skipping execution")
         return (None, None, {}) if return_execution else (None, None)
@@ -1808,6 +1817,22 @@ def run_syntheval_evaluation(
         return (None, None, {}) if return_execution else (None, None)
 
     default_fit_frame, tuning_frame = _evaluation_role_frames(dataset, evaluation_role)
+    if released_synthetic_datasets is not None or released_final_holdout_frame is not None:
+        if evaluation_role != "final_holdout":
+            if released_final_holdout_frame is not None:
+                raise ValueError(
+                    "released_final_holdout_frame is only valid for final_holdout evaluation"
+                )
+            raise ValueError(
+                "released_synthetic_datasets is only valid for final_holdout evaluation"
+            )
+        if released_synthetic_datasets is None or released_final_holdout_frame is None:
+            raise ValueError(
+                "released_synthetic_datasets and released_final_holdout_frame must be provided "
+                "together for final_holdout evaluation"
+            )
+        tuning_frame = released_final_holdout_frame
+        synthetic_datasets = released_synthetic_datasets
     fit_frame = default_fit_frame if fit_frame is None else fit_frame
     preset_dir = ensure_dir(preset_dir)
     preset_filename = (
@@ -2029,6 +2054,8 @@ def run_binary_target_syntheval_evaluation(
     fit_frame: pd.DataFrame | None = None,
     fit_roles: tuple[str, ...] = ("train",),
     semantic_context: Mapping[str, Any] | None = None,
+    released_final_holdout_frame: pd.DataFrame | None = None,
+    released_synthetic_datasets: dict[str, pd.DataFrame] | None = None,
 ) -> (
     tuple[pd.DataFrame | None, pd.DataFrame | None]
     | tuple[pd.DataFrame | None, pd.DataFrame | None, dict[str, dict]]
@@ -2049,6 +2076,13 @@ def run_binary_target_syntheval_evaluation(
     BINARY_ONLY_METRICS are selected. When ``return_execution`` is true, the
     structured per-model execution payloads are appended.
     """
+    if evaluation_role == "final_holdout" and (
+        released_synthetic_datasets is None or released_final_holdout_frame is None
+    ):
+        raise ValueError(
+            "final_holdout evaluation requires both released_synthetic_datasets and "
+            "released_final_holdout_frame; both must be provided together"
+        )
     if not selection_cfg.enabled:
         logger.info("[syntheval] disabled; skipping binary-target execution")
         return (None, None, {}) if return_execution else (None, None)
@@ -2078,6 +2112,23 @@ def run_binary_target_syntheval_evaluation(
             f"Unsupported SynthEval evaluation_role {evaluation_role!r}; "
             "expected 'tuning' or 'final_holdout'"
         )
+    if released_synthetic_datasets is not None or released_final_holdout_frame is not None:
+        if evaluation_role != "final_holdout":
+            if released_final_holdout_frame is not None:
+                raise ValueError(
+                    "released_final_holdout_frame is only valid for final_holdout evaluation"
+                )
+            raise ValueError(
+                "released_synthetic_datasets is only valid for final_holdout evaluation"
+            )
+        if released_synthetic_datasets is None or released_final_holdout_frame is None:
+            raise ValueError(
+                "released_synthetic_datasets and released_final_holdout_frame must be provided "
+                "together for final_holdout evaluation"
+            )
+        final_holdout_frame = released_final_holdout_frame
+        evidence_frame = final_holdout_frame
+        synthetic_datasets = released_synthetic_datasets
     fit_frame = canonical_fit_frame if fit_frame is None else fit_frame
     binary_fit_frame = _binarize(fit_frame)
     binary_tuning_frame = _binarize(tuning_frame)
