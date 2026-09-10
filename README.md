@@ -40,15 +40,24 @@ target,categorical,
 > [!TIP]
 > Treat the example configurations as templates, not defaults for your data. Dataset paths, feature roles, target, version, generation methods, and evaluation settings should be reviewed for each project.
 
-New dataset profiles must define the three canonical population roles in
-`data.split`: `train` is the only role allowed to fit learned state,
-`tuning` drives HPO and candidate selection, and `final_holdout` is reserved
-for post-selection evidence. Use `mode: patient_group` with
-`patient_id_column` (or a complete identity mapping sidecar) when rows are
-repeated observations. If the data is patient-level but has no identifier,
-use `one_row_per_patient: true`; this is an explicit assertion, not an
-inference. Patient identity is removed from model frames and retained only in
-local role-assignment metadata.
+New dataset profiles must define canonical `data.split` roles `train`,
+`tuning`, and `final_holdout`. Roles are patient-disjoint: no patient may
+occur in more than one role, including through repeated encounters. `train`
+fits candidate learned state, `tuning` drives HPO and candidate selection,
+and `final_holdout` is reserved for post-selection evidence. Direct patient
+identity is required directly through `data.patient_id_column`, used for
+disjoint assignment, and removed from model
+frames. Raw identity remains only in local role-assignment metadata; it is
+never a feature or release-form evaluation field.
+
+Dataset roles are separate: **patient ID** identifies a person across
+encounters; **target** is the outcome evaluated for utility/fairness;
+**quasi-identifiers (QIs)** are explicitly declared linkage/attacker fields;
+**sensitive attributes** are fields whose disclosure is measured by privacy
+attacks; and **protected attributes** define fairness subgroups for
+representation, EO, and log-disparity evidence. Sensitive attributes are not
+automatically QIs or protected attributes, and protected attributes are not
+inferred from sensitive fields. Patient ID is none of these model roles.
 
 Historical `train`/`test` artifacts are supported only when the profile sets
 `data.legacy_two_role: true`. They remain readable for compatibility, but
@@ -69,7 +78,8 @@ baseline-adjusted categorical attack value while both diagnostics are retained.
 
 The SynthCity structural privacy screens (`k-anonymization`, `distinct
 l-diversity`, `k-map`, and `delta-presence`) are configurable KMeans proxy
-screens, not formal privacy guarantees. Their calibration is tied to
+screens, not formal privacy guarantees or formal release-form k/l metrics.
+Their calibration is tied to
 `evaluation.synthcity.structural_n_clusters`,
 `evaluation.synthcity.structural_min_rows_per_cluster`, the selected sensitive
 features, the DataLoader representation, sample sizes, and the random seed.
@@ -80,7 +90,7 @@ carry over automatically.
 
 The four commands form an ordered pipeline:
 
-1. **Impute** missing feature values using TabImpute or RefiDiff, with schema-aware caching and automatic CPU/GPU device selection. Canonical TabImpute roles fit reusable encoding/scaling state on `train` only, transform `tuning` and `final_holdout`, and record that state provenance in the local cache sidecar.
+1. **Impute** missing feature values with fixed HyperImpute plugins. Canonical imputation is HyperImpute-only: candidate state fits `train`, while final state fits `train` plus `tuning`; transforms never fit on `tuning` or `final_holdout`. Canonical TabImpute and RefiDiff execution paths are blocked/deferred because they cannot honor role isolation. Retained benchmark/legacy code is not a canonical release path.
 2. **Generate** candidate synthetic datasets with configured SynthCity, TabPFN, and TabPFGen models; optional Optuna hyperparameter searches are persisted and resumable. Each HPO context is stored in a digest-versioned sidecar with a latest pointer, so changing the objective creates a new study identity without overwriting prior context evidence.
 3. **Evaluate** candidates for utility, privacy, and fairness. Candidate ranking uses only `train` plus `tuning`; after selection, the chosen generator is refit on those two roles and evaluated once against `final_holdout`. Evaluation can process models in parallel within configured resource limits and writes a ranked table, report, and diagnostics.
 4. **Plot** recorded data-quality, generation, HPO, and evaluation artifacts without rerunning earlier stages.
@@ -120,8 +130,51 @@ evaluation:
 
 Set `group_mode: patient_group` and provide a non-empty `group_column` when
 rows represent repeated observations of the same patient or entity. The
-identifier must be present and non-null in the imputed train, holdout, and
-synthetic evaluation frames, and real train/holdout groups must be disjoint.
+identifier is required for role assignment and provenance, but is excluded
+from every model and release metric frame. Real `train`, `tuning`, and
+`final_holdout` populations are patient-disjoint. Patient-disjoint roles do
+not make encounter records independent: privacy metrics cannot claim
+protection against linkage or inference among multiple encounters from one
+patient beyond this role isolation.
+
+## Release populations, privacy, and fairness evidence
+
+Candidate utility compares release-form synthetic data with `tuning`. Final
+audit utility compares selected release-form synthetic data with
+`final_holdout`; it does not reuse candidate scores. MIA members are
+`train+tuning`, and non-members are patient-disjoint `final_holdout`.
+Attribute-disclosure attackers fit on synthetic QIs and score `final_holdout`.
+Representation, EO, and worst log disparity use final evidence. Invalid
+required evidence is indeterminate, not silently substituted or reweighted.
+
+Formal release-form privacy metrics use transformed QIs and sensitive fields:
+`S_k` and `S_l` are formal k-anonymity and l-diversity scores, with `S_DCR`
+and `S_epsilon` as separate formal release components. SynthCity's
+`k-anonymization`, `l-diversity`, `k-map`, and `delta-presence` are blocked
+KMeans proxy metrics, not formal k/l evidence and not release authorization.
+
+## Fixed utility, normalization, and final audit score
+
+HPO utility is fixed:
+
+```text
+U_tuning = (S_TSTR + S_MMD + S_JSD) / 3
+```
+
+Final audit uses:
+
+```text
+U = (S_TSTR + S_MMD + S_JSD) / 3
+I = min(S_k, S_l, S_DCR, S_epsilon)
+P = (I * S_MIA * S_attribute)^(1/3)
+F = 0.40*S_representation + 0.40*S_EO + 0.20*S_worst_log_disparity
+R_final = 0.45*U + 0.30*P + 0.25*F
+```
+
+Direct normalized components are not double-normalized. Raw anchored metrics
+use fixed clipped anchors. Invalid required evidence makes its dimension and
+`R_final` indeterminate. `R_final` is audit-only; post-holdout reranking and
+release authorization from this score are prohibited.
 
 The shipped privacy thresholds are calibration-only and disabled by default.
 Enabling `evaluation.privacy_gate` requires each threshold to name an exact
@@ -152,7 +205,11 @@ invoked by Stage A.
 
 ## Optional: RefiDiff masked-cell benchmark
 
-Use `synthdata-imputation-benchmark` when selecting RefiDiff settings for your dataset, especially when it has many columns. This is separate from normal imputation: it temporarily hides a sample of values that were originally observed in the **training split**, imputes them, and compares the predictions with the known values. Numeric columns are assessed by standardized error and categorical columns by accuracy and balanced accuracy. Sensitive columns are not masked or scored.
+The retained `synthdata-imputation-benchmark` and RefiDiff material is
+exploratory/legacy only. RefiDiff and TabImpute paths are blocked or deferred
+for canonical role-isolated execution and cannot support canonical release
+claims. Do not use benchmark results to select canonical production
+imputation.
 
 The benchmark does not overwrite your regular imputed datasets. It writes an append-only study containing the masks, parameter settings, per-column metrics, and aggregate results under the configured imputation output directory.
 
