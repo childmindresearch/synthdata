@@ -21,6 +21,8 @@ from synthdata.data import (
     mask_outliers_as_missing,
     remap_binary_one_two,
     schema_column_roles,
+    semantic_context_fingerprint,
+    semantic_context_payload,
     warn_non_numeric_feature_columns,
 )
 
@@ -213,6 +215,35 @@ class TestVariableSchema:
         assert manifest["train_split_fingerprint"] == dataset.train_split_fingerprint
         assert manifest["test_split_fingerprint"] == dataset.test_split_fingerprint
 
+    def test_legacy_two_role_loader_does_not_require_patient_hmac_secret(
+        self, tmp_path, monkeypatch
+    ):
+        raw_path = tmp_path / "raw.csv"
+        pd.DataFrame({"feature": [10, 11, 12, 13], "target": [0, 1, 0, 1]}).to_csv(
+            raw_path, index=False
+        )
+        schema_path = tmp_path / "schema.csv"
+        schema_path.write_text("column,kind\nfeature,continuous\ntarget,categorical\n")
+        cfg = Config(
+            name="legacy_no_secret",
+            data=DataConfig(
+                source="csv",
+                path=str(raw_path),
+                target_column="target",
+                variable_schema_path=str(schema_path),
+                data_dir=str(tmp_path / "derived"),
+                train_size=0.5,
+                stratify=True,
+                legacy_two_role=True,
+            ),
+        )
+        monkeypatch.delenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", raising=False)
+
+        dataset = load_dataset(cfg)
+
+        assert dataset.legacy_two_role is True
+        assert set(dataset.roles) == {"train", "final_holdout"}
+
     def test_continuous_target_remains_continuous_in_dataset_metadata(self, tmp_path):
         raw_path = tmp_path / "raw.csv"
         pd.DataFrame(
@@ -244,6 +275,126 @@ class TestVariableSchema:
         assert dataset.target_is_categorical is False
         assert dataset.all_categorical_columns == []
         assert pd.api.types.is_float_dtype(dataset.full_df["target"])
+
+    @staticmethod
+    def _write_canonical_inputs(tmp_path, *, release_generalization=None):
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        patients = np.repeat(np.arange(1, 13), 2)
+        raw_path = tmp_path / "canonical.csv"
+        pd.DataFrame(
+            {
+                "patient_id": patients,
+                "feature": np.arange(24, dtype=float),
+                "sensitive": np.tile(["low", "high"], 12),
+                "protected": np.repeat(["A", "B"], 12),
+                "target": np.tile([0, 1], 12),
+            }
+        ).to_csv(raw_path, index=False)
+        schema_path = tmp_path / "canonical_schema.csv"
+        schema_path.write_text(
+            "column,kind\nfeature,continuous\nsensitive,categorical\n"
+            "protected,categorical\ntarget,categorical\n"
+        )
+        cfg = Config(
+            name="canonical_loader",
+            seed=7,
+            data=DataConfig(
+                source="csv",
+                path=str(raw_path),
+                target_column="target",
+                patient_id_column="patient_id",
+                canonical=True,
+                sensitive_columns=["sensitive"],
+                protected_columns=["protected"],
+                variable_schema_path=str(schema_path),
+                data_dir=str(tmp_path / "derived"),
+                split=DataSplitConfig(
+                    mode="patient_group",
+                    patient_id_column="patient_id",
+                    train_fraction=0.5,
+                    tuning_fraction=0.25,
+                    final_holdout_fraction=0.25,
+                    candidate_count=64,
+                ),
+            ),
+        )
+        if release_generalization is not None:
+            cfg.evaluation.release_generalization.columns = release_generalization
+        return cfg
+
+    def test_canonical_loader_keeps_identity_sidecar_out_of_all_artifacts(self, tmp_path):
+        dataset = load_dataset(self._write_canonical_inputs(tmp_path))
+        payload = semantic_context_payload(dataset)
+        manifest = json.loads((dataset.data_dir / "dataset_manifest.json").read_text())
+        assignment_files = list((dataset.data_dir / "assignments").glob("*/assignment.csv"))
+
+        assert dataset.identity_sidecar.tolist() == list(np.repeat(np.arange(1, 13), 2))
+        assert len(dataset.identity_sidecar) == len(dataset.full_df)
+        assert "patient_id" not in dataset.full_df.columns
+        assert all("patient_id" not in frame.columns for frame in dataset.roles.values())
+        assert "patient_id" not in dataset.feature_columns
+        assert all(
+            set(groups.astype(str)).isdisjoint({str(value) for value in range(1, 13)})
+            for groups in dataset.role_groups.values()
+        )
+        assert "patient_id" not in str(dataset.assignment.to_dict())
+        assert "identity_sidecar" not in manifest
+        assert "patient_id" not in json.dumps(payload)
+        for path in [
+            *assignment_files,
+            *(dataset.data_dir / f"{role}.csv" for role in dataset.roles),
+        ]:
+            assert "patient_id" not in path.read_text().splitlines()[0]
+            assert "unit-test-only-patient-id-secret" not in path.read_text()
+        assert "unit-test-only-patient-id-secret" not in json.dumps(manifest)
+        assert "unit-test-only-patient-id-secret" not in json.dumps(payload)
+
+    @pytest.mark.parametrize("secret", [None, "   "])
+    def test_canonical_loader_requires_external_identity_hmac_secret(
+        self, tmp_path, monkeypatch, secret
+    ):
+        if secret is None:
+            monkeypatch.delenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", raising=False)
+        else:
+            monkeypatch.setenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", secret)
+        with pytest.raises(ValueError, match="SYNTHDATA_PATIENT_ID_HMAC_KEY"):
+            load_dataset(self._write_canonical_inputs(tmp_path))
+
+    def test_canonical_loader_propagates_distinct_sensitive_and_protected_roles(self, tmp_path):
+        dataset = load_dataset(self._write_canonical_inputs(tmp_path))
+        payload = semantic_context_payload(dataset)
+        manifest = json.loads((dataset.data_dir / "dataset_manifest.json").read_text())
+
+        assert dataset.sensitive_columns == ["sensitive"]
+        assert dataset.protected_columns == ["protected"]
+        assert manifest["sensitive_columns"] == ["sensitive"]
+        assert manifest["protected_columns"] == ["protected"]
+        assert payload["sensitive_columns"] == ["sensitive"]
+        assert payload["protected_columns"] == ["protected"]
+        assert payload["sensitive_target_types"] == {"sensitive": "categorical"}
+
+    def test_release_generalization_is_copied_and_changes_semantic_context(self, tmp_path):
+        mapping = {"feature": {"kind": "bin", "bins": [0, 10]}}
+        first = load_dataset(
+            self._write_canonical_inputs(tmp_path / "first", release_generalization=mapping)
+        )
+        second = load_dataset(
+            self._write_canonical_inputs(
+                tmp_path / "second",
+                release_generalization={"feature": {"kind": "bin", "bins": [0, 5]}},
+            )
+        )
+
+        assert first.release_generalization == mapping
+        assert semantic_context_payload(first)["release_generalization"] == mapping
+        assert semantic_context_fingerprint(first) != semantic_context_fingerprint(second)
+
+    @pytest.mark.parametrize(
+        "mapping", [{"target": {"kind": "bin"}}, {"patient_id": {"kind": "bin"}}]
+    )
+    def test_release_generalization_rejects_target_and_identity(self, tmp_path, mapping):
+        with pytest.raises(ValueError, match="model features only|identity columns"):
+            load_dataset(self._write_canonical_inputs(tmp_path, release_generalization=mapping))
 
     @staticmethod
     def _canonical_config(raw_path, schema_path, data_dir, split):

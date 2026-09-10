@@ -85,6 +85,12 @@ def role_context_payload(dataset, roles: tuple[str, ...] = ROLE_NAMES) -> dict:
             ),
             "rows": int(len(frame)),
         }
+    identity_fingerprint = dataset.identity_fingerprint
+    if dataset.assignment is not None and "population_group_hash" in dataset.assignment:
+        selected = dataset.assignment[dataset.assignment["role"].isin(role_set)]
+        identity_fingerprint = dataframe_fingerprint(
+            selected[["row_key", "population_group_hash"]].sort_values("row_key")
+        )
     return {
         "schema_version": "role-context-v1",
         "dataset_name": dataset.name,
@@ -92,6 +98,7 @@ def role_context_payload(dataset, roles: tuple[str, ...] = ROLE_NAMES) -> dict:
         "roles": role_payload,
         "assignment_fingerprint": assignment_fingerprint,
         "assignment_policy_fingerprint": dataset.assignment_policy_fingerprint,
+        "identity_fingerprint": identity_fingerprint,
         "semantic_fingerprint": dataset.semantic_fingerprint,
         "variable_schema_fingerprint": dataset.variable_schema_fingerprint,
         "compatibility_mode": "legacy_two_role" if dataset.legacy_two_role else None,
@@ -108,10 +115,17 @@ def role_context_fingerprint(dataset, roles: tuple[str, ...] = ROLE_NAMES) -> st
 SEMANTIC_CONTEXT_SCHEMA_VERSION = "semantic-context-v1"
 
 
+def semantic_declaration_fingerprint(value) -> str:
+    """Return deterministic fingerprint for one semantic declaration."""
+    encoded = json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
 def semantic_context_payload(
     dataset,
     *,
     classification_score: str | None = None,
+    roles: tuple[str, ...] | None = None,
 ) -> dict:
     """Return the resolved semantic declarations used by downstream stages."""
     if classification_score is not None and classification_score not in {
@@ -134,6 +148,21 @@ def semantic_context_payload(
         for column in modeling_columns
         if column in dataset.variable_schema
     }
+    # Candidate semantic declarations must not inherit final-holdout provenance.
+    # Full role provenance remains available through an explicit roles=ROLE_NAMES.
+    semantic_roles = roles
+    if semantic_roles is None:
+        semantic_roles = ("train", "tuning") if dataset.has_canonical_roles else ROLE_NAMES
+    role_context = role_context_payload(dataset, semantic_roles)
+    identity_metadata = dataset.role_metadata.get("identity", {})
+    identity_dimension = {
+        "fingerprint": role_context["identity_fingerprint"],
+        "source": identity_metadata.get("identity_source"),
+        "mode": identity_metadata.get("mode"),
+        "tokenization_algorithm": identity_metadata.get("tokenization_algorithm"),
+        "tokenization_version": identity_metadata.get("tokenization_version"),
+        "tokenization_scope_fingerprint": identity_metadata.get("tokenization_scope_fingerprint"),
+    }
     payload = {
         "schema_version": SEMANTIC_CONTEXT_SCHEMA_VERSION,
         "dataset_name": dataset.name,
@@ -145,11 +174,25 @@ def semantic_context_payload(
         "ordinal_columns": list(dataset.ordinal_columns),
         "categorical_columns": list(dataset.categorical_columns),
         "protected_columns": list(dataset.protected_columns),
+        "sensitive_columns": list(dataset.sensitive_columns),
         "quasi_identifier_columns": list(dataset.quasi_identifier_columns),
+        "release_generalization": dict(dataset.release_generalization),
+        "quasi_identifier_fingerprint": semantic_declaration_fingerprint(
+            dataset.quasi_identifier_columns
+        ),
+        "sensitive_fingerprint": semantic_declaration_fingerprint(dataset.sensitive_columns),
+        "protected_fingerprint": semantic_declaration_fingerprint(dataset.protected_columns),
+        "schema_fingerprint": semantic_declaration_fingerprint(variable_schema),
+        "release_generalization_fingerprint": semantic_declaration_fingerprint(
+            dataset.release_generalization
+        ),
+        "role_fingerprint": role_context_fingerprint(dataset, semantic_roles),
+        "identity_fingerprint": role_context["identity_fingerprint"],
+        "identity_dimension": identity_dimension,
         "feature_types": feature_types,
         "sensitive_target_types": {
             column: feature_types[column]
-            for column in dataset.protected_columns
+            for column in dataset.sensitive_columns
             if column in feature_types
         },
         "source_table": {
@@ -205,7 +248,17 @@ def validate_semantic_context(
         "ordinal_columns",
         "categorical_columns",
         "protected_columns",
+        "sensitive_columns",
         "quasi_identifier_columns",
+        "release_generalization",
+        "quasi_identifier_fingerprint",
+        "sensitive_fingerprint",
+        "protected_fingerprint",
+        "schema_fingerprint",
+        "release_generalization_fingerprint",
+        "role_fingerprint",
+        "identity_fingerprint",
+        "identity_dimension",
         "sensitive_target_types",
         "feature_types",
         "source_table",
@@ -259,6 +312,7 @@ def validate_semantic_context(
         "ordinal_columns",
         "categorical_columns",
         "protected_columns",
+        "sensitive_columns",
         "quasi_identifier_columns",
     )
     for field in list_fields:
@@ -273,6 +327,43 @@ def validate_semantic_context(
     for field in mapping_fields:
         if not isinstance(context.get(field), Mapping):
             raise ValueError(f"semantic_context.{field} must be an object")
+    fingerprint_fields = (
+        "quasi_identifier_fingerprint",
+        "sensitive_fingerprint",
+        "protected_fingerprint",
+        "schema_fingerprint",
+        "release_generalization_fingerprint",
+        "role_fingerprint",
+        "identity_fingerprint",
+    )
+    for field in fingerprint_fields:
+        if not isinstance(context[field], str) or not context[field]:
+            raise ValueError(f"semantic_context.{field} must be a non-empty string")
+    for field in ("variable_schema_fingerprint", "semantic_fingerprint"):
+        if context[field] is not None and (
+            not isinstance(context[field], str) or not context[field]
+        ):
+            raise ValueError(f"semantic_context.{field} must be a string or None")
+    if not isinstance(context["identity_dimension"], Mapping):
+        raise ValueError("semantic_context.identity_dimension must be an object")
+    expected_declaration_fingerprints = {
+        "quasi_identifier_fingerprint": semantic_declaration_fingerprint(
+            context["quasi_identifier_columns"]
+        ),
+        "sensitive_fingerprint": semantic_declaration_fingerprint(context["sensitive_columns"]),
+        "protected_fingerprint": semantic_declaration_fingerprint(context["protected_columns"]),
+        "schema_fingerprint": semantic_declaration_fingerprint(context["variable_schema"]),
+        "release_generalization_fingerprint": semantic_declaration_fingerprint(
+            context["release_generalization"]
+        ),
+    }
+    for field, expected in expected_declaration_fingerprints.items():
+        if context[field] != expected:
+            raise ValueError(f"semantic_context.{field} does not match its declaration")
+    if context["identity_dimension"].get("fingerprint") != context["identity_fingerprint"]:
+        raise ValueError(
+            "semantic_context.identity_dimension fingerprint disagrees with identity_fingerprint"
+        )
 
     if not set(context["nominal_columns"]) | set(context["ordinal_columns"]) <= set(
         expected_features
@@ -284,6 +375,10 @@ def validate_semantic_context(
         raise ValueError("semantic_context categorical_columns disagree with nominal/ordinal roles")
     if not set(context["protected_columns"]) <= set(model_columns):
         raise ValueError("semantic_context protected_columns contain unknown modeling columns")
+    if not set(context["sensitive_columns"]) <= set(model_columns):
+        raise ValueError("semantic_context sensitive_columns contain unknown modeling columns")
+    if not isinstance(context["release_generalization"], Mapping):
+        raise ValueError("semantic_context.release_generalization must be an object")
     if not set(context["quasi_identifier_columns"]) <= set(expected_features):
         raise ValueError("semantic_context quasi_identifier_columns contain non-feature columns")
     overlap = sorted(set(context["quasi_identifier_columns"]) & set(context["protected_columns"]))
@@ -313,10 +408,10 @@ def validate_semantic_context(
                 f"semantic_context variable_schema kind does not match feature_types for {column!r}"
             )
     expected_sensitive_types = {
-        column: feature_types[column] for column in context["protected_columns"]
+        column: feature_types[column] for column in context["sensitive_columns"]
     }
     if dict(context["sensitive_target_types"]) != expected_sensitive_types:
-        raise ValueError("semantic_context sensitive_target_types disagree with protected_columns")
+        raise ValueError("semantic_context sensitive_target_types disagree with sensitive_columns")
     if not set(context["source_table"]) <= set(model_columns):
         raise ValueError("semantic_context source_table contains unknown modeling columns")
     if context["classification_score"] not in {None, "balanced_accuracy", "macro_f1"}:
@@ -328,10 +423,11 @@ def semantic_context_fingerprint(
     dataset,
     *,
     classification_score: str | None = None,
+    roles: tuple[str, ...] | None = None,
 ) -> str:
     """Return the digest of the resolved semantic context for a dataset."""
     return semantic_context_digest(
-        semantic_context_payload(dataset, classification_score=classification_score)
+        semantic_context_payload(dataset, classification_score=classification_score, roles=roles)
     )
 
 
@@ -369,8 +465,8 @@ class Dataset:
     #: experiment manifests for traceability. None if not set by the user.
     version: str | None = None
 
-    #: Explicit protected attributes and quasi-identifiers. ``sensitive_columns``
-    #: remains as a historical compatibility alias for protected columns.
+    #: Explicit protected attributes and quasi-identifiers. Sensitive columns
+    #: are retained as a separate declaration for attack semantics.
     protected_columns: list = dataclasses.field(default_factory=list)
     quasi_identifier_columns: list = dataclasses.field(default_factory=list)
 
@@ -391,6 +487,10 @@ class Dataset:
     assignment_fingerprint: str | None = None
     assignment_policy_fingerprint: str | None = None
     semantic_fingerprint: str | None = None
+    identity_sidecar: pd.Series | None = None
+    identity_fingerprint: str | None = None
+    release_generalization: dict = dataclasses.field(default_factory=dict)
+    role_context_fingerprint: str | None = None
 
     #: Numeric model-space frames populated once imputation has run
     #: (see synthdata.imputation).
@@ -406,13 +506,8 @@ class Dataset:
 
     def __post_init__(self) -> None:
         """Normalize role state and capture fingerprints for held frames."""
-        if self.protected_columns and self.sensitive_columns:
-            if self.protected_columns != self.sensitive_columns:
-                raise ValueError("Dataset protected_columns and sensitive_columns disagree")
-        elif self.protected_columns:
-            self.sensitive_columns = list(self.protected_columns)
-        else:
-            self.protected_columns = list(self.sensitive_columns)
+        self.protected_columns = list(self.protected_columns)
+        self.sensitive_columns = list(self.sensitive_columns)
 
         if self.roles:
             if self.legacy_two_role:
@@ -454,6 +549,12 @@ class Dataset:
         if self.assignment_policy_fingerprint is None:
             split_metadata = self.role_metadata.get("split", {})
             self.assignment_policy_fingerprint = split_metadata.get("assignment_policy_fingerprint")
+        if self.identity_fingerprint is None:
+            self.identity_fingerprint = self.role_metadata.get("identity", {}).get(
+                "identity_fingerprint"
+            )
+        if self.role_context_fingerprint is None:
+            self.role_context_fingerprint = self.assignment_fingerprint
 
     @property
     def has_canonical_roles(self) -> bool:
@@ -1471,7 +1572,8 @@ def _validate_loader_column_declarations(
     split_cfg,
 ) -> dict[str, list[str]]:
     declarations = {
-        "protected_columns": list(cfg.data.protected_columns or cfg.data.sensitive_columns),
+        "protected_columns": list(cfg.data.protected_columns),
+        "sensitive_columns": list(cfg.data.sensitive_columns),
         "quasi_identifier_columns": list(cfg.data.quasi_identifier_columns),
     }
     identity_columns = _configured_identity_columns(split_cfg)
@@ -1528,6 +1630,8 @@ def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
         "train_split_fingerprint": dataset.train_split_fingerprint,
         "test_split_fingerprint": dataset.test_split_fingerprint,
         "sensitive_columns": dataset.sensitive_columns,
+        "protected_columns": dataset.protected_columns,
+        "release_generalization": dataset.release_generalization,
         "n_rows": int(len(dataset.full_df)),
         "seed": cfg.seed,
         "last_loaded_at": datetime.now(UTC).isoformat(),
@@ -1625,14 +1729,38 @@ def load_dataset(cfg: Config) -> Dataset:
         )
     if split_cfg is not None and cfg.data.legacy_two_role:
         raise ValueError("data.split and data.legacy_two_role are mutually exclusive")
+    if split_cfg is not None and cfg.data.patient_id_column is not None:
+        if split_cfg.mode != "patient_group":
+            raise ValueError("data.patient_id_column requires data.split.mode='patient_group'")
+        split_cfg = dataclasses.replace(
+            split_cfg,
+            patient_id_column=cfg.data.patient_id_column,
+            identity_mapping_path=None,
+            mapping_row_key_column=None,
+            mapping_patient_key_column=None,
+            one_row_per_patient=False,
+        )
     semantic_declarations = _validate_loader_column_declarations(
         cfg,
         target_column,
         split_cfg,
     )
-    identity = resolve_population_identity(df, split_cfg)
+    token_scope = hashlib.sha256(
+        json.dumps(
+            {
+                "dataset_name": cfg.name,
+                "dataset_version": cfg.data.version,
+                "source_fingerprint": source_fingerprint,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    identity = resolve_population_identity(df, split_cfg, token_scope=token_scope)
     df = identity.model_frame
     groups = identity.groups
+    if identity.identity_sidecar is not None:
+        identity.identity_sidecar = identity.identity_sidecar.reset_index(drop=True)
 
     configured_identity_columns = _configured_identity_columns(split_cfg)
 
@@ -1713,6 +1841,7 @@ def load_dataset(cfg: Config) -> Dataset:
         df = mask_outliers_as_missing(df, outlier_columns, cfg.data.outlier_zscore_threshold)
 
     protected_columns = semantic_declarations["protected_columns"]
+    sensitive_columns = semantic_declarations["sensitive_columns"]
     quasi_identifier_columns = semantic_declarations["quasi_identifier_columns"]
     for declaration_name, columns in semantic_declarations.items():
         missing = [column for column in columns if column not in df.columns]
@@ -1725,6 +1854,23 @@ def load_dataset(cfg: Config) -> Dataset:
             raise ValueError(
                 f"data.{declaration_name} must not contain target column {target_column!r}"
             )
+
+    release_generalization = json.loads(
+        json.dumps(cfg.evaluation.release_generalization.columns, sort_keys=True, default=str)
+    )
+    invalid_release_columns = sorted(set(release_generalization) - set(feature_columns))
+    if invalid_release_columns:
+        raise ValueError(
+            "evaluation.release_generalization.columns must reference model features only; "
+            f"invalid column(s): {invalid_release_columns}"
+        )
+    identity_columns = _configured_identity_columns(split_cfg)
+    identity_release_columns = sorted(set(release_generalization) & identity_columns)
+    if identity_release_columns:
+        raise ValueError(
+            "evaluation.release_generalization.columns must not reference identity columns: "
+            f"{identity_release_columns}"
+        )
 
     if split_cfg is None:
         train_df, test_df = train_test_split(
@@ -1739,7 +1885,7 @@ def load_dataset(cfg: Config) -> Dataset:
             feature_columns=feature_columns,
             nominal_columns=nominal_columns,
             ordinal_columns=ordinal_columns,
-            sensitive_columns=list(protected_columns),
+            sensitive_columns=list(sensitive_columns),
             data_dir=data_dir,
             full_df=df,
             train_df=train_df,
@@ -1754,6 +1900,9 @@ def load_dataset(cfg: Config) -> Dataset:
                 "compatibility_mode": "legacy_two_role",
                 "identity": identity.metadata,
             },
+            identity_sidecar=identity.identity_sidecar,
+            identity_fingerprint=identity.metadata.get("identity_fingerprint"),
+            release_generalization=release_generalization,
         )
         paths = dataset.paths()
         df.to_csv(paths["full"], index=False)
@@ -1790,7 +1939,7 @@ def load_dataset(cfg: Config) -> Dataset:
             feature_columns=feature_columns,
             nominal_columns=nominal_columns,
             ordinal_columns=ordinal_columns,
-            sensitive_columns=list(protected_columns),
+            sensitive_columns=list(sensitive_columns),
             data_dir=data_dir,
             full_df=df,
             train_df=None,
@@ -1808,6 +1957,9 @@ def load_dataset(cfg: Config) -> Dataset:
             assignment_fingerprint=role_assignment.assignment_fingerprint,
             assignment_policy_fingerprint=role_assignment.assignment_policy_fingerprint,
             semantic_fingerprint=semantic_fingerprint,
+            identity_sidecar=identity.identity_sidecar,
+            identity_fingerprint=identity.metadata.get("identity_fingerprint"),
+            release_generalization=release_generalization,
         )
         paths = dataset.paths()
         df.to_csv(paths["full"], index=False)

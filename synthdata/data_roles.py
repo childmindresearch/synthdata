@@ -7,7 +7,9 @@ returned role frames never contain those identifiers.
 
 import dataclasses
 import hashlib
+import hmac
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,7 @@ class PopulationIdentity:
     row_keys: pd.Series
     source: str
     metadata: dict[str, Any]
+    identity_sidecar: pd.Series | None = None
 
 
 @dataclasses.dataclass
@@ -50,8 +53,26 @@ def _stable_value(value: Any) -> str:
     return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
 
 
-def _value_hash(value: Any) -> str:
-    return hashlib.sha256(_stable_value(value).encode()).hexdigest()
+TOKENIZATION_ALGORITHM = "hmac-sha256"
+TOKENIZATION_VERSION = "population-group-token-v1"
+PATIENT_ID_HMAC_KEY_ENV = "SYNTHDATA_PATIENT_ID_HMAC_KEY"
+
+
+def _opaque_group_token(value: Any, scope: str, *, token_secret: str | bytes) -> str:
+    """Return deterministic, opaque token for one population identifier."""
+    key = token_secret.encode() if isinstance(token_secret, str) else token_secret
+    message = f"{TOKENIZATION_VERSION}:{scope}:{_stable_value(value)}".encode()
+    return hmac.new(key, message, hashlib.sha256).hexdigest()
+
+
+def _required_token_secret() -> str:
+    secret = os.environ.get(PATIENT_ID_HMAC_KEY_ENV, "")
+    if not secret.strip():
+        raise ValueError(
+            f"Canonical patient_group identity requires non-empty {PATIENT_ID_HMAC_KEY_ENV}; "
+            "set this external secret before loading patient-group data"
+        )
+    return secret
 
 
 def _payload_fingerprint(payload: Any) -> str:
@@ -80,6 +101,9 @@ def _validate_identity_series(series: pd.Series, description: str) -> None:
         raise ValueError(
             f"{description} must contain scalar values; found non-scalar value(s): {non_scalar[:3]}"
         )
+    empty = [value for value in series.tolist() if isinstance(value, str) and not value.strip()]
+    if empty:
+        raise ValueError(f"{description} contains empty or whitespace-only values")
 
 
 def _read_mapping(path: Path) -> pd.DataFrame:
@@ -104,6 +128,8 @@ def _read_mapping(path: Path) -> pd.DataFrame:
 def resolve_population_identity(
     df: pd.DataFrame,
     split: DataSplitConfig | None,
+    *,
+    token_scope: str = "default-population-scope",
 ) -> PopulationIdentity:
     """Resolve and remove the configured population identifier from ``df``."""
     row_keys = pd.Series(np.arange(len(df), dtype=np.int64), index=df.index, name="row_key")
@@ -114,31 +140,19 @@ def resolve_population_identity(
             row_keys=row_keys,
             source="row",
             metadata={"mode": "row", "population_unit": "row"},
+            identity_sidecar=None,
         )
 
     if split.mode != "patient_group":
         raise ValueError(f"Unsupported data.split.mode: {split.mode!r}")
 
     if split.one_row_per_patient:
-        groups = pd.Series(
-            [f"row_group_{row_key}" for row_key in row_keys],
-            index=df.index,
-            name="population_group",
+        raise ValueError(
+            "one_row_per_patient is not a leakage-safe identity source; configure "
+            "patient_id_column or an approved identity mapping sidecar"
         )
-        metadata = {
-            "mode": "patient_group",
-            "population_unit": "patient_group",
-            "identity_source": "one_row_per_patient",
-            "identity_fingerprint": _series_fingerprint(groups),
-            "raw_identifier_persisted": False,
-        }
-        return PopulationIdentity(
-            groups=groups,
-            model_frame=df.copy(),
-            row_keys=row_keys,
-            source="one_row_per_patient",
-            metadata=metadata,
-        )
+
+    token_secret = _required_token_secret()
 
     if split.patient_id_column is not None:
         column = split.patient_id_column
@@ -149,29 +163,35 @@ def resolve_population_identity(
             )
         groups = df[column].copy()
         _validate_identity_series(groups, f"Patient identifier column {column!r}")
-        normalized = groups.map(_stable_value)
+        normalized = groups.map(
+            lambda value: _opaque_group_token(value, token_scope, token_secret=token_secret)
+        )
         model_frame = df.drop(columns=[column]).copy()
         metadata = {
             "mode": "patient_group",
             "population_unit": "patient_group",
             "identity_source": "source_column",
             "identity_column": column,
-            "identity_fingerprint": _series_fingerprint(groups),
+            "identity_fingerprint": _series_fingerprint(normalized),
             "n_population_groups": int(normalized.nunique()),
             "raw_identifier_persisted": False,
+            "tokenization_algorithm": TOKENIZATION_ALGORITHM,
+            "tokenization_version": TOKENIZATION_VERSION,
+            "tokenization_scope_fingerprint": hashlib.sha256(token_scope.encode()).hexdigest(),
         }
         return PopulationIdentity(
-            groups=groups.rename("population_group"),
+            groups=normalized.rename("population_group"),
             model_frame=model_frame,
             row_keys=row_keys,
             source="source_column",
             metadata=metadata,
+            identity_sidecar=groups.rename("patient_id"),
         )
 
     if split.identity_mapping_path is None:
         raise ValueError(
             "patient_group mode requires patient_id_column, identity_mapping_path, "
-            "or one_row_per_patient=true"
+            "or an approved identity mapping sidecar"
         )
     row_column = split.mapping_row_key_column
     patient_column = split.mapping_patient_key_column
@@ -228,6 +248,9 @@ def resolve_population_identity(
     key_to_patient = dict(zip(mapping_keys, mapped_patients, strict=True))
     groups = source_keys.map(key_to_patient)
     _validate_identity_series(groups, "Patient identity mapping assignments")
+    safe_groups = groups.map(
+        lambda value: _opaque_group_token(value, token_scope, token_secret=token_secret)
+    )
     if patient_column in df.columns and patient_column != row_column:
         source_patients = df[patient_column].copy()
         _validate_identity_series(
@@ -256,16 +279,20 @@ def resolve_population_identity(
         "mapping_row_key_column": row_column,
         "mapping_patient_key_column": patient_column,
         "identity_columns_removed": identity_columns,
-        "identity_fingerprint": _series_fingerprint(groups),
-        "n_population_groups": int(groups.map(_stable_value).nunique()),
+        "identity_fingerprint": _series_fingerprint(safe_groups),
+        "n_population_groups": int(safe_groups.nunique()),
         "raw_identifier_persisted": False,
+        "tokenization_algorithm": TOKENIZATION_ALGORITHM,
+        "tokenization_version": TOKENIZATION_VERSION,
+        "tokenization_scope_fingerprint": hashlib.sha256(token_scope.encode()).hexdigest(),
     }
     return PopulationIdentity(
-        groups=groups.rename("population_group"),
+        groups=safe_groups.rename("population_group"),
         model_frame=model_frame,
         row_keys=row_keys,
         source="mapping_file",
         metadata=metadata,
+        identity_sidecar=groups.rename("patient_id"),
     )
 
 
@@ -679,7 +706,7 @@ def _build_group_candidate(
     split: DataSplitConfig,
     rng: np.random.Generator,
 ) -> dict[str, np.ndarray]:
-    normalized_groups = group_values.map(_stable_value)
+    normalized_groups = group_values
     group_positions = {
         group: np.flatnonzero(normalized_groups.to_numpy() == group)
         for group in normalized_groups.unique().tolist()
@@ -972,7 +999,7 @@ def allocate_roles(
         }
     )
     if groups is not None:
-        assignment["population_group_hash"] = groups.map(_value_hash).to_numpy()
+        assignment["population_group_hash"] = groups.to_numpy(copy=True)
     assignment_payload = assignment.to_json(orient="records", date_format="iso")
     assignment_fingerprint = hashlib.sha256(assignment_payload.encode()).hexdigest()
     assignment_policy = {

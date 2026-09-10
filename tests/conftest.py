@@ -23,6 +23,12 @@ from synthdata.data_roles import allocate_roles, resolve_population_identity
 from synthdata.utils import ensure_dir
 
 
+@pytest.fixture(autouse=True)
+def patient_id_hmac_secret(monkeypatch):
+    """Provide only test-local key material for canonical identity resolution."""
+    monkeypatch.setenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", "unit-test-only-patient-id-secret")
+
+
 @pytest.fixture
 def sample_mixed_df() -> pd.DataFrame:
     """A small (30-row) DataFrame mixing numeric, string-categorical, a {1,2}
@@ -121,21 +127,7 @@ def make_canonical_dataset(tmp_path):
 
     def _make(identity_mode: str = "column") -> Dataset:
         if identity_mode == "one_row_per_patient":
-            frame = pd.DataFrame(
-                {
-                    "feature": np.arange(12, dtype=float),
-                    "protected": ["A"] * 6 + ["B"] * 6,
-                    "target": [0, 1] * 6,
-                }
-            )
-            split = DataSplitConfig(
-                mode="patient_group",
-                train_fraction=0.5,
-                tuning_fraction=0.25,
-                final_holdout_fraction=0.25,
-                candidate_count=64,
-                one_row_per_patient=True,
-            )
+            raise ValueError("fixture no longer supports row-index identity")
         else:
             patient_ids = np.repeat(np.arange(1, 13), 2)
             frame = pd.DataFrame(
@@ -209,6 +201,7 @@ def make_canonical_dataset(tmp_path):
                 "target": {"kind": "categorical", "ordinal_order": None},
             },
             assignment_fingerprint=assignment.assignment_fingerprint,
+            identity_sidecar=identity.identity_sidecar,
         )
         dataset.set_imputed_roles(
             {role: role_frame.copy() for role, role_frame in assignment.frames.items()}
