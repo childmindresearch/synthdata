@@ -1,4 +1,4 @@
-"""Absolute (not merely relative-to-other-models) privacy safety floor.
+"""Absolute privacy audit evidence.
 
 The combined evaluation table's ranked/scaled columns (see
 :mod:`synthdata.evaluation.combine`) only tell you which model looks *better
@@ -426,7 +426,11 @@ def evaluate_privacy_gate(
     contexts: Mapping[tuple[str, str], MetricEvaluationContext] | None = None,
     execution_passes: Mapping[tuple[str, ...], str] | None = None,
 ) -> pd.DataFrame | None:
-    """Check configured raw thresholds against contract-validated evidence."""
+    """Check configured raw thresholds as audit-only evidence.
+
+    Results never block release or alter candidate selection; Stage-A
+    exact-copy screening remains the sole automated privacy block.
+    """
     if not privacy_gate_cfg.enabled:
         logger.info("[privacy_gate] disabled via evaluation.privacy_gate.enabled; skipping")
         return None
@@ -649,6 +653,12 @@ def evaluate_privacy_gate(
             for model in result.index
         },
     }
+    result.attrs["provenance"] = {
+        "status": "audit_only",
+        "automated_gate": False,
+        "selection_effect": "none",
+        "stage_a_exact_copy_screen": "sole_automated_privacy_block",
+    }
     for model in result.index[~result[_PASS_COL]]:
         logger.warning(
             "[privacy_gate] model %r FAILED the privacy gate: %s",
@@ -672,10 +682,10 @@ def merge_privacy_gate_results(
     combined[("__all__", "privacy_gate", _PASS_COL)] = gate_result[_PASS_COL]
     combined[("__all__", "privacy_gate", _STATUS_COL)] = gate_result[_STATUS_COL]
     combined[("__all__", "privacy_gate", _VIOLATIONS_COL)] = gate_result[_VIOLATIONS_COL]
-    invalid_models = ~gate_result[_PASS_COL].astype(bool)
-    rank_columns = [
-        column for column in combined.columns if len(column) == 3 and column[2] == "rank"
-    ]
-    for column in rank_columns:
-        combined.loc[invalid_models, column] = pd.NA
+    combined.attrs["privacy_gate_provenance"] = {
+        "status": "audit_only",
+        "automated_gate": False,
+        "selection_effect": "none",
+        "stage_a_exact_copy_screen": "sole_automated_privacy_block",
+    }
     return combined

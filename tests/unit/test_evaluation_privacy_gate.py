@@ -636,7 +636,7 @@ class TestMergePrivacyGateResults:
         assert ("__all__", "privacy_gate", "violations") in merged.columns
         assert merged.loc["model_a", ("__all__", "privacy_gate", "pass")] == True  # noqa: E712
 
-    def test_gate_failure_invalidates_precomputed_policy_ranks(self):
+    def test_gate_failure_retains_precomputed_policy_ranks_as_audit_only(self):
         case = _case(
             {
                 "mia_recall": {
@@ -652,5 +652,26 @@ class TestMergePrivacyGateResults:
         gate_result = _evaluate(case)
         merged = merge_privacy_gate_results(combined, gate_result)
 
-        assert pd.isna(merged.loc["model_a", ("__all__", "overall", "rank")])
+        assert merged.loc["model_a", ("__all__", "overall", "rank")] == pytest.approx(0.8)
         assert merged.loc["model_b", ("__all__", "overall", "rank")] == pytest.approx(0.2)
+        assert merged.attrs["privacy_gate_provenance"] == {
+            "status": "audit_only",
+            "automated_gate": False,
+            "selection_effect": "none",
+            "stage_a_exact_copy_screen": "sole_automated_privacy_block",
+        }
+
+    def test_result_declares_audit_only_provenance(self):
+        result = _evaluate(
+            _case(
+                {
+                    "mia_recall": {
+                        "values": {"model_a": 0.5},
+                        "threshold": {"bound": "max", "value": 0.6},
+                    }
+                }
+            )
+        )
+
+        assert result.attrs["provenance"]["automated_gate"] is False
+        assert result.attrs["provenance"]["selection_effect"] == "none"

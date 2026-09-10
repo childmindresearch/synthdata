@@ -1,5 +1,7 @@
-"""Combines synthcity + SynthEval + custom (log disparity / fork-only fairness)
-results into a single ranked table with 3-level MultiIndex columns:
+"""Combines evaluation evidence into one 3-level MultiIndex audit table.
+
+The compatibility ``rank`` columns are absolute fixed-transform evidence;
+candidate-relative min-max values are not used for policy selection.
 ``(framework, type, metric)`` where ``framework in {synthcity, syntheval, custom}``
 and metric types include ``utility``, ``privacy``, ``fairness``, and explicit
 ``audit`` evidence columns for model-level failures.
@@ -28,6 +30,7 @@ from synthdata.evaluation.metric_contracts import (
     MetricValidationResult,
     UnknownMetricContractError,
 )
+from synthdata.evaluation.release_score import normalize_component
 from synthdata.evaluation.syntheval_eval import extract_oriented_values, extract_raw_values
 from synthdata.utils import get_logger
 
@@ -587,7 +590,7 @@ def _task12_frames(
 
 
 def _minmax_scale(col: pd.Series) -> pd.Series:
-    """Per-column min-max scaling; NaN-safe (ties -> 0.5, NaNs preserved)."""
+    """Scale values for audit/compatibility diagnostic ranks, never policy selection."""
     valid = col.dropna()
     if valid.empty:
         return col
@@ -621,27 +624,13 @@ def build_combined_table(
     custom_validations: Mapping[str, MetricValidationResult] | None = None,
     task12_validations: Mapping[str, MetricValidationResult] | None = None,
 ) -> pd.DataFrame:
-    """Build the single combined, ranked, multi-index evaluation table.
+    """Build combined audit evidence and fixed-transform tuning utility.
 
-    Ranking scheme -- a hierarchical *mean-of-means*, not a flat sum, so a
-    framework/type with many metric columns (e.g. synthcity's ~7-column
-    "performance" category) can't silently outweigh one with few (e.g.
-    syntheval's single-column ``cls_acc``) purely by virtue of column count:
-
-      1. Every metric is oriented so "higher = better", then min-max scaled
-         across models (independently per metric).
-      2. A sub-rank is computed per ``(framework, type)`` group as the MEAN
-         of that group's scaled metrics -- column ``(framework, type, "rank")``.
-      3. A rolled-up rank per ``type`` (utility/privacy/fairness) is the MEAN
-         of the *group ranks* from step 2 across frameworks (not a flat mean/
-         sum of every individual metric of that type) -- column
-         ``("__all__", type, "rank")``.
-      4. One overall rank is the WEIGHTED SUM of the 3 type-level rollups from
-         step 3, using ``rank_weights`` (default: equal weight 1.0 each, see
-         ``DEFAULT_RANK_WEIGHTS``) -- column ``("__all__", "overall", "rank")``.
-    Models are sorted descending by the overall rank.
+    ``(__all__, overall, rank)`` remains for backward-compatible consumers,
+    but equals complete canonical ``U_tuning`` only. Incomplete evidence stays
+    indeterminate; no candidate-relative ranking or reweighting occurs.
+    ``rank_weights`` is accepted for API compatibility and ignored.
     """
-    rank_weights = rank_weights or DEFAULT_RANK_WEIGHTS
 
     sc_raw, sc_oriented = _synthcity_frames(
         synthcity_results,
@@ -680,44 +669,94 @@ def build_combined_table(
         )
     )
 
-    scaled_df = oriented_df.apply(_minmax_scale, axis=0)
-
     combined = raw_df.copy()
+
+    # Per-framework diagnostics retain legacy rank columns for report/table
+    # compatibility. They are not consumed by policy selection.
+    scaled_df = oriented_df.apply(_minmax_scale, axis=0)
 
     # Step 2: per (framework, type) sub-rank -- MEAN of that group's scaled metrics.
     groups = sorted(
         set(
             zip(
-                scaled_df.columns.get_level_values(0),
-                scaled_df.columns.get_level_values(1),
+                oriented_df.columns.get_level_values(0),
+                oriented_df.columns.get_level_values(1),
                 strict=True,
             )
         )
     )
     for framework, type_ in groups:
-        cols = [c for c in scaled_df.columns if c[0] == framework and c[1] == type_]
-        combined[(framework, type_, _RANK)] = scaled_df[cols].mean(axis=1, skipna=True)
+        cols = [c for c in oriented_df.columns if c[0] == framework and c[1] == type_]
+        combined[(framework, type_, _RANK)] = oriented_df[cols].mean(axis=1, skipna=True)
+        scaled_cols = [c for c in scaled_df.columns if c[0] == framework and c[1] == type_]
+        combined[(framework, type_, _RANK)] = scaled_df[scaled_cols].mean(axis=1, skipna=True)
 
-    # Step 3: rolled-up rank per type -- MEAN of the group ranks just computed
-    # for that type (across frameworks), NOT a flat mean/sum of every
-    # individual metric of that type.
     for type_ in _TYPES:
-        group_rank_cols = [(fw, t, _RANK) for fw, t in groups if t == type_]
-        if group_rank_cols:
-            combined[(_ALL, type_, _RANK)] = combined[group_rank_cols].mean(axis=1, skipna=True)
+        group_cols = [
+            (framework, type_, _RANK) for framework, current_type in groups if current_type == type_
+        ]
+        if group_cols:
+            combined[(_ALL, type_, _RANK)] = combined[group_cols].mean(axis=1, skipna=True)
 
-    # Step 4: overall rank -- WEIGHTED SUM of the type-level rollups.
-    overall_terms = []
-    for type_ in _TYPES:
-        key = (_ALL, type_, _RANK)
-        if key in combined.columns:
-            weight = rank_weights.get(type_, 1.0)
-            overall_terms.append(combined[key] * weight)
-    if overall_terms:
-        overall = pd.concat(overall_terms, axis=1).sum(axis=1, min_count=1)
-    else:
-        overall = pd.Series(float("nan"), index=combined.index)
-    combined[(_ALL, "overall", _RANK)] = overall
+    # Fixed canonical utility transform. These metric identities are emitted
+    # by Task 12/HPO; missing any one component makes U_tuning indeterminate.
+    utility_keys = {
+        "tstr": "tstr_macro_f1.v1",
+        "mmd": "mixed_mmd.v1",
+        "jsd": "elastic_net_jsd.v1",
+    }
+    utility = pd.DataFrame(index=model_names, dtype=float)
+    validations = task12_validations or {}
+    for component, metric in utility_keys.items():
+        values = pd.Series(float("nan"), index=model_names, dtype=float)
+        for column in combined.columns:
+            if column[2] == metric:
+                values = pd.to_numeric(combined[column], errors="coerce")
+                break
+        # Validation policy_value is already the producer's fixed transform;
+        # consume it directly to avoid double normalization.
+        for model in model_names:
+            validation = validations.get(model)
+            if validation is None:
+                continue
+            for record in validation.records:
+                if str(record.expected_key) == metric and record.status == "succeeded":
+                    policy_value = record.policy_value
+                    values.loc[model] = (
+                        float(policy_value)
+                        if isinstance(policy_value, (int, float))
+                        and not isinstance(policy_value, bool)
+                        and math.isfinite(float(policy_value))
+                        else float("nan")
+                    )
+                    break
+        # Canonical HPO values are fixed policy scores: TSTR is a score, while
+        # MMD/JSD are distances with configured fixed anchors/transforms.
+        for model in model_names:
+            if pd.isna(values.loc[model]):
+                continue
+            validation = validations.get(model)
+            has_policy_value = validation is not None and any(
+                str(record.expected_key) == metric
+                and record.status == "succeeded"
+                and record.policy_value is not None
+                for record in validation.records
+            )
+            if not has_policy_value:
+                raw_value = values.loc[model]
+                values.loc[model] = normalize_component(
+                    raw_value,
+                    kind="risk"
+                    if component == "mmd"
+                    else "jsd"
+                    if component == "jsd"
+                    else "direct",
+                    anchor=1.0 if component == "mmd" else None,
+                )
+        utility[component] = values
+    u_tuning = utility.mean(axis=1).where(utility.notna().all(axis=1))
+    combined[(_ALL, "utility", "U_tuning")] = u_tuning
+    combined[(_ALL, "overall", _RANK)] = u_tuning
 
     combined.columns = pd.MultiIndex.from_tuples(
         combined.columns, names=["framework", "type", "metric"]

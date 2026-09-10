@@ -4,6 +4,7 @@ highlights -- so a non-engineer reviewer can understand the evaluation
 outcome without reading ``combined_evaluation.csv`` directly.
 """
 
+import math
 import os
 from pathlib import Path
 
@@ -23,6 +24,7 @@ logger = get_logger(__name__)
 
 _GATE_PASS_COL = ("__all__", "privacy_gate", "pass")
 _GATE_VIOLATIONS_COL = ("__all__", "privacy_gate", "violations")
+_TUNING_UTILITY_COL = ("__all__", "utility", "U_tuning")
 
 
 def _dataframe_to_markdown(df: pd.DataFrame) -> str:
@@ -87,6 +89,7 @@ def _privacy_gate_section(combined: pd.DataFrame) -> str:
     lines.append(
         f"- **FAILING ({len(failing)})**: " + (", ".join(f"`{m}`" for m in failing) or "none")
     )
+    lines.append("- Gate result is an audit warning; it does not filter candidate selection.")
     if failing:
         lines.append("")
         lines.append("### Violations")
@@ -97,35 +100,65 @@ def _privacy_gate_section(combined: pd.DataFrame) -> str:
 
 
 def _recommended_model_section(combined: pd.DataFrame) -> str:
-    if ("__all__", "overall", "rank") not in combined.columns:
-        return "## Recommended model\n\nNo overall rank column was produced."
+    if _TUNING_UTILITY_COL not in combined.columns:
+        return (
+            "## Recommended model\n\n"
+            "No overall rank column was produced; no complete fixed-transform `U_tuning` "
+            "column was produced."
+        )
 
-    if _GATE_PASS_COL in combined.columns:
-        eligible = combined[combined[_GATE_PASS_COL]]
-        if eligible.empty:
-            return (
-                "## Recommended model\n\n"
-                "**No model passed the privacy gate this run** -- refusing to recommend a "
-                "gate-failing model regardless of its overall rank. See the Privacy gate "
-                "section above for violation details, and either loosen/verify the configured "
-                "thresholds (`evaluation.privacy_gate.thresholds`) or improve the "
-                "generator(s) before re-evaluating."
-            )
-    else:
-        eligible = combined
+    values = pd.to_numeric(combined[_TUNING_UTILITY_COL], errors="coerce")
+    eligible = combined.loc[values.notna() & values.map(math.isfinite)]
+    if eligible.empty:
+        return "## Recommended model\n\nNo model has complete finite `U_tuning` evidence."
 
-    best = eligible.sort_values(("__all__", "overall", "rank"), ascending=False).index[0]
-    overall_rank = eligible.loc[best, ("__all__", "overall", "rank")]
+    best = eligible[_TUNING_UTILITY_COL].idxmax()
+    tuning_utility = eligible.loc[best, _TUNING_UTILITY_COL]
     lines = [
         "## Recommended model",
         "",
-        f"**`{best}`** (overall rank score: {overall_rank:.3f})",
+        f"**`{best}`** (`U_tuning`: {tuning_utility:.3f})",
+        "",
+        "Selected using highest complete fixed-transform tuning utility only; all candidate "
+        "audit rows are retained.",
     ]
     if _GATE_PASS_COL in combined.columns:
         lines.append("")
+        gate_pass = bool(combined.loc[best, _GATE_PASS_COL])
         lines.append(
-            "Selected as the top overall-ranked model among those that passed the privacy gate."
+            "**Privacy-gate warning:** selected model "
+            + ("passed." if gate_pass else "failed; selection was not blocked.")
         )
+    return "\n".join(lines)
+
+
+def _release_score_section(extras: dict) -> str:
+    """Render final-holdout release score as audit evidence, never selection input."""
+    evidence = extras.get("final_holdout_evidence") or {}
+    score = evidence.get("release_score") or extras.get("release_score")
+    lines = ["## Final-holdout release score audit", ""]
+    if not isinstance(score, dict):
+        lines.append("No final-holdout release score was recorded.")
+        return "\n".join(lines)
+
+    lines.append(
+        "**Audit-only:** this score is computed after candidate selection and is not used to rerank models."
+    )
+    lines.append("")
+    lines.append(f"- Status: `{score.get('status', 'unknown')}`")
+    lines.append(f"- R_final: `{_fmt_metric(score.get('score'))}`")
+    dimensions = score.get("dimensions") or {}
+    for name in ("utility", "privacy", "fairness"):
+        dimension = dimensions.get(name) or {}
+        lines.append(f"- {name.capitalize()}: `{_fmt_metric(dimension.get('score'))}`")
+    if "identity" in (dimensions.get("privacy") or {}):
+        lines.append(f"- Identity safety: `{_fmt_metric(dimensions['privacy'].get('identity'))}`")
+    indeterminate = score.get("indeterminate_dimensions") or []
+    if indeterminate:
+        lines.append(
+            "- Indeterminate dimensions: " + ", ".join(f"`{item}`" for item in indeterminate)
+        )
+    lines.append(f"- Audit-only label: `{bool(score.get('audit_only', True))}`")
     return "\n".join(lines)
 
 
@@ -327,6 +360,8 @@ def build_evaluation_report(
         _privacy_gate_section(combined),
         "",
         _recommended_model_section(combined),
+        "",
+        _release_score_section(extras),
         "",
         _fairness_highlights_section(combined, extras),
         "",

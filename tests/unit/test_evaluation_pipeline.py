@@ -11,6 +11,7 @@ import pytest
 from synthdata.data import dataframe_fingerprint
 from synthdata.evaluation import (
     _generation_metadata,
+    _release_score_inputs,
     _select_policy_model,
     _synthcity_semantic_context,
     artifacts,
@@ -23,6 +24,7 @@ from synthdata.evaluation import (
 )
 from synthdata.evaluation import tstr as tstr_module
 from synthdata.evaluation.release import transform_release_roles
+from synthdata.evaluation.release_score import compute_release_score
 from synthdata.generation import pipeline as generation_pipeline
 
 pytestmark = pytest.mark.unit
@@ -295,15 +297,155 @@ def test_generation_metadata_preserves_current_cache_envelope(make_config):
     assert result["data_sha256"]
 
 
-def test_selection_rejects_non_finite_overall_rank_when_gate_is_disabled():
+def test_selection_uses_complete_tuning_utility_and_ignores_gate_and_legacy_rank():
     combined = pd.DataFrame(index=["model_a"])
-    combined[("__all__", "overall", "rank")] = [float("nan")]
+    combined[("__all__", "overall", "rank")] = [1.0]
+    combined[("__all__", "privacy_gate", "pass")] = [False]
+    combined[("__all__", "utility", "U_tuning")] = [0.75]
+    combined.columns = pd.MultiIndex.from_tuples(combined.columns)
+
+    selected, error = _select_policy_model(combined)
+
+    assert selected == "model_a"
+    assert error is None
+
+
+def test_selection_requires_complete_finite_tuning_utility():
+    combined = pd.DataFrame(
+        {
+            ("__all__", "overall", "rank"): [1.0],
+            ("__all__", "utility", "U_tuning"): [float("nan")],
+        },
+        index=["model_a"],
+    )
     combined.columns = pd.MultiIndex.from_tuples(combined.columns)
 
     selected, error = _select_policy_model(combined)
 
     assert selected is None
-    assert error == "no candidate has a decision-eligible overall rank"
+    assert error == "no candidate has complete finite U_tuning"
+
+
+def test_multi_model_selection_does_not_rerank_on_final_holdout_evidence():
+    combined = pd.DataFrame(
+        {
+            ("__all__", "utility", "U_tuning"): [0.90, 0.80],
+            ("__all__", "overall", "rank"): [0.90, 0.80],
+        },
+        index=["model_a", "model_b"],
+    )
+    combined.columns = pd.MultiIndex.from_tuples(combined.columns)
+
+    selected, error = _select_policy_model(combined)
+
+    assert error is None
+    assert selected == "model_a"
+    final_holdout_scores = {"model_a": 0.20, "model_b": 0.95}
+    assert final_holdout_scores["model_b"] > final_holdout_scores["model_a"]
+    assert selected == "model_a"
+
+
+def test_release_score_adapter_maps_successful_task12_aggregate_records():
+    role_hashes = {"train": "train", "tuning": "tuning", "final_holdout": "holdout"}
+    common = {
+        "producer": "task12-test",
+        "protocol_version": task12_eval.TASK12_PROTOCOL_VERSION,
+        "seed": 7,
+        "release_transform_digest": "release-transform",
+        "common_protocol_digest": "common-protocol",
+        "role_hashes": role_hashes,
+        "fit_roles": ["train", "tuning"],
+    }
+    records = [
+        task12_eval._task12_record(
+            "model_a",
+            "release_privacy.v1",
+            0.6,
+            role_hashes=role_hashes,
+            evaluation_role="final_holdout",
+            metadata={
+                **common,
+                "k": {"safety_score": 0.91},
+                "l": {"safety_score": 0.82},
+                "dcr": 0.73,
+                "epsilon": 0.64,
+                "mia": 0.55,
+                "attribute": 0.46,
+            },
+        ),
+        task12_eval._task12_record(
+            "model_a",
+            "representation_evidence.v1",
+            0.87,
+            role_hashes=role_hashes,
+            evaluation_role="final_holdout",
+            metadata={**common, "summary_stats": {"worst_abs_log_disparity": 0.12}},
+        ),
+        task12_eval._task12_record(
+            "model_a",
+            "equalized_odds.final.v1",
+            0.78,
+            role_hashes=role_hashes,
+            evaluation_role="final_holdout",
+            metadata=common,
+        ),
+    ]
+    blocked_validations = task12_eval.validate_task12_custom_results(
+        {"model_a": records},
+        role_hashes=role_hashes,
+        evaluation_role="final_holdout",
+    )
+    validation = blocked_validations["model_a"]
+    successful_records = tuple(
+        replace(
+            record,
+            status="succeeded",
+            contract_id=f"custom.{record.expected_key}",
+            raw_value=next(
+                item.raw_value for item in records if item.emitted_key == record.expected_key
+            ),
+            policy_value=next(
+                item.raw_value for item in records if item.emitted_key == record.expected_key
+            ),
+        )
+        for record in validation.records
+    )
+    validations = replace(validation, records=successful_records)
+
+    _utility, privacy, fairness = _release_score_inputs(
+        {("custom", "task12"): {"model_a": validations}}
+    )
+
+    assert {name: item["value"] for name, item in privacy.items()} == {
+        "S_k": 0.91,
+        "S_l": 0.82,
+        "S_DCR": 0.73,
+        "S_epsilon": 0.64,
+        "S_MIA": 0.55,
+        "S_attribute": 0.46,
+    }
+    assert {name: item["value"] for name, item in fairness.items()} == {
+        "S_representation": 0.87,
+        "S_worst_log_disparity": 0.12,
+        "S_EO": 0.78,
+    }
+    assert privacy["S_k"]["evidence"]["metadata"]["common_protocol_digest"] == "common-protocol"
+    assert privacy["S_k"]["evidence"]["record"]["model_name"] == "model_a"
+
+    release_score = compute_release_score(
+        utility={"S_TSTR": 0.8, "S_MMD": 0.7, "S_JSD": 0.6},
+        privacy=privacy,
+        fairness=fairness,
+    )
+
+    assert release_score["status"] == "succeeded"
+    assert release_score["dimensions"]["privacy"]["score"] == pytest.approx(
+        (0.64 * 0.55 * 0.46) ** (1 / 3)
+    )
+    assert release_score["dimensions"]["fairness"]["score"] == pytest.approx(
+        0.4 * 0.87 + 0.4 * 0.78 + 0.2 * 0.12
+    )
+    assert release_score["score"] is not None
 
 
 def test_run_evaluation_rejects_conflicting_synthcity_qi_override(
@@ -469,6 +611,93 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     assert final_configuration["fit_frame_fingerprint"] != "refit-imputed"
     assert final_configuration["refit_fit_frame_fingerprint"] == "refit-imputed"
     assert list(combined.index) == ["model_a"]
+
+
+def test_run_evaluation_keeps_multi_model_selection_outside_final_holdout(
+    make_config, make_canonical_dataset, monkeypatch
+):
+    cfg = make_config()
+    cfg.evaluation.synthcity.metrics = ["identifiability_score"]
+    cfg.evaluation.syntheval.enabled = False
+    cfg.evaluation.custom.enabled = False
+    cfg.evaluation.binary_target.enabled = False
+    cfg.evaluation.save_per_model_syntheval_plots = False
+    cfg.evaluation.generate_report = False
+    cfg.evaluation.privacy_gate.enabled = False
+
+    dataset = make_canonical_dataset()
+    synthetic = dataset.role_frame("train", imputed=True).copy()
+    selected_models = []
+    final_task12_models = []
+    final_custom_models = []
+    synthcity_report = pd.DataFrame(
+        {"mean": [0.25] * 4, "direction": ["minimize"] * 4},
+        index=[
+            "privacy.identifiability_score.score",
+            "privacy.identifiability_score.score_OC",
+            "privacy.identifiability_score.score_entropy_weighted",
+            "privacy.identifiability_score.score_OC_entropy_weighted",
+        ],
+    )
+
+    def fake_run_synthcity(selected, *args, **kwargs):
+        selected_models.append((kwargs.get("evaluation_role", "tuning"), set(selected)))
+        # Deliberately make final evidence look better for model_b if it were run.
+        report = synthcity_report.copy()
+        if kwargs.get("evaluation_role") == "final_holdout":
+            report.loc[:, "mean"] = 0.99
+        return {model: report for model in selected}
+
+    def fake_run_task12(selected, *args, **kwargs):
+        if kwargs.get("evaluation_role") == "final_holdout":
+            final_task12_models.append(set(selected))
+        return {}
+
+    def fake_run_log_disparity(selected, *args, **kwargs):
+        if kwargs.get("evaluation_role") == "final_holdout":
+            final_custom_models.append(set(selected))
+        return {}
+
+    combined = pd.DataFrame(
+        {
+            ("__all__", "utility", "U_tuning"): [0.90, 0.80],
+            ("__all__", "overall", "rank"): [0.90, 0.80],
+        },
+        index=["model_a", "model_b"],
+    )
+    combined.columns = pd.MultiIndex.from_tuples(combined.columns)
+
+    monkeypatch.setattr(synthcity_eval, "run_synthcity_evaluation", fake_run_synthcity)
+    monkeypatch.setattr(task12_eval, "run_task12_custom_evaluation", fake_run_task12)
+    monkeypatch.setattr(custom_eval, "run_log_disparity_evaluation", fake_run_log_disparity)
+    monkeypatch.setattr(
+        "synthdata.evaluation.combine.build_combined_table", lambda *args, **kwargs: combined
+    )
+    monkeypatch.setattr(
+        generation_pipeline,
+        "refit_selected_model",
+        lambda *args, **kwargs: _fake_refit_metadata(synthetic, kwargs["output_dir"]),
+    )
+
+    result, extras = run_evaluation(
+        cfg,
+        dataset,
+        {"model_a": synthetic.copy(), "model_b": synthetic.copy()},
+    )
+
+    assert selected_models == [("tuning", {"model_a", "model_b"}), ("final_holdout", {"model_a"})]
+    assert final_task12_models == [{"model_a"}]
+    assert final_custom_models == [{"model_a"}]
+    assert set(result.index) == {"model_a", "model_b"}
+    assert extras["final_holdout_evidence"]["selected_model"] == "model_a"
+
+    evidence = artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)
+    release_score = artifacts.load_release_score_evidence(cfg.evaluation.output_dir)
+    assert evidence["selected_model"] == "model_a"
+    assert "model_b" not in evidence["frameworks"]["synthcity"]["validation"]
+    assert release_score["candidate_audit_models"] == ["model_a", "model_b"]
+    assert set(release_score["models"]) == {"model_a"}
+    assert release_score["selected_model"] == "model_a"
 
 
 def test_run_evaluation_succeeds_with_authoritative_final_task10_evidence(
@@ -663,6 +892,10 @@ def test_run_evaluation_succeeds_with_authoritative_final_task10_evidence(
     evidence = artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)
     assert evidence["state"] == "succeeded"
     assert extras["final_holdout_evidence"]["state"] == "succeeded"
+    assert evidence["release_score"]["audit_only"] is True
+    assert "dimensions" in evidence["release_score"]
+    release_score_evidence = artifacts.load_release_score_evidence(cfg.evaluation.output_dir)
+    assert release_score_evidence["models"]["model_a"] == evidence["release_score"]
     assert list(combined.index) == ["model_a"]
     assert tstr_calls == ["final_holdout"]
     task12_records = evidence["frameworks"]["custom"]["task12_validation"]["model_a"]["records"]

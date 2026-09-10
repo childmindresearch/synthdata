@@ -16,6 +16,7 @@ from synthdata.evaluation.artifacts import (
     load_final_holdout_evidence,
     load_log_disparity_reports,
     load_metric_contract_manifest,
+    load_release_score_evidence,
     load_synthcity_metric_status,
     load_syntheval_execution,
     load_syntheval_metric_status,
@@ -634,6 +635,46 @@ def test_log_disparity_artifacts_round_trip_and_render(tmp_path):
     assert loaded["model_a"]["summary_stats"]["model"] == "model_a"
     assert artifact_bundle_dir(evaluation_dir).joinpath("manifest.json").exists()
     assert build_log_disparity_report_figure(loaded["model_a"]).data
+
+
+def test_release_score_evidence_round_trip_and_manifest_integrity(tmp_path):
+    evaluation_dir = tmp_path / "evaluation"
+    evaluation_dir.mkdir()
+    combined = pd.concat([_combined(), _combined().rename(index={"model_a": "model_b"})])
+    combined.to_csv(evaluation_dir / "combined_evaluation.csv")
+    score = {
+        "model_a": {
+            "status": "succeeded",
+            "score": 0.8125,
+            "dimensions": {
+                "utility": {"score": 0.8},
+                "privacy": {"score": 0.9},
+                "fairness": {"score": 0.7},
+            },
+            "audit_only": True,
+        }
+    }
+    persist_evaluation_artifacts(
+        evaluation_dir,
+        combined,
+        {},
+        native_syntheval_plot_dir=None,
+        final_holdout_evidence={"evaluation_role": "final_holdout", "selected_model": "model_a"},
+        release_score=score,
+    )
+    loaded = load_release_score_evidence(evaluation_dir)
+    assert loaded["models"]["model_a"] == score["model_a"]
+    assert loaded["selected_model"] == "model_a"
+    assert loaded["candidate_audit_models"] == ["model_a", "model_b"]
+    manifest_path = artifact_bundle_dir(evaluation_dir) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    sidecar = artifact_bundle_dir(evaluation_dir) / "release_score_evidence.json"
+    sidecar.write_text(sidecar.read_text().replace("0.8125", "0.8126"))
+    with pytest.raises(ValueError, match="integrity"):
+        load_release_score_evidence(evaluation_dir)
+    assert manifest["release_score_evidence"]["audit_only"] is True
+    assert manifest["release_score_evidence"]["inventory_scope"] == "selected_model"
+    assert manifest["release_score_evidence"]["selected_model"] == "model_a"
 
 
 def test_missing_native_plot_is_reported(tmp_path):

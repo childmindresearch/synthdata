@@ -2080,6 +2080,83 @@ def collect_source_provenance(
     }
 
 
+def _release_score_payload(
+    evidence: Mapping[str, Any],
+    model_index: Any,
+    selected_model: str,
+) -> dict[str, Any]:
+    """Normalize release-score evidence into an audit-only sidecar payload."""
+    models = evidence.get("models") if isinstance(evidence.get("models"), Mapping) else evidence
+    if not isinstance(models, Mapping):
+        raise ValueError("Release-score evidence must be an object keyed by model")
+    normalized = {str(name): value for name, value in models.items()}
+    expected = {selected_model}
+    if set(normalized) != expected:
+        raise ValueError(
+            "Release-score evidence model inventory must contain selected model only: "
+            f"recorded={sorted(normalized)!r}, expected={sorted(expected)!r}"
+        )
+    return {
+        "schema_version": "release-score-evidence-v1",
+        "audit_only": True,
+        "inventory_scope": "selected_model",
+        "selected_model": selected_model,
+        "candidate_audit_models": [str(name) for name in model_index],
+        "models": normalized,
+    }
+
+
+def _validate_release_score_manifest_entry(entry: Mapping[str, Any]) -> None:
+    """Validate manifest metadata for release-score evidence."""
+    if not isinstance(entry, Mapping):
+        raise ValueError("Release-score evidence manifest entry must be an object")
+    if entry.get("audit_only") is not True:
+        raise ValueError("Release-score evidence must be marked audit_only")
+    if entry.get("inventory_scope") != "selected_model":
+        raise ValueError("Release-score evidence inventory scope must be selected_model")
+    _non_empty_string(entry.get("selected_model"), "Release-score evidence selected model")
+    _non_empty_string(entry.get("path"), "Release-score evidence")
+    digest = _non_empty_string(entry.get("sha256"), "Release-score evidence sha256")
+    if not _SHA256_PATTERN.fullmatch(digest):
+        raise ValueError("Release-score evidence sha256 must be a lowercase SHA-256 digest")
+    _string_list(entry.get("models"), "Release-score evidence models", unique=True)
+    _string_list(
+        entry.get("candidate_audit_models"),
+        "Release-score evidence candidate audit models",
+        unique=True,
+    )
+
+
+def _validate_release_score_payload(payload: Mapping[str, Any], *, path: Path) -> None:
+    if payload.get("schema_version") != "release-score-evidence-v1":
+        raise ValueError(f"Unsupported release-score evidence schema at {path}")
+    if payload.get("audit_only") is not True:
+        raise ValueError(f"Release-score evidence must be audit-only at {path}")
+    if payload.get("inventory_scope") != "selected_model":
+        raise ValueError(f"Release-score evidence inventory scope is invalid at {path}")
+    selected_model = _non_empty_string(
+        payload.get("selected_model"), "Release-score evidence selected model"
+    )
+    candidate_audit_models = payload.get("candidate_audit_models")
+    _string_list(
+        candidate_audit_models, "Release-score evidence candidate audit models", unique=True
+    )
+    if selected_model not in candidate_audit_models:
+        raise ValueError(
+            f"Release-score selected model {selected_model!r} is absent from candidate audit models"
+        )
+    models = payload.get("models")
+    if not isinstance(models, Mapping):
+        raise ValueError(f"Release-score evidence models must be an object at {path}")
+    for model_name, score in models.items():
+        if not isinstance(model_name, str) or not model_name:
+            raise ValueError(f"Release-score evidence contains invalid model name at {path}")
+        if not isinstance(score, Mapping):
+            raise ValueError(f"Release-score evidence for {model_name!r} must be an object")
+        if score.get("audit_only") is not True:
+            raise ValueError(f"Release-score evidence for {model_name!r} is not audit-only")
+
+
 def persist_evaluation_artifacts(
     evaluation_dir: str | Path,
     combined: pd.DataFrame,
@@ -2098,6 +2175,8 @@ def persist_evaluation_artifacts(
     semantic_context_fingerprint: str | None = None,
     generator_metadata: Mapping[str, Any] | None = None,
     final_holdout_evidence: Mapping[str, Any] | None = None,
+    release_score_evidence: Mapping[str, Any] | None = None,
+    release_score: Mapping[str, Any] | None = None,
 ) -> Path:
     """Persist plot-ready evaluation outputs and return the bundle manifest path.
 
@@ -2307,6 +2386,35 @@ def persist_evaluation_artifacts(
             "selected_model": evidence_payload.get("selected_model"),
         }
 
+    # Release scores are durable audit evidence only.  Keep this separate from
+    # combined evaluation so loading it can never affect candidate selection.
+    score_input = release_score_evidence
+    if score_input is not None and release_score is not None:
+        raise ValueError("Provide only one of release_score_evidence and release_score")
+    if score_input is None:
+        score_input = release_score
+    release_score_artifact = None
+    if score_input is not None:
+        if final_holdout_evidence is None:
+            raise ValueError(
+                "Release-score evidence requires final-holdout selected-model metadata"
+            )
+        selected_model = _non_empty_string(
+            final_holdout_evidence.get("selected_model"), "Final-holdout selected model"
+        )
+        score_payload = _release_score_payload(score_input, combined.index, selected_model)
+        score_path = bundle_dir / "release_score_evidence.json"
+        _atomic_json(score_path, score_payload)
+        release_score_artifact = {
+            "path": str(score_path.relative_to(evaluation_dir)),
+            "sha256": _file_digest(score_path),
+            "models": sorted(score_payload["models"]),
+            "candidate_audit_models": score_payload["candidate_audit_models"],
+            "selected_model": score_payload["selected_model"],
+            "inventory_scope": score_payload["inventory_scope"],
+            "audit_only": True,
+        }
+
     manifest = {
         "schema_version": _ARTIFACT_SCHEMA_VERSION,
         "created_at": datetime.now(UTC).isoformat(),
@@ -2360,6 +2468,8 @@ def persist_evaluation_artifacts(
             manifest["syntheval_execution"] = status_artifacts["syntheval_execution"]
     if final_holdout_artifact is not None:
         manifest["final_holdout_evidence"] = final_holdout_artifact
+    if release_score_artifact is not None:
+        manifest["release_score_evidence"] = release_score_artifact
     manifest_path = bundle_dir / "manifest.json"
     _atomic_json(manifest_path, manifest)
     logger.info(
@@ -3164,6 +3274,45 @@ def load_final_holdout_evidence(evaluation_dir: str | Path) -> dict:
     return enriched_payload
 
 
+def load_release_score_evidence(evaluation_dir: str | Path) -> dict[str, Any]:
+    """Load and integrity-check audit-only release-score decomposition."""
+    bundle_dir, manifest = _load_manifest(evaluation_dir)
+    entry = manifest.get("release_score_evidence")
+    if not entry:
+        raise FileNotFoundError(
+            "Release-score evidence sidecar is not recorded in the evaluation manifest"
+        )
+    payload, path = _read_json_artifact(bundle_dir.parent, entry, "Release-score evidence sidecar")
+    _validate_release_score_payload(payload, path=path)
+    combined_models = set(manifest["combined_evaluation"]["models"])
+    if set(payload["candidate_audit_models"]) != combined_models:
+        raise ValueError(
+            "Release-score candidate audit inventory does not match combined evaluation"
+        )
+    final_entry = manifest.get("final_holdout_evidence")
+    if not isinstance(final_entry, Mapping):
+        raise ValueError("Release-score evidence requires final-holdout selected-model metadata")
+    final_payload, _final_path = _read_json_artifact(
+        bundle_dir.parent, final_entry, "Final-holdout evidence sidecar"
+    )
+    selected_model = _non_empty_string(
+        final_payload.get("selected_model"), "Final-holdout selected model"
+    )
+    if payload["selected_model"] != selected_model:
+        raise ValueError("Release-score selected model does not match final-holdout evidence")
+    if set(payload["models"]) != {selected_model}:
+        raise ValueError("Release-score evidence inventory must contain selected model only")
+    if set(entry["models"]) != set(payload["models"]):
+        raise ValueError("Release-score manifest model inventory does not match its payload")
+    if entry["selected_model"] != selected_model:
+        raise ValueError("Release-score manifest selected model does not match its payload")
+    if set(entry["candidate_audit_models"]) != combined_models:
+        raise ValueError(
+            "Release-score manifest candidate inventory does not match combined evaluation"
+        )
+    return payload
+
+
 def load_metric_contract_manifest(evaluation_dir: str | Path) -> dict:
     """Load and integrity-check the metric contract manifest sidecar."""
     bundle_dir, manifest = _load_manifest(evaluation_dir)
@@ -3249,6 +3398,9 @@ def _load_manifest(evaluation_dir: str | Path) -> tuple[Path, dict]:
         value = manifest.get(key)
         if value is not None and not isinstance(value, dict):
             raise ValueError(f"Evaluation artifact manifest field {key!r} must be an object")
+    release_entry = manifest.get("release_score_evidence")
+    if release_entry is not None:
+        _validate_release_score_manifest_entry(release_entry)
     return bundle_dir, manifest
 
 

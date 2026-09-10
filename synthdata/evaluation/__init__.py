@@ -37,6 +37,7 @@ from synthdata.evaluation.metric_contracts import (
     is_verified_task10_tstr,
 )
 from synthdata.evaluation.release import transform_release_roles
+from synthdata.evaluation.release_score import compute_release_score
 from synthdata.evaluation.tstr import run_tstr_evaluation
 from synthdata.utils import ensure_dir, get_logger
 
@@ -278,26 +279,132 @@ def _synthcity_semantic_context(dataset: Dataset, selection_cfg) -> dict:
 
 
 def _select_policy_model(combined: pd.DataFrame) -> tuple[str | None, str | None]:
-    """Select one candidate using only the completed candidate ranking."""
-    rank_column = ("__all__", "overall", "rank")
-    if rank_column not in combined.columns:
-        return None, "candidate ranking did not produce an overall rank"
+    """Select candidate using complete fixed-transform tuning utility only."""
+    utility_column = ("__all__", "utility", "U_tuning")
+    if utility_column not in combined.columns:
+        return None, "candidate table did not produce U_tuning"
 
-    eligible = combined
-    gate_column = ("__all__", "privacy_gate", "pass")
-    if gate_column in combined.columns:
-        eligible = combined.loc[combined[gate_column].fillna(False).astype(bool)]
-        if eligible.empty:
-            return None, "no candidate passed the privacy gate"
-    eligible = eligible.loc[
-        eligible[rank_column].map(
-            lambda value: isinstance(value, (int, float)) and math.isfinite(value)
+    eligible = combined.loc[
+        combined[utility_column].map(
+            lambda value: (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+            )
         )
     ]
     if eligible.empty:
-        return None, "no candidate has a decision-eligible overall rank"
-    selected = eligible.sort_values(rank_column, ascending=False).index[0]
+        return None, "no candidate has complete finite U_tuning"
+    selected = eligible.sort_values(utility_column, ascending=False).index[0]
     return str(selected), None
+
+
+def _release_score_inputs(validations: dict) -> tuple[dict, dict, dict]:
+    """Adapt validated final evidence into release-score component inputs.
+
+    Task 12 deliberately emits aggregate records.  Keep those records as the
+    evidence attached to each adapter; never derive a component from a
+    candidate-relative value or from an unsuccessful record.
+    """
+    utility: dict[str, object] = {}
+    privacy: dict[str, object] = {}
+    fairness: dict[str, object] = {}
+
+    def add(
+        destination: dict,
+        name: str,
+        value: object,
+        evidence: object,
+        adapter: str,
+        *,
+        normalized: bool = False,
+    ) -> None:
+        if value is not None and name not in destination:
+            component = {
+                "value": value,
+                "evidence": evidence,
+                "adapter": adapter,
+            }
+            if normalized:
+                component["score"] = value
+            destination[name] = component
+
+    def iter_validations(value):
+        if isinstance(value, dict):
+            for nested in value.values():
+                yield from iter_validations(nested)
+        elif hasattr(value, "records"):
+            yield value
+
+    for validation in iter_validations(validations):
+        records = getattr(validation, "records", ())
+        for record in records:
+            if getattr(record, "status", None) != "succeeded":
+                continue
+            key = str(getattr(record, "expected_key", "")).lower()
+            raw = getattr(record, "raw_value", None)
+            metadata = {}
+            metadata.update(getattr(record, "source_metadata", {}) or {})
+            metadata.update(getattr(record, "result_metadata", {}) or {})
+            evidence = {"record": record.to_dict(), "metadata": metadata}
+            if "release_privacy.v1" in key:
+                for component in ("k", "l"):
+                    aggregate = metadata.get(component)
+                    score = aggregate.get("safety_score") if isinstance(aggregate, dict) else None
+                    add(
+                        privacy,
+                        f"S_{component}",
+                        score,
+                        evidence,
+                        f"{key}.{component}.safety_score",
+                        normalized=True,
+                    )
+                for component in ("dcr", "epsilon", "mia", "attribute"):
+                    alias = {
+                        "dcr": "S_DCR",
+                        "epsilon": "S_epsilon",
+                        "mia": "S_MIA",
+                        "attribute": "S_attribute",
+                    }[component]
+                    add(
+                        privacy,
+                        alias,
+                        metadata.get(component),
+                        evidence,
+                        f"{key}.{component}",
+                        normalized=True,
+                    )
+            elif "representation_evidence.v1" in key:
+                add(fairness, "S_representation", raw, evidence, key, normalized=True)
+                stats = metadata.get("summary_stats", {})
+                if isinstance(stats, dict):
+                    add(
+                        fairness,
+                        "S_worst_log_disparity",
+                        stats.get("worst_abs_log_disparity"),
+                        evidence,
+                        f"{key}.summary_stats.worst_abs_log_disparity",
+                        normalized=True,
+                    )
+            elif "equalized_odds.final.v1" in key:
+                add(fairness, "S_EO", raw, evidence, key, normalized=True)
+            elif any(name in key for name in ("tstr", "macro_f1")):
+                add(utility, "tstr", raw, evidence, key)
+            elif "mmd" in key:
+                add(utility, "mmd", raw, evidence, key)
+            elif "jsd" in key:
+                add(utility, "jsd", raw, evidence, key)
+            elif "dcr" in key or "distance_to_closest" in key:
+                add(privacy, "dcr", raw, evidence, key)
+            elif "epsilon" in key:
+                add(privacy, "epsilon", raw, evidence, key)
+            elif "mia" in key:
+                add(privacy, "mia", raw, evidence, key)
+            elif "attribute" in key:
+                add(privacy, "attribute", raw, evidence, key)
+            elif "log_disparity" in key:
+                add(fairness, "worst_log_disparity", raw, evidence, key)
+    return utility, privacy, fairness
 
 
 def _validation_payloads(
@@ -732,20 +839,39 @@ def _run_final_holdout_evidence(
         )
 
     rank_value = combined.loc[selected_model, ("__all__", "overall", "rank")]
+    tuning_utility = combined.loc[selected_model, ("__all__", "utility", "U_tuning")]
     selection = {
         "source": "combined_evaluation.csv",
         "model": selected_model,
+        "U_tuning": float(tuning_utility),
+        # Retained as audit evidence; this value is not used for selection.
         "overall_rank": float(rank_value) if pd.notna(rank_value) else None,
     }
     gate_column = ("__all__", "privacy_gate", "pass")
     if gate_column in combined.columns:
         gate_value = combined.loc[selected_model, gate_column]
         selection["privacy_gate_pass"] = bool(gate_value) if pd.notna(gate_value) else False
+    final_score_validations = {
+        ("synthcity", "main"): final_synthcity_validations,
+        **final_syntheval_validations,
+        ("custom", "log_disparity"): final_custom_validations,
+        ("custom", "task12"): final_task12_validations,
+    }
+    utility_evidence, privacy_evidence, fairness_evidence = _release_score_inputs(
+        final_score_validations
+    )
+    release_score = compute_release_score(
+        utility=utility_evidence,
+        privacy=privacy_evidence,
+        fairness=fairness_evidence,
+        provenance={"model": selected_model, "evaluation_role": "final_holdout"},
+    )
     evidence = {
         **base_evidence,
         "state": "failed" if final_validation_failures else "succeeded",
         "selected_model": selected_model,
         "candidate_selection": selection,
+        "release_score": release_score,
         "final_refit": refit_metadata,
         "role_hashes": {
             "imputed_evaluation": final_role_hashes,
@@ -1267,6 +1393,11 @@ def run_evaluation(
         role_context_fingerprints,
     )
     generator_metadata = _generation_metadata(cfg, model_names)
+    release_score_evidence = (
+        {final_holdout_evidence["selected_model"]: final_holdout_evidence["release_score"]}
+        if final_holdout_evidence.get("release_score") is not None
+        else None
+    )
     syntheval_execution_artifacts = {}
     if syntheval_executions:
         syntheval_execution_artifacts[("syntheval", "main")] = syntheval_executions
@@ -1288,6 +1419,7 @@ def run_evaluation(
         generator_metadata=generator_metadata,
         semantic_context=synthcity_semantics,
         final_holdout_evidence=final_holdout_evidence,
+        release_score_evidence=release_score_evidence,
     )
 
     extras = {

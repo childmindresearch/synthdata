@@ -534,7 +534,7 @@ class TestBuildCombinedTable:
         assert combined.loc["model_a", ("__all__", "utility", "rank")] == pytest.approx(1.0)
         assert combined.loc["model_b", ("__all__", "utility", "rank")] == pytest.approx(0.0)
 
-    def test_rank_weights_zero_excludes_type_from_overall(self):
+    def test_incomplete_fixed_utility_is_indeterminate_regardless_of_rank_weights(self):
         synthcity_results = {
             "model_a": pd.DataFrame(
                 {"mean": [1.0], "direction": ["maximize"]}, index=["privacy.identifiability_score"]
@@ -551,7 +551,7 @@ class TestBuildCombinedTable:
             model_names=["model_a", "model_b"],
             rank_weights={"utility": 1.0, "privacy": 0.0, "fairness": 1.0},
         )
-        assert combined[("__all__", "overall", "rank")].tolist() == [0.0, 0.0]
+        assert combined[("__all__", "overall", "rank")].isna().all()
 
     def test_rank_weights_asymmetric_changes_sort_order(self):
         synthcity_results = {
