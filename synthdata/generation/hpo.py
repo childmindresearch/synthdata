@@ -2564,6 +2564,70 @@ def _persist_hpo_trial_checkpoints(
             )
 
 
+_HPO_RUNNING_RECOVERY_SCHEMA_VERSION = "hpo-running-recovery-v1"
+
+
+def _recover_running_trials(
+    study: optuna.Study,
+    *,
+    context: Mapping[str, Any],
+) -> int:
+    """Terminalize persisted interrupted trials before allocating more work.
+
+    Optuna does not expose a public ``Study`` method for changing a persisted
+    trial by number.  Its storage contract does expose the transition by the
+    trial's stable storage id, which preserves all existing trial evidence.
+    """
+    running_trials = [
+        trial for trial in study.trials if trial.state == optuna.trial.TrialState.RUNNING
+    ]
+    if not running_trials:
+        return 0
+
+    context_digest = hpo_context_digest(context)
+    recovered = 0
+    for trial in running_trials:
+        recovery = {
+            "schema_version": _HPO_RUNNING_RECOVERY_SCHEMA_VERSION,
+            "study_name": study.study_name,
+            "context_digest": context_digest,
+            "trial_number": trial.number,
+            "original_state": "RUNNING",
+            "reason_code": "stale_running_trial_recovery",
+            "terminal_state": "FAIL",
+        }
+        existing = (trial.user_attrs or {}).get("hpo_running_recovery")
+        if existing is not None and existing != recovery:
+            raise RuntimeError(
+                f"HPO study {study.study_name!r} trial {trial.number} has conflicting "
+                "running-trial recovery metadata"
+            )
+        if existing is None:
+            study._storage.set_trial_user_attr(  # noqa: SLF001 - storage transition needs trial id
+                trial._trial_id,
+                "hpo_running_recovery",
+                recovery,  # noqa: SLF001
+            )
+
+        transitioned = study._storage.set_trial_state_values(  # noqa: SLF001
+            trial._trial_id,  # noqa: SLF001
+            optuna.trial.TrialState.FAIL,
+        )
+        if not transitioned:
+            raise RuntimeError(
+                f"HPO study {study.study_name!r} trial {trial.number} remains RUNNING; "
+                "refusing to allocate replacement trials"
+            )
+        recovered += 1
+        logger.warning(
+            "[%s] recovered stale RUNNING trial=%d as FAIL reason=%s",
+            study.study_name,
+            trial.number,
+            recovery["reason_code"],
+        )
+    return recovered
+
+
 def run_study(
     study_name: str,
     objective_fn: Callable[[optuna.Trial], float],
@@ -2620,6 +2684,8 @@ def run_study(
                 len(existing_checkpoints),
                 checkpoint_implementation_fingerprint[:16],
             )
+
+    _recover_running_trials(study, context=context_payload)
 
     def _set_outcome(trial: optuna.Trial, state: str, error: BaseException | None = None) -> None:
         existing_outcome = getattr(trial, "user_attrs", {}).get("hpo_outcome")

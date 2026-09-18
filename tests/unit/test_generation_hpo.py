@@ -1006,6 +1006,92 @@ def test_completed_hpo_checkpoint_is_durable_and_resume_skips_terminal_trial(tmp
     assert load_hpo_trial_checkpoint(checkpoint_path, hpo_context=context) == checkpoint
 
 
+def test_resuming_recovers_stale_running_trial_without_extra_allocation(tmp_path):
+    config = HPOConfig(n_trials=2, timeout_seconds=None)
+    context = _hpo_context()
+    study = hpo_module.create_study(
+        "hpo_stale_running", config, tmp_path, seed=0, hpo_context=context
+    )
+    study.optimize(lambda _trial: 0.25, n_trials=1)
+    stale = study.ask()
+    stale.suggest_float("learning_rate", 0.1, 0.2)
+    stale_number = stale.number
+
+    calls = []
+    result = run_study(
+        "hpo_stale_running",
+        lambda _trial: calls.append(True) or 0.5,
+        config,
+        tmp_path,
+        seed=0,
+        drop_keys=(),
+        hpo_context=context,
+    )
+
+    resumed = optuna.load_study(
+        study_name=contextual_study_name("hpo_stale_running", context),
+        storage=default_storage_url(tmp_path),
+    )
+    recovered = resumed.trials[stale_number]
+    assert result == {}
+    assert calls == []
+    assert len(resumed.trials) == 2
+    assert recovered.state == optuna.trial.TrialState.FAIL
+    assert recovered.params == stale.params
+    assert recovered.user_attrs["hpo_running_recovery"] == {
+        "schema_version": "hpo-running-recovery-v1",
+        "study_name": resumed.study_name,
+        "context_digest": hpo_context_digest(context),
+        "trial_number": stale_number,
+        "original_state": "RUNNING",
+        "reason_code": "stale_running_trial_recovery",
+        "terminal_state": "FAIL",
+    }
+
+
+def test_stale_running_recovery_is_idempotent(tmp_path):
+    config = HPOConfig(n_trials=1, timeout_seconds=None)
+    context = _hpo_context()
+    study = hpo_module.create_study(
+        "hpo_stale_idempotent", config, tmp_path, seed=0, hpo_context=context
+    )
+    stale = study.ask()
+    stale.suggest_int("depth", 1, 2)
+
+    with pytest.raises(RuntimeError, match="produced no completed trials"):
+        run_study(
+            "hpo_stale_idempotent",
+            lambda _trial: 0.5,
+            config,
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+        )
+    first = optuna.load_study(
+        study_name=contextual_study_name("hpo_stale_idempotent", context),
+        storage=default_storage_url(tmp_path),
+    ).trials[0]
+
+    with pytest.raises(RuntimeError, match="produced no completed trials"):
+        run_study(
+            "hpo_stale_idempotent",
+            lambda _trial: pytest.fail("recovery must not allocate a trial"),
+            config,
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+        )
+    second = optuna.load_study(
+        study_name=contextual_study_name("hpo_stale_idempotent", context),
+        storage=default_storage_url(tmp_path),
+    ).trials[0]
+    assert second.state == optuna.trial.TrialState.FAIL
+    assert second.params == first.params
+    assert second.user_attrs == first.user_attrs
+
+
 def test_hpo_checkpoint_resume_rejects_changed_implementation_fingerprint(tmp_path):
     calls = []
 
