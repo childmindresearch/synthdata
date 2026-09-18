@@ -211,6 +211,26 @@ class TestLoadExperimentResumability:
 
         assert final_context["imputed_fingerprint"] == final_context["raw_fingerprint"]
 
+    def test_candidate_resume_allows_changed_final_holdout_imputation(
+        self, make_config, make_canonical_dataset
+    ):
+        cfg = make_config(experiment_id="protected-ctgan-n40-20260918-candidate")
+        recorded = make_canonical_dataset()
+        experiment = start_experiment(cfg, dataset=recorded)
+        experiment.record("generation")
+        before = experiment.manifest_path.read_bytes()
+
+        current = make_canonical_dataset()
+        current.imputed_roles["final_holdout"].iloc[0, 0] = -1
+        resumed = start_experiment(cfg, dataset=current)
+
+        assert resumed.id == experiment.id
+        assert experiment.manifest_path.read_bytes() == before
+
+        current.imputed_roles["train"].iloc[0, 0] = -1
+        with pytest.raises(ValueError, match="role context"):
+            start_experiment(cfg, dataset=current)
+
     def test_final_holdout_handoff_rejects_raw_change(self, make_config, make_canonical_dataset):
         experiment, current = self._handoff_experiment(make_config, make_canonical_dataset)
         current.roles["final_holdout"].iloc[0, 0] = -1

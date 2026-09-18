@@ -223,7 +223,8 @@ def _build_experiment(
             recorded_payload = manifest.get("role_context")
             context_matches = recorded_context == role_context_digest
             if (
-                not allow_final_holdout_handoff
+                not candidate_phase
+                and not allow_final_holdout_handoff
                 and isinstance(recorded_payload, dict)
                 and dataset is not None
                 and dataset.has_canonical_roles
