@@ -18,11 +18,14 @@ from synthdata.data import semantic_context_digest
 from synthdata.evaluation.catalog import emitted_keys_for_synthcity_metrics
 from synthdata.generation.hpo import (
     HPO_GENERATOR_METADATA_SCHEMA_VERSION,
+    HPOMetadataSerializationError,
     StageAScreenContract,
     _resolve_utility_policy,
     _safe_exception_message,
     evaluate_canonical_hpo_metrics,
+    hpo_exception_provenance,
     hpo_score,
+    normalize_hpo_metadata,
     persist_stage_a_trial_exception,
     prepare_stage_a_screen,
     screen_stage_a_trial,
@@ -262,7 +265,7 @@ def generator_metadata_matches_request(
         return False
     return (
         metadata.get("plugin_name") == name.removesuffix("_hpo")
-        and metadata.get("requested_parameters") == dict(params)
+        and metadata.get("requested_parameters") == normalize_hpo_metadata(params)
         and metadata.get("n_samples") == n_samples
         and metadata.get("random_state") == random_state
     )
@@ -277,6 +280,7 @@ def build_generator_metadata(
     plugin_fqdn: str,
     privacy_accounting: dict | None = None,
     implementation_fingerprint: str | None = None,
+    effective_parameters: dict | None = None,
 ) -> dict:
     """Build and validate the common metadata record for one generation call."""
     generator_context = generator_metadata_context(name, params)
@@ -289,11 +293,15 @@ def build_generator_metadata(
         "generator_context": generator_context,
         "plugin_name": name,
         "plugin_fqdn": plugin_fqdn,
-        "requested_parameters": dict(params),
+        "requested_parameters": normalize_hpo_metadata(params, location="requested_parameters"),
         "n_samples": int(n_samples),
         "random_state": int(random_state),
         "privacy_accounting": privacy_accounting,
     }
+    if effective_parameters is not None:
+        metadata["effective_parameters"] = normalize_hpo_metadata(
+            effective_parameters, location="effective_parameters"
+        )
     if implementation_fingerprint is not None:
         metadata["implementation_fingerprint"] = implementation_fingerprint
     if not generator_metadata_is_valid(metadata, generator_context):
@@ -301,7 +309,7 @@ def build_generator_metadata(
             f"Plugin {name!r} did not return complete generator metadata for "
             f"privacy claim {generator_context['privacy_claim_type']!r}"
         )
-    return metadata
+    return normalize_hpo_metadata(metadata)
 
 
 def build_hpo_generator_metadata(
@@ -310,6 +318,8 @@ def build_hpo_generator_metadata(
     synthetic_size: int | None,
     random_state: int,
     metric_metadata: dict | None,
+    *,
+    requested_parameters: dict | None = None,
 ) -> dict:
     """Normalize benchmark runtime metadata for durable HPO checkpoints."""
     base_name = name.removesuffix("_hpo")
@@ -390,7 +400,9 @@ def build_hpo_generator_metadata(
         accounting = runtime["accounting"]
 
     requested_parameters = (
-        runtime.get("requested_parameters")
+        requested_parameters
+        if requested_parameters is not None
+        else runtime.get("requested_parameters")
         if runtime is not None and isinstance(runtime.get("requested_parameters"), dict)
         else params
     )
@@ -411,8 +423,41 @@ def build_hpo_generator_metadata(
         plugin_fqdn=plugin_fqdn,
         privacy_accounting=accounting,
         implementation_fingerprint=implementation_fingerprint,
+        effective_parameters=params,
     )
-    return json.loads(json.dumps(metadata, sort_keys=True, default=str, allow_nan=False))
+    return normalize_hpo_metadata(metadata)
+
+
+def upgrade_canonical_hpo_generator_metadata(
+    metadata: object,
+    name: str,
+    sampled_parameters: dict,
+    effective_parameters: dict,
+    implementation_fingerprint: str,
+) -> dict:
+    """Upgrade validated fit/generate v1 metadata to durable HPO metadata."""
+    base_name = name.removesuffix("_hpo")
+    expected_context = generator_metadata_context(base_name, effective_parameters)
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("schema_version") != GENERATOR_METADATA_SCHEMA_VERSION
+        or metadata.get("plugin_name") != base_name
+        or not generator_metadata_is_valid(metadata, expected_context)
+    ):
+        raise RuntimeError(
+            f"Canonical HPO generator returned incomplete metadata for {base_name!r}"
+        )
+
+    return build_generator_metadata(
+        base_name,
+        sampled_parameters,
+        metadata["n_samples"],
+        metadata["random_state"],
+        plugin_fqdn=metadata["plugin_fqdn"],
+        privacy_accounting=metadata["privacy_accounting"],
+        implementation_fingerprint=implementation_fingerprint,
+        effective_parameters=effective_parameters,
+    )
 
 
 def fit_generate(
@@ -557,7 +602,7 @@ def build_synthcity_objective(
             return
         if not callable(setter):
             raise TypeError(f"Optuna trial attribute setter for {key!r} is not callable")
-        setter(key, value)
+        setter(key, normalize_hpo_metadata(value, location=f"trial.user_attrs.{key}"))
 
     def objective(trial: optuna.Trial) -> float:
         set_trial_attr(trial, "generator_plugin_name", base_name)
@@ -573,13 +618,32 @@ def build_synthcity_objective(
             implementation_fingerprint,
         )
         try:
-            params = plugin_cls.sample_hyperparameters_optuna(trial)
+            sampled_params = plugin_cls.sample_hyperparameters_optuna(trial)
+            params = dict(sampled_params)
             if accepts_iter:
                 params["n_iter"] = min(params.get("n_iter", iter_cap), iter_cap)
             params["random_state"] = seed
             if accepts_device:
                 params["device"] = torch.device(trial_device)
+            set_trial_attr(trial, "generator_requested_parameters", sampled_params)
+            set_trial_attr(trial, "generator_effective_parameters", params)
             set_trial_attr(trial, "generator_metadata_state", "pending")
+        except HPOMetadataSerializationError as exc:
+            set_trial_attr(
+                trial,
+                "generator_metadata_state",
+                "missing",
+            )
+            set_trial_attr(
+                trial,
+                "hpo_error_provenance",
+                hpo_exception_provenance(exc, location="synthcity_objective.setup"),
+            )
+            raise optuna.TrialPruned(
+                "hpo_metadata_serialization_failure: "
+                f"{_safe_exception_message('hpo_metadata_serialization_failure')} "
+                f"[{type(exc).__name__}]"
+            ) from exc
         except (TypeError, ValueError, RuntimeError) as exc:
             if stage_a_contract is not None:
                 if stage_a_root is None or study_name is None:
@@ -637,6 +701,13 @@ def build_synthcity_objective(
                     seed,
                     workspace=str(workspace_path),
                     device=trial_device,
+                )
+                generator_metadata = upgrade_canonical_hpo_generator_metadata(
+                    generator_metadata,
+                    name,
+                    sampled_params,
+                    params,
+                    implementation_fingerprint,
                 )
                 if candidate_screen is not None:
                     candidate_screen(candidate_df)
@@ -710,7 +781,12 @@ def build_synthcity_objective(
                 set_trial_attr(trial, "result_metadata", metric_metadata)
             if not canonical:
                 generator_metadata = build_hpo_generator_metadata(
-                    base_name, params, synthetic_size, seed, metric_metadata
+                    base_name,
+                    params,
+                    synthetic_size,
+                    seed,
+                    metric_metadata,
+                    requested_parameters=sampled_params,
                 )
             set_trial_attr(trial, "generator_metadata", generator_metadata)
             set_trial_attr(trial, "generator_metadata_state", "present")
@@ -723,6 +799,19 @@ def build_synthcity_objective(
             if getattr(trial, "user_attrs", {}).get("generator_metadata_state") != "present":
                 set_trial_attr(trial, "generator_metadata_state", "missing")
             raise
+        except HPOMetadataSerializationError as exc:
+            if getattr(trial, "user_attrs", {}).get("generator_metadata_state") != "present":
+                set_trial_attr(trial, "generator_metadata_state", "missing")
+            set_trial_attr(
+                trial,
+                "hpo_error_provenance",
+                hpo_exception_provenance(exc, location="synthcity_objective"),
+            )
+            raise optuna.TrialPruned(
+                "hpo_metadata_serialization_failure: "
+                f"{_safe_exception_message('hpo_metadata_serialization_failure')} "
+                f"[{type(exc).__name__}]"
+            ) from exc
         except (TypeError, ValueError, RuntimeError) as exc:
             if getattr(trial, "user_attrs", {}).get("generator_metadata_state") != "present":
                 set_trial_attr(trial, "generator_metadata_state", "missing")
@@ -738,7 +827,18 @@ def build_synthcity_objective(
                     stage_a_contract,
                     exc,
                 )
-            reason_code = "hpo_trial_exception"
+            reason_code = getattr(exc, "reason_code", "hpo_trial_exception")
+            if reason_code not in {
+                "stage_a_screen_exception",
+                "metric_evaluation_exception",
+                "hpo_trial_exception",
+            }:
+                reason_code = "hpo_trial_exception"
+            set_trial_attr(
+                trial,
+                "hpo_error_provenance",
+                hpo_exception_provenance(exc, location="synthcity_objective"),
+            )
             logger.warning(
                 "[%s] trial %d failed: %s (%s)",
                 name,

@@ -14,6 +14,7 @@ Provides:
 """
 
 import dataclasses
+import enum
 import hashlib
 import json
 import math
@@ -49,6 +50,7 @@ HPO_CONTEXT_SCHEMA_VERSION = "hpo-context-v2"
 HPO_TRIAL_CHECKPOINT_SCHEMA_VERSION = "hpo-trial-checkpoint-v1"
 LEGACY_GENERATOR_METADATA_SCHEMA_VERSION = "generator-metadata-v1"
 HPO_GENERATOR_METADATA_SCHEMA_VERSION = "generator-metadata-v2"
+HPO_METADATA_SERIALIZATION_REASON_CODE = "hpo_metadata_serialization_failure"
 STAGE_A_SCREEN_IDS = (
     "shape_schema",
     "bounds_categories",
@@ -62,11 +64,163 @@ _SAFE_EXCEPTION_MESSAGES = {
     "stage_a_screen_exception": "Stage A screen failed; exception details suppressed.",
     "metric_evaluation_exception": "Metric evaluation failed; exception details suppressed.",
     "hpo_trial_exception": "HPO trial failed; exception details suppressed.",
+    HPO_METADATA_SERIALIZATION_REASON_CODE: "HPO metadata serialization failed; exception details suppressed.",
 }
+_SAFE_ERROR_LOCATION = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$")
+_SAFE_ERROR_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _safe_exception_message(reason_code: str) -> str:
-    return _SAFE_EXCEPTION_MESSAGES[reason_code]
+    return _SAFE_EXCEPTION_MESSAGES.get(
+        reason_code, _SAFE_EXCEPTION_MESSAGES["hpo_trial_exception"]
+    )
+
+
+def _reject_unsafe_metadata_path(value: str | Path, location: str) -> str:
+    """Return safe relative path identifiers without retaining raw filesystem paths."""
+    if isinstance(value, Path) or not isinstance(value, str) or _looks_like_unsafe_path(value):
+        raise HPOMetadataSerializationError(value, location)
+    return value.replace("\\", "/")
+
+
+def _looks_like_unsafe_path(value: str) -> bool:
+    """Recognize path strings that cannot be durable metadata identifiers."""
+    path = Path(value)
+    components = re.split(r"[\\/]", value)
+    return (
+        path.is_absolute()
+        or value.startswith(("/", "\\", "~/", "~\\"))
+        or bool(re.match(r"^[A-Za-z]:", value))
+        or any(component in {".", ".."} for component in components)
+    )
+
+
+class HPOMetadataSerializationError(TypeError):
+    """Raised when durable HPO metadata contains an unsupported value."""
+
+    reason_code = HPO_METADATA_SERIALIZATION_REASON_CODE
+
+    def __init__(self, value: Any, location: str = "metadata") -> None:
+        self.location = location
+        super().__init__(f"unsupported HPO metadata value at {location}: {type(value).__name__}")
+
+
+def normalize_hpo_metadata(value: Any, *, location: str = "metadata") -> Any:
+    """Convert supported runtime values to deterministic JSON-compatible values."""
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, str):
+        if _looks_like_unsafe_path(value) and not location.endswith("result_path"):
+            raise HPOMetadataSerializationError(value, location)
+        if location.endswith("result_path"):
+            return _reject_unsafe_metadata_path(value, location)
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise HPOMetadataSerializationError(value, location)
+        return value
+    if isinstance(value, enum.Enum):
+        return normalize_hpo_metadata(value.value, location=location)
+    if isinstance(value, Path):
+        raise HPOMetadataSerializationError(value, location)
+    if isinstance(value, np.generic):
+        return normalize_hpo_metadata(value.item(), location=location)
+    if isinstance(value, np.ndarray):
+        return [
+            normalize_hpo_metadata(item, location=f"{location}[{index}]")
+            for index, item in enumerate(value.tolist())
+        ]
+    if type(value).__module__.startswith("torch") and type(value).__name__ == "device":
+        return str(value)
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        normalized_items: list[tuple[str, Any]] = []
+        for key, item in value.items():
+            if isinstance(key, os.PathLike):
+                raise HPOMetadataSerializationError(key, location)
+            normalized_key = str(key)
+            if _looks_like_unsafe_path(normalized_key):
+                raise HPOMetadataSerializationError(key, location)
+            if isinstance(key, str):
+                normalized_key = normalized_key.replace("\\", "/")
+            normalized_items.append((normalized_key, item))
+        for normalized_key, item in sorted(normalized_items, key=lambda entry: entry[0]):
+            if normalized_key in result:
+                raise HPOMetadataSerializationError(value, location)
+            result[normalized_key] = normalize_hpo_metadata(
+                item, location=f"{location}.{normalized_key}"
+            )
+        return result
+    if isinstance(value, (list, tuple)):
+        return [
+            normalize_hpo_metadata(item, location=f"{location}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, (set, frozenset)):
+        normalized = [normalize_hpo_metadata(item, location=location) for item in value]
+        return sorted(
+            normalized, key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"))
+        )
+    raise HPOMetadataSerializationError(value, location)
+
+
+def hpo_exception_provenance(error: BaseException, *, location: str) -> dict[str, str]:
+    """Return safe, stable diagnostics without preserving exception text."""
+    reason_code = getattr(error, "reason_code", "hpo_trial_exception")
+    if reason_code not in _SAFE_EXCEPTION_MESSAGES:
+        reason_code = "hpo_trial_exception"
+    error_type = type(error).__name__
+    fingerprint = hashlib.sha256(f"{reason_code}:{error_type}:{location}".encode()).hexdigest()
+    return {
+        "error_type": error_type,
+        "error_message": _safe_exception_message(reason_code),
+        "error_reason_code": reason_code,
+        "error_location": location,
+        "error_fingerprint": fingerprint,
+    }
+
+
+def _validate_hpo_error_provenance(value: Any) -> dict[str, str]:
+    """Validate bounded, sanitized exception provenance from a checkpoint."""
+    if not isinstance(value, Mapping):
+        raise RuntimeError("HPO error provenance must be an object")
+    required = {
+        "error_type",
+        "error_message",
+        "error_reason_code",
+        "error_location",
+        "error_fingerprint",
+    }
+    if set(value) != required:
+        raise RuntimeError("HPO error provenance has an invalid shape")
+    reason_code = value["error_reason_code"]
+    if not isinstance(reason_code, str) or reason_code not in _SAFE_EXCEPTION_MESSAGES:
+        raise RuntimeError("HPO error provenance has an unsafe reason code")
+    error_type = value["error_type"]
+    if not isinstance(error_type, str) or not error_type or len(error_type) > 128:
+        raise RuntimeError("HPO error provenance has an invalid error type")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,127}", error_type):
+        raise RuntimeError("HPO error provenance has an invalid error type")
+    if value["error_message"] != _safe_exception_message(reason_code):
+        raise RuntimeError("HPO error provenance has an unsafe error message")
+    location = value["error_location"]
+    if (
+        not isinstance(location, str)
+        or not location
+        or len(location) > 128
+        or not _SAFE_ERROR_LOCATION.fullmatch(location)
+    ):
+        raise RuntimeError("HPO error provenance has an unsafe error location")
+    fingerprint = value["error_fingerprint"]
+    if not isinstance(fingerprint, str) or not _SAFE_ERROR_FINGERPRINT.fullmatch(fingerprint):
+        raise RuntimeError("HPO error provenance has an invalid fingerprint")
+    expected = hpo_exception_provenance(
+        type(error_type, (Exception,), {"reason_code": reason_code})(),
+        location=location,
+    )["error_fingerprint"]
+    if fingerprint != expected:
+        raise RuntimeError("HPO error provenance has an invalid fingerprint")
+    return {key: value[key] for key in required}
 
 
 def _validate_study_name(study_name: Any) -> str:
@@ -102,10 +256,9 @@ def _checkpoint_stage_a_result_identifier(value: Any) -> str | None:
     """Keep only safe relative Stage A identifiers in durable checkpoints."""
     if not isinstance(value, str) or not value:
         return None
-    path = Path(value)
-    if path.is_absolute() or ".." in path.parts:
+    if _looks_like_unsafe_path(value):
         return None
-    return path.as_posix()
+    return value.replace("\\", "/")
 
 
 def _is_missing_scalar(value: Any) -> bool:
@@ -2244,6 +2397,12 @@ def _validate_hpo_generator_metadata(payload: Any, label: str) -> None:
         raise RuntimeError(f"{label}.generator_context must be an object")
     if not isinstance(payload["requested_parameters"], Mapping):
         raise RuntimeError(f"{label}.requested_parameters must be an object")
+    try:
+        normalized = normalize_hpo_metadata(payload)
+    except HPOMetadataSerializationError as exc:
+        raise RuntimeError(f"{label} contains unserializable metadata") from exc
+    if normalized != payload:
+        raise RuntimeError(f"{label} is not normalized JSON metadata")
     n_samples = payload["n_samples"]
     if isinstance(n_samples, bool) or not isinstance(n_samples, int) or n_samples <= 0:
         raise RuntimeError(f"{label}.n_samples must be a positive integer")
@@ -2349,7 +2508,7 @@ def _validate_hpo_generator_evidence(
 
 
 def _json_document(payload: Any) -> Any:
-    return json.loads(json.dumps(payload, sort_keys=True, default=str, allow_nan=False))
+    return normalize_hpo_metadata(payload)
 
 
 def _validate_hpo_trial_checkpoint(
@@ -2418,9 +2577,7 @@ def _validate_hpo_trial_checkpoint(
         raise RuntimeError("HPO trial checkpoint stage_a metadata must be an object")
     result_path = stage_a.get("result_path")
     if result_path is not None and (
-        not isinstance(result_path, str)
-        or Path(result_path).is_absolute()
-        or ".." in Path(result_path).parts
+        not isinstance(result_path, str) or _looks_like_unsafe_path(result_path)
     ):
         raise RuntimeError("HPO trial checkpoint stage_a result_path must be relative and safe")
     metric_metadata = metadata.get("metric_metadata")
@@ -2438,6 +2595,27 @@ def _validate_hpo_trial_checkpoint(
     outcome = metadata.get("outcome")
     if outcome is not None and not isinstance(outcome, Mapping):
         raise RuntimeError("HPO trial checkpoint outcome must be an object or null")
+    error_provenance = metadata.get("hpo_error_provenance")
+    if error_provenance is not None:
+        try:
+            normalized_provenance = normalize_hpo_metadata(error_provenance)
+        except HPOMetadataSerializationError as exc:
+            raise RuntimeError(
+                "HPO trial checkpoint hpo_error_provenance is not normalized JSON metadata"
+            ) from exc
+        if normalized_provenance != error_provenance:
+            raise RuntimeError(
+                "HPO trial checkpoint hpo_error_provenance is not normalized JSON metadata"
+            )
+        validated_provenance = _validate_hpo_error_provenance(error_provenance)
+        if (
+            validated_provenance["error_reason_code"] == HPO_METADATA_SERIALIZATION_REASON_CODE
+            and state == "pruned"
+        ):
+            if not isinstance(outcome, Mapping):
+                raise RuntimeError("Metadata serialization outcome must preserve error provenance")
+            if any(outcome.get(key) != value for key, value in validated_provenance.items()):
+                raise RuntimeError("Metadata serialization outcome does not match error provenance")
     return dict(payload)
 
 
@@ -2491,6 +2669,7 @@ def persist_hpo_trial_checkpoint(
                 "metric_metadata": metric_metadata,
                 "result_metadata": result_metadata,
                 "outcome": attrs.get("hpo_outcome"),
+                "hpo_error_provenance": attrs.get("hpo_error_provenance"),
                 "generator": {
                     "state": attrs.get("generator_metadata_state", "not_recorded"),
                     "plugin_name": attrs.get("generator_plugin_name"),
@@ -2692,14 +2871,11 @@ def run_study(
         outcome = dict(existing_outcome) if isinstance(existing_outcome, Mapping) else {}
         outcome["state"] = state
         if error is not None:
-            reason_code = "hpo_trial_exception"
-            outcome.update(
-                {
-                    "error_type": type(error).__name__,
-                    "error_message": _safe_exception_message(reason_code),
-                    "error_reason_code": reason_code,
-                }
-            )
+            provenance = getattr(trial, "user_attrs", {}).get("hpo_error_provenance")
+            if isinstance(provenance, Mapping):
+                outcome.update(provenance)
+            else:
+                outcome.update(hpo_exception_provenance(error, location="tracked_objective"))
         trial.set_user_attr("hpo_outcome", outcome)
 
     def _tracked_objective(trial: optuna.Trial) -> float:

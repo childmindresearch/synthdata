@@ -1,5 +1,6 @@
 """Unit tests for the explicit scope of resumable HPO artifacts."""
 
+import enum
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -8,10 +9,12 @@ import numpy as np
 import optuna
 import pandas as pd
 import pytest
+import torch
 
 from synthdata.config import HPOConfig, load_config
 from synthdata.data import semantic_context_payload
 from synthdata.generation import hpo as hpo_module
+from synthdata.generation import synthcity_backend as synthcity_backend_module
 from synthdata.generation.hpo import (
     HPO_OBJECTIVE_METRICS,
     HPO_TRIAL_CHECKPOINT_SCHEMA_VERSION,
@@ -25,6 +28,7 @@ from synthdata.generation.hpo import (
     hpo_context_digest,
     hpo_score,
     load_hpo_trial_checkpoint,
+    normalize_hpo_metadata,
     persist_hpo_trial_checkpoint,
     persist_stage_a_contract,
     run_study,
@@ -1259,14 +1263,445 @@ def test_failed_hpo_checkpoint_persists_exception_context(tmp_path):
         "error_type": "RuntimeError",
         "error_message": "HPO trial failed; exception details suppressed.",
         "error_reason_code": "hpo_trial_exception",
+        "error_location": "tracked_objective",
+        "error_fingerprint": checkpoint["metadata"]["outcome"]["error_fingerprint"],
         "state": "failed",
     }
     assert sentinel not in json.dumps(checkpoint)
 
 
+def test_hpo_metadata_normalizes_runtime_values_deterministically():
+    class Mode(enum.Enum):
+        FAST = "fast"
+
+    value = {
+        "device": torch.device("cpu"),
+        "array": np.asarray([np.int64(3), np.float64(1.5)]),
+        "identifier": "workspace/model",
+        "mode": Mode.FAST,
+        "nested": {"values": (np.int32(2),)},
+    }
+
+    assert normalize_hpo_metadata(value) == {
+        "array": [3, 1.5],
+        "device": "cpu",
+        "mode": "fast",
+        "nested": {"values": [2]},
+        "identifier": "workspace/model",
+    }
+
+
 def test_hpo_metric_config_rejects_calibrating_privacy_metric():
     with pytest.raises(ValueError, match="not approved operational objectives"):
         validate_hpo_metric_config({"privacy": ["identifiability_score"]})
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        Path("workspace/model"),
+        Path("/tmp/raw-data"),
+        "/tmp/raw-data",
+        "../secret",
+        "..\\secret",
+        "\\tmp\\raw-data",
+        "\\\\server\\share\\raw-data",
+        "C:raw-data",
+        "C:\\tmp\\raw-data",
+    ],
+)
+def test_hpo_metadata_rejects_raw_paths_without_echoing_value(unsafe):
+    with pytest.raises(TypeError, match="unsupported HPO metadata value") as error:
+        normalize_hpo_metadata({"path": unsafe})
+
+    assert str(unsafe) not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "unsafe_key",
+    [
+        Path("workspace/model"),
+        Path("/tmp/raw-data"),
+        "/tmp/raw-data",
+        "../secret",
+        "..\\secret",
+        "\\tmp\\raw-data",
+        "\\\\server\\share\\raw-data",
+        "C:raw-data",
+        "C:\\tmp\\raw-data",
+    ],
+)
+def test_hpo_metadata_rejects_unsafe_mapping_keys_without_echoing_input(unsafe_key):
+    with pytest.raises(TypeError, match="unsupported HPO metadata value") as error:
+        normalize_hpo_metadata({unsafe_key: "value"})
+
+    assert str(unsafe_key) not in str(error.value)
+
+
+def test_hpo_metadata_allows_safe_mapping_keys_recursively():
+    assert normalize_hpo_metadata({"workspace/model": {"nested/v1": 1}, "ordinary": "value"}) == {
+        "ordinary": "value",
+        "workspace/model": {"nested/v1": 1},
+    }
+
+
+def test_hpo_metadata_normalizes_safe_nested_windows_mapping_key():
+    assert normalize_hpo_metadata({r"nested\v1": "value"}) == {"nested/v1": "value"}
+
+
+def test_hpo_metadata_rejects_mapping_key_collision_after_normalization():
+    with pytest.raises(TypeError, match="unsupported HPO metadata value") as error:
+        normalize_hpo_metadata({r"nested\v1": "backslash", "nested/v1": "slash"})
+
+    assert r"nested\v1" not in str(error.value)
+    assert "nested/v1" not in str(error.value)
+
+
+def test_hpo_metadata_allows_safe_slash_bearing_identifier():
+    assert normalize_hpo_metadata({"identifier": "urn:example/model/v1"}) == {
+        "identifier": "urn:example/model/v1"
+    }
+
+
+def test_hpo_exception_provenance_maps_unknown_reason_code():
+    error = RuntimeError("SECRET /tmp/raw-data")
+    error.reason_code = "untrusted_reason"  # type: ignore[attr-defined]
+
+    provenance = hpo_module.hpo_exception_provenance(error, location="test")
+
+    assert provenance["error_reason_code"] == "hpo_trial_exception"
+    assert provenance["error_message"] == "HPO trial failed; exception details suppressed."
+    assert "SECRET" not in json.dumps(provenance)
+
+
+def test_hpo_error_provenance_validator_recomputes_fingerprint():
+    provenance = hpo_module.hpo_exception_provenance(
+        RuntimeError("SECRET"), location="tracked_objective"
+    )
+
+    provenance["error_fingerprint"] = "0" * 64
+    with pytest.raises(RuntimeError, match="invalid fingerprint"):
+        hpo_module._validate_hpo_error_provenance(provenance)
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("error_message", "safe message altered"),
+        ("error_location", "../unsafe"),
+        ("error_reason_code", "untrusted_reason"),
+    ],
+)
+def test_hpo_error_provenance_validator_rejects_unsafe_or_tampered_fields(field, value):
+    provenance = hpo_module.hpo_exception_provenance(
+        RuntimeError("SECRET"), location="tracked_objective"
+    )
+    provenance[field] = value
+
+    with pytest.raises(RuntimeError):
+        hpo_module._validate_hpo_error_provenance(provenance)
+
+    assert "SECRET" not in json.dumps(provenance)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: value.pop("error_type"),
+        lambda value: value.__setitem__("extra", "field"),
+    ],
+)
+def test_hpo_error_provenance_validator_rejects_invalid_shape(mutation):
+    provenance = hpo_module.hpo_exception_provenance(
+        RuntimeError("SECRET"), location="tracked_objective"
+    )
+    mutation(provenance)
+
+    with pytest.raises(RuntimeError, match="invalid shape"):
+        hpo_module._validate_hpo_error_provenance(provenance)
+
+
+def test_hpo_metadata_serialization_provenance_survives_checkpoint(tmp_path, monkeypatch):
+    class FakePlugin:
+        @staticmethod
+        def sample_hyperparameters_optuna(_trial):
+            return {"unsafe": Path("/secret/raw-data")}
+
+    monkeypatch.setattr(synthcity_backend_module, "get_plugin_class", lambda _name: FakePlugin)
+    monkeypatch.setattr(synthcity_backend_module, "plugin_accepts", lambda *_args: False)
+    objective = build_synthcity_objective(
+        "ctgan",
+        train_loader=object(),
+        tuning_loader=object(),
+        hpo_cfg=HPOConfig(
+            n_trials=1,
+            timeout_seconds=None,
+        ),
+        seed=0,
+        train_df=pd.DataFrame({"target": [0]}),
+        tuning_df=pd.DataFrame({"target": [0]}),
+        target_column="target",
+    )
+    context = _hpo_context()
+
+    with pytest.raises(RuntimeError, match="produced no completed trials"):
+        run_study(
+            "metadata_serialization_failure",
+            objective,
+            HPOConfig(n_trials=1, timeout_seconds=None),
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+        )
+
+    checkpoint = load_hpo_trial_checkpoint(
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name("metadata_serialization_failure", context)
+        / "trial-0"
+        / "checkpoint.json",
+        hpo_context=context,
+    )
+    provenance = checkpoint["metadata"]["hpo_error_provenance"]
+    assert provenance["error_reason_code"] == "hpo_metadata_serialization_failure"
+    assert provenance["error_type"] == "HPOMetadataSerializationError"
+    assert provenance["error_location"] == "synthcity_objective.setup"
+    assert checkpoint["metadata"]["outcome"] == {
+        **provenance,
+        "state": "pruned",
+    }
+    assert checkpoint["state"] == "pruned"
+    assert "/secret/raw-data" not in json.dumps(checkpoint)
+
+
+def test_synthcity_objective_persists_sampled_and_effective_parameters(tmp_path, monkeypatch):
+    fit_calls = []
+
+    class FakePlugin:
+        @staticmethod
+        def sample_hyperparameters_optuna(trial):
+            return {"n_iter": trial.suggest_int("n_iter", 100, 100)}
+
+    def fake_canonical_metrics(*_args, **_kwargs):
+        report = pd.DataFrame(
+            {
+                "mean": [0.25, 0.25, 0.25],
+                "direction": _strings("minimize", "minimize", "maximize"),
+            },
+            index=_strings("mixed_mmd.v1", "elastic_net_jsd.v1", "tstr_macro_f1.v1"),
+        )
+        report.attrs["metric_metadata"] = {}
+        report.attrs["hpo_provenance"] = _hpo_context()
+        return report
+
+    def fake_fit_generate(*args, **kwargs):
+        fit_calls.append((args, kwargs))
+        metadata = {
+            "schema_version": "generator-metadata-v1",
+            "generator_context": {"privacy_claim_type": "none"},
+            "plugin_name": "ctgan",
+            "plugin_fqdn": "synthcity.ctgan",
+            "requested_parameters": {"n_iter": 100},
+            "n_samples": 1,
+            "random_state": 0,
+            "privacy_accounting": None,
+        }
+        return pd.DataFrame({"target": [0]}), metadata
+
+    monkeypatch.setattr(synthcity_backend_module, "get_plugin_class", lambda _name: FakePlugin)
+    monkeypatch.setattr(
+        synthcity_backend_module,
+        "plugin_accepts",
+        lambda _name, parameter: parameter in {"n_iter", "device"},
+    )
+    monkeypatch.setattr(synthcity_backend_module, "fit_generate", fake_fit_generate)
+    monkeypatch.setattr(
+        synthcity_backend_module, "evaluate_canonical_hpo_metrics", fake_canonical_metrics
+    )
+    monkeypatch.setattr(synthcity_backend_module, "hpo_score", lambda *_args, **_kwargs: 0.25)
+
+    config = HPOConfig(
+        n_trials=1,
+        timeout_seconds=None,
+        n_iter_cap=40,
+    )
+    context = _hpo_context()
+    objective = build_synthcity_objective(
+        "ctgan",
+        train_loader=object(),
+        tuning_loader=object(),
+        hpo_cfg=config,
+        seed=0,
+        device="cuda",
+        train_df=pd.DataFrame({"target": [0]}),
+        tuning_df=pd.DataFrame({"target": [0]}),
+        target_column="target",
+        synthetic_size=1,
+    )
+    run_study(
+        "fake_ctgan_boundary",
+        objective,
+        config,
+        tmp_path,
+        seed=0,
+        drop_keys=(),
+        hpo_context=context,
+    )
+
+    checkpoint = load_hpo_trial_checkpoint(
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name("fake_ctgan_boundary", context)
+        / "trial-0"
+        / "checkpoint.json",
+        hpo_context=context,
+    )
+    generator = checkpoint["metadata"]["generator"]["metadata"]
+    assert len(fit_calls) == 1
+    assert fit_calls[0][1]["device"] == "cuda"
+    assert fit_calls[0][0][1]["n_iter"] == 40
+    assert isinstance(fit_calls[0][0][1]["device"], torch.device)
+    assert fit_calls[0][0][1]["device"] == torch.device("cuda")
+    assert generator["requested_parameters"]["n_iter"] == 100
+    assert generator["effective_parameters"]["n_iter"] == 40
+    assert generator["effective_parameters"]["device"] == "cuda"
+    trial = optuna.load_study(
+        study_name=contextual_study_name("fake_ctgan_boundary", context),
+        storage=f"sqlite:///{tmp_path / 'optuna_studies.db'}",
+    ).trials[0]
+    assert trial.user_attrs["generator_requested_parameters"]["n_iter"] == 100
+    assert trial.user_attrs["generator_effective_parameters"] == {
+        "n_iter": 40,
+        "random_state": 0,
+        "device": "cuda",
+    }
+    json.dumps(checkpoint)
+
+
+def test_hpo_checkpoint_boundary_keeps_requested_and_effective_parameters(tmp_path):
+    context = _hpo_context()
+    study = optuna.create_study(direction="minimize")
+    trial = study.ask()
+    trial.set_user_attr("generator_metadata_state", "present")
+    trial.set_user_attr("generator_plugin_name", "ctgan")
+    trial.set_user_attr("generator_privacy_claim_type", "none")
+    trial.set_user_attr("generator_implementation_fingerprint", "impl")
+    trial.set_user_attr(
+        "generator_metadata",
+        {
+            "schema_version": "generator-metadata-v2",
+            "generator_context": {"privacy_claim_type": "none"},
+            "plugin_name": "ctgan",
+            "plugin_fqdn": "synthcity.ctgan",
+            "requested_parameters": {"n_iter": 100, "device": "cpu"},
+            "effective_parameters": {"n_iter": 40, "device": "cpu"},
+            "n_samples": 4,
+            "random_state": 0,
+            "privacy_accounting": None,
+            "implementation_fingerprint": "impl",
+        },
+    )
+    study.tell(trial, 0.25)
+
+    checkpoint_path = persist_hpo_trial_checkpoint(
+        tmp_path,
+        "boundary",
+        study.trials[0],
+        hpo_context=context,
+        expected_implementation_fingerprint="impl",
+    )
+    checkpoint = load_hpo_trial_checkpoint(
+        checkpoint_path,
+        hpo_context=context,
+        expected_implementation_fingerprint="impl",
+    )
+    metadata = checkpoint["metadata"]["generator"]["metadata"]
+
+    json.dumps(checkpoint)
+    assert metadata["requested_parameters"]["n_iter"] == 100
+    assert metadata["effective_parameters"]["n_iter"] == 40
+    assert metadata["effective_parameters"]["device"] == "cpu"
+
+
+def test_synthcity_objective_rejects_malformed_v1_generator_metadata(tmp_path, monkeypatch):
+    class FakePlugin:
+        @staticmethod
+        def sample_hyperparameters_optuna(_trial):
+            return {"n_iter": 100}
+
+    def fake_canonical_metrics(*_args, **_kwargs):
+        report = pd.DataFrame(
+            {
+                "mean": [0.25, 0.25, 0.25],
+                "direction": _strings("minimize", "minimize", "maximize"),
+            },
+            index=_strings("mixed_mmd.v1", "elastic_net_jsd.v1", "tstr_macro_f1.v1"),
+        )
+        report.attrs["metric_metadata"] = {}
+        report.attrs["hpo_provenance"] = _hpo_context()
+        return report
+
+    def fake_fit_generate(*_args, **_kwargs):
+        return pd.DataFrame({"target": [0]}), {
+            "schema_version": "generator-metadata-v1",
+            "generator_context": {"privacy_claim_type": "none"},
+            "plugin_name": "ctgan",
+            "n_samples": 1,
+            "random_state": 0,
+            "privacy_accounting": None,
+        }
+
+    monkeypatch.setattr(synthcity_backend_module, "get_plugin_class", lambda _name: FakePlugin)
+    monkeypatch.setattr(
+        synthcity_backend_module,
+        "plugin_accepts",
+        lambda _name, parameter: parameter in {"n_iter", "device"},
+    )
+    monkeypatch.setattr(synthcity_backend_module, "fit_generate", fake_fit_generate)
+    monkeypatch.setattr(
+        synthcity_backend_module, "evaluate_canonical_hpo_metrics", fake_canonical_metrics
+    )
+    monkeypatch.setattr(synthcity_backend_module, "hpo_score", lambda *_args, **_kwargs: 0.25)
+
+    config = HPOConfig(n_trials=1, timeout_seconds=None, n_iter_cap=40)
+    context = _hpo_context()
+    objective = build_synthcity_objective(
+        "ctgan",
+        train_loader=object(),
+        tuning_loader=object(),
+        hpo_cfg=config,
+        seed=0,
+        train_df=pd.DataFrame({"target": [0]}),
+        tuning_df=pd.DataFrame({"target": [0]}),
+        target_column="target",
+    )
+
+    with pytest.raises(RuntimeError, match="produced no completed trials"):
+        run_study(
+            "malformed_v1_metadata",
+            objective,
+            config,
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+        )
+
+    checkpoint = load_hpo_trial_checkpoint(
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name("malformed_v1_metadata", context)
+        / "trial-0"
+        / "checkpoint.json",
+        hpo_context=context,
+    )
+    assert checkpoint["state"] == "pruned"
+    assert checkpoint["metadata"]["generator"]["state"] == "missing"
+    assert (
+        "generator" not in checkpoint["metadata"]
+        or checkpoint["metadata"]["generator"].get("metadata") is None
+    )
 
 
 def test_hpo_builders_reject_unsafe_config_before_backend_execution():
