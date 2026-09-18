@@ -1,9 +1,12 @@
 """Unit tests for synthdata.experiment: append-only manifest + resumability."""
 
 import json
+from pathlib import Path
 
 import pytest
+import yaml
 
+from synthdata.data import role_context_fingerprint, role_context_payload
 from synthdata.experiment import (
     _timestamp_id,
     dataset_plots_dir,
@@ -28,7 +31,29 @@ class TestTimestampId:
         assert timestamp_part.endswith("Z")
 
 
+def test_protected_n40_profile_requires_fresh_auto_experiment_id():
+    profile = yaml.safe_load(
+        (
+            Path(__file__).parents[2] / "configs/config_loris_protected_generation_n40.yaml"
+        ).read_text()
+    )
+
+    assert "id" not in profile["experiment"]
+    assert profile["generation"]["force_retrain"] is True
+    assert profile["generation"]["n_samples"] == 100
+    assert profile["generation"]["synthcity"]["params"]["ctgan"]["n_iter"] == 40
+
+
 class TestStartExperiment:
+    def test_auto_generated_id_does_not_reuse_existing_artifacts(self, make_config, mocker):
+        cfg = make_config(tag="smoke")
+        mocker.patch("synthdata.experiment._timestamp_id", return_value="20260917T160200Z_smoke")
+        first = start_experiment(cfg)
+        second = start_experiment(cfg)
+
+        assert first.id != second.id
+        assert first.manifest_path.parent != second.manifest_path.parent
+
     def test_creates_directories_and_manifest(self, make_config):
         cfg = make_config()
         experiment = start_experiment(cfg)
@@ -152,6 +177,113 @@ class TestRecordAppendOnly:
 
 
 class TestLoadExperimentResumability:
+    def _handoff_experiment(self, make_config, make_canonical_dataset):
+        recorded = make_canonical_dataset()
+        recorded.imputed_roles.pop("final_holdout")
+        recorded.full_imputed_df = recorded.imputed_roles.get("train")
+        experiment = start_experiment(make_config(), dataset=recorded)
+        experiment.record("generation")
+        return experiment, make_canonical_dataset()
+
+    def test_final_holdout_imputation_handoff_is_explicit_and_manifest_preserved(
+        self, make_config, make_canonical_dataset
+    ):
+        experiment, current = self._handoff_experiment(make_config, make_canonical_dataset)
+        before = experiment.manifest_path.read_bytes()
+
+        loaded = load_experiment(
+            make_config(experiment_id=experiment.id),
+            dataset=current,
+            allow_final_holdout_handoff=True,
+        )
+
+        assert loaded.id == experiment.id
+        assert experiment.manifest_path.read_bytes() == before
+
+    def test_generation_context_uses_raw_equivalent_final_holdout_baseline(
+        self, make_config, make_canonical_dataset
+    ):
+        dataset = make_canonical_dataset()
+        experiment = start_experiment(make_config(), dataset=dataset)
+        experiment.record("generation")
+        manifest = json.loads(experiment.manifest_path.read_text())
+        final_context = manifest["role_context"]["roles"]["final_holdout"]
+
+        assert final_context["imputed_fingerprint"] == final_context["raw_fingerprint"]
+
+    def test_final_holdout_handoff_rejects_raw_change(self, make_config, make_canonical_dataset):
+        experiment, current = self._handoff_experiment(make_config, make_canonical_dataset)
+        current.roles["final_holdout"].iloc[0, 0] = -1
+
+        with pytest.raises(ValueError, match="role context"):
+            load_experiment(
+                make_config(experiment_id=experiment.id),
+                dataset=current,
+                allow_final_holdout_handoff=True,
+            )
+
+    def test_final_holdout_handoff_rejects_rows_change(self, make_config, make_canonical_dataset):
+        experiment, current = self._handoff_experiment(make_config, make_canonical_dataset)
+        current.roles["final_holdout"] = current.roles["final_holdout"].iloc[:-1].copy()
+        current.imputed_roles["final_holdout"] = (
+            current.imputed_roles["final_holdout"].iloc[:-1].copy()
+        )
+
+        with pytest.raises(ValueError, match="role context"):
+            load_experiment(
+                make_config(experiment_id=experiment.id),
+                dataset=current,
+                allow_final_holdout_handoff=True,
+            )
+
+    def test_final_holdout_handoff_rejects_assignment_change(
+        self, make_config, make_canonical_dataset
+    ):
+        experiment, current = self._handoff_experiment(make_config, make_canonical_dataset)
+        current.assignment.loc[current.assignment.index[0], "role"] = "tuning"
+
+        with pytest.raises(ValueError, match="role context"):
+            load_experiment(
+                make_config(experiment_id=experiment.id),
+                dataset=current,
+                allow_final_holdout_handoff=True,
+            )
+
+    @pytest.mark.parametrize("role", ["train", "tuning"])
+    def test_final_holdout_handoff_rejects_candidate_imputed_change(
+        self, make_config, make_canonical_dataset, role
+    ):
+        experiment, current = self._handoff_experiment(make_config, make_canonical_dataset)
+        current.imputed_roles[role].iloc[0, 0] = -999
+
+        with pytest.raises(ValueError, match="role context"):
+            load_experiment(
+                make_config(experiment_id=experiment.id),
+                dataset=current,
+                allow_final_holdout_handoff=True,
+            )
+
+    def test_final_holdout_handoff_rejects_arbitrary_context_change(
+        self, make_config, make_canonical_dataset
+    ):
+        experiment, current = self._handoff_experiment(make_config, make_canonical_dataset)
+        current.semantic_fingerprint = "changed"
+
+        with pytest.raises(ValueError, match="role context"):
+            load_experiment(
+                make_config(experiment_id=experiment.id),
+                dataset=current,
+                allow_final_holdout_handoff=True,
+            )
+
+    def test_final_holdout_handoff_is_rejected_by_default(
+        self, make_config, make_canonical_dataset
+    ):
+        experiment, current = self._handoff_experiment(make_config, make_canonical_dataset)
+
+        with pytest.raises(ValueError, match="role context"):
+            load_experiment(make_config(experiment_id=experiment.id), dataset=current)
+
     def test_resumes_via_explicit_id(self, make_config):
         cfg = make_config()
         started = start_experiment(cfg)
@@ -176,6 +308,39 @@ class TestLoadExperimentResumability:
         cfg = make_config()
         with pytest.raises(FileNotFoundError, match="No experiment found"):
             load_experiment(cfg)
+
+    def test_generation_context_rejects_assignment_identity_mismatch(
+        self, make_config, make_canonical_dataset
+    ):
+        dataset = make_canonical_dataset()
+        experiment = start_experiment(make_config(), dataset=dataset)
+        context = role_context_payload(dataset, ("train", "tuning"))
+        context["roles"]["train"]["raw_fingerprint"] = "stale-assignment-identity"
+
+        with pytest.raises(RuntimeError, match="differs from experiment dataset lineage"):
+            experiment.validate_generation_context(
+                context,
+                role_context_fingerprint(dataset, ("train", "tuning")),
+            )
+
+    def test_generation_context_accepts_current_snapshot_without_rewriting_manifest(
+        self, make_config, make_canonical_dataset
+    ):
+        dataset = make_canonical_dataset()
+        experiment = start_experiment(make_config(), dataset=dataset)
+        before = (
+            experiment.manifest_path.read_bytes() if experiment.manifest_path.exists() else None
+        )
+        context = role_context_payload(dataset, ("train", "tuning"))
+        full_roles = ("train", "tuning", "final_holdout")
+        experiment.validate_generation_context(
+            context,
+            role_context_fingerprint(dataset, ("train", "tuning")),
+            full_context=role_context_payload(dataset, full_roles),
+            full_fingerprint=role_context_fingerprint(dataset, full_roles),
+        )
+        after = experiment.manifest_path.read_bytes() if experiment.manifest_path.exists() else None
+        assert after == before
 
     def test_latest_pointer_tracks_most_recent_start(self, make_config):
         cfg = make_config(experiment_id="exp-1")

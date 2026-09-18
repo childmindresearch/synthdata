@@ -304,6 +304,8 @@ class SynthcityModelsConfig:
             "ddpm",
         ]
     )
+    #: Per-plugin keyword arguments for non-HPO SynthCity generation.
+    params: dict = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -362,13 +364,28 @@ class HPOConfig:
     #: may be used; privacy/calibration metrics fail closed at objective setup.
     metric_config: dict = dataclasses.field(
         default_factory=lambda: {
-            "task12": [
+            "canonical_objectives": [
                 "tstr_macro_f1.v1",
                 "mixed_mmd.v1",
                 "elastic_net_jsd.v1",
             ],
         }
     )
+
+    def __post_init__(self) -> None:
+        """Canonicalize legacy objective key while rejecting ambiguous input."""
+        legacy = self.metric_config.get("task12")
+        canonical = self.metric_config.get("canonical_objectives")
+        if legacy is not None and canonical is not None and legacy != canonical:
+            raise ValueError(
+                "generation.hpo.metric_config cannot define conflicting task12 and canonical_objectives"
+            )
+        if legacy is not None:
+            self.metric_config = {
+                **{key: value for key, value in self.metric_config.items() if key != "task12"},
+                "canonical_objectives": legacy,
+            }
+
     #: Deterministic candidate screens run before any objective metrics.
     stage_a: StageAScreenConfig = dataclasses.field(default_factory=StageAScreenConfig)
     #: Optuna storage URL, e.g. "sqlite:///output/dataset/optuna_studies.db".
@@ -378,7 +395,7 @@ class HPOConfig:
     best_params_path: str | None = None
     #: Override n_iter for the final "optimized" build of iterative models (None = no override).
     final_n_iter_override: int | None = None
-    #: Fixed tuning objective policy; canonical profiles may not replace its metrics.
+    #: Canonical HPO objective policy; canonical profiles may not replace its metrics.
     utility_policy: dict = dataclasses.field(
         default_factory=lambda: {
             "metrics": [
@@ -389,8 +406,6 @@ class HPOConfig:
             "weights": [1 / 3, 1 / 3, 1 / 3],
         }
     )
-    #: Provenance marker requiring Task 13 HPO code to consume this fixed policy.
-    utility_policy_provenance: str | None = None
 
 
 @dataclasses.dataclass
@@ -835,7 +850,6 @@ def _validate_policy_config(cfg: Any) -> None:
                 "evaluation.release_generalization",
                 "evaluation.release_generalization.columns",
                 "generation.hpo.utility_policy",
-                "generation.hpo.utility_policy_provenance",
             }
             required.update(
                 f"evaluation.privacy_policy.{name}"
@@ -865,14 +879,6 @@ def _validate_policy_config(cfg: Any) -> None:
                 raise ValueError(
                     "Canonical policy is incomplete; explicitly configure: " + ", ".join(missing)
                 )
-        if (
-            not isinstance(cfg.generation.hpo.utility_policy_provenance, str)
-            or not cfg.generation.hpo.utility_policy_provenance.strip()
-        ):
-            raise ValueError(
-                "generation.hpo.utility_policy_provenance must state that Task 13 consumes "
-                "fixed utility_policy; HPO execution is not wired by config validation"
-            )
     if cfg.data.canonical and cfg.evaluation.log_disparity.protected_bins is not None:
         raise ValueError(
             "Canonical evaluation rejects positional evaluation.log_disparity.protected_bins; "
@@ -1098,14 +1104,19 @@ def _validate(cfg: Config) -> None:
             raise ValueError(f"data.{field_name} must be a list of column names, got {value!r}")
         if len(value) != len(set(value)):
             raise ValueError(f"data.{field_name} must not contain duplicate columns")
-    declared_roles = (
-        set(cfg.data.protected_columns)
-        | set(cfg.data.sensitive_columns)
-        | set(cfg.data.quasi_identifier_columns)
-    )
-    if cfg.data.target_column in declared_roles:
+    target_role_overlap = {
+        role
+        for role, columns in (
+            ("protected_columns", cfg.data.protected_columns),
+            ("sensitive_columns", cfg.data.sensitive_columns),
+            ("quasi_identifier_columns", cfg.data.quasi_identifier_columns),
+        )
+        if cfg.data.target_column in columns
+    }
+    if target_role_overlap:
         raise ValueError(
-            "data.target_column must not be declared as a protected attribute or quasi-identifier"
+            "data.target_column must not overlap protected_columns, sensitive_columns, or "
+            f"quasi_identifier_columns: {sorted(target_role_overlap)}"
         )
     _validate_data_split_config(cfg.data)
     if cfg.data.canonical:
@@ -1155,7 +1166,9 @@ def _validate(cfg: Config) -> None:
             "data.patient_id_column is reserved for canonical profiles; set data.canonical=true "
             "or remove it from this legacy/noncanonical profile"
         )
-    drop_columns = cfg.data.drop_columns or []
+    if cfg.data.drop_columns is None:
+        cfg.data.drop_columns = []
+    drop_columns = cfg.data.drop_columns
     if not isinstance(drop_columns, list) or any(
         not isinstance(column, str) for column in drop_columns
     ):

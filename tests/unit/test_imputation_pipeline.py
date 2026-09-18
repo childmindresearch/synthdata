@@ -11,10 +11,15 @@ import pytest
 from synthdata.data import dataframe_fingerprint, load_imputed_splits
 from synthdata.imputation import pipeline as imputation_pipeline
 from synthdata.imputation.hyperimpute_backend import (
+    FIT_FRAME_FINGERPRINT_VERSION,
     HyperImputeError,
     HyperImputeState,
     fit_dataframe,
+    metadata_fingerprint,
     transform_dataframe,
+)
+from synthdata.imputation.hyperimpute_backend import (
+    state_metadata as hyper_state_metadata,
 )
 from synthdata.imputation.pipeline import (
     _CACHE_KEY_FILENAME,
@@ -57,6 +62,15 @@ def test_fixed_hyperimpute_rejects_all_missing_training_feature():
     frame = pd.DataFrame({"value": [None, None], "target": [0, 1]})
     with pytest.raises(HyperImputeError, match="no observed training value"):
         fit_dataframe(frame, ["value"], [], fit_roles=("train",))
+
+
+def test_fitted_hyperimpute_state_uses_canonical_frame_fingerprint():
+    frame = pd.DataFrame({"value": [1.0, None], "target": [0, 1]})
+    state = fit_dataframe(frame, ["value"], [], fit_roles=("train",))
+
+    assert state.fit_fingerprint == dataframe_fingerprint(frame)
+    metadata = hyper_state_metadata(state)
+    assert metadata["fit_frame_fingerprint_version"] == FIT_FRAME_FINGERPRINT_VERSION
 
 
 def test_final_phase_fits_train_and_tuning_and_transforms_holdout_only(
@@ -120,6 +134,34 @@ class TestCacheKeyPayload:
         assert (
             _cache_key_record(cfg, dataset_a)["cache_key"]
             != _cache_key_record(cfg, dataset_b)["cache_key"]
+        )
+
+    def test_categorical_order_follows_feature_order(self, make_config, make_dataset):
+        cfg = make_config()
+        dataset = make_dataset(
+            feature_columns=["group", "smoker", "age"],
+            nominal_columns=["smoker", "group"],
+        )
+
+        assert dataset.categorical_columns == ["group", "smoker"]
+        assert _cache_key_payload(cfg, dataset)["categorical_columns"] == ["group", "smoker"]
+
+    def test_categorical_order_change_changes_hash(self, make_config, make_dataset):
+        cfg = make_config()
+        first = make_dataset(
+            feature_columns=["group", "smoker", "age"],
+            nominal_columns=["group", "smoker"],
+            name="first-order",
+        )
+        second = make_dataset(
+            feature_columns=["smoker", "group", "age"],
+            nominal_columns=["group", "smoker"],
+            name="second-order",
+        )
+
+        assert (
+            _cache_key_record(cfg, first)["cache_key"]
+            != _cache_key_record(cfg, second)["cache_key"]
         )
 
     def test_ordinal_columns_change_changes_hash(self, make_config, make_dataset):
@@ -215,6 +257,11 @@ class TestCacheKeyPayload:
         assert final["fit_roles"] == ["train", "tuning"]
         assert final["transform_roles"] == ["final_holdout"]
 
+    @pytest.mark.parametrize("builder", [_cache_key_payload, _cache_key_record])
+    def test_cache_key_builders_reject_invalid_phase(self, make_config, make_dataset, builder):
+        with pytest.raises(ValueError, match="expected 'candidate' or 'final'"):
+            builder(make_config(), make_dataset(), phase="invalid")
+
 
 class TestLoadCachedKey:
     def test_missing_file_returns_none(self, tmp_path):
@@ -240,6 +287,123 @@ class TestLoadCachedKey:
 
 
 class TestRunImputationCaching:
+    def test_invalid_phase_rejected_before_writing_artifacts(self, make_config, make_dataset):
+        dataset = make_dataset()
+
+        with pytest.raises(ValueError, match="expected 'candidate' or 'final'"):
+            run_imputation(make_config(), dataset, phase="invalid")
+
+        assert list(dataset.data_dir.iterdir()) == []
+
+    def test_canonical_candidate_cache_reload_matches_generation_key(
+        self, make_config, make_canonical_dataset
+    ):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+
+        run_imputation(cfg, dataset)
+        record = json.loads((dataset.data_dir / _CACHE_KEY_FILENAME).read_text())
+        fresh = make_canonical_dataset()
+        fresh.data_dir = dataset.data_dir
+
+        assert record["cache_key"] == _cache_key_record(cfg, fresh)["cache_key"]
+        load_imputed_splits(fresh, expected_cache_key=record["cache_key"])
+        assert fresh.full_imputed_df is not None
+
+    def test_canonical_candidate_cache_records_phase_aware_metadata(
+        self, make_config, make_canonical_dataset
+    ):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+
+        run_imputation(cfg, dataset)
+        record = json.loads((dataset.data_dir / _CACHE_KEY_FILENAME).read_text())
+
+        assert record["phase"] == "candidate"
+        assert record["fit_roles"] == ["train"]
+        assert record["transform_roles"] == ["train", "tuning"]
+        assert record["fit_frame_fingerprint"] == dataframe_fingerprint(dataset.roles["train"])
+        assert "fit_role" not in record
+        assert "fit_role_fingerprint" not in record
+
+    def test_final_phase_preserves_candidate_cache(self, make_config, make_canonical_dataset):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+
+        run_imputation(cfg, dataset)
+        candidate_record = json.loads((dataset.data_dir / _CACHE_KEY_FILENAME).read_text())
+        run_imputation(cfg, dataset, phase="final")
+
+        assert json.loads((dataset.data_dir / _CACHE_KEY_FILENAME).read_text()) == candidate_record
+        final_record = json.loads(
+            (dataset.data_dir / "imputation_final" / _CACHE_KEY_FILENAME).read_text()
+        )
+        assert final_record["phase"] == "final"
+
+    def test_canonical_final_cache_writes_and_reloads_phase_metadata(
+        self, make_config, make_canonical_dataset
+    ):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+
+        run_imputation(cfg, dataset, phase="final")
+        record = json.loads(
+            (dataset.data_dir / "imputation_final" / _CACHE_KEY_FILENAME).read_text()
+        )
+        fresh = make_canonical_dataset()
+        fresh.data_dir = dataset.data_dir
+
+        load_imputed_splits(fresh, expected_cache_key=record["cache_key"], phase="final")
+        fit_frame = pd.concat([fresh.roles["train"], fresh.roles["tuning"]], axis=0)
+        assert record["phase"] == "final"
+        assert record["fit_roles"] == ["train", "tuning"]
+        assert record["transform_roles"] == ["final_holdout"]
+        assert record["fit_frame_fingerprint"] == dataframe_fingerprint(fit_frame)
+        assert fresh.full_imputed_df is not None
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            lambda record: record.update(phase="final"),
+            lambda record: record.update(fit_frame_fingerprint="changed"),
+            lambda record: record.pop("phase"),
+            lambda record: record.pop("fit_roles"),
+            lambda record: record.pop("transform_roles"),
+            lambda record: record.pop("fit_frame_fingerprint"),
+        ],
+        ids=[
+            "phase-mismatch",
+            "fit-frame-mismatch",
+            "missing-phase",
+            "missing-fit-roles",
+            "missing-transform-roles",
+            "missing-fit-frame",
+        ],
+    )
+    def test_canonical_candidate_loader_rejects_invalid_phase_metadata(
+        self, make_config, make_canonical_dataset, change
+    ):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+        run_imputation(cfg, dataset)
+        cache_path = dataset.data_dir / _CACHE_KEY_FILENAME
+        record = json.loads(cache_path.read_text())
+        change(record)
+        cache_path.write_text(json.dumps(record))
+
+        fresh = make_canonical_dataset()
+        fresh.data_dir = dataset.data_dir
+        fresh.full_imputed_df = None
+        fresh.imputed_roles = {}
+        load_imputed_splits(fresh)
+
+        assert fresh.full_imputed_df is None
+
     def test_canonical_hyperimpute_cache_records_train_fit_state(
         self, make_config, make_canonical_dataset
     ):
@@ -256,6 +420,30 @@ class TestRunImputationCaching:
         assert fit_state["status"] == "not_required"
         assert fit_state["fit_frame_fingerprint"] == dataframe_fingerprint(dataset.roles["train"])
         assert fit_state["transform_roles"] == ["train", "tuning"]
+        assert fit_state["categorical_columns"] == dataset.categorical_columns
+        assert record["categorical_columns"] == dataset.categorical_columns
+
+    def test_reordered_hyperimpute_state_retrains(
+        self, make_config, make_canonical_dataset, mocker
+    ):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+        run_imputation(cfg, dataset)
+
+        cache_path = dataset.data_dir / _CACHE_KEY_FILENAME
+        record = json.loads(cache_path.read_text())
+        record["fit_state"]["categorical_columns"] = ["feature", "protected"]
+        record["fit_state"]["state_fingerprint"] = metadata_fingerprint(record["fit_state"])
+        cache_path.write_text(json.dumps(record))
+
+        rerun = mocker.patch(
+            "synthdata.imputation.pipeline._impute_canonical_roles",
+            wraps=imputation_pipeline._impute_canonical_roles,
+        )
+        run_imputation(cfg, make_canonical_dataset())
+
+        rerun.assert_called_once()
 
     def test_canonical_cache_without_fit_state_retrains(
         self, make_config, make_canonical_dataset, mocker
@@ -279,6 +467,52 @@ class TestRunImputationCaching:
         run_imputation(cfg, rerun_dataset)
 
         rerun.assert_called_once()
+
+    @pytest.mark.parametrize("version", [None, "dataframe_fingerprint_v0"])
+    def test_canonical_cache_with_stale_fingerprint_version_retrains(
+        self, make_config, make_canonical_dataset, mocker, version
+    ):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+        run_imputation(cfg, dataset)
+
+        cache_path = dataset.data_dir / _CACHE_KEY_FILENAME
+        record = json.loads(cache_path.read_text())
+        if version is None:
+            record["fit_state"].pop("fit_frame_fingerprint_version")
+        else:
+            record["fit_state"]["fit_frame_fingerprint_version"] = version
+        record["fit_state"]["state_fingerprint"] = metadata_fingerprint(record["fit_state"])
+        cache_path.write_text(json.dumps(record))
+
+        rerun_dataset = make_canonical_dataset()
+        rerun = mocker.patch(
+            "synthdata.imputation.pipeline._impute_canonical_roles",
+            wraps=imputation_pipeline._impute_canonical_roles,
+        )
+
+        run_imputation(cfg, rerun_dataset)
+
+        rerun.assert_called_once()
+
+    def test_canonical_cache_with_current_fingerprint_version_is_reused(
+        self, make_config, make_canonical_dataset, mocker
+    ):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+        run_imputation(cfg, dataset)
+
+        rerun_dataset = make_canonical_dataset()
+        rerun = mocker.patch(
+            "synthdata.imputation.pipeline._impute_canonical_roles",
+            wraps=imputation_pipeline._impute_canonical_roles,
+        )
+
+        run_imputation(cfg, rerun_dataset)
+
+        rerun.assert_not_called()
 
     def test_persists_and_reloads_decoded_ordinal_splits(self, make_config, make_dataset, mocker):
         cfg = make_config()

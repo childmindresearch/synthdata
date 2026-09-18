@@ -26,12 +26,14 @@ from synthdata.data import (
     role_context_payload,
     semantic_context_digest,
     semantic_context_payload,
+    validate_imputation_cache_lineage,
 )
 from synthdata.evaluation.metric_contracts import DEFAULT_METRIC_CONTRACT_REGISTRY
 from synthdata.evaluation.release import PROTOCOL_VERSION, _release_transform_digest
 from synthdata.generation import hpo as hpo_mod
 from synthdata.generation import synthcity_backend as sc
 from synthdata.generation import tabpfn_backend as tpfn
+from synthdata.imputation.pipeline import _cache_key_record
 from synthdata.utils import (
     ensure_dir,
     get_logger,
@@ -172,7 +174,7 @@ def _build_stage_a_contract(
         target_column=dataset.target_column,
         target_is_categorical=dataset.target_is_categorical,
         categorical_columns=dataset.categorical_columns,
-        protected_columns=dataset.sensitive_columns,
+        protected_columns=dataset.protected_columns,
         minimum_target_count=stage_a_cfg.minimum_class_count,
         minimum_protected_group_count=stage_a_cfg.minimum_protected_group_count,
         minimum_target_by_protected_group_count=(
@@ -555,13 +557,15 @@ def refit_selected_model(
             params = load_hpo_params("synthcity", plugin_name)
             if gen_cfg.hpo.final_n_iter_override and sc.plugin_accepts(plugin_name, "n_iter"):
                 params["n_iter"] = gen_cfg.hpo.final_n_iter_override
+        else:
+            params = dict(gen_cfg.synthcity.params.get(plugin_name, {}))
         feature_types = {column: entry["kind"] for column, entry in dataset.variable_schema.items()}
         source_table = {
             column: entry["source_table"]
             for column, entry in dataset.variable_schema.items()
             if entry.get("source_table") is not None
         }
-        fairness_column = dataset.sensitive_columns[0] if dataset.sensitive_columns else None
+        fairness_column = dataset.protected_columns[0] if dataset.protected_columns else None
         fit_loader = sc.make_loader(
             imputed_fit_frame,
             dataset.target_column,
@@ -811,21 +815,48 @@ def run_generation(
         raise RuntimeError(
             "Dataset must be imputed before generation (run synthdata.imputation.run_imputation first)"
         )
+    if needs_imputed_data(gen_cfg):
+        validate_imputation_cache_lineage(
+            dataset,
+            _cache_key_record(cfg, dataset),
+            required=dataset.has_canonical_roles,
+        )
 
     output_dir = ensure_dir(gen_cfg.output_dir)
     n_samples = gen_cfg.n_samples
     seed = cfg.seed
     device = resolve_device(cfg.device)
     task_type = "classification" if dataset.target_is_categorical else "regression"
-    context_roles = ("train", "tuning") if gen_cfg.hpo.enabled else ("train",)
+    # Candidate artifacts are evaluated against train+tuning regardless of
+    # whether HPO selected parameters.  This is provenance only: every
+    # generator below still receives train_loader exclusively when HPO is off.
+    context_roles = ("train", "tuning") if dataset.has_canonical_roles else ("train",)
+    fit_context_roles = ("train",)
     generation_role_context = role_context_payload(dataset, context_roles)
     generation_role_context_fingerprint = role_context_fingerprint(dataset, context_roles)
+    fit_context = role_context_payload(dataset, fit_context_roles)
+    fit_context_fingerprint = role_context_fingerprint(dataset, fit_context_roles)
     generation_semantic_context = semantic_context_payload(
         dataset,
         classification_score=cfg.evaluation.synthcity.classification_score,
         roles=context_roles,
     )
     generation_semantic_context_digest = semantic_context_digest(generation_semantic_context)
+    if experiment is not None and hasattr(experiment, "validate_generation_context"):
+        full_roles = (
+            ("train", "tuning", "final_holdout")
+            if dataset.has_canonical_roles
+            else (
+                "train",
+                "final_holdout",
+            )
+        )
+        experiment.validate_generation_context(
+            generation_role_context,
+            generation_role_context_fingerprint,
+            full_context=role_context_payload(dataset, full_roles, candidate_phase=True),
+            full_fingerprint=role_context_fingerprint(dataset, full_roles, candidate_phase=True),
+        )
 
     stage_a_contract = None
     stage_a_root = None
@@ -908,6 +939,8 @@ def run_generation(
             "model_name": name,
             "role_context_fingerprint": generation_role_context_fingerprint,
             "role_context": generation_role_context,
+            "fit_context_fingerprint": fit_context_fingerprint,
+            "fit_context": fit_context,
             "variable_schema_fingerprint": dataset.variable_schema_fingerprint,
             "semantic_context": generation_semantic_context,
             "semantic_context_digest": generation_semantic_context_digest,
@@ -1033,22 +1066,52 @@ def run_generation(
                 "generator_metadata": generator_metadata,
             },
         )
+        persisted_metadata = load_json(metadata_path)
+        expected_persisted_context = {
+            key: cache_metadata[key]
+            for key in (
+                "role_context_fingerprint",
+                "role_context",
+                "fit_context_fingerprint",
+                "fit_context",
+                "semantic_context_digest",
+            )
+        }
+        if any(
+            persisted_metadata.get(key) != value
+            for key, value in expected_persisted_context.items()
+        ):
+            raise RuntimeError(
+                f"{name} generation cache persisted context differs from validated experiment context"
+            )
         synthetic_datasets[name] = df
         if plot_callback is not None:
             try:
                 plot_callback(name, df, extra)
-            except (ValueError, TypeError, OSError, RuntimeError) as exc:
+            except Exception as exc:  # noqa: BLE001 - plotting must not fail generation
                 # Plotting must never break generation: skip just this
                 # figure, but persist the skip to the experiment manifest so
                 # it's visible from the output directory, not just the console.
-                logger.warning("[%s] plot callback failed: %s", name, exc)
+                logger.warning(
+                    "[%s] plot callback failed; reason_code=plot_callback_failed exception_type=%s",
+                    name,
+                    type(exc).__name__,
+                )
                 if experiment is not None:
-                    experiment.record(
-                        "generation_plot_failed",
-                        model=name,
-                        error=str(exc),
-                        error_type=type(exc).__name__,
-                    )
+                    try:
+                        experiment.record(
+                            "generation_plot_failed",
+                            model=name,
+                            reason_code="plot_callback_failed",
+                            message="Generation plot callback failed.",
+                            error_type=type(exc).__name__,
+                        )
+                    except Exception:  # noqa: BLE001 - manifest persistence is best effort
+                        logger.warning(
+                            "[%s] could not persist generation plot failure; "
+                            "reason_code=plot_failure_manifest_write_failed",
+                            name,
+                        )
         return df
 
     # ------------------------------------------------------------------
@@ -1057,7 +1120,7 @@ def run_generation(
     if gen_cfg.synthcity.enabled and gen_cfg.synthcity.names:
         if fit_imputed_df is None:
             raise RuntimeError("SynthCity generation requires an imputed train role")
-        fairness_column = dataset.sensitive_columns[0] if dataset.sensitive_columns else None
+        fairness_column = dataset.protected_columns[0] if dataset.protected_columns else None
         train_loader = sc.make_loader(
             fit_imputed_df,
             dataset.target_column,
@@ -1099,17 +1162,19 @@ def run_generation(
             )
 
         for name in gen_cfg.synthcity.names:
+            model_params = dict(gen_cfg.synthcity.params.get(name, {}))
             _cached_or_build(
                 name,
-                lambda name=name: sc.fit_generate(
+                lambda name=name, model_params=model_params: sc.fit_generate(
                     name,
-                    {},
+                    model_params,
                     train_loader,
                     n_samples,
                     seed,
                     workspace=str(output_dir / "synthcity_workspace"),
                     device=device,
                 ),
+                resolved_parameters=model_params,
             )
 
             if gen_cfg.hpo.enabled:
@@ -1245,7 +1310,7 @@ def run_generation(
                 fit_imputed_df,
                 tuning_imputed_df,
                 dataset.target_column,
-                dataset.sensitive_columns,
+                dataset.protected_columns,
                 gen_cfg.hpo.metric_config,
                 seed,
                 workspace=output_dir / "synthcity_workspace",

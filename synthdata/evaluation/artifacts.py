@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import uuid
 from collections.abc import Mapping
@@ -23,7 +24,7 @@ from typing import Any, cast
 import pandas as pd
 
 from synthdata.data import semantic_context_digest
-from synthdata.evaluation.catalog import CUSTOM_TASK12_MANIFEST, TASK12_EXPECTED_MANIFEST
+from synthdata.evaluation.catalog import CANONICAL_EXPECTED_MANIFEST, CUSTOM_CANONICAL_MANIFEST
 from synthdata.evaluation.metric_contracts import (
     CONTRACT_REGISTRY_VERSION,
     CONTRACT_SCHEMA_VERSION,
@@ -41,7 +42,9 @@ from synthdata.evaluation.metric_contracts import (
     MetricStatusRecord,
     MetricValidationResult,
     UnknownMetricContractError,
-    is_verified_task10_tstr,
+    is_verified_authoritative_tstr,
+    safe_metric_metadata,
+    safe_metric_status_error,
 )
 from synthdata.evaluation.syntheval_eval import (
     _execution_payload_failed,
@@ -53,6 +56,7 @@ logger = get_logger(__name__)
 
 _ARTIFACT_SCHEMA_VERSION = 1
 _BUNDLE_NAME = "evaluation_artifacts-v1"
+_ATTEMPTS_DIRNAME = "attempts"
 _LOG_REPORT_TABLES = (
     "leaf_results",
     "hierarchy_results",
@@ -61,6 +65,25 @@ _LOG_REPORT_TABLES = (
     "legend_table",
     "label_counts",
 )
+_SAFE_LOG_DISPARITY_REASONS = frozenset(
+    {
+        "evaluator_exception",
+        "incomplete_report",
+        "log_disparity_evaluation_failed",
+        "log_disparity_evaluation_indeterminate",
+        "malformed_report",
+        "metric_evaluation_failed",
+        "missing_declared_protected_fields",
+        "missing_or_invalid_release_provenance",
+        "missing release provenance",
+        "missing_real_evidence_provenance",
+        "missing_requested_evaluation_role",
+        "report_state_missing_or_unknown",
+        "synthetic_real_population_alias",
+        "undeclared_protected_fields",
+    }
+)
+_SAFE_EXCEPTION_TYPE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _GENERATOR_METADATA_SCHEMA_VERSION = "generator-metadata-v1"
 _GENERATOR_METADATA_V2_SCHEMA_VERSION = "generator-metadata-v2"
 _PATE_ACCOUNTING_FIELDS = (
@@ -125,6 +148,19 @@ _PROVENANCE_INVENTORY_FIELDS = (
     "intervals",
     "invalid_reasons",
     "selected_model_provenance",
+)
+_ROLE_HASH_MAP_KEYS = frozenset({"imputed_evaluation", "custom_raw_evaluation"})
+_ROLE_NAMES = frozenset({"train", "tuning", "final_holdout", "refit_fit", "synthetic", "reference"})
+_FIT_FRAME_FINGERPRINT_KEYS = frozenset({"raw", "imputed"})
+_FINAL_REFIT_IDENTITY_KEYS = frozenset(
+    {
+        "model_name",
+        "cache_key",
+        "data_sha256",
+        "metadata_sha256",
+        "fit_frame_fingerprint",
+        "fit_frame_fingerprints",
+    }
 )
 _LEGACY_FINAL_EVIDENCE_SCHEMA = "final-holdout-evidence-legacy-v1"
 
@@ -193,6 +229,48 @@ def artifact_bundle_dir(evaluation_dir: str | Path) -> Path:
     return Path(evaluation_dir) / _BUNDLE_NAME
 
 
+def select_evaluation_attempt(
+    evaluation_dir: str | Path, *, experiment_id: str | None = None
+) -> tuple[Path, dict[str, Any]]:
+    """Select append-only evaluation destination and its lineage metadata.
+
+    The canonical directory is retained for the first evaluation. Once any
+    evidence exists there, subsequent evaluations receive exclusive attempt
+    directories and never touch historical files.
+    """
+    root = Path(evaluation_dir)
+    evidence_names = ("combined_evaluation.csv", "report.md", _BUNDLE_NAME)
+    has_history = any((root / name).exists() for name in evidence_names)
+    if not has_history and root.is_dir():
+        has_history = any(path.name != _ATTEMPTS_DIRNAME for path in root.iterdir())
+    if not has_history and (root / _ATTEMPTS_DIRNAME).is_dir():
+        has_history = any((root / _ATTEMPTS_DIRNAME).iterdir())
+    if not has_history:
+        return root, {
+            "attempt_id": "canonical",
+            "attempt_root": str(root),
+            "source_experiment_id": experiment_id,
+            "prior_attempt": None,
+        }
+    attempts = root / _ATTEMPTS_DIRNAME
+    ensure_dir(attempts)
+    while True:
+        attempt_id = (
+            f"eval_{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}_{uuid.uuid4().hex[:12]}"
+        )
+        attempt_root = attempts / attempt_id
+        try:
+            attempt_root.mkdir()
+        except FileExistsError:
+            continue
+        return attempt_root, {
+            "attempt_id": attempt_id,
+            "attempt_root": str(attempt_root),
+            "source_experiment_id": experiment_id,
+            "prior_attempt": str(root),
+        }
+
+
 def expected_evaluation_context(
     dataset,
     *,
@@ -259,6 +337,135 @@ def _model_artifact_id(model_name: str) -> str:
 
 def _file_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_validated_generated_datasets(
+    generation_dir: str | Path,
+    dataset,
+    *,
+    model_names: list[str] | None = None,
+    classification_score: str | None = None,
+    generation_hpo_enabled: bool | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Load generated CSVs only when their current cache envelopes verify.
+
+    Canonical evaluation treats generated data and its sidecar as one
+    integrity-bound artifact.  This preflight deliberately rejects legacy or
+    unlisted files rather than allowing them to reach any evaluator.
+    """
+    root = Path(generation_dir)
+    if root.is_symlink() or not root.is_dir() or not root.resolve().is_dir():
+        raise ValueError("Generated-data root must be a regular directory")
+    root = root.resolve()
+    csv_paths = sorted(root.glob("*.csv"))
+    if any(
+        path.is_symlink() or not path.is_file() or not path.resolve().is_file()
+        for path in csv_paths
+    ):
+        raise ValueError("Generated CSVs must be contained regular files, not symlinks")
+    discovered = {path.stem for path in csv_paths}
+    expected = set(model_names) if model_names else discovered
+    if discovered != expected:
+        missing = sorted(expected - discovered)
+        unexpected = sorted(discovered - expected)
+        raise ValueError(
+            f"Generated model inventory mismatch; missing={missing}, unexpected={unexpected}"
+        )
+    if not expected:
+        return {}
+
+    from synthdata.data import role_context_payload, semantic_context_payload
+
+    # Scope is an identity of persisted generated data, not a mutable setting
+    # in the evaluation config.  Read every envelope before constructing the
+    # expected role context so one stale config flag cannot reinterpret caches.
+    cache_payloads: dict[str, Mapping[str, Any]] = {}
+    persisted_scopes: dict[str, tuple[str, ...]] = {}
+    for model_name in sorted(expected):
+        metadata_path = _relative_artifact_path(root, f"{model_name}.cache.json", "Generated cache")
+        if (
+            metadata_path.is_symlink()
+            or not metadata_path.is_file()
+            or not metadata_path.resolve().is_file()
+        ):
+            raise ValueError(f"Generated cache sidecar is missing or unsafe for {model_name!r}")
+        try:
+            payload = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Generated cache sidecar is unreadable for {model_name!r}") from exc
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"Generated cache for {model_name!r} must be an object")
+        if payload.get("schema_version") != _GENERATION_CACHE_SCHEMA_VERSION:
+            raise ValueError(f"Generated cache for {model_name!r} is not generation-cache-v3")
+        cache_payloads[model_name] = payload
+        persisted_scopes[model_name] = _persisted_generation_scope(
+            payload, f"Generated cache for {model_name!r}"
+        )
+
+    scopes = set(persisted_scopes.values())
+    if len(scopes) != 1:
+        raise ValueError(
+            "Selected generation caches have mixed persisted generation scopes: "
+            f"{sorted((model, scope) for model, scope in persisted_scopes.items())}"
+        )
+    candidate_roles = next(iter(scopes))
+
+    # Canonical candidate evaluation always includes tuning, even for a
+    # non-HPO generator. HPO metadata still validates its own train+tuning
+    # scope above; it must not redefine candidate provenance.
+    candidate_roles = ("train", "final_holdout") if dataset.legacy_two_role else ("train", "tuning")
+    expected_fit_context = role_context_payload(dataset, ("train",))
+    # ``generation_hpo_enabled`` remains accepted for callers compiled against
+    # this API, but is intentionally not consulted: persisted HPO metadata is
+    # authoritative (including when config is stale or disagrees).
+    expected_role_context = role_context_payload(dataset, candidate_roles)
+    semantic_context = semantic_context_payload(
+        dataset,
+        classification_score=classification_score,
+        roles=candidate_roles,
+    )
+    expected_columns = list(dataset.full_df.columns)
+    expected_schema = dataset.variable_schema_fingerprint
+    expected_registry = DEFAULT_METRIC_CONTRACT_REGISTRY.digest()
+    loaded: dict[str, pd.DataFrame] = {}
+    for model_name in sorted(expected):
+        csv_path = _relative_artifact_path(root, f"{model_name}.csv", "Generated data")
+        metadata_path = _relative_artifact_path(root, f"{model_name}.cache.json", "Generated cache")
+        if (
+            metadata_path.is_symlink()
+            or not metadata_path.is_file()
+            or not metadata_path.resolve().is_file()
+        ):
+            raise ValueError(f"Generated cache sidecar is missing or unsafe for {model_name!r}")
+        payload = cache_payloads[model_name]
+        _validate_cache_envelope(
+            payload,
+            f"Generated cache for {model_name!r}",
+            expected_model_name=model_name,
+            expected_role_context=expected_role_context,
+            expected_role_context_fingerprint=_mapping_digest(expected_role_context),
+            expected_fit_context=expected_fit_context,
+            expected_fit_context_fingerprint=_mapping_digest(expected_fit_context),
+            expected_semantic_context_fingerprint=semantic_context_digest(semantic_context),
+            expected_registry_digest=expected_registry,
+        )
+        if payload.get("variable_schema_fingerprint") != expected_schema:
+            raise ValueError(f"Generated cache for {model_name!r} has a stale variable schema")
+        if payload["columns"] != expected_columns:
+            raise ValueError(f"Generated cache for {model_name!r} has unexpected columns")
+        data_digest = _file_digest(csv_path)
+        if data_digest != payload["synthetic_data_sha256"]:
+            raise ValueError(f"Generated data digest does not match cache for {model_name!r}")
+        try:
+            frame = pd.read_csv(csv_path)
+        except (OSError, ValueError, pd.errors.ParserError) as exc:
+            raise ValueError(f"Generated data is unreadable for {model_name!r}") from exc
+        if list(frame.columns) != expected_columns or list(frame.columns) != payload["columns"]:
+            raise ValueError(f"Generated data columns do not match cache for {model_name!r}")
+        if len(frame) != payload["row_count"]:
+            raise ValueError(f"Generated data row count does not match cache for {model_name!r}")
+        loaded[model_name] = frame
+    return loaded
 
 
 def _non_empty_string(value: Any, label: str) -> str:
@@ -353,7 +560,7 @@ def _load_plan02_governance(
     try:
         payload = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Plan 02 governance ledger is unreadable at {path}: {exc}") from exc
+        raise ValueError("Plan 02 governance ledger is unreadable") from exc
     _validate_plan02_governance(payload, path)
     return dict(payload), path, _file_digest(path)
 
@@ -496,6 +703,42 @@ def _sha256_digest(value: Any, label: str) -> str:
     return digest
 
 
+def _persisted_generation_scope(payload: Mapping[str, Any], label: str) -> tuple[str, ...]:
+    """Derive generation roles from immutable cache HPO metadata.
+
+    All-null HPO fields identify ordinary train-only generation.  HPO caches
+    must carry one complete canonical context, its schema marker, and its
+    canonical digest; partial metadata is never interpreted heuristically.
+    """
+    context = payload.get("hpo_context")
+    schema = payload.get("hpo_context_schema_version")
+    digest = payload.get("hpo_context_digest")
+    if context is None and schema is None and digest is None:
+        role_context = payload.get("role_context")
+        if isinstance(role_context, Mapping):
+            roles = role_context.get("roles")
+            if isinstance(roles, Mapping) and "tuning" in roles:
+                return ("train", "tuning")
+        return ("train",)
+    if not isinstance(context, Mapping):
+        raise ValueError(f"{label} has incomplete HPO metadata")
+    if schema != "hpo-context-v1":
+        raise ValueError(f"{label}.hpo_context_schema_version is unsupported")
+    supplied_digest = _sha256_digest(digest, f"{label}.hpo_context_digest")
+    from synthdata.generation.hpo import (
+        _require_validated_hpo_context,
+        hpo_context_digest,
+    )
+
+    if supplied_digest != hpo_context_digest(context):
+        raise ValueError(f"{label}.hpo_context_digest does not match hpo_context")
+    try:
+        _require_validated_hpo_context(context, label=f"{label}.hpo_context")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+    return ("train", "tuning")
+
+
 def _validate_cache_envelope(
     payload: Any,
     label: str,
@@ -505,6 +748,8 @@ def _validate_cache_envelope(
     expected_role_context_fingerprint: str | None = None,
     expected_semantic_context_fingerprint: str | None = None,
     expected_registry_digest: str | None = None,
+    expected_fit_context: Mapping[str, Any] | None = None,
+    expected_fit_context_fingerprint: str | None = None,
 ) -> None:
     if not isinstance(payload, Mapping):
         raise ValueError(f"{label} must be an object")
@@ -514,6 +759,8 @@ def _validate_cache_envelope(
             "model_name",
             "role_context_fingerprint",
             "role_context",
+            "fit_context_fingerprint",
+            "fit_context",
             "variable_schema_fingerprint",
             "semantic_context",
             "semantic_context_digest",
@@ -605,6 +852,26 @@ def _validate_cache_envelope(
         raise ValueError(f"{label}.role_context_fingerprint does not match the evaluation manifest")
     if expected_role_context is not None and dict(role_context) != dict(expected_role_context):
         raise ValueError(f"{label}.role_context does not match the evaluation manifest")
+
+    if schema_version == _GENERATION_CACHE_SCHEMA_VERSION:
+        fit_context = payload["fit_context"]
+        if not isinstance(fit_context, Mapping):
+            raise ValueError(f"{label}.fit_context must be an object")
+        _validate_role_context_payload(fit_context, f"{label}.fit_context")
+        fit_context_fingerprint = _sha256_digest(
+            payload["fit_context_fingerprint"], f"{label}.fit_context_fingerprint"
+        )
+        if _mapping_digest(fit_context) != fit_context_fingerprint:
+            raise ValueError(f"{label}.fit_context_fingerprint does not match fit_context")
+        if (
+            expected_fit_context_fingerprint is not None
+            and fit_context_fingerprint != expected_fit_context_fingerprint
+        ):
+            raise ValueError(
+                f"{label}.fit_context_fingerprint does not match the generation contract"
+            )
+        if expected_fit_context is not None and dict(fit_context) != dict(expected_fit_context):
+            raise ValueError(f"{label}.fit_context does not match the generation contract")
 
     semantic_manifest = {
         "semantic_context": payload["semantic_context"],
@@ -717,6 +984,7 @@ def _validate_generator_metadata_manifest(
     *,
     manifest: Mapping[str, Any] | None = None,
     expected_model_names: list[str] | None = None,
+    artifact_root: Path | None = None,
 ) -> None:
     if payload is None:
         return
@@ -784,47 +1052,49 @@ def _validate_generator_metadata_manifest(
                     f"Evaluation artifact generator_metadata[{model_name!r}].data_path",
                 )
             )
-            if not metadata_path.is_file():
-                raise FileNotFoundError(f"Generator metadata is missing at {metadata_path}")
-            if not data_path.is_file():
-                raise FileNotFoundError(f"Generated data is missing at {data_path}")
+            if artifact_root is not None:
+                metadata_path = _relative_artifact_path(
+                    artifact_root, metadata_path, "Generator metadata"
+                )
+                data_path = _relative_artifact_path(artifact_root, data_path, "Generated data")
+            if metadata_path.is_symlink() or data_path.is_symlink():
+                raise ValueError("Generator cache artifacts must not be symlinks")
+            if not metadata_path.is_file() or not metadata_path.resolve().is_file():
+                raise FileNotFoundError("Generator metadata artifact is missing")
+            if not data_path.is_file() or not data_path.resolve().is_file():
+                raise FileNotFoundError("Generated data artifact is missing")
             try:
                 sidecar_payload = json.loads(metadata_path.read_text())
             except (OSError, json.JSONDecodeError) as exc:
-                raise ValueError(f"Generator metadata is unreadable at {metadata_path}") from exc
+                raise ValueError("Generator metadata artifact is unreadable") from exc
             if sidecar_payload != dict(cache_metadata):
-                raise ValueError(
-                    f"Generator cache envelope does not match its metadata sidecar at {metadata_path}"
-                )
+                raise ValueError("Generator cache envelope does not match its metadata sidecar")
             if _file_digest(metadata_path) != _sha256_digest(
                 entry.get("metadata_sha256"),
                 f"Evaluation artifact generator_metadata[{model_name!r}].metadata_sha256",
             ):
                 raise ValueError(
-                    f"Generator metadata failed integrity verification at {metadata_path}"
+                    "Generator metadata failed integrity verification; cache envelope does not "
+                    "match its metadata sidecar"
                 )
             data_digest = _file_digest(data_path)
             if data_digest != _sha256_digest(
                 entry.get("data_sha256"),
                 f"Evaluation artifact generator_metadata[{model_name!r}].data_sha256",
             ):
-                raise ValueError(f"Generated data failed integrity verification at {data_path}")
+                raise ValueError("Generated data failed integrity verification")
             if data_digest != cache_metadata["synthetic_data_sha256"]:
                 raise ValueError(
-                    f"Generator cache synthetic_data_sha256 does not match {data_path}"
+                    "Generator cache synthetic_data_sha256 does not match generated data"
                 )
             try:
                 frame = pd.read_csv(data_path)
             except (OSError, ValueError, pd.errors.ParserError) as exc:
-                raise ValueError(f"Generated data is unreadable at {data_path}") from exc
+                raise ValueError("Generated data artifact is unreadable") from exc
             if list(frame.columns) != cache_metadata["columns"]:
-                raise ValueError(
-                    f"Generated data columns do not match cache metadata at {data_path}"
-                )
+                raise ValueError("Generated data columns do not match cache metadata")
             if len(frame) != cache_metadata["n_samples"]:
-                raise ValueError(
-                    f"Generated data row count does not match cache metadata at {data_path}"
-                )
+                raise ValueError("Generated data row count does not match cache metadata")
             if entry.get("metadata") != cache_metadata["generator_metadata"]:
                 raise ValueError("Generator metadata entry does not match its cache envelope")
         elif state == "legacy":
@@ -972,17 +1242,182 @@ def _non_negative_int(value: Any, label: str) -> None:
         raise ValueError(f"{label} must be a non-negative integer")
 
 
+def _require_exact_keys(value: Mapping[str, Any], expected: set[str], label: str) -> None:
+    """Reject omitted or unknown keys in persisted closed-schema mappings."""
+    actual = set(value)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unknown = sorted(actual - expected)
+        raise ValueError(f"{label} has invalid fields; missing={missing}, unknown={unknown}")
+
+
+def _validate_role_hash_map(value: Any, label: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an object")
+    for role, digest in value.items():
+        _non_empty_string(role, f"{label} role")
+        if role not in _ROLE_NAMES:
+            raise ValueError(f"{label} contains unknown role {role!r}")
+        _sha256_digest(digest, f"{label}.{role}")
+
+
+def _validate_role_hashes(value: Any, label: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an object")
+    if set(value) == {"evidence"}:
+        _validate_role_hash_map(value["evidence"], f"{label}.evidence")
+        return
+    _require_exact_keys(value, set(_ROLE_HASH_MAP_KEYS), label)
+    for key in value:
+        _validate_role_hash_map(value[key], f"{label}.{key}")
+
+
+def _validate_fit_frame_fingerprints(value: Any, label: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an object")
+    _require_exact_keys(value, set(_FIT_FRAME_FINGERPRINT_KEYS), label)
+    for key in _FIT_FRAME_FINGERPRINT_KEYS:
+        _non_empty_string(value[key], f"{label}.{key}")
+
+
+def _validate_final_refit_identity(
+    value: Any, label: str, *, require_complete: bool = True
+) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an object")
+    _require_exact_keys(value, set(_FINAL_REFIT_IDENTITY_KEYS), label)
+    legacy = value.get("fit_frame_fingerprints") is None
+    for key in (
+        "model_name",
+        "cache_key",
+        "data_sha256",
+        "metadata_sha256",
+        "fit_frame_fingerprint",
+    ):
+        _non_empty_string(value[key], f"{label}.{key}")
+    _sha256_digest(value["data_sha256"], f"{label}.data_sha256")
+    _sha256_digest(value["metadata_sha256"], f"{label}.metadata_sha256")
+    if legacy:
+        return
+    _non_empty_string(value["fit_frame_fingerprint"], f"{label}.fit_frame_fingerprint")
+    _validate_fit_frame_fingerprints(
+        value["fit_frame_fingerprints"], f"{label}.fit_frame_fingerprints"
+    )
+
+
+def _validate_selected_model_provenance(value: Any, label: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an object")
+    _require_exact_keys(value, {"model", "selection", "fit_roles", "refit"}, label)
+    _non_empty_string(value["model"], f"{label}.model")
+    if not isinstance(value["selection"], Mapping):
+        raise ValueError(f"{label}.selection must be an object")
+    _non_empty_string(value["selection"].get("source"), f"{label}.selection.source")
+    _non_empty_string(value["selection"].get("model"), f"{label}.selection.model")
+    _string_list(value["fit_roles"], f"{label}.fit_roles", unique=True)
+    _validate_final_refit_identity(value["refit"], f"{label}.refit")
+
+
 def _relative_artifact_path(root: Path, value: Any, label: str) -> Path:
-    relative = Path(_non_empty_string(value, f"{label} path"))
+    relative = Path(
+        _non_empty_string(str(value) if isinstance(value, Path) else value, f"{label} path")
+    )
     if relative.is_absolute():
         raise ValueError(f"{label} path must be relative to its recorded root")
     root = root.resolve()
+    # Check lexical components before resolving: resolving first would hide an
+    # intermediate or final symlink and make an apparently contained path ambiguous.
+    current = root
+    for component in relative.parts:
+        if component in {"", "."}:
+            continue
+        if component == "..":
+            current = current.parent
+            continue
+        current /= component
+        if current.is_symlink():
+            raise ValueError(f"{label} path contains a symlink component")
     path = (root / relative).resolve()
     try:
         path.relative_to(root)
     except ValueError as exc:
-        raise ValueError(f"{label} path escapes its recorded root: {value!r}") from exc
+        raise ValueError(f"{label} path escapes its recorded root") from exc
     return path
+
+
+def _safe_source_path(source: Path, label: str, *, contained_in: Path | None = None) -> Path:
+    """Return source only when it is a contained, canonical regular file."""
+    if source.is_symlink():
+        raise ValueError(f"{label} source must not be a symlink")
+    if not source.exists() or not source.is_file():
+        raise ValueError(f"{label} source must be a regular file")
+    resolved = source.resolve()
+    if contained_in is not None:
+        root = contained_in.resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"{label} source escapes its declared root") from exc
+    if resolved.is_symlink() or not resolved.is_file():
+        raise ValueError(f"{label} source must resolve to a regular file")
+    return resolved
+
+
+def _safe_bundle_destination(bundle_dir: Path, relative: str, label: str) -> Path:
+    """Return destination after rejecting traversal and symlinked components."""
+    destination = _relative_artifact_path(bundle_dir, relative, label)
+    bundle_root = bundle_dir.resolve()
+    try:
+        destination.relative_to(bundle_root)
+    except ValueError as exc:
+        raise ValueError(f"{label} destination escapes the artifact bundle") from exc
+    current = bundle_root
+    for component in destination.relative_to(bundle_root).parts[:-1]:
+        current /= component
+        if current.is_symlink():
+            raise ValueError(f"{label} destination contains a symlink")
+    if destination.is_symlink():
+        raise ValueError(f"{label} destination must not be a symlink")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    return destination
+
+
+def _ensure_safe_directory(path: Path, label: str) -> Path:
+    """Create directory only when existing path components are not symlinks."""
+    absolute = path.absolute()
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        if current.is_symlink():
+            raise ValueError(f"{label} contains a symlink component")
+    return ensure_dir(path)
+
+
+def _copy_regular_source(
+    source: Path, destination: Path, label: str, *, contained_in: Path | None = None
+) -> None:
+    """Copy a regular source without following source or destination symlinks."""
+    canonical_source = _safe_source_path(source, label, contained_in=contained_in)
+    if destination.is_symlink() or not destination.parent.is_dir():
+        raise ValueError(f"{label} destination is unsafe")
+    shutil.copyfile(canonical_source, destination, follow_symlinks=False)
+
+
+def _bundle_source_path(
+    value: Any,
+    *,
+    bundle_dir: Path,
+    label: str,
+    source_root: Path | None = None,
+) -> Path:
+    """Resolve transient or already-bundled source paths without using CWD."""
+    raw = Path(_non_empty_string(value, f"{label} path"))
+    source = (
+        raw
+        if raw.is_absolute()
+        else _relative_artifact_path(source_root or bundle_dir.parent, raw, label)
+    )
+    return _safe_source_path(source, label)
 
 
 def _verified_artifact_path(root: Path, entry: Mapping[str, Any], label: str) -> Path:
@@ -992,11 +1427,51 @@ def _verified_artifact_path(root: Path, entry: Mapping[str, Any], label: str) ->
     digest = _non_empty_string(entry.get("sha256"), f"{label} sha256")
     if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
         raise ValueError(f"{label} sha256 must be a lowercase SHA-256 digest")
-    if not path.is_file():
-        raise FileNotFoundError(f"{label} artifact is missing at {path}")
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError(f"{label} artifact is missing")
     if _file_digest(path) != digest:
-        raise ValueError(f"{label} failed integrity verification at {path}")
+        raise ValueError(f"{label} failed integrity verification")
     return path
+
+
+def _clear_native_plot_destination(path: Path) -> None:
+    """Remove native plot output without ever following a destination symlink."""
+    if path.is_symlink():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def _native_plot_source_files(root: Path) -> list[tuple[Path, Path]]:
+    """Return regular, contained native plot files and their relative IDs."""
+    if root.is_symlink() or not root.is_dir():
+        return []
+    resolved_root = root.resolve()
+    files: list[tuple[Path, Path]] = []
+    for source in sorted(root.rglob("*")):
+        if source.is_symlink() or not source.is_file():
+            continue
+        resolved_source = source.resolve()
+        try:
+            resolved_source.relative_to(resolved_root)
+        except ValueError:
+            continue
+        files.append((source, source.relative_to(root)))
+    return files
+
+
+def _native_bundle_root(bundle_dir: Path, root_value: Any) -> Path:
+    """Resolve native plot root and require it to remain inside its bundle."""
+    root = _relative_artifact_path(bundle_dir.parent, root_value, "Native SynthEval plot root")
+    if root.is_symlink():
+        raise ValueError("Native SynthEval plot root must not be a symlink")
+    try:
+        root.relative_to(bundle_dir.resolve())
+    except ValueError as exc:
+        raise ValueError("Native SynthEval plot root escapes the artifact bundle") from exc
+    return root
 
 
 def _read_json_artifact(
@@ -1006,9 +1481,9 @@ def _read_json_artifact(
     try:
         payload = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{label} artifact is unreadable at {path}: {exc}") from exc
+        raise ValueError(f"{label} artifact is unreadable") from exc
     if not isinstance(payload, dict):
-        raise ValueError(f"{label} artifact must contain a JSON object at {path}")
+        raise ValueError(f"{label} artifact must contain a JSON object")
     return payload, path
 
 
@@ -1160,11 +1635,11 @@ def _contract_registry_from_payload(
                 )
             )
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"Metric contract {index} is invalid at {path}: {exc}") from exc
+            raise ValueError(f"Metric contract {index} is invalid") from exc
     try:
         registry = MetricContractRegistry(contracts)
     except ValueError as exc:
-        raise ValueError(f"Metric contract manifest is invalid at {path}: {exc}") from exc
+        raise ValueError("Metric contract manifest is invalid") from exc
     if registry.digest() != digest:
         raise ValueError(f"Metric contract manifest digest does not match its contracts at {path}")
     return registry
@@ -1204,7 +1679,7 @@ def _metric_context_from_payload(payload: Any, label: str) -> MetricEvaluationCo
             resolved_configuration=resolved_configuration,
         )
     except ValueError as exc:
-        raise ValueError(f"{label} is invalid: {exc}") from exc
+        raise ValueError(f"{label} is invalid") from exc
 
 
 def _metric_status_record_from_payload(
@@ -1291,15 +1766,35 @@ def _metric_status_record_from_payload(
     error = payload["error"]
     if error is not None and not isinstance(error, str):
         raise ValueError(f"{label}.error must be a string or None")
+    expected_error = safe_metric_status_error(status)
+    safe_error_pattern = (
+        rf"^{re.escape(expected_error)}; exception_type=[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception)$"
+        if expected_error
+        else r"$^"
+    )
+    if (
+        error is not None
+        and error != expected_error
+        and re.fullmatch(safe_error_pattern, error) is None
+    ):
+        # Durable status errors are intentionally a closed schema.  In
+        # particular, evaluator exception bodies must never be persisted.
+        raise ValueError(f"{label}.error is not a safe metric status reason")
     source_metadata = payload["source_metadata"]
     if not isinstance(source_metadata, dict):
         raise ValueError(f"{label}.source_metadata must be an object")
+    source_metadata = safe_metric_metadata(
+        source_metadata, label=f"{label}.source_metadata", strict=True
+    )
     result_metadata = payload.get(
         "result_metadata",
         source_metadata.get("result_metadata", {}),
     )
     if not isinstance(result_metadata, dict):
         raise ValueError(f"{label}.result_metadata must be an object")
+    result_metadata = safe_metric_metadata(
+        result_metadata, label=f"{label}.result_metadata", strict=True
+    )
     if (
         "result_metadata" in source_metadata
         and source_metadata["result_metadata"] != result_metadata
@@ -1311,6 +1806,11 @@ def _metric_status_record_from_payload(
     provenance = payload.get("provenance", {})
     if not isinstance(provenance, dict):
         raise ValueError(f"{label}.provenance must be an object")
+    provenance = safe_metric_metadata(provenance, label=f"{label}.provenance", strict=True)
+    support = safe_metric_metadata(payload.get("support"), label=f"{label}.support", strict=True)
+    bandwidth = safe_metric_metadata(
+        payload.get("bandwidth"), label=f"{label}.bandwidth", strict=True
+    )
     for field in ("raw_value", "policy_value", "uncertainty"):
         _finite_or_none(payload[field], f"{label}.{field}")
     sample_size = payload["sample_size"]
@@ -1346,12 +1846,12 @@ def _metric_status_record_from_payload(
             source_metadata=source_metadata,
             result_metadata=result_metadata,
             fit_roles=tuple(fit_roles),
-            support=payload.get("support"),
-            bandwidth=payload.get("bandwidth"),
+            support=support,
+            bandwidth=bandwidth,
             provenance=provenance,
         )
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{label} is invalid: {exc}") from exc
+        raise ValueError(f"{label} is invalid") from exc
 
     if context is not None:
         if not allow_mixed_execution_pass and record.execution_pass != context.execution_pass:
@@ -1548,7 +2048,7 @@ def _metric_validation_result_from_payload(
             evaluation_context=context,
         )
     except ValueError as exc:
-        raise ValueError(f"{label} is invalid: {exc}") from exc
+        raise ValueError(f"{label} is invalid") from exc
 
     sequences = {
         "expected_keys": result.expected_keys,
@@ -1638,26 +2138,38 @@ def _validate_metric_status_payload(
             f"{framework} metric status sidecar semantic_context_fingerprint does not match "
             "the evaluation artifact manifest"
         )
-    container = payload.get(container_key)
+    actual_container_key = container_key
+    container = payload.get(actual_container_key)
+    legacy_custom_models = framework == "custom" and container_key == "passes" and container is None
+    if legacy_custom_models:
+        actual_container_key = "models"
+        container = payload.get(actual_container_key)
     if not isinstance(container, dict):
         raise ValueError(
             f"{framework} metric status sidecar is missing its {container_key!r} mapping"
         )
-    if container_key == "models":
+    if actual_container_key == "models":
         for model_name, result_payload in container.items():
             model_name = _non_empty_string(model_name, f"{framework} model name")
-            _metric_validation_result_from_payload(
+            result = _metric_validation_result_from_payload(
                 result_payload,
                 label=f"{framework} model {model_name!r}",
                 model_name=model_name,
                 framework=framework,
                 registry=registry,
             )
+            if framework == "custom" and (
+                result.evaluation_context is None
+                or result.evaluation_context.execution_pass != "main"
+            ):
+                raise ValueError(
+                    f"{framework} legacy model {model_name!r} must be a main-pass result"
+                )
         return
     for pass_identity, model_results in container.items():
         pass_identity = _non_empty_string(pass_identity, f"{framework} execution pass")
         pass_framework, separator, execution_pass = pass_identity.partition(":")
-        if not separator or pass_framework not in {"syntheval", "custom"}:
+        if not separator or pass_framework != framework:
             raise ValueError(f"Invalid {framework} execution pass identity {pass_identity!r}")
         _non_empty_string(execution_pass, f"{framework} execution pass name")
         if not isinstance(model_results, dict):
@@ -1688,6 +2200,7 @@ def _validate_syntheval_execution_payload(
     model_name: str,
     execution_pass: str,
     expected_semantic_context_fingerprint: str | None = None,
+    expected_semantic_context: Mapping[str, Any] | None = None,
 ) -> None:
     if not isinstance(payload, Mapping):
         raise ValueError(f"{label} must be an object")
@@ -1701,6 +2214,8 @@ def _validate_syntheval_execution_payload(
         "main": "native",
         "binary_target": "binary_collapsed",
     }.get(execution_pass)
+    if expected_target_view is None:
+        raise ValueError(f"{label} has an unknown execution pass")
     if expected_target_view is not None and payload.get("target_view") != expected_target_view:
         raise ValueError(f"{label} has a mismatched target_view")
     for field in ("expected_manifest_digest", "context_fingerprint"):
@@ -1735,6 +2250,10 @@ def _validate_syntheval_execution_payload(
         raise ValueError(
             f"{label}.semantic_context_digest does not match the evaluation artifact manifest"
         )
+    if expected_semantic_context is not None and dict(semantic_context or {}) != dict(
+        expected_semantic_context
+    ):
+        raise ValueError(f"{label}.semantic_context does not match its pass manifest")
     if payload.get("role_context") is not None:
         _validate_evaluation_role_context_payload(payload["role_context"], f"{label}.role_context")
     preprocessing_fingerprint = payload.get("preprocessing_fingerprint")
@@ -1795,7 +2314,9 @@ def _load_contract_registry_if_present(
     return registry
 
 
-def _enrich_final_refit_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
+def _enrich_final_refit_evidence(
+    evidence: Mapping[str, Any], *, artifact_root: Path | None = None
+) -> dict[str, Any]:
     """Validate and digest refit files referenced by final-holdout evidence."""
     enriched = dict(evidence)
     legacy_marker = evidence.get("legacy_schema_version")
@@ -1820,16 +2341,23 @@ def _enrich_final_refit_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("Final-holdout evidence final_refit metadata must be an object")
     data_path = Path(_non_empty_string(refit.get("path"), "Final refit data path"))
     metadata_path = Path(_non_empty_string(refit.get("metadata_path"), "Final refit metadata path"))
+    if artifact_root is not None:
+        data_path = _relative_artifact_path(artifact_root, data_path, "Final refit data")
+        metadata_path = _relative_artifact_path(
+            artifact_root, metadata_path, "Final refit metadata"
+        )
     cache_key = _non_empty_string(refit.get("cache_key"), "Final refit cache key")
     fit_roles = _string_list(refit.get("fit_roles"), "Final refit fit_roles", unique=True)
     if fit_roles != ["train", "tuning"]:
         raise ValueError(
             f"Final refit must declare exactly fit_roles=['train', 'tuning']; got {fit_roles!r}"
         )
-    if not data_path.is_file():
-        raise FileNotFoundError(f"Final refit synthetic data is missing at {data_path}")
-    if not metadata_path.is_file():
-        raise FileNotFoundError(f"Final refit metadata is missing at {metadata_path}")
+    if data_path.is_symlink() or metadata_path.is_symlink():
+        raise ValueError("Final refit artifacts must not be symlinks")
+    if not data_path.is_file() or not data_path.resolve().is_file():
+        raise FileNotFoundError("Final refit synthetic data artifact is missing")
+    if not metadata_path.is_file() or not metadata_path.resolve().is_file():
+        raise FileNotFoundError("Final refit metadata artifact is missing")
     for field, path, artifact_name in (
         ("data_sha256", data_path, "synthetic data"),
         ("metadata_sha256", metadata_path, "metadata"),
@@ -1837,22 +2365,20 @@ def _enrich_final_refit_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
         if field in refit:
             recorded_digest = _non_empty_string(refit[field], f"Final refit {field}")
             if recorded_digest != _file_digest(path):
-                raise ValueError(
-                    f"Final refit {artifact_name} failed integrity verification at {path}"
-                )
+                raise ValueError(f"Final refit {artifact_name} failed integrity verification")
     try:
         cache_metadata = json.loads(metadata_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Final refit metadata is unreadable at {metadata_path}: {exc}") from exc
+        raise ValueError("Final refit metadata artifact is unreadable") from exc
     if not isinstance(cache_metadata, dict):
-        raise ValueError(f"Final refit metadata must be an object at {metadata_path}")
+        raise ValueError("Final refit metadata artifact must be an object")
     cache_schema = cache_metadata.get("schema_version")
     generator_metadata = refit.get("generator_metadata", cache_metadata.get("generator_metadata"))
     if cache_schema in _LEGACY_CACHE_SCHEMA_VERSIONS:
         if cache_schema != "final-refit-v1":
-            raise ValueError(f"Final refit metadata has an invalid schema at {metadata_path}")
+            raise ValueError("Final refit metadata artifact has an invalid schema")
         if cache_metadata.get("cache_key") != cache_key:
-            raise ValueError(f"Final refit cache-key mismatch at {metadata_path}")
+            raise ValueError("Final refit cache-key mismatch")
         if generator_metadata is None:
             raise ValueError(
                 "Non-blocked final-holdout evidence requires complete generator_metadata"
@@ -1873,7 +2399,7 @@ def _enrich_final_refit_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
         expected_model_name=refit.get("model_name"),
     )
     if cache_metadata.get("cache_key") != cache_key:
-        raise ValueError(f"Final refit cache-key mismatch at {metadata_path}")
+        raise ValueError("Final refit cache-key mismatch")
     if generator_metadata is None:
         raise ValueError("Non-blocked final-holdout evidence requires complete generator_metadata")
     _validate_generator_metadata_payload(generator_metadata, "Final refit generator_metadata")
@@ -1908,23 +2434,113 @@ def _enrich_final_refit_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
     try:
         frame = pd.read_csv(data_path)
     except (OSError, ValueError, pd.errors.ParserError) as exc:
-        raise ValueError(f"Final refit data is unreadable at {data_path}") from exc
+        raise ValueError("Final refit data artifact is unreadable") from exc
     if list(frame.columns) != cache_metadata["columns"]:
-        raise ValueError(f"Final refit data columns do not match metadata at {data_path}")
+        raise ValueError("Final refit data columns do not match metadata")
     if len(frame) != cache_metadata["n_samples"]:
-        raise ValueError(f"Final refit data row count does not match metadata at {data_path}")
+        raise ValueError("Final refit data row count does not match metadata")
     data_digest = _file_digest(data_path)
     if data_digest != cache_metadata["synthetic_data_sha256"]:
-        raise ValueError(f"Final refit synthetic data failed its cache digest at {data_path}")
+        raise ValueError("Final refit synthetic data failed its cache digest")
     enriched["final_refit"] = {
         **dict(refit),
         "provenance_state": "verified",
+        "model_name": refit.get("model_name", cache_metadata.get("model_name")),
+        "fit_frame_fingerprint": refit.get(
+            "fit_frame_fingerprint", cache_metadata.get("fit_frame_fingerprint")
+        ),
+        "fit_frame_fingerprints": refit.get(
+            "fit_frame_fingerprints", cache_metadata.get("fit_frame_fingerprints")
+        ),
         "data_sha256": data_digest,
         "metadata_sha256": _file_digest(metadata_path),
         "cache_metadata": dict(cache_metadata),
         "generator_metadata": generator_metadata,
     }
     return enriched
+
+
+def _bundle_refit_evidence(evidence: Mapping[str, Any], *, bundle_dir: Path) -> dict[str, Any]:
+    """Copy transient refit files into bundle and return portable evidence."""
+    if bundle_dir.is_symlink():
+        raise ValueError("Evaluation artifact bundle must not be a symlink")
+    bundle_root = bundle_dir.resolve()
+    attempt_root = bundle_root.parent
+    payload = dict(evidence)
+    refit = payload.get("final_refit")
+    if not isinstance(refit, Mapping):
+        return payload
+    copied = dict(refit)
+    for source_key, artifact_name in (
+        ("path", "final_refit/data.csv"),
+        ("metadata_path", "final_refit/metadata.json"),
+    ):
+        source = _bundle_source_path(
+            refit.get(source_key), bundle_dir=bundle_root, label=f"Final refit {source_key}"
+        )
+        destination = _safe_bundle_destination(
+            bundle_root, artifact_name, f"Final refit {source_key}"
+        )
+        _copy_regular_source(source, destination, f"Final refit {source_key}")
+        copied[source_key] = str(destination.relative_to(attempt_root))
+        _relative_artifact_path(attempt_root, copied[source_key], f"Final refit {source_key}")
+        copied["data_sha256" if source_key == "path" else "metadata_sha256"] = _file_digest(
+            destination
+        )
+    payload["final_refit"] = copied
+    return payload
+
+
+def _bundle_generator_metadata(
+    metadata: Mapping[str, Any],
+    *,
+    bundle_dir: Path,
+    source_root: Path | None = None,
+) -> dict[str, Any]:
+    """Copy candidate cache files and replace transient paths with bundle IDs."""
+    if bundle_dir.is_symlink():
+        raise ValueError("Evaluation artifact bundle must not be a symlink")
+    bundle_root = bundle_dir.resolve()
+    attempt_root = bundle_root.parent
+    if source_root is not None and any(
+        isinstance(entry, Mapping) and entry.get("state") == "present"
+        for entry in metadata.values()
+    ):
+        if (
+            source_root.is_symlink()
+            or not source_root.is_dir()
+            or not source_root.resolve().is_dir()
+        ):
+            raise ValueError("Generator source root must be a regular directory")
+        source_root = source_root.resolve()
+    result: dict[str, Any] = {}
+    for model_name, entry in metadata.items():
+        if not isinstance(entry, Mapping) or entry.get("state") != "present":
+            result[model_name] = dict(entry) if isinstance(entry, Mapping) else entry
+            continue
+        copied = dict(entry)
+        safe_model_id = _model_artifact_id(str(model_name))
+        for source_key, artifact_name in (
+            ("data_path", f"generation/{safe_model_id}.csv"),
+            ("metadata_path", f"generation/{safe_model_id}.cache.json"),
+        ):
+            source = _bundle_source_path(
+                entry.get(source_key),
+                bundle_dir=bundle_root,
+                source_root=source_root,
+                label=f"Generator {source_key}",
+            )
+            destination = _safe_bundle_destination(
+                bundle_root, artifact_name, f"Generator {source_key}"
+            )
+            _copy_regular_source(source, destination, f"Generator {source_key}")
+            copied[source_key] = str(destination.relative_to(attempt_root))
+            _relative_artifact_path(attempt_root, copied[source_key], f"Generator {source_key}")
+            copied["data_sha256" if source_key == "data_path" else "metadata_sha256"] = (
+                _file_digest(destination)
+            )
+        result[model_name] = copied
+    return result
 
 
 def _git_provenance(
@@ -1960,9 +2576,15 @@ def _git_provenance(
             text=True,
             timeout=2,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return {"revision": None, "dirty": None, "error": f"{type(exc).__name__}: {exc}"}
+    except (OSError, subprocess.SubprocessError):
+        return {
+            "revision": None,
+            "dirty": None,
+            "error": "git_provenance_unavailable",
+        }
     revision_value = revision.stdout.strip() if revision.returncode == 0 else None
+    if revision_value is not None and _GIT_REVISION_PATTERN.fullmatch(revision_value) is None:
+        revision_value = None
     status_entries = status.stdout.splitlines() if status.returncode == 0 else []
     untracked_entries = (
         [entry.decode(errors="surrogateescape") for entry in untracked.stdout.split(b"\0") if entry]
@@ -1977,12 +2599,7 @@ def _git_provenance(
         ("status", status),
     ):
         if result.returncode != 0:
-            stderr = (
-                result.stderr.decode(errors="replace")
-                if isinstance(result.stderr, bytes)
-                else result.stderr
-            )
-            command_errors.append(f"{name}={result.returncode}: {stderr.strip()}")
+            command_errors.append(f"{name}_command_failed")
 
     tracked_diff_digest = hashlib.sha256(diff.stdout).hexdigest() if diff.returncode == 0 else None
     untracked_content_digest = None
@@ -2006,8 +2623,8 @@ def _git_provenance(
                 else:
                     raise OSError(f"untracked path is not a regular file or symlink: {file_path}")
             untracked_content_digest = content_hasher.hexdigest()
-        except OSError as exc:
-            content_error = f"untracked content digest failed: {type(exc).__name__}: {exc}"
+        except OSError:
+            content_error = "untracked_content_digest_failed"
 
     worktree_content_digest = None
     if revision_value and tracked_diff_digest and untracked_content_digest:
@@ -2026,12 +2643,12 @@ def _git_provenance(
         "baseline_revision": baseline_revision,
         "baseline_source": baseline_source,
         "dirty": bool(status_entries) if status.returncode == 0 else None,
-        "status_entries": status_entries,
-        "untracked_entries": untracked_entries,
+        "status_entries": ["worktree_dirty"] if status_entries else [],
+        "untracked_entries": ["untracked_files_present"] if untracked_entries else [],
         "tracked_diff_digest": tracked_diff_digest,
         "untracked_content_digest": untracked_content_digest,
         "worktree_content_digest": worktree_content_digest,
-        "error": "; ".join(errors) or None,
+        "error": errors or None,
     }
 
 
@@ -2197,6 +2814,20 @@ def _release_score_payload(
     }
 
 
+def _safe_log_disparity_reason(value: Any, *, fallback: str) -> str:
+    """Return an allowlisted log-disparity reason code."""
+    if isinstance(value, str) and value in _SAFE_LOG_DISPARITY_REASONS:
+        return value
+    return fallback
+
+
+def _safe_log_disparity_error_type(value: Any) -> str:
+    """Return a validated exception type without retaining exception details."""
+    if isinstance(value, str) and _SAFE_EXCEPTION_TYPE_PATTERN.fullmatch(value):
+        return value
+    return "UnknownError"
+
+
 def _validate_release_score_manifest_entry(entry: Mapping[str, Any]) -> None:
     """Validate manifest metadata for release-score evidence."""
     if not isinstance(entry, Mapping):
@@ -2219,6 +2850,18 @@ def _validate_release_score_manifest_entry(entry: Mapping[str, Any]) -> None:
 
 
 def _validate_release_score_payload(payload: Mapping[str, Any], *, path: Path) -> None:
+    _require_exact_keys(
+        payload,
+        {
+            "schema_version",
+            "audit_only",
+            "inventory_scope",
+            "selected_model",
+            "candidate_audit_models",
+            "models",
+        },
+        "Release-score evidence",
+    )
     if payload.get("schema_version") != "release-score-evidence-v1":
         raise ValueError(f"Unsupported release-score evidence schema at {path}")
     if payload.get("audit_only") is not True:
@@ -2246,6 +2889,437 @@ def _validate_release_score_payload(payload: Mapping[str, Any], *, path: Path) -
             raise ValueError(f"Release-score evidence for {model_name!r} must be an object")
         if score.get("audit_only") is not True:
             raise ValueError(f"Release-score evidence for {model_name!r} is not audit-only")
+        _validate_release_score_record(score, model_name=model_name, path=path)
+
+
+def _validate_release_score_record(
+    score: Mapping[str, Any], *, model_name: str, path: Path
+) -> None:
+    """Validate score state, finite values, and complete decomposition."""
+    if score.get("status") == "succeeded" and (
+        not isinstance(score.get("score"), (int, float))
+        or isinstance(score.get("score"), bool)
+        or not math.isfinite(float(cast(Real, score.get("score"))))
+    ):
+        raise ValueError(f"Succeeded release score for {model_name!r} is not finite")
+    allowed_score_keys = {
+        "status",
+        "score",
+        "audit_only",
+        "dimensions",
+        "provenance",
+        "R_final",
+        "formula",
+        "weights",
+        "anchors",
+        "indeterminate_dimensions",
+    }
+    required_score_keys = {"status", "score", "audit_only", "dimensions", "provenance"}
+    _require_exact_keys(
+        score,
+        required_score_keys | (set(score) & (allowed_score_keys - required_score_keys)),
+        f"Release-score record for {model_name!r}",
+    )
+    provenance = score["provenance"]
+    if not isinstance(provenance, Mapping):
+        raise ValueError(f"Release-score provenance for {model_name!r} must be an object")
+    status = score.get("status")
+    if status not in {"succeeded", "indeterminate"}:
+        raise ValueError(f"Release-score state for {model_name!r} is invalid at {path}")
+    if status == "indeterminate" and "final_holdout_binding" not in provenance:
+        return
+    _require_exact_keys(
+        provenance,
+        {"final_holdout_binding", "final_holdout_binding_digest"},
+        f"Release-score provenance for {model_name!r}",
+    )
+    binding = provenance["final_holdout_binding"]
+    if not isinstance(binding, Mapping):
+        raise ValueError(f"Release-score binding for {model_name!r} must be an object")
+    _require_exact_keys(
+        binding,
+        {
+            "schema_version",
+            "selected_model",
+            "role_context_fingerprint",
+            "role_hashes",
+            "raw_imputed_role_hashes",
+            "release_transform_digest",
+            "common_protocol_digest",
+            "final_refit_identity",
+            "selected_model_provenance",
+        },
+        f"Release-score binding for {model_name!r}",
+    )
+    # Persist preflight uses a sentinel binding before final evidence is copied.
+    # Full recursive validation runs once canonical binding is attached.
+    if provenance.get("final_holdout_binding_digest") == "placeholder":
+        return
+    _non_empty_string(binding["schema_version"], "Release-score binding schema_version")
+    _non_empty_string(binding["selected_model"], "Release-score binding selected_model")
+    _non_empty_string(binding["role_context_fingerprint"], "Release-score binding role context")
+    _validate_role_hashes(
+        binding["role_hashes"], f"Release-score binding for {model_name!r}.role_hashes"
+    )
+    raw_hashes = binding["raw_imputed_role_hashes"]
+    if not isinstance(raw_hashes, Mapping):
+        raise ValueError("Release-score raw/imputed role hashes must be an object")
+    _require_exact_keys(
+        raw_hashes, {"evidence", "custom_raw"}, "Release-score raw/imputed role hashes"
+    )
+    _validate_role_hash_map(
+        raw_hashes["evidence"], "Release-score raw/imputed role hashes.evidence"
+    )
+    _validate_role_hash_map(
+        raw_hashes["custom_raw"], "Release-score raw/imputed role hashes.custom_raw"
+    )
+    _sha256_digest(binding["release_transform_digest"], "Release-score release transform digest")
+    _sha256_digest(binding["common_protocol_digest"], "Release-score common protocol digest")
+    identity = binding["final_refit_identity"]
+    _validate_final_refit_identity(
+        identity, f"Release-score final-refit identity for {model_name!r}"
+    )
+    _validate_selected_model_provenance(
+        binding["selected_model_provenance"],
+        f"Release-score selected-model provenance for {model_name!r}",
+    )
+    value = score.get("score")
+    if status == "succeeded" and (
+        not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value)
+    ):
+        raise ValueError(f"Succeeded release score for {model_name!r} is not finite")
+    if status not in {"succeeded", "indeterminate"}:
+        raise ValueError(f"Release-score state for {model_name!r} is invalid at {path}")
+
+    def finite(value: Any) -> bool:
+        return (
+            isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+        )
+
+    if status == "succeeded" and not finite(value):
+        raise ValueError(f"Succeeded release score for {model_name!r} is not finite")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and not 0 <= value <= 1:
+        raise ValueError(f"Release score for {model_name!r} is outside [0, 1]")
+    if status == "indeterminate" and value is not None:
+        raise ValueError(f"Indeterminate release score for {model_name!r} must be null")
+    for field in ("formula",):
+        if field in score:
+            _non_empty_string(score[field], f"Release-score {field}")
+    if "R_final" in score and not finite(score["R_final"]):
+        raise ValueError(f"Release-score R_final for {model_name!r} is not finite")
+    if "weights" in score:
+        weights = score["weights"]
+        if not isinstance(weights, Mapping):
+            raise ValueError("Release-score weights must be an object")
+        _require_exact_keys(weights, {"utility", "privacy", "fairness"}, "Release-score weights")
+        for key, weight in weights.items():
+            if not finite(weight) or not 0 <= weight <= 1:
+                raise ValueError(f"Release-score weights.{key} is invalid")
+    if "anchors" in score:
+        anchors = score["anchors"]
+        if not isinstance(anchors, Mapping):
+            raise ValueError("Release-score anchors must be an object")
+        _require_exact_keys(
+            anchors,
+            {
+                "mmd",
+                "epsilon_excess",
+                "mia_advantage",
+                "attribute_disclosure",
+                "equalized_odds_gap",
+                "worst_absolute_log_disparity",
+            },
+            "Release-score anchors",
+        )
+        for key, anchor in anchors.items():
+            if not finite(anchor) or anchor <= 0:
+                raise ValueError(f"Release-score anchors.{key} is invalid")
+    if "indeterminate_dimensions" in score:
+        _string_list(
+            score["indeterminate_dimensions"], "Release-score indeterminate_dimensions", unique=True
+        )
+    dimensions = score.get("dimensions")
+    required = {
+        "utility": {"tstr", "mmd", "jsd"},
+        "privacy": {"k", "l", "dcr", "epsilon", "mia", "attribute"},
+        "fairness": {"representation", "eo", "worst_log_disparity"},
+    }
+    if not isinstance(dimensions, Mapping) or set(dimensions) != set(required):
+        raise ValueError(f"Release-score dimensions are incomplete for {model_name!r}")
+    all_succeeded = True
+    for dimension, components in required.items():
+        item = dimensions.get(dimension)
+        if not isinstance(item, Mapping):
+            raise ValueError(f"Release-score {dimension} is not an object")
+        if set(item) - {"score", "components", "identity"} or not {"score", "components"}.issubset(
+            item
+        ):
+            raise ValueError(f"Release-score {dimension} has invalid fields")
+        dimension_score = item.get("score")
+        if dimension_score is not None and not finite(dimension_score):
+            raise ValueError(f"Release-score {dimension} score is not finite")
+        if (
+            isinstance(dimension_score, (int, float))
+            and not isinstance(dimension_score, bool)
+            and not 0 <= dimension_score <= 1
+        ):
+            raise ValueError(f"Release-score {dimension} score is outside [0, 1]")
+        component_payload = item.get("components")
+        if not isinstance(component_payload, Mapping) or set(component_payload) != components:
+            raise ValueError(f"Release-score {dimension} components are incomplete")
+        for component in components:
+            record = component_payload[component]
+            if not isinstance(record, Mapping) or record.get("status") not in {
+                "succeeded",
+                "indeterminate",
+            }:
+                raise ValueError(
+                    f"Release-score component {dimension}.{component} has invalid state"
+                )
+            if set(record) - {"score", "status", "evidence"} or not {"score", "status"}.issubset(
+                record
+            ):
+                raise ValueError(
+                    f"Release-score component {dimension}.{component} has invalid fields"
+                )
+            component_score = record.get("score")
+            if record["status"] == "succeeded" and not finite(component_score):
+                raise ValueError(f"Release-score component {dimension}.{component} is not finite")
+            if (
+                isinstance(component_score, (int, float))
+                and not isinstance(component_score, bool)
+                and not 0 <= component_score <= 1
+            ):
+                raise ValueError(
+                    f"Release-score component {dimension}.{component} is outside [0, 1]"
+                )
+            if record["status"] == "indeterminate" and component_score is not None:
+                raise ValueError(f"Indeterminate component {dimension}.{component} must be null")
+            all_succeeded &= record["status"] == "succeeded"
+        all_succeeded &= dimension_score is not None
+    if (status == "succeeded") != all_succeeded:
+        raise ValueError(f"Release-score state is inconsistent for {model_name!r}")
+
+
+def _release_score_binding(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    """Return canonical identity of exact final-holdout score evidence."""
+    inventory = evidence.get("provenance_inventory")
+    refit = evidence.get("final_refit")
+    if not isinstance(inventory, Mapping):
+        raise ValueError("Release-score provenance requires provenance_inventory")
+    if not isinstance(refit, Mapping) and evidence.get("state") != "blocked":
+        raise ValueError("Release-score provenance requires final_refit identity")
+    refit_mapping: Mapping[str, Any] = refit if isinstance(refit, Mapping) else {}
+    inventory_role_hashes = inventory.get("role_hashes")
+    if not isinstance(inventory_role_hashes, Mapping):
+        raise ValueError("Release-score provenance requires role hash inventory")
+    imputed_role_hashes = inventory_role_hashes.get("imputed_evaluation")
+    custom_raw_role_hashes = inventory_role_hashes.get("custom_raw_evaluation")
+    binding = {
+        "schema_version": "final-holdout-release-binding-v1",
+        "selected_model": evidence.get("selected_model"),
+        "role_context_fingerprint": evidence.get("role_context_fingerprint"),
+        "role_hashes": evidence.get("role_hashes", inventory.get("role_hashes")),
+        "raw_imputed_role_hashes": {
+            "evidence": imputed_role_hashes,
+            "custom_raw": custom_raw_role_hashes,
+        },
+        "release_transform_digest": inventory.get("release_transform_digest"),
+        "common_protocol_digest": evidence.get("common_protocol_digest")
+        or inventory.get("common_protocol_digest")
+        or (
+            inventory.get("supports", {}).get("release_transform", {}).get("common_protocol_digest")
+            if isinstance(inventory.get("supports"), Mapping)
+            and isinstance(inventory.get("supports", {}).get("release_transform"), Mapping)
+            else None
+        ),
+        "final_refit_identity": {
+            key: refit_mapping.get(key)
+            for key in (
+                "model_name",
+                "cache_key",
+                "data_sha256",
+                "metadata_sha256",
+                "fit_frame_fingerprint",
+                "fit_frame_fingerprints",
+            )
+        },
+        "selected_model_provenance": {
+            "model": inventory.get("selected_model_provenance", {}).get("model")
+            if isinstance(inventory.get("selected_model_provenance"), Mapping)
+            else None,
+            "selection": evidence.get("candidate_selection", {}),
+            "fit_roles": refit_mapping.get("fit_roles"),
+            "refit": {
+                key: (
+                    inventory.get("selected_model_provenance", {}).get("refit", {}).get(key)
+                    if isinstance(inventory.get("selected_model_provenance"), Mapping)
+                    and isinstance(
+                        inventory.get("selected_model_provenance", {}).get("refit"), Mapping
+                    )
+                    else refit_mapping.get(key)
+                )
+                or refit_mapping.get(key)
+                for key in _FINAL_REFIT_IDENTITY_KEYS
+            },
+        },
+    }
+    if evidence.get("state") != "blocked":
+        binding["final_refit_identity"]["model_name"] = (
+            binding["final_refit_identity"]["model_name"] or binding["selected_model"]
+        )
+        if not isinstance(binding["selected_model_provenance"].get("selection"), Mapping):
+            binding["selected_model_provenance"]["selection"] = {
+                "source": "final_holdout_evidence",
+                "model": binding["selected_model"],
+            }
+        if not binding["selected_model_provenance"].get("model"):
+            binding["selected_model_provenance"]["model"] = binding["selected_model"]
+        identity = binding["final_refit_identity"]
+        required = {
+            "role_context_fingerprint": binding["role_context_fingerprint"],
+            "release_transform_digest": binding["release_transform_digest"],
+            "common_protocol_digest": binding["common_protocol_digest"],
+            "selected_model": binding["selected_model"],
+            **{
+                field: identity.get(field)
+                for field in ("model_name", "cache_key", "data_sha256", "metadata_sha256")
+            },
+        }
+        missing = [field for field, value in required.items() if value in (None, "", {}, [])]
+        if missing:
+            raise ValueError(
+                "Release-score provenance binding identity is incomplete: " + ", ".join(missing)
+            )
+    return binding
+
+
+def _bind_release_score_provenance(score: dict[str, Any], evidence: Mapping[str, Any]) -> None:
+    if (
+        score.get("status") == "indeterminate"
+        and evidence.get("state") in {"failed", "blocked"}
+        and not isinstance(evidence.get("final_refit"), Mapping)
+        and not evidence.get("role_context_fingerprint")
+        and not evidence.get("common_protocol_digest")
+    ):
+        # Failed/blocked indeterminate producer states may intentionally carry
+        # no release binding. They remain indeterminate and are not migrated
+        # into a synthetic current binding.
+        return
+    binding = _release_score_binding(evidence)
+    provenance = score.setdefault("provenance", {})
+    if not isinstance(provenance, dict):
+        raise ValueError("Release-score provenance must be an object")
+    provenance["final_holdout_binding"] = binding
+    provenance["final_holdout_binding_digest"] = _mapping_digest(binding)
+
+
+def _validate_release_score_binding(
+    score: Mapping[str, Any], evidence: Mapping[str, Any], *, label: str
+) -> None:
+    provenance = score.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise ValueError(f"{label} is missing release-score provenance")
+    binding = provenance.get("final_holdout_binding")
+    digest = provenance.get("final_holdout_binding_digest")
+    if (
+        score.get("status") == "indeterminate"
+        and evidence.get("state") in {"failed", "blocked"}
+        and binding is None
+        and digest is None
+    ):
+        return
+    expected = _release_score_binding(evidence)
+    if binding != expected or digest != _mapping_digest(expected):
+        raise ValueError(f"{label} final-holdout provenance binding is invalid")
+
+
+def _partition_framework_validation_results(
+    validation_results: Mapping[Any, Any] | None,
+    *,
+    custom_validation_results: Mapping[Any, Any] | None,
+) -> tuple[
+    dict[tuple[str, str], Mapping[str, Any]] | None,
+    dict[tuple[str, str], Mapping[str, Any]] | None,
+]:
+    """Partition mixed validation results before writing framework sidecars."""
+    syntheval_results: dict[tuple[str, str], Mapping[str, Any]] = {}
+    custom_results: dict[tuple[str, str], Mapping[str, Any]] = {}
+    ordinary_custom_results = {
+        str(model_name): result
+        for model_name, result in (custom_validation_results or {}).items()
+        if not isinstance(model_name, tuple)
+    }
+    if ordinary_custom_results:
+        custom_results[("custom", "main")] = ordinary_custom_results
+    for mapping in (validation_results, custom_validation_results):
+        if mapping is None:
+            continue
+        for identity, results in mapping.items():
+            if not isinstance(identity, tuple) or len(identity) != 2:
+                continue
+            framework, execution_pass = identity
+            if not isinstance(framework, str) or not isinstance(execution_pass, str):
+                raise ValueError("Validation framework/pass identity must contain strings")
+            if framework == "syntheval":
+                if not isinstance(results, Mapping):
+                    raise ValueError(f"SynthEval pass {identity!r} must map models to results")
+                syntheval_results[(framework, execution_pass)] = results
+            elif framework == "custom":
+                if not isinstance(results, Mapping):
+                    raise ValueError(f"Custom pass {identity!r} must map models to results")
+                custom_results[(framework, execution_pass)] = results
+    return (
+        syntheval_results or None,
+        custom_results or None,
+    )
+
+
+def _partition_syntheval_passes(
+    pass_results: Mapping[tuple[str, str], Mapping[str, Any]] | None,
+) -> dict[tuple[str, str], Mapping[str, Any]] | None:
+    """Keep only SynthEval passes in SynthEval execution artifacts."""
+    if pass_results is None:
+        return None
+    return {
+        identity: results
+        for identity, results in pass_results.items()
+        if identity[0] == "syntheval"
+    }
+
+
+def _validate_custom_raw_role_hashes(
+    validation_results: Mapping[tuple[str, str], Mapping[str, Any]] | None,
+    role_context: Mapping[str, Any] | None,
+) -> None:
+    """Reject custom contexts whose hashes are not the declared raw roles."""
+    if validation_results is None or role_context is None:
+        return
+    candidate = role_context.get("candidate")
+    if not isinstance(candidate, Mapping) or not isinstance(candidate.get("roles"), Mapping):
+        raise ValueError("Custom validation requires a declared candidate raw role map")
+    raw_hashes = {
+        role: details.get("raw_fingerprint")
+        for role, details in candidate["roles"].items()
+        if isinstance(details, Mapping)
+    }
+    if not raw_hashes or any(
+        not isinstance(value, str) or not value for value in raw_hashes.values()
+    ):
+        raise ValueError("Custom validation requires non-empty declared raw role hashes")
+    for pass_identity, results in validation_results.items():
+        for model_name, result in results.items():
+            context = getattr(result, "evaluation_context", None)
+            if context is None and isinstance(result, Mapping):
+                context = result.get("evaluation_context")
+            observed = getattr(context, "role_hashes", None)
+            if observed is None and isinstance(context, Mapping):
+                observed = context.get("role_hashes")
+            if dict(observed or {}) != raw_hashes:
+                raise ValueError(
+                    f"Custom model {model_name!r} pass {pass_identity!r} role hashes "
+                    "do not match the declared raw role map"
+                )
 
 
 def persist_evaluation_artifacts(
@@ -2257,7 +3331,7 @@ def persist_evaluation_artifacts(
     synthcity_validation_results: Mapping[str, Any] | None = None,
     syntheval_validation_results: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
     syntheval_execution_results: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
-    custom_validation_results: Mapping[str, Any] | None = None,
+    custom_validation_results: Mapping[Any, Any] | None = None,
     metric_contract_manifest: dict[str, Any] | None = None,
     source_provenance: Mapping[str, Any] | None = None,
     role_context: Mapping[str, Any] | None = None,
@@ -2268,6 +3342,7 @@ def persist_evaluation_artifacts(
     final_holdout_evidence: Mapping[str, Any] | None = None,
     release_score_evidence: Mapping[str, Any] | None = None,
     release_score: Mapping[str, Any] | None = None,
+    attempt_metadata: Mapping[str, Any] | None = None,
 ) -> Path:
     """Persist plot-ready evaluation outputs and return the bundle manifest path.
 
@@ -2276,7 +3351,52 @@ def persist_evaluation_artifacts(
     command never mistakes a partial report for a successful evaluation.
     """
     evaluation_dir = Path(evaluation_dir)
-    bundle_dir = ensure_dir(artifact_bundle_dir(evaluation_dir))
+    syntheval_validation_results, custom_validation_results = (
+        _partition_framework_validation_results(
+            syntheval_validation_results,
+            custom_validation_results=custom_validation_results,
+        )
+    )
+    _validate_custom_raw_role_hashes(custom_validation_results, role_context)
+    syntheval_execution_results = _partition_syntheval_passes(syntheval_execution_results)
+    semantic_contexts: dict[str, dict[str, Any]] = {}
+    for pass_key, model_payloads in (syntheval_execution_results or {}).items():
+        pass_identity = ":".join(pass_key) if isinstance(pass_key, tuple) else str(pass_key)
+        pass_context: Mapping[str, Any] | None = None
+        for model_name, payload in model_payloads.items():
+            if not isinstance(payload, Mapping):
+                raise ValueError(
+                    f"SynthEval pass {pass_identity!r}, model {model_name!r} payload must be an object"
+                )
+            context = payload.get("semantic_context")
+            digest = payload.get("semantic_context_digest")
+            if not isinstance(context, Mapping) or not isinstance(digest, str):
+                if pass_identity == "syntheval:main":
+                    # Explicit legacy compatibility: historical main-only
+                    # checkpoints predate persisted semantic payloads.
+                    continue
+                raise ValueError(
+                    f"SynthEval pass {pass_identity!r}, model {model_name!r} requires semantic context"
+                )
+            if digest != semantic_context_digest(context):
+                raise ValueError(
+                    f"SynthEval pass {pass_identity!r}, model {model_name!r} has invalid semantic context digest"
+                )
+            if pass_context is None:
+                pass_context = context
+            elif dict(pass_context) != dict(context):
+                raise ValueError(
+                    f"SynthEval pass {pass_identity!r} has inconsistent semantic contexts"
+                )
+        if pass_context is not None:
+            semantic_contexts[pass_identity] = {
+                "semantic_context": dict(pass_context),
+                "semantic_context_fingerprint": semantic_context_digest(pass_context),
+            }
+    bundle_dir = artifact_bundle_dir(evaluation_dir)
+    if bundle_dir.is_symlink():
+        raise ValueError(f"Evaluation artifact bundle must not be a symlink: {bundle_dir}")
+    bundle_dir = _ensure_safe_directory(bundle_dir, "Evaluation artifact bundle")
     combined_path = evaluation_dir / "combined_evaluation.csv"
     if not combined_path.exists():
         raise FileNotFoundError(
@@ -2301,22 +3421,133 @@ def persist_evaluation_artifacts(
         else {}
     )
 
+    # Preflight score and final-evidence linkage before writing either score
+    # sidecar.  This is intentionally before all artifact production below so
+    # malformed release evidence cannot leave a plausible success marker.
+    score_input = release_score_evidence
+    if score_input is not None and release_score is not None:
+        raise ValueError("Provide only one of release_score_evidence and release_score")
+    if score_input is None:
+        score_input = release_score
+    score_payload = None
+    preflight_evidence_payload = None
+    if score_input is not None:
+        if final_holdout_evidence is None:
+            raise ValueError(
+                "Release-score evidence requires final-holdout selected-model metadata"
+            )
+        selected_model = _non_empty_string(
+            final_holdout_evidence.get("selected_model"), "Final-holdout selected model"
+        )
+        score_payload = _release_score_payload(score_input, combined.index, selected_model)
+        score_record = score_payload["models"][selected_model]
+        if not isinstance(score_record, dict):
+            raise ValueError("Release-score record must be mutable for provenance binding")
+        if score_record.get("status") not in {"succeeded", "indeterminate"}:
+            raise ValueError("Release-score record has invalid state")
+        if score_record.get("status") == "indeterminate":
+            _validate_release_score_record(score_record, model_name=selected_model, path=bundle_dir)
+        preflight_evidence_payload = _enrich_final_refit_evidence(
+            _bundle_refit_evidence(final_holdout_evidence, bundle_dir=bundle_dir),
+            artifact_root=evaluation_dir,
+        )
+        _bind_release_score_provenance(score_record, preflight_evidence_payload)
+        if score_record.get("status") == "succeeded":
+            _validate_release_score_record(score_record, model_name=selected_model, path=bundle_dir)
+        _validate_release_score_payload(score_payload, path=bundle_dir)
+
+    if final_holdout_evidence is not None:
+        preflight_evidence_payload = _enrich_final_refit_evidence(
+            _bundle_refit_evidence(final_holdout_evidence, bundle_dir=bundle_dir),
+            artifact_root=evaluation_dir,
+        )
+        if score_payload is not None:
+            selected = score_payload["selected_model"]
+            preflight_evidence_payload["release_score"] = score_payload["models"][selected]
+        preflight_evidence_payload["schema_version"] = "final-holdout-evidence-v1"
+        _validate_final_holdout_evidence_payload(
+            preflight_evidence_payload,
+            entry={
+                "state": preflight_evidence_payload.get("state"),
+                "selected_model": preflight_evidence_payload.get("selected_model"),
+            },
+            manifest={
+                "combined_evaluation": {"models": list(combined.index)},
+                "semantic_context_fingerprint": semantic_manifest.get(
+                    "semantic_context_fingerprint"
+                ),
+            },
+            path=bundle_dir / "final_holdout_evidence.json",
+        )
+
     log_manifest: dict[str, dict[str, Any]] = {}
-    log_root = ensure_dir(bundle_dir / "log_disparity")
+    log_root = _ensure_safe_directory(bundle_dir / "log_disparity", "Log-disparity artifact")
     for model_name, report in sorted(log_disparity_reports.items()):
-        model_dir = ensure_dir(log_root / _model_artifact_id(model_name))
+        report = cast(dict[str, Any], report)
+        model_dir = _ensure_safe_directory(
+            log_root / _model_artifact_id(model_name), "Log-disparity artifact"
+        )
         metadata_path = model_dir / "metadata.json"
-        if "error" in report:
+        declared_state = report.get("state") if isinstance(report, Mapping) else None
+        if declared_state not in {"succeeded", "failed", "indeterminate"}:
+            report = {
+                "state": "indeterminate",
+                "reason": "report_state_missing_or_unknown",
+                "missing_tables": list(_LOG_REPORT_TABLES),
+            }
+            declared_state = "indeterminate"
+        if "error" in report or declared_state == "failed":
+            reason = _safe_log_disparity_reason(
+                report.get("reason"), fallback="log_disparity_evaluation_failed"
+            )
             metadata = {
                 "state": "failed",
                 "model_name": model_name,
-                "error_type": report.get("error_type"),
-                "error": report["error"],
+                "error_type": _safe_log_disparity_error_type(report.get("error_type")),
+                "reason": reason,
             }
             _atomic_json(metadata_path, metadata)
             log_manifest[model_name] = {
                 "path": str(model_dir.relative_to(bundle_dir)),
                 "state": "failed",
+                "metadata_sha256": _file_digest(metadata_path),
+            }
+            continue
+
+        if declared_state == "indeterminate":
+            result_metadata = report.get("result_metadata")
+            if not isinstance(result_metadata, Mapping):
+                result_metadata = {}
+            reason = report.get("reason") or result_metadata.get("release_evidence_reason")
+            if not isinstance(reason, str) or not reason:
+                raise ValueError(
+                    f"Cannot persist indeterminate log-disparity report for model {model_name!r}: "
+                    "missing reason."
+                )
+            missing_tables = report.get("missing_tables", list(_LOG_REPORT_TABLES))
+            if missing_tables != list(_LOG_REPORT_TABLES):
+                raise ValueError(
+                    f"Cannot persist indeterminate log-disparity report for model {model_name!r}: "
+                    "missing_tables must list all required tables."
+                )
+            safe_reason = _safe_log_disparity_reason(
+                reason, fallback="log_disparity_evaluation_indeterminate"
+            )
+            metadata = {
+                "state": "indeterminate",
+                "model_name": model_name,
+                "reason": safe_reason,
+                "missing_tables": list(missing_tables),
+                "result_metadata": safe_metric_metadata(
+                    result_metadata, label="log-disparity result_metadata"
+                ),
+            }
+            _atomic_json(metadata_path, metadata)
+            log_manifest[model_name] = {
+                "path": str(model_dir.relative_to(bundle_dir)),
+                "state": "indeterminate",
+                "reason": safe_reason,
+                "missing_tables": list(missing_tables),
                 "metadata_sha256": _file_digest(metadata_path),
             }
             continue
@@ -2335,11 +3566,23 @@ def persist_evaluation_artifacts(
             "protected_order_map": report["protected_order_map"],
             "target_order": report["target_order"],
         }
+        if "result_metadata" in report:
+            if not isinstance(report["result_metadata"], Mapping):
+                raise ValueError("Log-disparity result_metadata must be an object")
+            metadata["result_metadata"] = safe_metric_metadata(
+                report["result_metadata"], label="log-disparity result_metadata"
+            )
         _atomic_json(metadata_path, metadata)
         table_manifest = {}
         for name in _LOG_REPORT_TABLES:
             path = model_dir / f"{name}.parquet"
-            _atomic_parquet(path, report[name])
+            table = report[name]
+            if not isinstance(table, pd.DataFrame):
+                raise ValueError(
+                    f"Cannot persist log-disparity table {name!r} for model {model_name!r}: "
+                    "expected a DataFrame."
+                )
+            _atomic_parquet(path, table)
             table_manifest[name] = {
                 "filename": path.name,
                 "sha256": _file_digest(path),
@@ -2352,17 +3595,34 @@ def persist_evaluation_artifacts(
         }
 
     native_files = []
+    native_root_manifest = None
+    bundle_native_root = bundle_dir / "native_syntheval_plots"
+    if bundle_native_root.is_symlink():
+        raise ValueError("Native SynthEval plot root must not be a symlink")
+    _clear_native_plot_destination(bundle_native_root)
     if native_syntheval_plot_dir is not None:
         native_root = Path(native_syntheval_plot_dir)
-        if native_root.exists():
+        source_files = _native_plot_source_files(native_root)
+        if source_files:
+            _ensure_safe_directory(bundle_native_root, "Native SynthEval plot destination")
+            for path, relative_path in source_files:
+                destination = _safe_bundle_destination(
+                    bundle_dir,
+                    str(Path("native_syntheval_plots") / relative_path),
+                    "Native SynthEval plot",
+                )
+                _copy_regular_source(
+                    path, destination, "Native SynthEval plot", contained_in=native_root
+                )
             native_files = [
                 {
-                    "path": str(path.relative_to(native_root)),
-                    "sha256": _file_digest(path),
+                    "path": str(relative_path),
+                    "sha256": _file_digest(bundle_native_root / relative_path),
                 }
-                for path in sorted(native_root.rglob("*"))
-                if path.is_file()
+                for _path, relative_path in source_files
             ]
+            if native_files:
+                native_root_manifest = str(bundle_native_root.relative_to(evaluation_dir))
 
     contract_artifacts = {}
     if metric_contract_manifest is not None:
@@ -2449,9 +3709,14 @@ def persist_evaluation_artifacts(
             "schema_version": _ARTIFACT_SCHEMA_VERSION,
             "framework": "custom",
             "source_provenance": dict(source_provenance or {}),
-            "models": {
-                model_name: result.to_dict() if hasattr(result, "to_dict") else result
-                for model_name, result in sorted(custom_validation_results.items())
+            "passes": {
+                f"{framework}:{execution_pass}": {
+                    model_name: result.to_dict() if hasattr(result, "to_dict") else result
+                    for model_name, result in sorted(results.items())
+                }
+                for (framework, execution_pass), results in sorted(
+                    custom_validation_results.items()
+                )
             },
         }
         status_path = bundle_dir / "custom_metric_status.json"
@@ -2459,7 +3724,7 @@ def persist_evaluation_artifacts(
         status_artifacts["custom"] = {
             "path": str(status_path.relative_to(evaluation_dir)),
             "sha256": _file_digest(status_path),
-            "models": sorted(status_payload["models"]),
+            "passes": sorted(status_payload["passes"]),
         }
 
     final_holdout_artifact = None
@@ -2467,7 +3732,19 @@ def persist_evaluation_artifacts(
         if final_holdout_evidence.get("evaluation_role") != "final_holdout":
             raise ValueError("Final-holdout evidence must declare evaluation_role='final_holdout'")
         evidence_path = bundle_dir / "final_holdout_evidence.json"
-        evidence_payload = _enrich_final_refit_evidence(final_holdout_evidence)
+        evidence_payload = _bundle_refit_evidence(final_holdout_evidence, bundle_dir=bundle_dir)
+        evidence_payload = _enrich_final_refit_evidence(
+            evidence_payload, artifact_root=evaluation_dir
+        )
+        if score_payload is not None:
+            evidence_payload["release_score"] = score_payload["models"][
+                score_payload["selected_model"]
+            ]
+            _validate_release_score_binding(
+                evidence_payload["release_score"],
+                evidence_payload,
+                label="Final-holdout release score",
+            )
         evidence_payload["schema_version"] = "final-holdout-evidence-v1"
         _atomic_json(evidence_path, evidence_payload)
         final_holdout_artifact = {
@@ -2479,21 +3756,8 @@ def persist_evaluation_artifacts(
 
     # Release scores are durable audit evidence only.  Keep this separate from
     # combined evaluation so loading it can never affect candidate selection.
-    score_input = release_score_evidence
-    if score_input is not None and release_score is not None:
-        raise ValueError("Provide only one of release_score_evidence and release_score")
-    if score_input is None:
-        score_input = release_score
     release_score_artifact = None
-    if score_input is not None:
-        if final_holdout_evidence is None:
-            raise ValueError(
-                "Release-score evidence requires final-holdout selected-model metadata"
-            )
-        selected_model = _non_empty_string(
-            final_holdout_evidence.get("selected_model"), "Final-holdout selected model"
-        )
-        score_payload = _release_score_payload(score_input, combined.index, selected_model)
+    if score_payload is not None:
         score_path = bundle_dir / "release_score_evidence.json"
         _atomic_json(score_path, score_payload)
         release_score_artifact = {
@@ -2516,12 +3780,14 @@ def persist_evaluation_artifacts(
         },
         "log_disparity": log_manifest,
         "native_syntheval_plots": {
-            "root": str(native_syntheval_plot_dir) if native_syntheval_plot_dir else None,
+            "root": native_root_manifest,
             "files": native_files,
         },
         "source_provenance": dict(source_provenance or {}),
-        "task12_metric_manifest": list(TASK12_EXPECTED_MANIFEST),
+        "canonical_metric_manifest": list(CANONICAL_EXPECTED_MANIFEST),
     }
+    if attempt_metadata is not None:
+        manifest["evaluation_attempt"] = dict(attempt_metadata)
     if role_context is not None:
         manifest["role_context"] = dict(role_context)
     if role_context_fingerprint is not None:
@@ -2529,14 +3795,34 @@ def persist_evaluation_artifacts(
     if semantic_context is not None:
         manifest["semantic_context"] = dict(semantic_context)
         manifest["semantic_context_fingerprint"] = semantic_manifest["semantic_context_fingerprint"]
+    if semantic_contexts:
+        manifest["semantic_contexts"] = semantic_contexts
     if generator_metadata is not None:
+        source_generation_root = None
+        if (
+            attempt_metadata is not None
+            and attempt_metadata.get("source_generation_root") is not None
+        ):
+            source_generation_root = Path(
+                _non_empty_string(
+                    attempt_metadata["source_generation_root"],
+                    "Evaluation attempt source_generation_root",
+                )
+            )
         manifest["generator_metadata"] = {
             model_name: dict(metadata) if isinstance(metadata, Mapping) else metadata
-            for model_name, metadata in sorted(generator_metadata.items())
+            for model_name, metadata in sorted(
+                _bundle_generator_metadata(
+                    generator_metadata,
+                    bundle_dir=bundle_dir,
+                    source_root=source_generation_root,
+                ).items()
+            )
         }
         _validate_generator_metadata_manifest(
             manifest["generator_metadata"],
             manifest=manifest,
+            artifact_root=evaluation_dir,
             expected_model_names=(
                 [str(model_name) for model_name in combined.index]
                 if len(combined.index) > 0
@@ -2660,6 +3946,30 @@ def load_syntheval_execution(evaluation_dir: str | Path) -> dict:
             raise ValueError(
                 f"SynthEval execution pass {pass_identity!r} must map models to payloads"
             )
+        context_entry = manifest.get("semantic_contexts", {}).get(pass_identity)
+        if not isinstance(context_entry, Mapping):
+            if execution_pass != "main" or "semantic_contexts" in manifest:
+                raise ValueError(
+                    f"SynthEval pass {pass_identity!r} has no manifest semantic context"
+                )
+            context_entry = {
+                "semantic_context": manifest.get("semantic_context"),
+                "semantic_context_fingerprint": manifest.get("semantic_context_fingerprint"),
+            }
+        pass_context = context_entry.get("semantic_context")
+        pass_digest = context_entry.get("semantic_context_fingerprint")
+        if not isinstance(pass_context, Mapping) or not isinstance(pass_digest, str):
+            if "semantic_contexts" not in manifest and execution_pass == "main":
+                pass_context = None
+                pass_digest = None
+            else:
+                raise ValueError(
+                    f"SynthEval pass {pass_identity!r} has an invalid manifest semantic context"
+                )
+        if pass_context is not None and pass_digest != semantic_context_digest(pass_context):
+            raise ValueError(
+                f"SynthEval pass {pass_identity!r} manifest semantic context digest is invalid"
+            )
         for model_name, execution_payload in model_payloads.items():
             model_name = _non_empty_string(model_name, "SynthEval execution model name")
             _validate_syntheval_execution_payload(
@@ -2667,7 +3977,8 @@ def load_syntheval_execution(evaluation_dir: str | Path) -> dict:
                 label=f"SynthEval pass {pass_identity!r}, model {model_name!r}",
                 model_name=model_name,
                 execution_pass=execution_pass,
-                expected_semantic_context_fingerprint=manifest.get("semantic_context_fingerprint"),
+                expected_semantic_context_fingerprint=pass_digest,
+                expected_semantic_context=pass_context,
             )
     return payload
 
@@ -2678,7 +3989,7 @@ def load_custom_metric_status(evaluation_dir: str | Path) -> dict:
         evaluation_dir,
         manifest_key="custom_metric_status",
         framework="custom",
-        container_key="models",
+        container_key="passes",
     )
 
 
@@ -2718,10 +4029,12 @@ def validate_evaluation_bundle(
 
     combined = load_combined_table(combined_path, validate_artifact=False)
 
-    recorded_task12 = manifest.get("task12_metric_manifest")
-    if tuple(recorded_task12 or ()) != TASK12_EXPECTED_MANIFEST:
+    recorded_manifest = manifest.get("canonical_metric_manifest")
+    if recorded_manifest is None:
+        recorded_manifest = manifest.get("task12_metric_manifest")
+    if tuple(recorded_manifest or ()) != CANONICAL_EXPECTED_MANIFEST:
         raise ValueError(
-            "Evaluation bundle Task 12 metric manifest must exactly match canonical identities"
+            "Evaluation bundle canonical metric manifest must exactly match canonical identities"
         )
 
     if expected_semantic_context_fingerprint is not None:
@@ -2731,6 +4044,16 @@ def validate_evaluation_bundle(
                 "Evaluation bundle semantic-context fingerprint does not match the current dataset"
             )
 
+    # Validate recorded semantic evidence before any legacy compatibility
+    # return.  Manifest hashes alone do not validate payload meaning.
+    try:
+        if "final_holdout_evidence" in manifest:
+            load_final_holdout_evidence(evaluation_dir)
+        if "release_score_evidence" in manifest:
+            load_release_score_evidence(evaluation_dir)
+    except (KeyError, OSError, TypeError, ValueError):
+        raise ValueError("Evaluation bundle semantic sidecar validation failed") from None
+
     registry = _load_contract_registry_if_present(
         bundle_dir,
         manifest,
@@ -2738,6 +4061,8 @@ def validate_evaluation_bundle(
     )
     if registry is None:
         semantic_sidecar_keys = {
+            "final_holdout_evidence",
+            "release_score_evidence",
             "synthcity_metric_status",
             "syntheval_metric_status",
             "syntheval_execution",
@@ -2791,9 +4116,12 @@ def validate_evaluation_bundle(
         framework: str,
         container_key: str,
     ) -> set[str]:
-        container = payload[container_key]
+        actual_container_key = container_key
+        if framework == "custom" and container_key == "passes" and "passes" not in payload:
+            actual_container_key = "models"
+        container = payload[actual_container_key]
         pass_identities = set()
-        if container_key == "models":
+        if actual_container_key == "models":
             observed_models = set(container)
             if observed_models != set(combined_models):
                 raise ValueError(
@@ -2881,7 +4209,7 @@ def validate_evaluation_bundle(
     status_entries = (
         ("synthcity", "synthcity_metric_status", "models"),
         ("syntheval", "syntheval_metric_status", "passes"),
-        ("custom", "custom_metric_status", "models"),
+        ("custom", "custom_metric_status", "passes"),
     )
     present_statuses = []
     for framework, manifest_key, container_key in status_entries:
@@ -3030,6 +4358,22 @@ def _validate_final_holdout_evidence_payload(
                 f"Final-holdout provenance_inventory contains empty evidence: {empty_inventory}"
             )
     score_payload = payload.get("release_score")
+    if isinstance(score_payload, Mapping):
+        selected_for_score = payload.get("selected_model")
+        if isinstance(selected_for_score, str):
+            _validate_release_score_record(score_payload, model_name=selected_for_score, path=path)
+            if score_payload.get("status") == "succeeded" or (
+                score_payload.get("status") == "indeterminate"
+                and isinstance(
+                    score_payload.get("provenance", {}).get("final_holdout_binding")
+                    if isinstance(score_payload.get("provenance"), Mapping)
+                    else None,
+                    Mapping,
+                )
+            ):
+                _validate_release_score_binding(
+                    score_payload, payload, label="Final-holdout release score"
+                )
     if (
         payload["audit_outcome_state"] == "complete"
         and score_payload is not None
@@ -3233,14 +4577,18 @@ def _validate_final_holdout_evidence_payload(
                     label=f"Final-holdout custom model {model_name!r}",
                     execution_pass="main",
                 )
-        task12_validation = custom.get("task12_validation")
-        if state != "blocked" and not isinstance(task12_validation, Mapping):
-            raise ValueError("Non-blocked final-holdout evidence requires Task 12 validation")
-        if isinstance(task12_validation, Mapping):
-            for model_name, result_payload in task12_validation.items():
+        release_evidence_validation = custom.get("release_evidence_validation")
+        if release_evidence_validation is None:
+            release_evidence_validation = custom.get("task12_validation")
+        if state != "blocked" and not isinstance(release_evidence_validation, Mapping):
+            raise ValueError(
+                "Non-blocked final-holdout evidence requires release-evidence validation"
+            )
+        if isinstance(release_evidence_validation, Mapping):
+            for model_name, result_payload in release_evidence_validation.items():
                 result = _metric_validation_result_from_payload(
                     result_payload,
-                    label=f"Final-holdout Task 12 model {model_name!r}",
+                    label=f"Final-holdout release-evidence model {model_name!r}",
                     model_name=model_name,
                     framework="custom",
                     registry=registry,
@@ -3248,14 +4596,14 @@ def _validate_final_holdout_evidence_payload(
                 )
                 if result.evaluation_context is None:
                     raise ValueError(
-                        f"Final-holdout Task 12 model {model_name!r} must carry evaluation context"
+                        f"Final-holdout release-evidence model {model_name!r} must carry evaluation context"
                     )
                 context = result.evaluation_context
                 if context.evaluation_role != "final_holdout":
                     raise ValueError(
-                        f"Final-holdout Task 12 model {model_name!r} has the wrong evaluation role"
+                        f"Final-holdout release-evidence model {model_name!r} has the wrong evaluation role"
                     )
-                expected_keys = tuple(CUSTOM_TASK12_MANIFEST)
+                expected_keys = tuple(CUSTOM_CANONICAL_MANIFEST)
                 observed_keys = tuple(
                     record.expected_key
                     for record in sorted(
@@ -3265,7 +4613,7 @@ def _validate_final_holdout_evidence_payload(
                 )
                 if observed_keys != expected_keys:
                     raise ValueError(
-                        f"Final-holdout Task 12 model {model_name!r} must contain canonical identities"
+                        f"Final-holdout release-evidence model {model_name!r} must contain canonical identities"
                     )
                 if any(
                     record.execution_pass
@@ -3277,41 +4625,44 @@ def _validate_final_holdout_evidence_payload(
                     for record in result.expected_records
                 ):
                     raise ValueError(
-                        f"Final-holdout Task 12 model {model_name!r} has an invalid execution pass"
+                        f"Final-holdout release-evidence model {model_name!r} has an invalid execution pass"
                     )
                 recorded_hashes = payload.get("role_hashes", {}).get("custom_raw_evaluation", {})
                 if isinstance(recorded_hashes, Mapping) and dict(context.role_hashes) != dict(
                     recorded_hashes
                 ):
                     raise ValueError(
-                        f"Final-holdout Task 12 model {model_name!r} role hashes do not match evidence"
+                        f"Final-holdout release-evidence model {model_name!r} role hashes do not match evidence"
                     )
                 for record in result.expected_records:
                     if record.status == "succeeded":
                         if record.fit_roles != ("train", "tuning"):
                             raise ValueError(
-                                f"Final-holdout Task 12 {record.expected_key} has invalid fit_roles"
+                                f"Final-holdout release-evidence {record.expected_key} has invalid fit_roles"
                             )
                         if not isinstance(record.support, Mapping):
                             raise ValueError(
-                                f"Final-holdout Task 12 {record.expected_key} is missing support"
+                                f"Final-holdout release-evidence {record.expected_key} is missing support"
                             )
                         metadata = {
                             **dict(record.source_metadata),
                             **dict(record.result_metadata),
                             **dict(record.provenance),
                         }
-                        if metadata.get("protocol_version") != "task12-evaluation-v1":
+                        if metadata.get("protocol_version") not in {
+                            "release-evidence-v2",
+                            "task12-evaluation-v1",
+                        }:
                             raise ValueError(
-                                f"Final-holdout Task 12 {record.expected_key} has invalid protocol_version"
+                                f"Final-holdout release-evidence {record.expected_key} has invalid protocol_version"
                             )
                         if metadata.get("release_transform_digest") is None:
                             raise ValueError(
-                                f"Final-holdout Task 12 {record.expected_key} is missing release transform digest"
+                                f"Final-holdout release-evidence {record.expected_key} is missing release transform digest"
                             )
                 if state == "succeeded" and not result.complete:
                     raise ValueError(
-                        "Succeeded final-holdout evidence has incomplete Task 12 validation"
+                        "Succeeded final-holdout evidence has incomplete release-evidence validation"
                     )
 
     syntheval = frameworks.get("syntheval")
@@ -3348,12 +4699,14 @@ def _validate_final_holdout_evidence_payload(
                                 verification_payload["prediction_artifact"] = metadata[
                                     "prediction_artifact"
                                 ]
-                            if record.get("status") == "succeeded" and not is_verified_task10_tstr(
+                            if record.get(
+                                "status"
+                            ) == "succeeded" and not is_verified_authoritative_tstr(
                                 verification_payload
                             ):
                                 raise ValueError(
                                     f"Final-holdout SynthEval model {model_name!r} has an "
-                                    "unverified Task 10 TSTR artifact"
+                                    "unverified authoritative TSTR artifact"
                                 )
                     validate_result(
                         result_payload,
@@ -3406,7 +4759,7 @@ def load_final_holdout_evidence(evaluation_dir: str | Path) -> dict:
     )
     registry = _load_contract_registry_if_present(bundle_dir, manifest)
     original_refit = payload.get("final_refit")
-    enriched_payload = _enrich_final_refit_evidence(payload)
+    enriched_payload = _enrich_final_refit_evidence(payload, artifact_root=bundle_dir.parent)
     if isinstance(original_refit, Mapping) and isinstance(
         enriched_payload.get("final_refit"), Mapping
     ):
@@ -3447,12 +4800,14 @@ def load_release_score_evidence(evaluation_dir: str | Path) -> dict[str, Any]:
         raise ValueError(
             "Release-score candidate audit inventory does not match combined evaluation"
         )
+    final_payload = load_final_holdout_evidence(evaluation_dir)
+    if final_payload.get("state") != "succeeded":
+        raise ValueError("Release-score evidence requires succeeded final-holdout evidence")
+    if final_payload.get("audit_outcome_state") != "complete":
+        raise ValueError("Release-score evidence requires complete final-holdout audit")
     final_entry = manifest.get("final_holdout_evidence")
     if not isinstance(final_entry, Mapping):
         raise ValueError("Release-score evidence requires final-holdout selected-model metadata")
-    final_payload, _final_path = _read_json_artifact(
-        bundle_dir.parent, final_entry, "Final-holdout evidence sidecar"
-    )
     selected_model = _non_empty_string(
         final_payload.get("selected_model"), "Final-holdout selected model"
     )
@@ -3460,6 +4815,13 @@ def load_release_score_evidence(evaluation_dir: str | Path) -> dict[str, Any]:
         raise ValueError("Release-score selected model does not match final-holdout evidence")
     if set(payload["models"]) != {selected_model}:
         raise ValueError("Release-score evidence inventory must contain selected model only")
+    final_score = final_payload.get("release_score")
+    if not isinstance(final_score, Mapping):
+        raise ValueError("Final-holdout evidence is missing its release score")
+    _validate_release_score_record(final_score, model_name=selected_model, path=path)
+    _validate_release_score_binding(final_score, final_payload, label="Final-holdout release score")
+    if dict(final_score) != dict(payload["models"][selected_model]):
+        raise ValueError("Release-score evidence does not match final-holdout release score")
     if set(entry["models"]) != set(payload["models"]):
         raise ValueError("Release-score manifest model inventory does not match its payload")
     if entry["selected_model"] != selected_model:
@@ -3510,9 +4872,9 @@ def _load_manifest(evaluation_dir: str | Path) -> tuple[Path, dict]:
     try:
         manifest = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Evaluation artifact manifest is unreadable at {path}: {exc}") from exc
+        raise ValueError("Evaluation artifact manifest is unreadable") from exc
     if not isinstance(manifest, dict):
-        raise ValueError(f"Evaluation artifact manifest must contain a JSON object at {path}")
+        raise ValueError("Evaluation artifact manifest must contain a JSON object")
     if manifest.get("schema_version") != _ARTIFACT_SCHEMA_VERSION:
         raise ValueError(
             f"Unsupported evaluation artifact schema at {path}: "
@@ -3528,6 +4890,7 @@ def _load_manifest(evaluation_dir: str | Path) -> tuple[Path, dict]:
     _validate_generator_metadata_manifest(
         manifest.get("generator_metadata"),
         manifest=manifest,
+        artifact_root=bundle_dir.parent,
     )
     combined = manifest.get("combined_evaluation")
     if not isinstance(combined, Mapping):
@@ -3556,6 +4919,39 @@ def _load_manifest(evaluation_dir: str | Path) -> tuple[Path, dict]:
         value = manifest.get(key)
         if value is not None and not isinstance(value, dict):
             raise ValueError(f"Evaluation artifact manifest field {key!r} must be an object")
+    native = manifest.get("native_syntheval_plots", {})
+    if native:
+        root_value = native.get("root")
+        files = native.get("files", [])
+        if root_value is not None:
+            _native_bundle_root(bundle_dir, root_value)
+        if not isinstance(files, list):
+            raise ValueError("Native SynthEval plot manifest files must be a list")
+        if root_value is None and files:
+            raise ValueError("Native SynthEval plot files require a recorded root")
+        seen_paths = set()
+        for entry in files:
+            if not isinstance(entry, Mapping):
+                raise ValueError("Native SynthEval plot manifest entries must be objects")
+            relative_path = _non_empty_string(entry.get("path"), "Native SynthEval plot")
+            if relative_path in seen_paths:
+                raise ValueError(
+                    f"Native SynthEval plot manifest contains duplicate path {relative_path!r}"
+                )
+            seen_paths.add(relative_path)
+            _relative_artifact_path(
+                _native_bundle_root(bundle_dir, root_value),
+                relative_path,
+                "Native SynthEval plot",
+            )
+            digest = _non_empty_string(entry.get("sha256"), "Native SynthEval plot sha256")
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError("Native SynthEval plot sha256 must be a lowercase SHA-256 digest")
+            _verified_artifact_path(
+                _native_bundle_root(bundle_dir, root_value), entry, "Native SynthEval plot"
+            )
     release_entry = manifest.get("release_score_evidence")
     if release_entry is not None:
         _validate_release_score_manifest_entry(release_entry)
@@ -3762,14 +5158,13 @@ def load_log_disparity_reports(evaluation_dir: str | Path) -> dict[str, dict]:
             metadata = json.loads(metadata_path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(
-                f"Log-disparity metadata for model {model_name!r} is unreadable at "
-                f"{metadata_path}: {exc}"
+                f"Log-disparity metadata for model {model_name!r} is unreadable"
             ) from exc
         if not isinstance(metadata, dict):
             raise ValueError(
                 f"Log-disparity metadata for model {model_name!r} must be an object at {metadata_path}"
             )
-        if entry.get("state") not in {"failed", "succeeded"}:
+        if entry.get("state") not in {"failed", "indeterminate", "succeeded"}:
             raise ValueError(
                 f"Log-disparity manifest entry for model {model_name!r} has invalid state "
                 f"{entry.get('state')!r}"
@@ -3779,13 +5174,53 @@ def load_log_disparity_reports(evaluation_dir: str | Path) -> dict[str, dict]:
                 f"Log-disparity metadata state does not match its manifest entry at {metadata_path}"
             )
         if metadata.get("state") == "failed":
-            _non_empty_string(
-                metadata.get("error"), f"Log-disparity failure for model {model_name!r}"
+            if "tables" in entry:
+                raise ValueError(
+                    f"Log-disparity failed artifact for model {model_name!r} must not include tables"
+                )
+            reason = _safe_log_disparity_reason(
+                metadata.get("reason"), fallback="log_disparity_evaluation_failed"
             )
             reports[model_name] = {
-                "error": metadata.get("error", "unknown persisted failure"),
-                "error_type": metadata.get("error_type", "UnknownError"),
+                "state": "failed",
+                "reason": reason,
+                "error_type": _safe_log_disparity_error_type(metadata.get("error_type")),
             }
+            continue
+        if metadata.get("state") == "indeterminate":
+            if "tables" in entry:
+                raise ValueError(
+                    f"Log-disparity indeterminate artifact for model {model_name!r} must not include tables"
+                )
+            reason = _non_empty_string(
+                metadata.get("reason"),
+                f"Log-disparity indeterminate reason for model {model_name!r}",
+            )
+            if reason not in _SAFE_LOG_DISPARITY_REASONS:
+                raise ValueError(
+                    f"Log-disparity indeterminate reason for model {model_name!r} is not allowlisted"
+                )
+            missing_tables = metadata.get("missing_tables")
+            if missing_tables != list(_LOG_REPORT_TABLES):
+                raise ValueError(
+                    f"Log-disparity indeterminate artifact for model {model_name!r} has invalid missing_tables"
+                )
+            reports[model_name] = {
+                "state": "indeterminate",
+                "reason": reason,
+                "missing_tables": list(missing_tables),
+            }
+            if "result_metadata" in metadata:
+                result_metadata = metadata["result_metadata"]
+                if not isinstance(result_metadata, dict):
+                    raise ValueError(
+                        f"Log-disparity indeterminate metadata for model {model_name!r} must include result_metadata"
+                    )
+                reports[model_name]["result_metadata"] = safe_metric_metadata(
+                    result_metadata,
+                    label=f"Log-disparity indeterminate result_metadata for model {model_name!r}",
+                    strict=True,
+                )
             continue
         protected_group_cols, protected_order_map = _validate_log_disparity_metadata(
             metadata,
@@ -3793,11 +5228,22 @@ def load_log_disparity_reports(evaluation_dir: str | Path) -> dict[str, dict]:
             path=metadata_path,
         )
         report = {
+            "state": "succeeded",
             "summary_stats": metadata["summary_stats"],
             "protected_group_cols": metadata["protected_group_cols"],
             "protected_order_map": metadata["protected_order_map"],
             "target_order": metadata["target_order"],
         }
+        if "result_metadata" in metadata:
+            if not isinstance(metadata["result_metadata"], dict):
+                raise ValueError(
+                    f"Log-disparity result_metadata must be an object at {metadata_path}"
+                )
+            report["result_metadata"] = safe_metric_metadata(
+                metadata["result_metadata"],
+                label=f"Log-disparity result_metadata for model {model_name!r}",
+                strict=True,
+            )
         tables = entry.get("tables")
         if not isinstance(tables, dict) or set(tables) != set(_LOG_REPORT_TABLES):
             raise ValueError(
@@ -3826,7 +5272,7 @@ def load_log_disparity_reports(evaluation_dir: str | Path) -> dict[str, dict]:
                 table = pd.read_parquet(path)
             except (OSError, TypeError, ValueError) as exc:
                 raise ValueError(
-                    f"Log-disparity table {table_name!r} for model {model_name!r} is unreadable at {path}: {exc}"
+                    f"Log-disparity table {table_name!r} for model {model_name!r} is unreadable"
                 ) from exc
             _validate_log_disparity_table(
                 table,
@@ -3864,7 +5310,7 @@ def verify_native_syntheval_artifacts(evaluation_dir: str | Path) -> None:
             f"No native SynthEval plot files were recorded under {root_value}. "
             "Re-run `synthdata-evaluate` to regenerate its native diagnostics."
         )
-    root = Path(root_value)
+    root = _native_bundle_root(_bundle_dir, root_value)
     missing_or_changed = []
     seen_paths = set()
     for entry in files:
@@ -3882,7 +5328,7 @@ def verify_native_syntheval_artifacts(evaluation_dir: str | Path) -> None:
             raise ValueError(
                 f"Native SynthEval plot sha256 must be a lowercase SHA-256 digest for {path}"
             )
-        if not path.is_file() or _file_digest(path) != digest:
+        if path.is_symlink() or not path.is_file() or _file_digest(path) != digest:
             missing_or_changed.append(str(path))
     if missing_or_changed:
         raise FileNotFoundError(

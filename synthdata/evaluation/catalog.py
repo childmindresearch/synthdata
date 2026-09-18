@@ -8,9 +8,9 @@ and target context, never discovered from an observed result table.
 
 from collections.abc import Mapping, Sequence
 
-# Task 12 release identities.  These are deliberately literal: adapters must
+# Canonical release-evidence identities. Adapters must
 # validate against these manifests instead of inferring identities from rows.
-TASK12_METRIC_MANIFEST = {
+CANONICAL_METRIC_MANIFEST = {
     "elastic_net_jsd": "elastic_net_jsd.v1",
     "mixed_mmd": "mixed_mmd.v1",
     "release_privacy": "release_privacy.v1",
@@ -19,12 +19,12 @@ TASK12_METRIC_MANIFEST = {
     "representation_evidence": "representation_evidence.v1",
 }
 
-TASK12_EXPECTED_MANIFEST = tuple(TASK12_METRIC_MANIFEST.values())
-TASK12_HPO_ALLOWLIST = frozenset(
+CANONICAL_EXPECTED_MANIFEST = tuple(CANONICAL_METRIC_MANIFEST.values())
+CANONICAL_HPO_ALLOWLIST = frozenset(
     {
-        TASK12_METRIC_MANIFEST["elastic_net_jsd"],
-        TASK12_METRIC_MANIFEST["mixed_mmd"],
-        TASK12_METRIC_MANIFEST["tstr_macro_f1"],
+        CANONICAL_METRIC_MANIFEST["elastic_net_jsd"],
+        CANONICAL_METRIC_MANIFEST["mixed_mmd"],
+        CANONICAL_METRIC_MANIFEST["tstr_macro_f1"],
     }
 )
 
@@ -45,35 +45,47 @@ LEGACY_AUDIT_MANIFEST = (
 # Framework-facing manifests are intentionally separate so each adapter can
 # bind only identities it owns.  A copy is returned by helper below; callers
 # must not mutate these module constants.
-SYNTHCITY_TASK12_MANIFEST = (
-    TASK12_METRIC_MANIFEST["elastic_net_jsd"],
-    TASK12_METRIC_MANIFEST["mixed_mmd"],
+SYNTHCITY_CANONICAL_MANIFEST = (
+    CANONICAL_METRIC_MANIFEST["elastic_net_jsd"],
+    CANONICAL_METRIC_MANIFEST["mixed_mmd"],
 )
-SYNTHEVAL_TASK12_MANIFEST = (TASK12_METRIC_MANIFEST["tstr_macro_f1"],)
-CUSTOM_TASK12_MANIFEST = (
-    TASK12_METRIC_MANIFEST["release_privacy"],
-    TASK12_METRIC_MANIFEST["equalized_odds"],
-    TASK12_METRIC_MANIFEST["representation_evidence"],
+SYNTHEVAL_CANONICAL_MANIFEST = (CANONICAL_METRIC_MANIFEST["tstr_macro_f1"],)
+CUSTOM_CANONICAL_MANIFEST = (
+    CANONICAL_METRIC_MANIFEST["release_privacy"],
+    CANONICAL_METRIC_MANIFEST["equalized_odds"],
+    CANONICAL_METRIC_MANIFEST["representation_evidence"],
 )
 
-TASK12_MANIFEST_BY_FRAMEWORK = {
-    "synthcity": SYNTHCITY_TASK12_MANIFEST,
-    "syntheval": SYNTHEVAL_TASK12_MANIFEST,
-    "custom": CUSTOM_TASK12_MANIFEST,
+CANONICAL_MANIFEST_BY_FRAMEWORK = {
+    "synthcity": SYNTHCITY_CANONICAL_MANIFEST,
+    "syntheval": SYNTHEVAL_CANONICAL_MANIFEST,
+    "custom": CUSTOM_CANONICAL_MANIFEST,
 }
 
 
-def task12_expected_manifest() -> tuple[str, ...]:
+def canonical_expected_manifest() -> tuple[str, ...]:
     """Return immutable release metric identities in canonical order."""
-    return TASK12_EXPECTED_MANIFEST
+    return CANONICAL_EXPECTED_MANIFEST
 
 
-def task12_manifest_for_framework(framework: str) -> tuple[str, ...]:
-    """Return exact Task 12 identities owned by ``framework``."""
+def canonical_manifest_for_framework(framework: str) -> tuple[str, ...]:
+    """Return exact canonical identities owned by ``framework``."""
     try:
-        return TASK12_MANIFEST_BY_FRAMEWORK[framework]
+        return CANONICAL_MANIFEST_BY_FRAMEWORK[framework]
     except KeyError as exc:
-        raise ValueError(f"Unknown Task 12 framework: {framework!r}") from exc
+        raise ValueError(f"Unknown canonical framework: {framework!r}") from exc
+
+
+# Deprecated read/import aliases. New producers must use semantic names above.
+TASK12_METRIC_MANIFEST = CANONICAL_METRIC_MANIFEST
+TASK12_EXPECTED_MANIFEST = CANONICAL_EXPECTED_MANIFEST
+TASK12_HPO_ALLOWLIST = CANONICAL_HPO_ALLOWLIST
+SYNTHCITY_TASK12_MANIFEST = SYNTHCITY_CANONICAL_MANIFEST
+SYNTHEVAL_TASK12_MANIFEST = SYNTHEVAL_CANONICAL_MANIFEST
+CUSTOM_TASK12_MANIFEST = CUSTOM_CANONICAL_MANIFEST
+TASK12_MANIFEST_BY_FRAMEWORK = CANONICAL_MANIFEST_BY_FRAMEWORK
+task12_expected_manifest = canonical_expected_manifest
+task12_manifest_for_framework = canonical_manifest_for_framework
 
 
 # ---------------------------------------------------------------------------
@@ -263,12 +275,12 @@ def emitted_keys_for_synthcity_metrics(
 
     emitted_keys = []
 
-    # Canonical Task 12 objectives are emitted by the adapter, not by a
+    # Canonical objectives are emitted by the adapter, not by a
     # native SynthCity category/name lookup.  Keep this branch explicit so a
     # framework report cannot silently rename an unrelated native metric.
     canonical = {
-        TASK12_METRIC_MANIFEST["elastic_net_jsd"],
-        TASK12_METRIC_MANIFEST["mixed_mmd"],
+        CANONICAL_METRIC_MANIFEST["elastic_net_jsd"],
+        CANONICAL_METRIC_MANIFEST["mixed_mmd"],
     }
     selected = [str(name) for names in metric_config.values() for name in names]
     if any(name in canonical for name in selected):

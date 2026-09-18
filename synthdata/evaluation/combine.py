@@ -12,6 +12,7 @@ and rolled up across frameworks per ``type``, plus one overall rank.
 """
 
 import math
+import re
 from collections.abc import Mapping
 from numbers import Real
 from pathlib import Path
@@ -40,6 +41,24 @@ logger = get_logger(__name__)
 
 _ALL = "__all__"
 _RANK = "rank"
+_SAFE_MODEL_ERROR_REASONS = {
+    "metric_evaluation_failed",
+    "synthcity_report_empty",
+    "SynthCity emitted an empty failure report",
+    "SynthCity metric evaluation failed.",
+}
+_SAFE_EXCEPTION_TYPE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _safe_synthcity_failure(error: object, error_type: object) -> tuple[str, str]:
+    """Return audit-safe SynthCity failure reason and exception type."""
+    reason = str(error) if isinstance(error, str) else ""
+    if reason not in _SAFE_MODEL_ERROR_REASONS:
+        reason = "metric_evaluation_failed"
+    exception_type = str(error_type) if isinstance(error_type, str) else ""
+    if not _SAFE_EXCEPTION_TYPE_PATTERN.fullmatch(exception_type):
+        exception_type = "UnknownError"
+    return reason, exception_type
 
 
 def _is_missing_value(value) -> bool:
@@ -49,6 +68,14 @@ def _is_missing_value(value) -> bool:
         return bool(pd.isna(value))
     except (TypeError, ValueError):
         return False
+
+
+def _finite_real(value: object) -> float | None:
+    """Return finite real values without coercing malformed evidence."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    numeric_value = float(value)
+    return numeric_value if math.isfinite(numeric_value) else None
 
 
 def validate_combined_table(combined: pd.DataFrame) -> pd.DataFrame:
@@ -318,8 +345,9 @@ def _synthcity_frames(
                 row = result.iloc[0]
                 error = row.get("error", "SynthCity evaluation failed")
                 error_type = row.get("error_type", "UnknownError")
-            failure_frame.loc[model_name, "__model_error"] = str(error)
-            failure_frame.loc[model_name, "__model_error_type"] = str(error_type)
+            safe_error, safe_error_type = _safe_synthcity_failure(error, error_type)
+            failure_frame.loc[model_name, "__model_error"] = safe_error
+            failure_frame.loc[model_name, "__model_error_type"] = safe_error_type
         raw = pd.concat([raw, failure_frame], axis=1)
 
     if synthcity_validations:
@@ -477,6 +505,28 @@ def _log_disparity_frames(
         if reports
         else pd.DataFrame(index=pd.Index(model_names))
     )
+    # Keep legacy/unvalidated report payloads available as audit evidence. The
+    # summary builder intentionally withholds values when report state is not
+    # explicitly successful, but raw evidence must not be rewritten or used
+    # for policy ranking on that account.
+    for model_name, report in reports.items():
+        summary_stats = report.get("summary_stats") if isinstance(report, Mapping) else None
+        if not isinstance(summary_stats, Mapping) or model_name not in raw.index:
+            continue
+        raw_values = {
+            "log_disparity_mean_abs": summary_stats.get("mean_abs_log_disparity"),
+            "log_disparity_median_abs": summary_stats.get("median_abs_log_disparity"),
+            "log_disparity_share_significant": summary_stats.get("share_significant_bh"),
+            "log_disparity_representation_safety": summary_stats.get(
+                "representation_safety", summary_stats.get("share_significant_bh")
+            ),
+            "log_disparity_worst_abs": summary_stats.get(
+                "worst_abs_log_disparity", summary_stats.get("mean_abs_log_disparity")
+            ),
+        }
+        for metric, value in raw_values.items():
+            if metric in raw.columns and value is not None:
+                raw.at[model_name, metric] = value
     if custom_validations:
         raw = _materialize_validation_records(
             raw,
@@ -532,7 +582,7 @@ def _log_disparity_frames(
     return raw, oriented
 
 
-def _task12_frames(
+def _release_evidence_frames(
     validations: Mapping[str, MetricValidationResult] | None,
     model_names: list,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -547,11 +597,36 @@ def _task12_frames(
             if record.status == "succeeded" and record.raw_value is not None:
                 raw.loc[model, record.expected_key] = record.raw_value
     oriented = raw.copy()
+    invalid_policy_models: set[str] = set()
     for key in keys:
-        contract = next(
-            (item for item in DEFAULT_METRIC_CONTRACT_REGISTRY if item.emitted_key_pattern == key),
-            None,
-        )
+        identities = {
+            (
+                record.framework,
+                record.expected_key,
+                record.execution_pass,
+                record.contract_id,
+                validation.contract_digest,
+            )
+            for validation in validations.values()
+            for record in validation.records
+            if record.expected_key == key and record.is_expected
+        }
+        contract = None
+        if len(identities) == 1:
+            framework, emitted_key, execution_pass, contract_id, digest = next(iter(identities))
+            try:
+                resolved = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
+                    framework=framework,
+                    emitted_key=emitted_key,
+                    execution_pass=execution_pass,
+                )
+                if (
+                    contract_id == resolved.contract_id
+                    and digest == DEFAULT_METRIC_CONTRACT_REGISTRY.digest()
+                ):
+                    contract = resolved
+            except (UnknownMetricContractError, ValueError):
+                contract = None
         if (
             key == "equalized_odds.final.v1"
             or contract is None
@@ -561,9 +636,24 @@ def _task12_frames(
             oriented[key] = pd.NA
         elif contract.direction == "minimize":
             oriented[key] = -oriented[key]
+        if key in {"tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"}:
+            for model, validation in validations.items():
+                if any(
+                    record.expected_key == key
+                    and record.status == "succeeded"
+                    and _finite_real(record.policy_value) is None
+                    for record in validation.records
+                ):
+                    invalid_policy_models.add(model)
+                    oriented.loc[model, key] = pd.NA
     raw = _append_validation_status_columns(
-        raw, model_names, validations, prefix="__model_custom_task12"
+        raw, model_names, validations, prefix="__model_custom_release_evidence"
     )
+    for model in invalid_policy_models:
+        raw.loc[model, "__model_custom_release_evidence_succeeded"] = False
+        raw.loc[model, "__model_custom_release_evidence_decision_eligible"] = False
+        raw.loc[model, "__model_custom_release_evidence_decision_status"] = "indeterminate"
+        raw.loc[model, "__model_custom_release_evidence_audit_status"] = "indeterminate"
     raw.columns = pd.MultiIndex.from_tuples(
         [
             (
@@ -624,6 +714,7 @@ def build_combined_table(
     | None = None,
     metric_execution_passes: Mapping[tuple[str, str, str], str] | None = None,
     custom_validations: Mapping[str, MetricValidationResult] | None = None,
+    release_evidence_validations: Mapping[str, MetricValidationResult] | None = None,
     task12_validations: Mapping[str, MetricValidationResult] | None = None,
 ) -> pd.DataFrame:
     """Build combined audit evidence and fixed-transform tuning utility.
@@ -633,6 +724,14 @@ def build_combined_table(
     indeterminate; no candidate-relative ranking or reweighting occurs.
     ``rank_weights`` is accepted for API compatibility and ignored.
     """
+
+    legacy_validation_argument = task12_validations is not None
+    if release_evidence_validations is not None and task12_validations is not None:
+        raise ValueError(
+            "Pass only one of release_evidence_validations or legacy task12_validations"
+        )
+    if release_evidence_validations is None:
+        release_evidence_validations = task12_validations
 
     sc_raw, sc_oriented = _synthcity_frames(
         synthcity_results,
@@ -651,11 +750,24 @@ def build_combined_table(
         model_names,
         custom_validations=custom_validations,
     )
-    task12_raw, task12_oriented = _task12_frames(task12_validations, model_names)
+    release_evidence_raw, release_evidence_oriented = _release_evidence_frames(
+        release_evidence_validations, model_names
+    )
+    if legacy_validation_argument:
+        legacy_prefix = "__model_custom_task12"
+        semantic_prefix = "__model_custom_release_evidence"
+        release_evidence_raw = release_evidence_raw.rename(
+            columns={
+                column: (*column[:2], column[2].replace(semantic_prefix, legacy_prefix))
+                for column in release_evidence_raw
+            }
+        )
 
-    raw_parts = [df for df in (sc_raw, se_raw, ld_raw, task12_raw) if not df.empty]
+    raw_parts = [df for df in (sc_raw, se_raw, ld_raw, release_evidence_raw) if not df.empty]
     oriented_parts = [
-        df for df in (sc_oriented, se_oriented, ld_oriented, task12_oriented) if not df.empty
+        df
+        for df in (sc_oriented, se_oriented, ld_oriented, release_evidence_oriented)
+        if not df.empty
     ]
 
     if not raw_parts:
@@ -701,19 +813,22 @@ def build_combined_table(
             combined[(_ALL, type_, _RANK)] = combined[group_cols].mean(axis=1, skipna=True)
 
     # Fixed canonical utility transform. These metric identities are emitted
-    # by Task 12/HPO; missing any one component makes U_tuning indeterminate.
+    # by canonical HPO objectives; missing any one component makes U_tuning indeterminate.
     utility_keys = {
         "tstr": "tstr_macro_f1.v1",
         "mmd": "mixed_mmd.v1",
         "jsd": "elastic_net_jsd.v1",
     }
     utility = pd.DataFrame(index=pd.Index(model_names), dtype=float)
-    validations = task12_validations or {}
+    validations = release_evidence_validations or {}
     for component, metric in utility_keys.items():
         values = pd.Series(float("nan"), index=model_names, dtype=float)
         for column in combined.columns:
             if column[2] == metric:
-                values = pd.to_numeric(combined[column], errors="coerce")
+                for model in model_names:
+                    numeric_value = _finite_real(combined.loc[model, column])
+                    if numeric_value is not None:
+                        values.loc[model] = numeric_value
                 break
         # Validation policy_value is already the producer's fixed transform;
         # consume it directly to avoid double normalization.
@@ -723,14 +838,7 @@ def build_combined_table(
                 continue
             for record in validation.records:
                 if str(record.expected_key) == metric and record.status == "succeeded":
-                    policy_value = record.policy_value
-                    values.loc[model] = (
-                        float(policy_value)
-                        if isinstance(policy_value, (int, float))
-                        and not isinstance(policy_value, bool)
-                        and math.isfinite(float(policy_value))
-                        else float("nan")
-                    )
+                    values.loc[model] = _finite_real(record.policy_value)
                     break
         # Canonical HPO values are fixed policy scores: TSTR is a score, while
         # MMD/JSD are distances with configured fixed anchors/transforms.
@@ -738,13 +846,11 @@ def build_combined_table(
             if pd.isna(values.loc[model]):
                 continue
             validation = validations.get(model)
-            has_policy_value = validation is not None and any(
-                str(record.expected_key) == metric
-                and record.status == "succeeded"
-                and record.policy_value is not None
+            has_policy_record = validation is not None and any(
+                str(record.expected_key) == metric and record.status == "succeeded"
                 for record in validation.records
             )
-            if not has_policy_value:
+            if validation is None and not has_policy_record:
                 raw_value = values.loc[model]
                 values.loc[model] = normalize_component(
                     raw_value,

@@ -5,6 +5,7 @@ import types
 import pandas as pd
 import pytest
 
+from synthdata.evaluation import release as release_module
 from synthdata.evaluation.release import (
     attribute_disclosure,
     closest_record_distance,
@@ -94,6 +95,29 @@ def test_role_transform_attaches_common_provenance():
     )
 
 
+def test_canonical_release_rejects_patient_id_when_argument_is_omitted():
+    frame = pd.DataFrame({"patient_id": ["p1"], "age": [42]})
+
+    with pytest.raises(ValueError, match="patient ID cannot be present"):
+        transform_release_roles(frame, {"tuning": frame.copy()})
+
+
+def test_canonical_release_rejects_explicit_patient_id_column():
+    frame = pd.DataFrame({"pid": ["p1"], "age": [42]})
+
+    with pytest.raises(ValueError, match="patient ID cannot be present"):
+        transform_release_roles(frame, {"tuning": frame.copy()}, patient_id_column="pid")
+
+
+def test_canonical_release_accepts_clean_model_frames():
+    frame = pd.DataFrame({"age": [42], "value": [1]})
+
+    synthetic, roles, _ = transform_release_roles(frame, {"tuning": frame.copy()})
+
+    assert list(synthetic.columns) == ["age", "value"]
+    assert list(roles["tuning"].columns) == ["age", "value"]
+
+
 def test_release_privacy_emits_complete_supported_task12_envelope():
     frame = pd.DataFrame(
         {
@@ -111,7 +135,7 @@ def test_release_privacy_emits_complete_supported_task12_envelope():
     )
 
     assert result["status"] == "succeeded"
-    assert result["protocol_version"] == "task12-evaluation-v1"
+    assert result["protocol_version"] == "release-evidence-v2"
     assert result["fit_roles"] == ["train"]
     assert (
         result["release_transform_digest"]
@@ -135,6 +159,59 @@ def test_release_privacy_rejects_incomplete_support():
 
     assert result["status"] == "indeterminate"
     assert "support floor" in result["invalid_reasons"][0]
+
+
+def test_release_privacy_does_not_persist_exception_body(monkeypatch):
+    sentinel = "SENTINEL_RAW_EXCEPTION_BODY /private/patient/path"
+    frame = pd.DataFrame({"qi": ["a"] * 20, "secret": ["x", "y"] * 10})
+    synthetic, roles, _ = transform_release_roles(frame, {"tuning": frame.copy()})
+
+    def fail(_frame):
+        raise ValueError(sentinel)
+
+    monkeypatch.setattr(release_module, "_validate_frame_provenance", fail)
+    result = release_privacy_evidence(
+        synthetic,
+        roles["tuning"],
+        quasi_identifiers=["qi"],
+        sensitive_fields=["secret"],
+    )
+
+    assert result["status"] == "indeterminate"
+    assert result["invalid_reasons"] == ["release_provenance_invalid"]
+    assert result["error_types"] == ["ValueError"]
+    assert sentinel not in repr(result)
+
+
+def test_attribute_disclosure_does_not_persist_exception_body(monkeypatch):
+    sentinel = "SENTINEL_RAW_EXCEPTION_BODY /private/patient/path"
+
+    class Classifier:
+        def __init__(self, **kwargs):
+            pass
+
+        def fit(self, x, y):
+            raise ValueError(sentinel)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "xgboost",
+        types.SimpleNamespace(XGBClassifier=Classifier, XGBRegressor=Classifier),
+    )
+    frame = pd.DataFrame({"qi": [1, 2], "secret": ["a", "b"]})
+    result = attribute_disclosure(
+        frame,
+        frame,
+        ["qi"],
+        ["secret"],
+        sensitive_types={"secret": "categorical"},
+    )
+
+    assert result["status"] == "indeterminate"
+    assert result["invalid_targets"] == ["secret"]
+    assert result["reason"] == "no required target has finite valid risk"
+    assert result["overall_state"] == "all_targets_invalid"
+    assert sentinel not in repr(result)
 
 
 def test_epsilon_frame_runner_draws_half_size_independently():

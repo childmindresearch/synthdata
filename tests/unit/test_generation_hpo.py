@@ -122,7 +122,7 @@ def test_loris_config_loads_canonical_versioned_equal_thirds_policy():
     metrics = [metric for values in metric_config.values() for metric in values]
 
     assert metric_config == {
-        "task12": [
+        "canonical_objectives": [
             "tstr_macro_f1.v1",
             "mixed_mmd.v1",
             "elastic_net_jsd.v1",
@@ -597,6 +597,25 @@ def test_run_study_and_resume_require_context(tmp_path):
         run_study("context_required", lambda _trial: 1.0, config, tmp_path, seed=0, drop_keys=())
 
 
+@pytest.mark.parametrize(
+    "unsafe_name",
+    ["../escape", "/absolute", "nested/name", "nested\\name", "bad\x00name", ".", "..", "   "],
+)
+def test_hpo_rejects_unsafe_study_names_without_echoing_input(unsafe_name):
+    with pytest.raises(ValueError, match="safe relative identifier") as error:
+        contextual_study_name(unsafe_name, _hpo_context())
+
+    assert unsafe_name not in str(error.value)
+
+
+def test_hpo_preserves_valid_study_name_in_contextual_name():
+    context = _hpo_context()
+
+    contextual_name = contextual_study_name("valid-model_v2", context)
+
+    assert contextual_name == f"valid-model_v2-{hpo_context_digest(context)[:16]}"
+
+
 def test_contextual_hpo_studies_are_separate_and_resumeable(tmp_path):
     config = HPOConfig(n_trials=1, timeout_seconds=None)
     first_context = _hpo_context()
@@ -800,12 +819,15 @@ def test_stage_a_trial_prune_and_persist_result(tmp_path):
     result_path = tmp_path / "hpo_test" / "trial-0" / "result.json"
     assert trial.state == optuna.trial.TrialState.PRUNED
     assert trial.user_attrs["stage_a_state"] == "pruned"
+    assert trial.user_attrs["stage_a_result_path"] == "hpo_test/trial-0/result.json"
+    assert not Path(trial.user_attrs["stage_a_result_path"]).is_absolute()
     assert result_path.exists()
     assert contract_path.exists()
     assert "exact_reuse" in result_path.read_text()
 
 
 def test_stage_a_trial_persists_screen_exception_as_pruned(tmp_path):
+    sentinel = "source frame does not match SECRET_PATH /tmp/raw-value"
     source = _stage_a_source()
     contract = _stage_a_contract(source)
     changed_source = source.copy()
@@ -838,16 +860,52 @@ def test_stage_a_trial_persists_screen_exception_as_pruned(tmp_path):
     assert payload["state"] == "pruned"
     assert payload["checks"][0]["screen"] == "stage_a_exception"
     assert payload["checks"][0]["observed"]["exception_type"] == "ValueError"
-    assert "source frame does not match" in payload["checks"][0]["observed"]["exception_message"]
-    assert "source frame does not match" in payload["prune_reasons"][0]
+    assert payload["checks"][0]["observed"]["exception_message"] == (
+        "Stage A screen failed; exception details suppressed."
+    )
+    assert payload["checks"][0]["observed"]["reason_code"] == "stage_a_screen_exception"
+    assert "source frame does not match" not in result_path.read_text()
+    assert sentinel not in result_path.read_text()
+    assert "source frame does not match" not in payload["prune_reasons"][0]
+
+
+def test_stage_a_result_path_in_checkpoint_is_relative_and_safe(tmp_path):
+    source = _stage_a_source()
+    contract = _stage_a_contract(source)
+    study = optuna.create_study(direction="minimize")
+
+    study.optimize(
+        _screen_trial_callback(
+            lambda trial: (
+                screen_stage_a_trial(
+                    trial, source.copy(), contract, source, tmp_path.resolve(), "safe_paths"
+                ),
+                0.0,
+            )[1]
+        ),
+        n_trials=1,
+    )
+    trial = study.trials[0]
+    checkpoint = persist_hpo_trial_checkpoint(
+        tmp_path / "checkpoints",
+        "safe_paths",
+        trial,
+        hpo_context=_hpo_context(),
+    )
+    payload = json.loads(checkpoint.read_text())
+    result_path = payload["metadata"]["stage_a"]["result_path"]
+    assert result_path == "safe_paths/trial-0/result.json"
+    assert not Path(result_path).is_absolute()
+    assert ".." not in Path(result_path).parts
 
 
 def test_stage_a_setup_failure_is_persisted_before_trial_construction(tmp_path, mocker):
+    sentinel = "categorical encoder failed SECRET_ID /tmp/raw-path"
     source = _stage_a_source()
     contract = _stage_a_contract(source)
     mocker.patch(
         "synthdata.generation.tabpfgen_backend.label_encode_non_numeric_columns",
-        side_effect=ValueError("categorical encoder failed"),
+        side_effect=ValueError(sentinel),
     )
 
     from synthdata.generation import tabpfgen_backend
@@ -873,7 +931,10 @@ def test_stage_a_setup_failure_is_persisted_before_trial_construction(tmp_path, 
     assert payload["trial_number"] is None
     assert payload["checks"][0]["screen"] == "stage_a_exception"
     assert payload["checks"][0]["observed"]["exception_type"] == "ValueError"
-    assert "categorical encoder failed" in payload["prune_reasons"][0]
+    assert payload["prune_reasons"][0] == (
+        "stage_a_screen_exception: Stage A screen failed; exception details suppressed."
+    )
+    assert sentinel not in result_path.read_text()
 
 
 def test_resumed_study_counts_pruned_trials_without_rerunning_them(tmp_path):
@@ -1081,8 +1142,10 @@ def test_durable_checkpoint_rejects_legacy_metadata_with_valid_context():
 
 
 def test_failed_hpo_checkpoint_persists_exception_context(tmp_path):
+    sentinel = "generator fit failed SECRET_VALUE /tmp/raw-path"
+
     def objective(_trial):
-        raise RuntimeError("generator fit failed")
+        raise RuntimeError(sentinel)
 
     config = HPOConfig(n_trials=1, timeout_seconds=None)
     context = _hpo_context()
@@ -1108,9 +1171,11 @@ def test_failed_hpo_checkpoint_persists_exception_context(tmp_path):
     assert checkpoint["state"] == "failed"
     assert checkpoint["metadata"]["outcome"] == {
         "error_type": "RuntimeError",
-        "error_message": "generator fit failed",
+        "error_message": "HPO trial failed; exception details suppressed.",
+        "error_reason_code": "hpo_trial_exception",
         "state": "failed",
     }
+    assert sentinel not in json.dumps(checkpoint)
 
 
 def test_hpo_metric_config_rejects_calibrating_privacy_metric():
@@ -1317,6 +1382,36 @@ def test_train_frozen_mmd_uses_train_for_fit_and_tuning_for_comparison():
     )
     assert changed["bandwidth"] == pytest.approx(result["bandwidth"])
     assert changed["b_mmd_clip"] != pytest.approx(result["b_mmd_clip"])
+
+
+def test_canonical_jsd_uses_tuning_for_candidate_evidence_not_train():
+    train = pd.DataFrame({"x": ["a", "b", "c"]})
+    tuning = pd.DataFrame({"x": ["a", "a", "b"]})
+    candidate = tuning.copy()
+
+    first = hpo_module.evaluate_canonical_hpo_metrics(
+        train,
+        tuning,
+        candidate,
+        metric_config={"task12": ["elastic_net_jsd.v1"]},
+        target_column="x",
+        feature_types={"x": "categorical"},
+    )
+    changed_tuning = tuning.assign(x=["c", "c", "c"])
+    second = hpo_module.evaluate_canonical_hpo_metrics(
+        train,
+        changed_tuning,
+        candidate,
+        metric_config={"task12": ["elastic_net_jsd.v1"]},
+        target_column="x",
+        feature_types={"x": "categorical"},
+    )
+
+    assert first.loc["elastic_net_jsd.v1", "fit_roles"] == ["train"]
+    assert first.loc["elastic_net_jsd.v1", "evaluation_role"] == "tuning"
+    assert second.loc["elastic_net_jsd.v1", "mean"] != pytest.approx(
+        first.loc["elastic_net_jsd.v1", "mean"]
+    )
 
 
 def test_hpo_context_is_invariant_to_candidate_order_and_excludes_holdout():

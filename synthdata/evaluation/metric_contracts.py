@@ -14,7 +14,8 @@ import json
 import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from numbers import Real
+from numbers import Integral, Real
+from pathlib import Path
 from typing import Any
 
 CONTRACT_SCHEMA_VERSION = 1
@@ -98,6 +99,104 @@ RESULT_STATUSES = frozenset(
         "blocked",
     }
 )
+
+# Error text is diagnostic-only at the evaluator boundary.  These are the only
+# failure details allowed to cross into durable metric-status artifacts.
+METRIC_STATUS_REASON_CODES = {
+    "failed": "metric_evaluation_failed",
+    "missing": "metric_observation_missing",
+    "duplicate": "metric_observation_duplicate",
+    "non_finite": "metric_value_non_finite",
+    "invalid_value": "metric_value_invalid",
+    "out_of_range": "metric_value_out_of_range",
+    "unknown_contract": "metric_contract_unknown",
+    "unexpected": "metric_observation_unexpected",
+    "wrong_role": "metric_evidence_role_invalid",
+    "wrong_target_view": "metric_target_view_invalid",
+    "wrong_direction": "metric_direction_invalid",
+    "group_unsafe": "metric_group_unsafe",
+    "blocked": "metric_evaluation_blocked",
+}
+_EXCEPTION_TYPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception)$")
+_SAFE_METADATA_KEY = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
+_SENSITIVE_METADATA = re.compile(
+    r"(?:^|[^a-z])(?:traceback|exception|secret|password|passwd|hmac|api[_ -]?key|private[_ -]?key|patient[_ -]?(?:id|identifier)|authorization|[a-z_][a-z0-9_]*(?:error|exception))(?:[^a-z]|$)",
+    re.IGNORECASE,
+)
+_OMIT_METADATA = object()
+
+
+def safe_metric_metadata(value: Any, *, label: str = "metadata", strict: bool = False) -> Any:
+    """Return deterministic JSON-safe metric evidence, failing closed when strict."""
+
+    def reject(path: str) -> Any:
+        if strict:
+            raise ValueError(f"{path} contains unsupported or unsafe metadata")
+        return _OMIT_METADATA
+
+    def visit(item: Any, path: str) -> Any:
+        if item is None or isinstance(item, bool):
+            return item
+        if isinstance(item, Integral):
+            return int(item)
+        if isinstance(item, Real):
+            number = float(item)
+            return number if math.isfinite(number) else reject(path)
+        if isinstance(item, str):
+            if (
+                len(item) > 256
+                or any(ord(character) < 32 for character in item)
+                or Path(item).is_absolute()
+                or re.match(r"^[A-Za-z]:[\\/]", item)
+                or _SENSITIVE_METADATA.search(item)
+            ):
+                return reject(path)
+            return item
+        if isinstance(item, Mapping):
+            result: dict[str, Any] = {}
+            for key, nested in sorted(item.items(), key=lambda pair: str(pair[0])):
+                if not isinstance(key, str) or not _SAFE_METADATA_KEY.fullmatch(key):
+                    rejected = reject(f"{path}.key")
+                    if rejected is not _OMIT_METADATA:
+                        return rejected
+                    continue
+                safe = visit(nested, f"{path}.{key}")
+                if safe is not _OMIT_METADATA:
+                    result[key] = safe
+            return result
+        if isinstance(item, (list, tuple)):
+            result = []
+            for index, nested in enumerate(item):
+                safe = visit(nested, f"{path}[{index}]")
+                if safe is not _OMIT_METADATA:
+                    result.append(safe)
+            return result
+        return reject(path)
+
+    sanitized = visit(value, label)
+    return {} if sanitized is _OMIT_METADATA else sanitized
+
+
+def safe_metric_status_error(status: str, diagnostic: object = None) -> str | None:
+    """Convert transient validation diagnostics to a safe durable reason."""
+    reason_code = METRIC_STATUS_REASON_CODES.get(status)
+    if reason_code is None:
+        return None
+    exception_type = None
+    if isinstance(diagnostic, str):
+        prefix = f"reason_code={reason_code}; exception_type="
+        candidate = (
+            diagnostic[len(prefix) :]
+            if diagnostic.startswith(prefix)
+            else diagnostic.split(":", 1)[0].strip()
+        )
+        if _EXCEPTION_TYPE.fullmatch(candidate):
+            exception_type = candidate
+    return (
+        f"reason_code={reason_code}; exception_type={exception_type}"
+        if exception_type
+        else f"reason_code={reason_code}"
+    )
 
 
 class MetricContractError(ValueError):
@@ -446,7 +545,7 @@ class MetricEvaluationContext:
         object.__setattr__(self, "role_hashes", dict(self.role_hashes))
         configuration = dict(self.resolved_configuration)
         # Reserved role metadata carries the release transform trust anchor through
-        # legacy Task 12 validators which construct this context themselves.
+        # legacy validators which construct this context themselves.
         if "release_transform_digest" not in configuration:
             digest = self.role_hashes.get("__release_transform_digest__")
             if digest is not None:
@@ -491,9 +590,10 @@ class MetricObservation:
 
 
 _SHA256_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+LEGACY_TSTR_PRODUCER = "task10_tstr"
 
 
-def is_verified_task10_tstr(
+def is_verified_authoritative_tstr(
     payload: Mapping[str, object],
     *,
     trusted_final_holdout_hash: str | None = None,
@@ -547,7 +647,7 @@ def is_verified_task10_tstr(
     ):
         return False
     return (
-        metadata.get("producer") == "task10_tstr"
+        metadata.get("producer") in {"authoritative_tstr", LEGACY_TSTR_PRODUCER}
         and metadata.get("protocol_version") == "tstr-v1"
         and isinstance(metadata.get("seed"), int)
         and not isinstance(metadata.get("seed"), bool)
@@ -558,7 +658,7 @@ def is_verified_task10_tstr(
         and isinstance(metadata.get("release_transform_digest"), str)
         and tuple(metadata.get("fit_roles", ())) == ("train", "tuning")
         and isinstance(artifact, Mapping)
-        and artifact.get("producer") == "task10_tstr"
+        and artifact.get("producer") in {"authoritative_tstr", LEGACY_TSTR_PRODUCER}
         and artifact.get("protocol_version") == "tstr-v1"
         and isinstance(artifact.get("seed"), int)
         and not isinstance(artifact.get("seed"), bool)
@@ -581,13 +681,17 @@ def is_verified_task10_tstr(
 
 
 def _tstr_artifact_digest(artifact: Mapping[str, object]) -> str:
-    """Recompute immutable Task 10 prediction-artifact identity."""
+    """Recompute immutable authoritative TSTR prediction-artifact identity."""
     import hashlib
 
     payload = {key: value for key, value in artifact.items() if key != "artifact_digest"}
     return hashlib.sha256(
         repr(sorted(payload.items(), key=lambda item: item[0])).encode("utf-8")
     ).hexdigest()
+
+
+# Deprecated compatibility alias for historical callers.
+is_verified_task10_tstr = is_verified_authoritative_tstr
 
 
 @dataclasses.dataclass(frozen=True)
@@ -662,13 +766,13 @@ class MetricStatusRecord:
             "direction": self.direction,
             "policy_transform": self.policy_transform,
             "qualifiers": list(self.qualifiers),
-            "error": self.error,
-            "source_metadata": dict(self.source_metadata),
-            "result_metadata": dict(self.result_metadata),
+            "error": safe_metric_status_error(self.status, self.error),
+            "source_metadata": safe_metric_metadata(self.source_metadata, label="source_metadata"),
+            "result_metadata": safe_metric_metadata(self.result_metadata, label="result_metadata"),
             "fit_roles": list(self.fit_roles),
-            "support": self.support,
-            "bandwidth": self.bandwidth,
-            "provenance": dict(self.provenance),
+            "support": safe_metric_metadata(self.support, label="support"),
+            "bandwidth": safe_metric_metadata(self.bandwidth, label="bandwidth"),
+            "provenance": safe_metric_metadata(self.provenance, label="provenance"),
         }
 
 
@@ -892,7 +996,7 @@ def _status_record(
         direction=contract.direction if contract else None,
         policy_transform=contract.policy_transform if contract else "identity",
         qualifiers=contract.qualifiers if contract else (),
-        error=error,
+        error=safe_metric_status_error(status, error),
         source_metadata=observation.source_metadata if observation else {},
         result_metadata=observation.result_metadata if observation else {},
         fit_roles=observation.fit_roles if observation else (),
@@ -1152,11 +1256,16 @@ def _validate_observation(
             observation.source_metadata.get("release_transform_digest"),
         ),
     )
-    if contract.protocol_version == "task12-evaluation-v1" and (
+    if contract.protocol_version in {"release-evidence-v2", "task12-evaluation-v1"} and (
         not isinstance(observed_release_digest, str)
         or _SHA256_DIGEST.fullmatch(observed_release_digest) is None
     ):
-        return "wrong_role", "Task 12 release-transform digest is missing or invalid", None, None
+        return (
+            "wrong_role",
+            "Release-evidence release-transform digest is missing or invalid",
+            None,
+            None,
+        )
     trusted_release_digest = context.resolved_configuration.get("release_transform_digest")
     if trusted_release_digest is not None and observed_release_digest != trusted_release_digest:
         return (
@@ -1180,7 +1289,7 @@ def _validate_observation(
     ):
         observed = metadata_value(field)
         requires_observed = expected is not None and (
-            field == "seed" or expected == "task12-evaluation-v1"
+            field == "seed" or expected in {"release-evidence-v2", "task12-evaluation-v1"}
         )
         if requires_observed and (observed is None or observed != expected):
             return "wrong_role", f"Observation {field} does not match contract", None, None
@@ -1288,7 +1397,7 @@ def resolve_metric_observations(
                     status="unknown_contract",
                     contract=None,
                     context=context,
-                    error=str(exc),
+                    error=safe_metric_status_error("unknown_contract", type(exc).__name__),
                 )
             )
             continue
@@ -1301,7 +1410,7 @@ def resolve_metric_observations(
                     status="unknown_contract",
                     contract=None,
                     context=context,
-                    error=str(exc),
+                    error=safe_metric_status_error("unknown_contract", type(exc).__name__),
                 )
             )
             continue
@@ -1395,7 +1504,7 @@ def resolve_metric_observations(
         except (UnknownMetricContractError, AmbiguousMetricContractError) as exc:
             contract = None
             status = "unknown_contract"
-            error = str(exc)
+            error = safe_metric_status_error("unknown_contract", type(exc).__name__)
         records.append(
             _status_record(
                 model_name=model_name,
@@ -1559,7 +1668,7 @@ def _build_default_contracts() -> tuple[MetricContract, ...]:
         "prdc",
         "alpha_precision",
     }
-    # Legacy framework metrics are never HPO objectives.  Task 12 objectives
+    # Legacy framework metrics are never HPO objectives. Canonical objectives
     # below are the only identities granted ``hpo_objective``.
     hpo_objective_synthcity = set()
     for category, metric_names in SYNTHCITY_METRIC_CONFIG.items():
@@ -2254,11 +2363,11 @@ def _build_default_contracts() -> tuple[MetricContract, ...]:
                 required_roles=("train", "tuning"),
                 status_reason="Legacy metric path is retained only as an explicit blocked audit record.",
                 qualifiers=("legacy", "blocked"),
-                protocol_version="task12-evaluation-v1",
+                protocol_version="release-evidence-v2",
             )
         )
 
-    task12_specs = (
+    canonical_specs = (
         (
             "synthcity",
             "elastic_net_jsd.v1",
@@ -2299,7 +2408,7 @@ def _build_default_contracts() -> tuple[MetricContract, ...]:
             "gate",
             ("train", "tuning"),
             "row",
-            "task12-evaluation-v1",
+            "release-evidence-v2",
             MetricAnchors(ideal=0.0, bad=1.0),
             None,
         ),
@@ -2325,7 +2434,7 @@ def _build_default_contracts() -> tuple[MetricContract, ...]:
         _transform_digest,
         anchors,
         seed,
-    ) in task12_specs:
+    ) in canonical_specs:
         contracts.append(
             _audit_contract(
                 contract_id=f"{framework}.{key}",
@@ -2346,7 +2455,7 @@ def _build_default_contracts() -> tuple[MetricContract, ...]:
                 required_support="declared_support_v1",
                 release_transform_digest=None,
                 seed=seed,
-                protocol_version="task12-evaluation-v1",
+                protocol_version="release-evidence-v2",
                 preprocessing_fit_role="train",
             )
         )
@@ -2367,7 +2476,7 @@ def _build_default_contracts() -> tuple[MetricContract, ...]:
             normalization_method="identity",
             required_support="all_target_protected_cells",
             release_transform_digest=None,
-            protocol_version="task12-evaluation-v1",
+            protocol_version="release-evidence-v2",
         )
     )
 

@@ -263,5 +263,5 @@ def run_refidiff_benchmark(cfg: Config, dataset: Dataset, study_id: str | None =
     """Reject deferred RefiDiff benchmark execution explicitly."""
     raise RuntimeError(
         "RefiDiff benchmark is deferred and blocked: legacy RefiDiff execution is not "
-        "available in role-isolated Task 6. No study was started."
+        "available in role-isolated benchmark mode. No study was started."
     )

@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import unicodedata
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from numbers import Real
@@ -31,7 +32,7 @@ import pandas as pd
 
 from synthdata.config import HPOConfig
 from synthdata.data import dataframe_fingerprint
-from synthdata.evaluation.catalog import TASK12_HPO_ALLOWLIST
+from synthdata.evaluation.catalog import CANONICAL_HPO_ALLOWLIST
 from synthdata.evaluation.metric_contracts import (
     DEFAULT_METRIC_CONTRACT_REGISTRY,
     MetricContractError,
@@ -56,6 +57,55 @@ STAGE_A_SCREEN_IDS = (
     "exact_reuse",
     "subgroup_collapse",
 )
+
+_SAFE_EXCEPTION_MESSAGES = {
+    "stage_a_screen_exception": "Stage A screen failed; exception details suppressed.",
+    "metric_evaluation_exception": "Metric evaluation failed; exception details suppressed.",
+    "hpo_trial_exception": "HPO trial failed; exception details suppressed.",
+}
+
+
+def _safe_exception_message(reason_code: str) -> str:
+    return _SAFE_EXCEPTION_MESSAGES[reason_code]
+
+
+def _validate_study_name(study_name: Any) -> str:
+    """Validate study name as one portable, filesystem-safe identifier."""
+    if not isinstance(study_name, str) or not study_name or not study_name.strip():
+        raise ValueError("study_name must be a safe relative identifier")
+    if study_name in {".", ".."}:
+        raise ValueError("study_name must be a safe relative identifier")
+    if any(character in study_name for character in ("/", "\\", ":")) or any(
+        unicodedata.category(character).startswith("C") for character in study_name
+    ):
+        raise ValueError("study_name must be a safe relative identifier")
+    path = Path(study_name)
+    if path.is_absolute() or len(path.parts) != 1 or path.name != study_name:
+        raise ValueError("study_name must be a safe relative identifier")
+    return study_name
+
+
+def _safe_stage_a_result_identifier(root: str | Path, path: str | Path) -> str:
+    """Return Stage A path as a workspace-relative, traversal-free identifier."""
+    root_path = Path(root).resolve()
+    result_path = Path(path).resolve()
+    try:
+        relative = result_path.relative_to(root_path)
+    except ValueError as exc:
+        raise ValueError("Stage A result path must be inside its workspace") from exc
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("Stage A result path must be relative to its workspace")
+    return relative.as_posix()
+
+
+def _checkpoint_stage_a_result_identifier(value: Any) -> str | None:
+    """Keep only safe relative Stage A identifiers in durable checkpoints."""
+    if not isinstance(value, str) or not value:
+        return None
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        return None
+    return path.as_posix()
 
 
 def _is_missing_scalar(value: Any) -> bool:
@@ -719,8 +769,9 @@ def _stage_a_exception_result(
     else:
         candidate_shape = (0, 0)
         candidate_columns = ()
-    message = str(error) or type(error).__name__
-    reason = f"Stage A screen raised {type(error).__name__}: {message}"
+    reason_code = "stage_a_screen_exception"
+    message = _safe_exception_message(reason_code)
+    reason = f"{reason_code}: {message}"
     return StageAScreenResult(
         contract_digest=contract.digest,
         candidate_shape=candidate_shape,
@@ -736,6 +787,7 @@ def _stage_a_exception_result(
                     "candidate_type": type(candidate_df).__name__,
                     "exception_type": type(error).__name__,
                     "exception_message": message,
+                    "reason_code": reason_code,
                 },
                 "reason": reason,
             },
@@ -753,7 +805,7 @@ def _record_stage_a_trial_result(
     result_path = persist_stage_a_result(root, study_name, trial.number, result)
     trial.set_user_attr("stage_a_state", result.state)
     trial.set_user_attr("stage_a_contract_digest", result.contract_digest)
-    trial.set_user_attr("stage_a_result_path", str(result_path))
+    trial.set_user_attr("stage_a_result_path", _safe_stage_a_result_identifier(root, result_path))
     trial.set_user_attr("stage_a_prune_reasons", list(result.prune_reasons))
     return result_path
 
@@ -765,6 +817,7 @@ def persist_stage_a_exception(
     error: TypeError | ValueError | RuntimeError,
 ) -> Path:
     """Persist a pre-trial Stage A construction failure for study diagnostics."""
+    study_name = _validate_study_name(study_name)
     result = _stage_a_exception_result(None, contract, error)
     path = Path(root) / study_name / "construction-failure.json"
     payload = {"study_name": study_name, "trial_number": None, **result.to_dict()}
@@ -804,6 +857,7 @@ def screen_stage_a_trial(
     study_name: str,
 ) -> StageAScreenResult:
     """Persist a trial screen and prune it when any required check fails."""
+    study_name = _validate_study_name(study_name)
     try:
         result = screen_stage_a(candidate_df, contract, source_df)
     except (TypeError, ValueError, RuntimeError) as exc:
@@ -851,6 +905,7 @@ def persist_stage_a_result(
     result: StageAScreenResult,
 ) -> Path:
     """Persist one Stage A outcome per trial so prunes are resumable and auditable."""
+    study_name = _validate_study_name(study_name)
     if isinstance(trial_number, bool) or trial_number < 0:
         raise ValueError("Stage A trial_number must be a non-negative integer")
     path = Path(root) / study_name / f"trial-{trial_number}" / "result.json"
@@ -879,12 +934,13 @@ def prepare_stage_a_screen(
         if any(value is not None for value in configured[1:]):
             raise ValueError("Stage A source_df, root, and study_name require a Stage A contract")
         return
-    if source_df is None or root is None or not study_name:
+    if source_df is None or root is None or study_name is None:
         raise ValueError("Stage A contract requires source_df, root, and non-empty study_name")
+    _validate_study_name(study_name)
     persist_stage_a_contract(Path(root) / study_name, contract)
 
 
-HPO_OBJECTIVE_METRICS = frozenset(TASK12_HPO_ALLOWLIST)
+HPO_OBJECTIVE_METRICS = frozenset(CANONICAL_HPO_ALLOWLIST)
 TUNING_UTILITY_METRICS = (
     "tstr_macro_f1.v1",
     "mixed_mmd.v1",
@@ -938,6 +994,31 @@ def _evaluate_train_frozen_mmd(
         "fit_role": "train",
         "comparison_role": "tuning",
     }
+
+
+def _evaluate_train_frozen_jsd(
+    train: pd.DataFrame,
+    tuning: pd.DataFrame,
+    candidate: pd.DataFrame,
+    *,
+    feature_types: Mapping[str, str] | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Compare candidate with tuning while freezing JSD support on train."""
+    from synthcity.metrics.eval_statistical import FrozenSupportJSD
+    from synthcity.plugins.core.dataloader import GenericDataLoader
+
+    class _TrainFrozenCandidateJSD(FrozenSupportJSD):
+        def _support(self, frame, column, feature_type):
+            return super()._support(train, column, feature_type)
+
+        def _continuous_edges(self, frame, column):
+            return super()._continuous_edges(train, column)
+
+    train_loader = GenericDataLoader(train, feature_types=dict(feature_types or {}))
+    evaluator = _TrainFrozenCandidateJSD(feature_types=dict(feature_types or {}))
+    value, metadata = evaluator._score_frame(tuning, candidate, train_loader)
+    metadata.update({"fit_role": "train", "comparison_role": "tuning"})
+    return value, metadata
 
 
 def _resolve_utility_policy(policy: Mapping[str, Any] | None = None) -> dict[str, list]:
@@ -1090,9 +1171,6 @@ def evaluate_canonical_hpo_metrics(
     policy = _resolve_utility_policy(utility_policy)
     keys = list(policy["metrics"])
     rows: dict[str, dict[str, Any]] = {}
-    train_loader: Any = None
-    tuning_loader: Any = None
-    synthetic_loader: Any = None
 
     def _release_provenance(release_meta: Mapping[str, Any]) -> dict[str, Any]:
         """Return complete, role-addressable provenance for one evaluation."""
@@ -1136,9 +1214,6 @@ def evaluate_canonical_hpo_metrics(
         }
         try:
             if key == "elastic_net_jsd.v1":
-                from synthcity.metrics.eval_statistical import FrozenSupportJSD
-                from synthcity.plugins.core.dataloader import GenericDataLoader
-
                 from synthdata.evaluation.release import transform_release_roles
 
                 released_synthetic, released_roles, release_meta = transform_release_roles(
@@ -1146,20 +1221,15 @@ def evaluate_canonical_hpo_metrics(
                     {"train": train_df, "tuning": tuning_df},
                     release_generalization or {},
                 )
-                if train_loader is None:
-                    train_loader = GenericDataLoader(released_roles["train"])
-                    tuning_loader = GenericDataLoader(released_roles["tuning"])
-                    synthetic_loader = GenericDataLoader(released_synthetic)
-                evaluator = FrozenSupportJSD(
-                    feature_types=dict(feature_types or {}),
+                value, candidate_metadata = _evaluate_train_frozen_jsd(
+                    released_roles["train"],
+                    released_roles["tuning"],
+                    released_synthetic,
+                    feature_types=feature_types,
                 )
-                result = evaluator.evaluate_frozen_support(
-                    train_loader, tuning_loader, synthetic_loader
-                )
-                value = result["candidate"]
                 metadata.update(
                     {
-                        "support": result["metadata"]["candidate"],
+                        "support": candidate_metadata,
                         "release_transform_digest": release_meta["synthetic"].get(
                             "release_transform_digest", release_meta["common_protocol_digest"]
                         ),
@@ -1248,11 +1318,14 @@ def evaluate_canonical_hpo_metrics(
                 **metadata,
             }
         except (ImportError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+            reason_code = "metric_evaluation_exception"
             rows[key] = {
                 "mean": float("nan"),
                 "direction": "maximize" if key == "tstr_macro_f1.v1" else "minimize",
                 "errors": 1,
-                "error_messages": str(exc),
+                "error_type": type(exc).__name__,
+                "error_messages": _safe_exception_message(reason_code),
+                "error_reason_code": reason_code,
                 **metadata,
             }
     report = pd.DataFrame.from_dict(rows, orient="index")
@@ -1808,7 +1881,7 @@ def build_synthetic_eval_fn(
     DomiasMIA's reference set, and an augmented fit-role+synthetic set for
     augmentation metrics. No evaluator-internal split is used.
 
-    Canonical Task 12 identities are evaluated by their canonical producers;
+    Canonical identities are evaluated by their canonical producers;
     they must never be translated to native SynthCity aliases.
     """
     validate_hpo_metric_config(metric_config, group_context=group_context)
@@ -1949,8 +2022,7 @@ def default_storage_url(output_dir: str | Path) -> str:
 
 def contextual_study_name(study_name: str, hpo_context: Mapping[str, Any] | None = None) -> str:
     """Return a stable, context-specific Optuna study name."""
-    if not isinstance(study_name, str) or not study_name:
-        raise ValueError("study_name must be a non-empty string")
+    study_name = _validate_study_name(study_name)
     context = _require_validated_hpo_context(hpo_context, label="HPO context")
     return f"{study_name}-{hpo_context_digest(context)[:16]}"
 
@@ -2081,6 +2153,7 @@ def create_study(
     *,
     hpo_context: Mapping[str, Any] | None = None,
 ) -> optuna.Study:
+    study_name = _validate_study_name(study_name)
     context_payload = _require_validated_hpo_context(hpo_context, label="HPO study context")
     storage = hpo_cfg.storage or default_storage_url(output_dir)
     contextual_name = contextual_study_name(study_name, context_payload)
@@ -2343,6 +2416,13 @@ def _validate_hpo_trial_checkpoint(
     stage_a = metadata.get("stage_a")
     if not isinstance(stage_a, Mapping):
         raise RuntimeError("HPO trial checkpoint stage_a metadata must be an object")
+    result_path = stage_a.get("result_path")
+    if result_path is not None and (
+        not isinstance(result_path, str)
+        or Path(result_path).is_absolute()
+        or ".." in Path(result_path).parts
+    ):
+        raise RuntimeError("HPO trial checkpoint stage_a result_path must be relative and safe")
     metric_metadata = metadata.get("metric_metadata")
     if metric_metadata is not None and not isinstance(metric_metadata, Mapping):
         raise RuntimeError("HPO trial checkpoint metric_metadata must be an object or null")
@@ -2370,8 +2450,7 @@ def persist_hpo_trial_checkpoint(
     expected_implementation_fingerprint: str | None = None,
 ) -> Path:
     """Persist one immutable, schema-versioned HPO trial outcome."""
-    if not isinstance(study_name, str) or not study_name:
-        raise ValueError("HPO checkpoint study_name must be non-empty")
+    study_name = _validate_study_name(study_name)
     trial_number = getattr(trial, "number", None)
     if isinstance(trial_number, bool) or not isinstance(trial_number, int) or trial_number < 0:
         raise ValueError("HPO checkpoint trial number must be a non-negative integer")
@@ -2404,7 +2483,9 @@ def persist_hpo_trial_checkpoint(
                 "stage_a": {
                     "state": attrs.get("stage_a_state"),
                     "contract_digest": attrs.get("stage_a_contract_digest"),
-                    "result_path": attrs.get("stage_a_result_path"),
+                    "result_path": _checkpoint_stage_a_result_identifier(
+                        attrs.get("stage_a_result_path")
+                    ),
                     "prune_reasons": attrs.get("stage_a_prune_reasons", []),
                 },
                 "metric_metadata": metric_metadata,
@@ -2506,6 +2587,7 @@ def run_study(
     with a running trial or no completed trial retain every cache so an active
     or unsuccessful run remains recoverable.
     """
+    study_name = _validate_study_name(study_name)
     context_payload = _require_validated_hpo_context(hpo_context, label="HPO study context")
     if (checkpoint_workspace is None) != (checkpoint_plugin is None):
         raise ValueError("checkpoint_workspace and checkpoint_plugin must be provided together")
@@ -2544,10 +2626,12 @@ def run_study(
         outcome = dict(existing_outcome) if isinstance(existing_outcome, Mapping) else {}
         outcome["state"] = state
         if error is not None:
+            reason_code = "hpo_trial_exception"
             outcome.update(
                 {
                     "error_type": type(error).__name__,
-                    "error_message": str(error) or type(error).__name__,
+                    "error_message": _safe_exception_message(reason_code),
+                    "error_reason_code": reason_code,
                 }
             )
         trial.set_user_attr("hpo_outcome", outcome)

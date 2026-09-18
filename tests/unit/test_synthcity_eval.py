@@ -30,6 +30,22 @@ pytestmark = pytest.mark.unit
 
 
 class TestResolveMetricConfig:
+    def test_failed_metric_report_does_not_persist_native_exception_text(self):
+        sentinel = "category=patient/HMAC_deadbeef /private/traceback.py:7"
+        report = pd.DataFrame(
+            {"error": [sentinel], "error_type": ["ValueError"]},
+            index=["sanity.common_rows_proportion"],
+        )
+
+        validation = validate_synthcity_report(
+            "model_a", report, expected_base_keys=["sanity.common_rows_proportion"]
+        )
+
+        errors = [record.error for record in validation.records]
+        assert all(error != sentinel for error in errors)
+        assert all(sentinel not in str(error) for error in errors)
+        assert any(error == "reason_code=metric_evaluation_failed" for error in errors)
+
     def test_default_selection_uses_native_attack_category(self):
         result = resolve_metric_config(FrameworkSelectionConfig())
 
@@ -751,7 +767,7 @@ class TestSynthcityContractBridge:
 
         record = validation.expected_records[0]
         assert record.status == "failed"
-        assert "ValueError" in (record.error or "")
+        assert record.error == "reason_code=metric_evaluation_failed"
         assert validation.complete is False
 
     def test_benchmark_metric_failure_reaches_root_status_bridge(self, monkeypatch, tmp_path):
@@ -806,8 +822,8 @@ class TestSynthcityContractBridge:
 
         record = validation.expected_records[0]
         assert record.status == "failed"
-        assert "ValueError" in (record.error or "")
-        assert "metric evaluation exploded" in (record.error or "")
+        assert record.error == "reason_code=metric_evaluation_failed"
+        assert "metric evaluation exploded" not in (record.error or "")
         assert validation.complete is False
 
     def test_non_finite_score_is_retained_as_failed_observation(self):
@@ -833,7 +849,7 @@ class TestSynthcityContractBridge:
         assert record.status == "failed"
         assert record.raw_value is None
         assert record.policy_value is None
-        assert "NonFiniteMetricResult" in (record.error or "")
+        assert record.error == "reason_code=metric_evaluation_failed"
         assert validation.complete is False
 
     def test_feature_rank_failure_has_no_policy_value(self):
@@ -949,7 +965,7 @@ class TestSynthcityContractBridge:
         record = validation.expected_records[0]
         assert record.expected_key == "sanity.common_rows_proportion.score"
         assert record.status == "group_unsafe"
-        assert "not group-safe" in (record.error or "")
+        assert record.error == "reason_code=metric_group_unsafe"
         assert record.source_metadata["group_safety"]["schema_version"] == "group-safety-v1"
 
     def test_model_level_failure_expands_selected_base_keys(self):
@@ -965,7 +981,7 @@ class TestSynthcityContractBridge:
         record = validation.expected_records[0]
         assert record.expected_key == "stats.ks_test.marginal"
         assert record.status == "failed"
-        assert "RuntimeError" in (record.error or "")
+        assert record.error == "reason_code=metric_evaluation_failed"
 
     def test_declared_selection_retains_omitted_metric_as_missing(self):
         report = pd.DataFrame(

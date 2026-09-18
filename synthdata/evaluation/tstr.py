@@ -138,7 +138,7 @@ def run_tstr_evaluation(
     missing = [value for value in classes if value not in synthetic_classes]
     extra = sorted((value for value in synthetic_classes if value not in set(classes)), key=str)
     metadata = {
-        "producer": "task10_tstr",
+        "producer": "authoritative_tstr",
         "protocol_version": PROTOCOL_VERSION,
         "producer_protocol_version": PROTOCOL_VERSION,
         "evaluation_role": evaluation_role,
@@ -189,7 +189,7 @@ def run_tstr_evaluation(
         return TSTRResult(
             report,
             envelope={
-                "producer": "task10_tstr",
+                "producer": "authoritative_tstr",
                 "protocol_version": PROTOCOL_VERSION,
                 "result_metadata": metadata,
                 "report": report,
@@ -232,7 +232,7 @@ def run_tstr_evaluation(
     if protected_columns and evaluation_role == "final_holdout":
         fairness_predictions = np.asarray(classes, dtype=object)[predictions]
         prediction_artifact = {
-            "producer": "task10_tstr",
+            "producer": "authoritative_tstr",
             "protocol_version": PROTOCOL_VERSION,
             "producer_protocol_version": PROTOCOL_VERSION,
             "seed": seed,
@@ -269,7 +269,7 @@ def run_tstr_evaluation(
         report["equalized_odds"] = fairness
         report["prediction_artifact"] = prediction_artifact
     envelope = {
-        "producer": "task10_tstr",
+        "producer": "authoritative_tstr",
         "protocol_version": PROTOCOL_VERSION,
         "result_metadata": metadata,
         "report": report,

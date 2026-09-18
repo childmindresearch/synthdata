@@ -10,13 +10,35 @@ from typing import cast
 import optuna
 import pandas as pd
 import pytest
+import yaml
 
-from synthdata.data import semantic_context_payload
+from synthdata.data import role_context_payload, semantic_context_payload
+from synthdata.experiment import start_experiment
 from synthdata.generation import hpo as hpo_mod
 from synthdata.generation import synthcity_backend as sc
-from synthdata.generation.pipeline import refit_selected_model, run_generation
+from synthdata.generation.pipeline import (
+    refit_selected_model,
+)
+from synthdata.generation.pipeline import (
+    run_generation as _run_generation,
+)
+from synthdata.plotting.generation_plots import save_generation_plots
 
 pytestmark = pytest.mark.unit
+
+
+def run_generation(cfg, dataset, *args, prepare_candidate_cache=True, **kwargs):
+    """Create candidate lineage for canonical fixtures before generation tests."""
+    if (
+        prepare_candidate_cache
+        and dataset.has_canonical_roles
+        and dataset.role_frame("train", imputed=True) is not None
+        and not (dataset.data_dir / ".imputation_cache_key.json").exists()
+    ):
+        from synthdata.imputation.pipeline import run_imputation
+
+        run_imputation(cfg, dataset)
+    return _run_generation(cfg, dataset, *args, **kwargs)
 
 
 def _pategan_generator_metadata(n_samples: int, params: dict | None = None) -> dict:
@@ -64,6 +86,184 @@ def _configure_tabpfn_only(cfg):
     cfg.generation.tabpfn.enabled = True
     cfg.generation.tabpfn.variants = ["custom"]
     cfg.generation.tabpfn.data_variants = ["raw"]
+
+
+def test_generation_does_not_execute_model_on_context_preflight_failure(
+    make_config, make_dataset, mocker
+):
+    cfg = make_config()
+    _configure_tabpfn_only(cfg)
+    dataset = make_dataset()
+    builder = mocker.patch("synthdata.generation.pipeline.tpfn.generate_tabpfn_custom")
+
+    class _Experiment:
+        def validate_generation_context(self, *_args, **_kwargs):
+            raise RuntimeError("context differs; refusing model execution")
+
+    with pytest.raises(RuntimeError, match="refusing model execution"):
+        run_generation(cfg, dataset, experiment=_Experiment())
+    builder.assert_not_called()
+
+
+def test_generation_does_not_execute_model_on_invalid_hyperimpute_fit_state(
+    make_config, make_canonical_dataset, mocker
+):
+    from synthdata.imputation.pipeline import run_imputation
+
+    cfg = make_config()
+    _configure_tabpfn_only(cfg)
+    cfg.generation.tabpfn.data_variants = ["imputed"]
+    dataset = make_canonical_dataset()
+    run_imputation(cfg, dataset)
+    cache_path = dataset.data_dir / ".imputation_cache_key.json"
+    record = json.loads(cache_path.read_text())
+    del record["fit_state"]
+    cache_path.write_text(json.dumps(record))
+    builder = mocker.patch("synthdata.generation.pipeline.tpfn.generate_tabpfn_custom")
+
+    with pytest.raises(RuntimeError, match="fit state is missing or invalid"):
+        run_generation(cfg, dataset)
+    builder.assert_not_called()
+
+
+def test_generation_does_not_execute_model_when_candidate_sidecar_is_missing(
+    make_config, make_canonical_dataset, mocker
+):
+    cfg = make_config()
+    _configure_tabpfn_only(cfg)
+    cfg.generation.tabpfn.data_variants = ["imputed"]
+    dataset = make_canonical_dataset()
+    from synthdata.imputation.pipeline import run_imputation
+
+    run_imputation(cfg, dataset)
+    (dataset.data_dir / ".imputation_cache_key.json").unlink()
+    builder = mocker.patch("synthdata.generation.pipeline.tpfn.generate_tabpfn_custom")
+
+    with pytest.raises(RuntimeError, match="lineage metadata is unavailable|unreadable"):
+        run_generation(cfg, dataset, prepare_candidate_cache=False)
+    builder.assert_not_called()
+
+
+def test_generation_reaches_model_with_valid_candidate_cache(
+    make_config, make_canonical_dataset, mocker
+):
+    cfg = make_config()
+    _configure_tabpfn_only(cfg)
+    cfg.generation.tabpfn.data_variants = ["imputed"]
+    dataset = make_canonical_dataset()
+    generated = dataset.role_frame("train", imputed=True).copy()
+    cfg.generation.n_samples = len(generated)
+    builder = mocker.patch(
+        "synthdata.generation.pipeline.tpfn.generate_tabpfn_custom",
+        return_value=(generated, None),
+    )
+
+    run_generation(cfg, dataset)
+
+    builder.assert_called_once()
+
+
+def test_non_hpo_generation_fits_train_but_persists_candidate_scope(
+    make_config, make_canonical_dataset, mocker
+):
+    cfg = make_config()
+    _configure_tabpfn_only(cfg)
+    dataset = make_canonical_dataset()
+    generated = dataset.role_frame("train", imputed=True).copy()
+    cfg.generation.n_samples = len(generated)
+    builder = mocker.patch(
+        "synthdata.generation.pipeline.tpfn.generate_tabpfn_custom",
+        return_value=(generated, None),
+    )
+
+    run_generation(cfg, dataset)
+
+    fit_frame = builder.call_args.args[0]
+    assert fit_frame.equals(dataset.role_frame("train", imputed=False))
+    cache = json.loads((Path(cfg.generation.output_dir) / "tabpfn_custom.cache.json").read_text())
+    assert cache["role_context"] == role_context_payload(dataset, ("train", "tuning"))
+    assert cache["fit_context"] == role_context_payload(dataset, ("train",))
+
+
+def test_generation_cache_rejects_tampered_fit_context(make_config, make_canonical_dataset, mocker):
+    cfg = make_config()
+    _configure_tabpfn_only(cfg)
+    dataset = make_canonical_dataset()
+    generated = dataset.role_frame("train", imputed=True).copy()
+    cfg.generation.n_samples = len(generated)
+    mocker.patch(
+        "synthdata.generation.pipeline.tpfn.generate_tabpfn_custom",
+        return_value=(generated, None),
+    )
+    run_generation(cfg, dataset)
+    cache_path = Path(cfg.generation.output_dir) / "tabpfn_custom.cache.json"
+    cache = json.loads(cache_path.read_text())
+    cache["fit_context"]["roles"]["train"]["rows"] += 1
+    cache_path.write_text(json.dumps(cache))
+    mock_builder = mocker.patch("synthdata.generation.pipeline.tpfn.generate_tabpfn_custom")
+
+    with pytest.raises(ValueError, match="fit_context"):
+        from synthdata.evaluation.artifacts import load_validated_generated_datasets
+
+        load_validated_generated_datasets(
+            cfg.generation.output_dir,
+            dataset,
+            model_names=["tabpfn_custom"],
+            classification_score=cfg.evaluation.synthcity.classification_score,
+        )
+    mock_builder.assert_not_called()
+
+
+def test_generation_candidate_context_ignores_final_phase_imputation(
+    make_config, make_canonical_dataset, mocker
+):
+    cfg = make_config()
+    _configure_tabpfn_only(cfg)
+    dataset = make_canonical_dataset()
+    generated = dataset.role_frame("train", imputed=True).copy()
+    cfg.generation.n_samples = len(generated)
+    builder = mocker.patch(
+        "synthdata.generation.pipeline.tpfn.generate_tabpfn_custom",
+        return_value=(generated, None),
+    )
+
+    from synthdata.imputation.pipeline import run_imputation
+
+    run_imputation(cfg, dataset)
+    experiment = start_experiment(cfg, dataset=dataset)
+    dataset.imputed_roles["final_holdout"].iloc[0, 0] = -123
+
+    run_generation(cfg, dataset, experiment=experiment)
+
+    builder.assert_called_once()
+
+
+@pytest.mark.parametrize("mismatch", ["raw", "assignment", "candidate_role"])
+def test_generation_rejects_candidate_context_mismatch(
+    make_config, make_canonical_dataset, mocker, mismatch
+):
+    cfg = make_config()
+    _configure_tabpfn_only(cfg)
+    dataset = make_canonical_dataset()
+    generated = dataset.role_frame("train", imputed=True).copy()
+    cfg.generation.n_samples = len(generated)
+    builder = mocker.patch(
+        "synthdata.generation.pipeline.tpfn.generate_tabpfn_custom",
+        return_value=(generated, None),
+    )
+
+    experiment = start_experiment(cfg, dataset=dataset)
+    if mismatch == "raw":
+        dataset.roles["final_holdout"].iloc[0, 0] = -123
+    elif mismatch == "assignment":
+        dataset.assignment.loc[dataset.assignment.index[0], "role"] = "tuning"
+    else:
+        dataset.imputed_roles["train"].iloc[0, 0] = -123
+
+    with pytest.raises(RuntimeError, match="dataset snapshot differs"):
+        run_generation(cfg, dataset, experiment=experiment)
+
+    builder.assert_not_called()
 
 
 def _set_schema(dataset, *, target_kind):
@@ -114,6 +314,73 @@ def test_tabpfn_generation_forwards_schema_derived_feature_roles(make_config, ma
     assert result["tabpfn_custom"].equals(generated)
 
 
+def test_plot_callback_failure_persists_safe_failure_metadata(make_config, make_dataset, mocker):
+    cfg = make_config()
+    _configure_tabpfn_only(cfg)
+    dataset = make_dataset(nominal_columns=["smoker"])
+    _set_schema(dataset, target_kind="categorical")
+    generated = dataset.train_df.copy()
+    cfg.generation.n_samples = len(generated)
+    mocker.patch(
+        "synthdata.generation.pipeline.tpfn.generate_tabpfn_custom",
+        return_value=(generated, None),
+    )
+
+    class _Experiment:
+        def __init__(self):
+            self.records = []
+
+        def record(self, stage, **fields):
+            self.records.append((stage, fields))
+
+    experiment = _Experiment()
+
+    def failing_plot(*_args):
+        raise ValueError("sentinel /private/secret/path")
+
+    result = run_generation(cfg, dataset, plot_callback=failing_plot, experiment=experiment)
+
+    assert result["tabpfn_custom"].equals(generated)
+    assert experiment.records == [
+        (
+            "generation_plot_failed",
+            {
+                "model": "tabpfn_custom",
+                "reason_code": "plot_callback_failed",
+                "message": "Generation plot callback failed.",
+                "error_type": "ValueError",
+            },
+        )
+    ]
+    assert "sentinel" not in json.dumps(experiment.records)
+    assert "/private/secret/path" not in json.dumps(experiment.records)
+
+
+def test_generation_plot_path_uses_bounded_model_id(mocker, tmp_path):
+    model_name = "../team/model: candidate"
+    dataset = mocker.Mock()
+    dataset.role_frame.return_value = pd.DataFrame({"feature": [1]})
+    dataset.decode_ordinal_frame.side_effect = lambda frame: frame
+    dataset.feature_columns = ["feature"]
+    dataset.target_column = "target"
+    dataset.all_categorical_columns = []
+    dataset.ordinal_category_orders = {}
+    mocker.patch(
+        "synthdata.plotting.generation_plots.plot_real_vs_synthetic", return_value=object()
+    )
+    save_figure = mocker.patch("synthdata.plotting.generation_plots.save_matplotlib_figure")
+    cfg = SimpleNamespace(
+        plots=SimpleNamespace(dpi=100, formats=("png",)),
+    )
+
+    save_generation_plots(cfg, dataset, {model_name: pd.DataFrame({"feature": [1]})}, tmp_path)
+
+    saved_path = save_figure.call_args.args[1]
+    assert saved_path.parent == tmp_path / "generation"
+    assert saved_path.name != model_name
+    assert saved_path.resolve().parent == (tmp_path / "generation").resolve()
+
+
 def test_tabpfgen_generation_forwards_complete_semantic_context(
     make_config, make_canonical_dataset, mocker
 ):
@@ -138,7 +405,7 @@ def test_tabpfgen_generation_forwards_complete_semantic_context(
     assert keyword_arguments["semantic_context"] == semantic_context_payload(
         dataset,
         classification_score=cfg.evaluation.synthcity.classification_score,
-        roles=("train",),
+        roles=("train", "tuning"),
     )
 
 
@@ -188,6 +455,50 @@ def test_tabpfgen_hpo_forwards_canonical_evaluation_contract(
         "mixed_mmd.v1",
         "elastic_net_jsd.v1",
     ]
+
+
+def test_tabpfgen_hpo_uses_protected_fields_for_fairness(
+    make_config, make_canonical_dataset, mocker
+):
+    cfg = make_config()
+    cfg.generation.synthcity.enabled = False
+    cfg.generation.tabpfn.enabled = False
+    cfg.generation.tabpfgen.enabled = True
+    cfg.generation.tabpfgen.variants = ["standard"]
+    cfg.generation.hpo.enabled = True
+    cfg.generation.hpo.n_trials = 1
+    cfg.generation.n_samples = 4
+    dataset = make_canonical_dataset()
+    dataset.sensitive_columns = ["feature"]
+    dataset.protected_columns = ["protected"]
+    generated = dataset.role_frame("train", imputed=True).head(4).copy()
+    eval_fn = mocker.patch(
+        "synthdata.generation.pipeline.hpo_mod.build_synthetic_eval_fn",
+        return_value=lambda _frame: 0.5,
+    )
+    mocker.patch(
+        "synthdata.generation.tabpfgen_backend.generate_tabpfgen_standard",
+        return_value=generated,
+    )
+    mocker.patch(
+        "synthdata.generation.tabpfgen_backend.build_tabpfgen_standard_objective",
+        return_value=lambda _trial: 0.5,
+    )
+    mocker.patch(
+        "synthdata.generation.pipeline.hpo_mod.run_study", return_value={"n_sgld_steps": 3}
+    )
+    mocker.patch(
+        "synthdata.generation.pipeline.sc.generator_implementation_fingerprint",
+        return_value="tabpfgen-impl",
+    )
+
+    run_generation(cfg, dataset)
+
+    assert eval_fn.call_args.args[3] == ["protected"]
+    assert eval_fn.call_args.kwargs["quasi_identifier_columns"] == dataset.quasi_identifier_columns
+    assert eval_fn.call_args.kwargs["sensitive_target_types"] == {
+        "feature": dataset.variable_schema["feature"]["kind"]
+    }
 
 
 def test_continuous_target_fails_before_tabpfn_cache_lookup(make_config, make_dataset, mocker):
@@ -318,6 +629,15 @@ def test_generation_cache_rejects_undersized_frame(make_config, make_canonical_d
     run_generation(cfg, dataset)
 
     fit_generate.assert_called_once()
+
+
+def test_loris_protected_n40_profile_forces_fresh_generation():
+    config = yaml.safe_load(Path("configs/config_loris_protected_generation_n40.yaml").read_text())
+
+    generation = config["generation"]
+    assert generation["force_retrain"] is True
+    assert generation["n_samples"] == 100
+    assert generation["synthcity"]["params"]["ctgan"]["n_iter"] == 40
 
 
 def test_non_private_generation_cache_requires_generator_metadata(
@@ -689,6 +1009,65 @@ def test_final_refit_cache_ignores_final_holdout_changes(
     assert first_metadata["cache_key"] == second_metadata["cache_key"]
     assert second_metadata["cache_state"] == "hit"
     fit_generate.assert_called_once()
+
+
+def test_synthcity_params_forward_and_invalidate_cache(make_config, make_canonical_dataset, mocker):
+    cfg = make_config()
+    cfg.generation.synthcity.names = ["ctgan"]
+    cfg.generation.synthcity.params = {"ctgan": {"n_iter": 50}}
+    cfg.generation.tabpfn.enabled = False
+    cfg.generation.tabpfgen.enabled = False
+    cfg.generation.hpo.enabled = False
+    cfg.generation.n_samples = 2
+    dataset = make_canonical_dataset()
+    synthetic = dataset.imputed_roles["train"].iloc[:2].copy()
+    mocker.patch("synthdata.generation.pipeline.sc.make_loader", return_value=object())
+    fit_generate = mocker.patch(
+        "synthdata.generation.pipeline.sc.fit_generate", return_value=synthetic
+    )
+
+    run_generation(cfg, dataset)
+    assert fit_generate.call_args.args[1] == {"n_iter": 50}
+    metadata_path = Path(cfg.generation.output_dir) / "ctgan.cache.json"
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["resolved_parameters"] == {"n_iter": 50}
+    first_key = metadata["cache_key"]
+
+    fit_generate.reset_mock()
+    run_generation(cfg, dataset)
+    fit_generate.assert_not_called()
+
+    cfg.generation.synthcity.params["ctgan"]["n_iter"] = 51
+    run_generation(cfg, dataset)
+    fit_generate.assert_called_once()
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["resolved_parameters"] == {"n_iter": 51}
+    assert metadata["cache_key"] != first_key
+
+
+def test_synthcity_loader_separates_fairness_from_sensitive_targets(
+    make_config, make_canonical_dataset, mocker
+):
+    cfg = make_config()
+    cfg.generation.synthcity.names = ["ctgan"]
+    cfg.generation.tabpfn.enabled = False
+    cfg.generation.tabpfgen.enabled = False
+    cfg.generation.hpo.enabled = False
+    cfg.generation.n_samples = 2
+    dataset = make_canonical_dataset()
+    dataset.sensitive_columns = ["feature"]
+    dataset.protected_columns = ["protected"]
+    synthetic = dataset.role_frame("train", imputed=True).head(2).copy()
+    loader = object()
+    make_loader = mocker.patch("synthdata.generation.pipeline.sc.make_loader", return_value=loader)
+    mocker.patch("synthdata.generation.pipeline.sc.fit_generate", return_value=synthetic)
+
+    run_generation(cfg, dataset)
+
+    _, loader_kwargs = make_loader.call_args
+    assert make_loader.call_args.args[2] == ["feature"]
+    assert loader_kwargs["fairness_column"] == "protected"
+    assert loader_kwargs["important_features"] == dataset.quasi_identifier_columns
 
 
 def test_final_refit_hpo_requires_canonical_context_before_cache_lookup(

@@ -2,6 +2,9 @@
 
 import hashlib
 import json
+import os
+import stat
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -268,6 +271,75 @@ def test_external_generator_semantic_context_is_validated(make_canonical_dataset
     assert resolved == payload
 
 
+def test_external_generator_semantic_context_accepts_protected_qi_overlap(
+    make_canonical_dataset,
+):
+    dataset = make_canonical_dataset("column")
+    dataset.quasi_identifier_columns = ["protected"]
+    dataset.sensitive_columns = ["feature"]
+    payload = semantic_context_payload(dataset)
+
+    resolved = validate_semantic_context(
+        payload,
+        target_column=dataset.target_column,
+        feature_columns=dataset.feature_columns,
+        categorical_columns=dataset.categorical_columns,
+        target_is_categorical=dataset.target_is_categorical,
+        variable_schema_fingerprint=dataset.variable_schema_fingerprint,
+        frame_columns=dataset.full_df.columns,
+    )
+
+    assert resolved == payload
+
+
+def test_external_generator_semantic_context_accepts_protected_sensitive_overlap(
+    make_canonical_dataset,
+):
+    dataset = make_canonical_dataset("column")
+    dataset.sensitive_columns = ["protected"]
+    payload = semantic_context_payload(dataset)
+
+    resolved = validate_semantic_context(
+        payload,
+        target_column=dataset.target_column,
+        feature_columns=dataset.feature_columns,
+        categorical_columns=dataset.categorical_columns,
+        target_is_categorical=dataset.target_is_categorical,
+        variable_schema_fingerprint=dataset.variable_schema_fingerprint,
+        frame_columns=dataset.full_df.columns,
+    )
+
+    assert resolved == payload
+
+
+@pytest.mark.parametrize(
+    ("sensitive", "quasi_identifiers", "message"),
+    [
+        (["feature"], ["feature"], "sensitive_columns.*quasi_identifier_columns"),
+        (["target"], [], "sensitive_columns.*target_column"),
+        ([], ["target"], "quasi_identifier_columns.*target_column"),
+    ],
+)
+def test_external_generator_semantic_context_rejects_prohibited_overlaps(
+    make_canonical_dataset, sensitive, quasi_identifiers, message
+):
+    dataset = make_canonical_dataset("column")
+    dataset.sensitive_columns = sensitive
+    dataset.quasi_identifier_columns = quasi_identifiers
+    payload = semantic_context_payload(dataset)
+
+    with pytest.raises(ValueError, match=message):
+        validate_semantic_context(
+            payload,
+            target_column=dataset.target_column,
+            feature_columns=dataset.feature_columns,
+            categorical_columns=dataset.categorical_columns,
+            target_is_categorical=dataset.target_is_categorical,
+            variable_schema_fingerprint=dataset.variable_schema_fingerprint,
+            frame_columns=dataset.full_df.columns,
+        )
+
+
 def test_external_generator_semantic_context_rejects_target_type_mismatch(
     make_canonical_dataset,
 ):
@@ -322,6 +394,91 @@ def test_row_identity_resolution_does_not_require_patient_hmac_secret(monkeypatc
 
     assert identity.groups is None
     pd.testing.assert_frame_equal(identity.model_frame, frame)
+
+
+def test_patient_group_bootstraps_and_reuses_private_key(tmp_path, monkeypatch):
+    monkeypatch.delenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", raising=False)
+    frame = pd.DataFrame({"patient_id": [1, 1, 2], "feature": [1, 2, 3]})
+    split = DataSplitConfig(mode="patient_group", patient_id_column="patient_id")
+    key_path = tmp_path / ".patient_id_hmac_key"
+
+    first = resolve_population_identity(frame, split, token_key_path=key_path)
+    second = resolve_population_identity(frame, split, token_key_path=key_path)
+
+    assert first.groups is not None and second.groups is not None
+    pd.testing.assert_series_equal(first.groups, second.groups)
+    assert key_path.read_text() and not key_path.is_symlink()
+    if os.name == "posix":
+        assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+
+
+def test_patient_group_without_key_path_fails_without_environment_secret(monkeypatch):
+    monkeypatch.delenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", raising=False)
+    frame = pd.DataFrame({"patient_id": [1, 2], "feature": [1, 2]})
+    split = DataSplitConfig(mode="patient_group", patient_id_column="patient_id")
+
+    with pytest.raises(ValueError, match="provide a bootstrap key path"):
+        resolve_population_identity(frame, split, token_key_path=None)
+
+
+def test_patient_group_rejects_directory_key_path(tmp_path, monkeypatch):
+    monkeypatch.delenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", raising=False)
+    key_path = tmp_path / ".patient_id_hmac_key"
+    key_path.mkdir()
+    frame = pd.DataFrame({"patient_id": [1, 2], "feature": [1, 2]})
+    split = DataSplitConfig(mode="patient_group", patient_id_column="patient_id")
+
+    with pytest.raises(ValueError, match="regular"):
+        resolve_population_identity(frame, split, token_key_path=key_path)
+
+
+def test_concurrent_first_callers_publish_one_complete_key(tmp_path, monkeypatch):
+    monkeypatch.delenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", raising=False)
+    frame = pd.DataFrame({"patient_id": [1, 1, 2], "feature": [1, 2, 3]})
+    split = DataSplitConfig(mode="patient_group", patient_id_column="patient_id")
+    key_path = tmp_path / ".patient_id_hmac_key"
+
+    def resolve():
+        return resolve_population_identity(frame, split, token_key_path=key_path)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first, second = executor.map(lambda _: resolve(), range(2))
+
+    assert key_path.read_text()
+    assert first.metadata["identity_fingerprint"] == second.metadata["identity_fingerprint"]
+    assert first.metadata["hmac_key_fingerprint"] == second.metadata["hmac_key_fingerprint"]
+    assert list(tmp_path.glob(f".{key_path.name}.*")) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission contract")
+@pytest.mark.parametrize("symlink", [False, True])
+def test_patient_group_rejects_insecure_or_symlink_key(tmp_path, monkeypatch, symlink):
+    monkeypatch.delenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", raising=False)
+    frame = pd.DataFrame({"patient_id": [1, 2], "feature": [1, 2]})
+    split = DataSplitConfig(mode="patient_group", patient_id_column="patient_id")
+    key_path = tmp_path / ".patient_id_hmac_key"
+    key_path.write_text("secret")
+    key_path.chmod(0o640 if not symlink else 0o600)
+    if symlink:
+        link_path = tmp_path / "link"
+        link_path.symlink_to(key_path)
+        key_path = link_path
+
+    with pytest.raises(ValueError, match="private|symlink"):
+        resolve_population_identity(frame, split, token_key_path=key_path)
+
+
+def test_patient_group_rejects_blank_key_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", raising=False)
+    key_path = tmp_path / ".patient_id_hmac_key"
+    key_path.write_text(" \n")
+    if os.name == "posix":
+        key_path.chmod(0o600)
+    frame = pd.DataFrame({"patient_id": [1, 2], "feature": [1, 2]})
+    split = DataSplitConfig(mode="patient_group", patient_id_column="patient_id")
+
+    with pytest.raises(ValueError, match="blank|malformed"):
+        resolve_population_identity(frame, split, token_key_path=key_path)
 
 
 def test_repeated_direct_patient_ids_share_opaque_role_assignment():

@@ -4,11 +4,13 @@ import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pandas as pd
 import pytest
 
+import scripts.run_evaluation as evaluation_cli
 from synthdata.data import dataframe_fingerprint
 from synthdata.evaluation import (
     _final_holdout_state_dimensions,
@@ -19,10 +21,11 @@ from synthdata.evaluation import (
     artifacts,
     custom_eval,
     privacy_gate,
+    release_evidence_eval,
     run_evaluation,
+    select_models,
     synthcity_eval,
     syntheval_eval,
-    task12_eval,
 )
 from synthdata.evaluation import tstr as tstr_module
 from synthdata.evaluation.release import transform_release_roles
@@ -30,6 +33,51 @@ from synthdata.evaluation.release_score import compute_release_score
 from synthdata.generation import pipeline as generation_pipeline
 
 pytestmark = pytest.mark.unit
+
+
+def test_select_models_fails_closed_before_evaluation_for_missing_requested_model(
+    make_config,
+):
+    cfg = make_config()
+    cfg.evaluation.models = ["present_model", "missing_model"]
+
+    with pytest.raises(ValueError, match="missing_model"):
+        select_models(cfg, {"present_model": pd.DataFrame()})
+
+
+def test_run_evaluation_missing_requested_model_stops_before_downstream_stages(
+    make_config, make_canonical_dataset, monkeypatch
+):
+    cfg = make_config()
+    cfg.evaluation.models = ["present_model", "missing_model"]
+    dataset = make_canonical_dataset()
+    synthetic = {"present_model": dataset.role_frame("train", imputed=True).copy()}
+    calls = []
+
+    monkeypatch.setattr(
+        synthcity_eval,
+        "run_synthcity_evaluation",
+        lambda *args, **kwargs: calls.append("synthcity") or pytest.fail("must not run"),
+    )
+    monkeypatch.setattr(
+        syntheval_eval,
+        "run_syntheval_evaluation",
+        lambda *args, **kwargs: calls.append("syntheval") or pytest.fail("must not run"),
+    )
+    monkeypatch.setattr(
+        generation_pipeline,
+        "refit_selected_model",
+        lambda *args, **kwargs: calls.append("refit") or pytest.fail("must not run"),
+    )
+    monkeypatch.setattr(
+        "synthdata.evaluation._select_policy_model",
+        lambda *args, **kwargs: calls.append("selection") or pytest.fail("must not run"),
+    )
+
+    with pytest.raises(ValueError, match="missing_model"):
+        run_evaluation(cfg, dataset, synthetic)
+
+    assert calls == []
 
 
 def _dataframe(
@@ -76,9 +124,11 @@ def _fake_refit_metadata(synthetic, output_dir):
             }
         )
     )
+    valid_hash = "0" * 64
     return synthetic.copy(), {
-        "fit_frame_fingerprint": "refit-imputed",
-        "fit_frame_fingerprints": {"raw": "refit-raw", "imputed": "refit-imputed"},
+        "model_name": "model_a",
+        "fit_frame_fingerprint": valid_hash,
+        "fit_frame_fingerprints": {"raw": valid_hash, "imputed": valid_hash},
         "input_role_hashes": {"raw": {}, "imputed": {}},
         "path": str(data_path),
         "metadata_path": str(metadata_path),
@@ -93,6 +143,183 @@ def _fake_refit_metadata_with_hash(synthetic, output_dir, refit_hash):
     metadata["fit_frame_fingerprint"] = refit_hash
     metadata["fit_frame_fingerprints"] = {"raw": refit_hash, "imputed": refit_hash}
     return refit_frame, metadata
+
+
+def test_evaluation_cli_hands_candidate_and_final_phase_roles_to_evaluator(
+    make_config, make_canonical_dataset, monkeypatch
+):
+    cfg = make_config()
+    candidate = make_canonical_dataset()
+    final = make_canonical_dataset()
+    candidate_roles = {role: frame.copy() for role, frame in candidate.roles.items()}
+    candidate_roles["train"].loc[:, "feature"] = -1
+    candidate_roles["tuning"].loc[:, "feature"] = -2
+    candidate.set_imputed_roles(candidate_roles)
+    final_roles = {role: frame.copy() for role, frame in final.roles.items()}
+    final_roles["final_holdout"].loc[:, "feature"] = -3
+    final.set_imputed_roles(final_roles)
+
+    phases = []
+    evaluated = {}
+    preflight_calls = []
+    lineage_calls = []
+
+    def load_splits(dataset, expected_cache_key=None, phase="candidate"):
+        phases.append((phase, expected_cache_key))
+        return candidate if phase == "candidate" else final
+
+    monkeypatch.setattr(evaluation_cli, "load_config", lambda _path: cfg)
+    datasets = iter((candidate, final))
+    monkeypatch.setattr(evaluation_cli, "load_dataset", lambda _cfg: next(datasets))
+    monkeypatch.setattr(evaluation_cli, "load_imputed_splits", load_splits)
+    monkeypatch.setattr(
+        evaluation_cli,
+        "validate_imputation_cache_lineage",
+        lambda dataset, cache_record, required=False: lineage_calls.append(
+            (dataset, cache_record, required)
+        ),
+    )
+    monkeypatch.setattr(
+        evaluation_cli,
+        "_cache_key_record",
+        lambda _cfg, _dataset, phase="candidate": {"cache_key": phase},
+    )
+    monkeypatch.setattr(
+        evaluation_cli,
+        "run_imputation",
+        lambda _cfg, dataset, phase="candidate": dataset,
+    )
+    experiment = SimpleNamespace(
+        generation_dir=cfg.generation.output_dir,
+        evaluation_dir=cfg.evaluation.output_dir,
+        plots_dir=cfg.plots.output_dir,
+        record=lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(evaluation_cli, "load_experiment", lambda *_args, **_kwargs: experiment)
+    monkeypatch.setattr(
+        evaluation_cli,
+        "_load_synthetic_datasets",
+        lambda _cfg, _dataset: preflight_calls.append(True) or {"model": candidate.full_df},
+    )
+
+    def fake_run_evaluation(_cfg, dataset, _synthetic, experiment=None):
+        evaluated["dataset"] = dataset
+        return pd.DataFrame(), {"artifact_manifest": "manifest.json"}
+
+    monkeypatch.setattr(evaluation_cli, "run_evaluation", fake_run_evaluation)
+    monkeypatch.setattr(evaluation_cli, "simple_rank_summary", lambda frame: frame)
+    monkeypatch.setattr("sys.argv", ["run_evaluation", "--config", "config.yaml"])
+
+    evaluation_cli.main()
+
+    assert [phase for phase, _key in phases] == ["candidate", "final"]
+    handed_off = evaluated["dataset"]
+    assert handed_off.role_frame("train", imputed=True)["feature"].eq(-1).all()
+    assert handed_off.role_frame("tuning", imputed=True)["feature"].eq(-2).all()
+    assert handed_off.role_frame("final_holdout", imputed=True)["feature"].eq(-3).all()
+    assert preflight_calls == [True]
+    assert len(lineage_calls) == 1
+    assert lineage_calls[0][1] == {"cache_key": "candidate"}
+    assert lineage_calls[0][2] is True
+
+
+def test_evaluation_cli_rejects_invalid_candidate_fit_state_before_evaluator(
+    make_config, make_canonical_dataset, monkeypatch
+):
+    cfg = make_config()
+    candidate = make_canonical_dataset()
+    final = make_canonical_dataset()
+    evaluation_cli.run_imputation(cfg, candidate)
+    cache_path = candidate.data_dir / ".imputation_cache_key.json"
+    cache_record = json.loads(cache_path.read_text())
+    del cache_record["fit_state"]
+    cache_path.write_text(json.dumps(cache_record))
+
+    monkeypatch.setattr(evaluation_cli, "load_config", lambda _path: cfg)
+    datasets = iter((candidate, final))
+    monkeypatch.setattr(evaluation_cli, "load_dataset", lambda _cfg: next(datasets))
+    monkeypatch.setattr(
+        evaluation_cli,
+        "load_experiment",
+        lambda *_args, **_kwargs: pytest.fail("evaluator must not be reached"),
+    )
+    monkeypatch.setattr("sys.argv", ["run_evaluation", "--config", "config.yaml"])
+
+    with pytest.raises(RuntimeError, match="Candidate HyperImpute fit state is missing or invalid"):
+        evaluation_cli.main()
+
+
+def test_evaluation_cli_explicit_experiment_id_overrides_latest_resolution(
+    make_config, monkeypatch
+):
+    cfg = make_config()
+    cfg.experiment.id = None
+
+    monkeypatch.setattr(evaluation_cli, "load_config", lambda _path: cfg)
+    monkeypatch.setattr(
+        evaluation_cli,
+        "load_dataset",
+        lambda _cfg: pytest.fail("explicit experiment override should be applied first"),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_evaluation",
+            "--config",
+            "configs/config_loris_protected_smoke.yaml",
+            "--experiment-id",
+            "fresh-protected-experiment",
+        ],
+    )
+
+    with pytest.raises(pytest.fail.Exception):
+        evaluation_cli.main()
+
+    assert cfg.experiment.id == "fresh-protected-experiment"
+
+
+def test_evaluation_cli_rejects_unvalidated_final_holdout(
+    make_config, make_canonical_dataset, monkeypatch
+):
+    cfg = make_config()
+    candidate = make_canonical_dataset()
+    final = make_canonical_dataset()
+    candidate.set_imputed_roles({role: frame.copy() for role, frame in candidate.roles.items()})
+    final.imputed_roles.clear()
+    final.full_imputed_df = None
+
+    calls = []
+
+    def load_splits(dataset, expected_cache_key=None, phase="candidate"):
+        calls.append(phase)
+        return candidate if phase == "candidate" else dataset
+
+    monkeypatch.setattr(evaluation_cli, "load_config", lambda _path: cfg)
+    datasets = iter((candidate, final))
+    monkeypatch.setattr(evaluation_cli, "load_dataset", lambda _cfg: next(datasets))
+    monkeypatch.setattr(evaluation_cli, "load_imputed_splits", load_splits)
+    monkeypatch.setattr(
+        evaluation_cli,
+        "validate_imputation_cache_lineage",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        evaluation_cli,
+        "_cache_key_record",
+        lambda _cfg, _dataset, phase="candidate": {"cache_key": phase},
+    )
+    monkeypatch.setattr(
+        evaluation_cli, "run_imputation", lambda _cfg, dataset, phase="candidate": dataset
+    )
+    monkeypatch.setattr(
+        evaluation_cli,
+        "load_experiment",
+        lambda *_args, **_kwargs: pytest.fail("load_experiment must not run"),
+    )
+    monkeypatch.setattr("sys.argv", ["run_evaluation", "--config", "config.yaml"])
+
+    with pytest.raises(SystemExit, match="refusing to evaluate raw final_holdout"):
+        evaluation_cli.main()
 
 
 def test_run_evaluation_validates_ranks_and_persists_status(
@@ -193,6 +420,20 @@ def test_run_evaluation_validates_ranks_and_persists_status(
     assert manifest.endswith("evaluation_artifacts-v1/manifest.json")
 
 
+def test_synthcity_semantic_context_accepts_protected_qi_and_sensitive_overlap(
+    make_config, make_canonical_dataset
+):
+    cfg = make_config()
+    dataset = make_canonical_dataset()
+    dataset.quasi_identifier_columns = ["protected"]
+    dataset.sensitive_columns = ["feature"]
+
+    semantic_context = _synthcity_semantic_context(dataset, cfg.evaluation.synthcity)
+
+    assert semantic_context["quasi_identifier_columns"] == ["protected"]
+    assert semantic_context["sensitive_target_types"] == {"feature": "continuous"}
+
+
 def test_run_evaluation_persists_generator_metadata_sidecars(
     make_config, make_canonical_dataset, monkeypatch
 ):
@@ -281,8 +522,10 @@ def test_run_evaluation_persists_generator_metadata_sidecars(
     assert manifest["generator_metadata"]["model_a"]["metadata"] == generator_metadata
 
 
-def test_generation_metadata_preserves_current_cache_envelope(make_config):
+def test_generation_metadata_preserves_current_cache_envelope(make_config, monkeypatch, tmp_path):
     cfg = make_config()
+    monkeypatch.chdir(tmp_path)
+    cfg.generation.output_dir = "output/generation"
     generation_dir = Path(cfg.generation.output_dir)
     generation_dir.mkdir(parents=True, exist_ok=True)
     metadata_path = generation_dir / "model_a.cache.json"
@@ -312,8 +555,8 @@ def test_generation_metadata_preserves_current_cache_envelope(make_config):
     assert result["state"] == "present"
     assert result["cache_metadata"] == cache_metadata
     assert result["metadata"] == generator_metadata
-    assert result["metadata_path"] == str(metadata_path)
-    assert result["data_path"] == str(data_path)
+    assert result["metadata_path"] == "model_a.cache.json"
+    assert result["data_path"] == "model_a.csv"
     assert result["metadata_sha256"]
     assert result["data_sha256"]
 
@@ -405,7 +648,7 @@ def test_release_score_adapter_maps_successful_task12_aggregate_records():
     role_hashes = {"train": "train", "tuning": "tuning", "final_holdout": "holdout"}
     common = {
         "producer": "task12-test",
-        "protocol_version": task12_eval.TASK12_PROTOCOL_VERSION,
+        "protocol_version": release_evidence_eval.RELEASE_EVIDENCE_PROTOCOL_VERSION,
         "seed": 7,
         "release_transform_digest": "release-transform",
         "common_protocol_digest": "common-protocol",
@@ -413,7 +656,7 @@ def test_release_score_adapter_maps_successful_task12_aggregate_records():
         "fit_roles": ["train", "tuning"],
     }
     records = [
-        task12_eval._task12_record(
+        release_evidence_eval._release_evidence_record(
             "model_a",
             "release_privacy.v1",
             0.6,
@@ -429,7 +672,7 @@ def test_release_score_adapter_maps_successful_task12_aggregate_records():
                 "attribute": 0.46,
             },
         ),
-        task12_eval._task12_record(
+        release_evidence_eval._release_evidence_record(
             "model_a",
             "representation_evidence.v1",
             0.87,
@@ -437,7 +680,7 @@ def test_release_score_adapter_maps_successful_task12_aggregate_records():
             evaluation_role="final_holdout",
             metadata={**common, "summary_stats": {"worst_abs_log_disparity": 0.12}},
         ),
-        task12_eval._task12_record(
+        release_evidence_eval._release_evidence_record(
             "model_a",
             "equalized_odds.final.v1",
             0.78,
@@ -446,7 +689,7 @@ def test_release_score_adapter_maps_successful_task12_aggregate_records():
             metadata=common,
         ),
     ]
-    blocked_validations = task12_eval.validate_task12_custom_results(
+    blocked_validations = release_evidence_eval.validate_release_evidence_results(
         {"model_a": records},
         role_hashes=role_hashes,
         evaluation_role="final_holdout",
@@ -671,8 +914,8 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     final_configuration = final_validation["model_a"]["evaluation_context"][
         "resolved_configuration"
     ]
-    assert final_configuration["fit_frame_fingerprint"] != "refit-imputed"
-    assert final_configuration["refit_fit_frame_fingerprint"] == "refit-imputed"
+    assert final_configuration["fit_frame_fingerprint"] != "0" * 64
+    assert final_configuration["refit_fit_frame_fingerprint"] == "0" * 64
     assert list(combined.index) == ["model_a"]
 
 
@@ -691,7 +934,7 @@ def test_run_evaluation_keeps_multi_model_selection_outside_final_holdout(
     dataset = make_canonical_dataset()
     synthetic = dataset.role_frame("train", imputed=True).copy()
     selected_models = []
-    final_task12_models = []
+    final_release_evidence_models = []
     final_custom_models = []
     synthcity_report = _dataframe(
         {"mean": [0.25] * 4, "direction": ["minimize"] * 4},
@@ -711,9 +954,9 @@ def test_run_evaluation_keeps_multi_model_selection_outside_final_holdout(
             report.loc[:, "mean"] = 0.99
         return {model: report for model in selected}
 
-    def fake_run_task12(selected, *args, **kwargs):
+    def fake_run_release_evidence(selected, *args, **kwargs):
         if kwargs.get("evaluation_role") == "final_holdout":
-            final_task12_models.append(set(selected))
+            final_release_evidence_models.append(set(selected))
         return {}
 
     def fake_run_log_disparity(selected, *args, **kwargs):
@@ -731,7 +974,9 @@ def test_run_evaluation_keeps_multi_model_selection_outside_final_holdout(
     combined.columns = pd.MultiIndex.from_tuples(combined.columns)
 
     monkeypatch.setattr(synthcity_eval, "run_synthcity_evaluation", fake_run_synthcity)
-    monkeypatch.setattr(task12_eval, "run_task12_custom_evaluation", fake_run_task12)
+    monkeypatch.setattr(
+        release_evidence_eval, "run_release_evidence_evaluation", fake_run_release_evidence
+    )
     monkeypatch.setattr(custom_eval, "run_log_disparity_evaluation", fake_run_log_disparity)
     monkeypatch.setattr(
         "synthdata.evaluation.combine.build_combined_table", lambda *args, **kwargs: combined
@@ -749,18 +994,16 @@ def test_run_evaluation_keeps_multi_model_selection_outside_final_holdout(
     )
 
     assert selected_models == [("tuning", {"model_a", "model_b"}), ("final_holdout", {"model_a"})]
-    assert final_task12_models == [{"model_a"}]
+    assert final_release_evidence_models == [{"model_a"}]
     assert final_custom_models == [{"model_a"}]
     assert set(result.index) == {"model_a", "model_b"}
     assert extras["final_holdout_evidence"]["selected_model"] == "model_a"
 
     evidence = artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)
-    release_score = artifacts.load_release_score_evidence(cfg.evaluation.output_dir)
+    with pytest.raises(ValueError, match="requires succeeded final-holdout evidence"):
+        artifacts.load_release_score_evidence(cfg.evaluation.output_dir)
     assert evidence["selected_model"] == "model_a"
     assert "model_b" not in evidence["frameworks"]["synthcity"]["validation"]
-    assert release_score["candidate_audit_models"] == ["model_a", "model_b"]
-    assert set(release_score["models"]) == {"model_a"}
-    assert release_score["selected_model"] == "model_a"
 
 
 @pytest.mark.parametrize("finite_final_score", [False, True])
@@ -841,8 +1084,8 @@ def test_run_evaluation_records_authoritative_final_task10_evidence(
         return {
             "status": "succeeded",
             "value": 0.0,
-            "producer": "task12_release_privacy",
-            "protocol_version": "task12-evaluation-v1",
+            "producer": "release_evidence_privacy",
+            "protocol_version": "release-evidence-v2",
             "seed": kwargs["seed"],
             "release_transform_digest": provenance["release_transform_digest"],
             "common_protocol_digest": provenance["common_protocol_digest"],
@@ -881,8 +1124,8 @@ def test_run_evaluation_records_authoritative_final_task10_evidence(
             "model_a": {
                 "summary_stats": {"representation_safety": 0.0},
                 "result_metadata": {
-                    "producer": "task12_representation",
-                    "protocol_version": "task12-evaluation-v1",
+                    "producer": "release_evidence_representation",
+                    "protocol_version": "release-evidence-v2",
                     "seed": cfg.seed,
                     "release_transform_digest": provenance["release_transform_digest"],
                     "common_protocol_digest": provenance["common_protocol_digest"],
@@ -909,19 +1152,19 @@ def test_run_evaluation_records_authoritative_final_task10_evidence(
             }
         }
 
-    monkeypatch.setattr(task12_eval, "release_privacy_evidence", valid_release)
+    monkeypatch.setattr(release_evidence_eval, "release_privacy_evidence", valid_release)
     monkeypatch.setattr(
-        task12_eval.custom_eval, "run_log_disparity_evaluation", valid_representation
+        release_evidence_eval.custom_eval, "run_log_disparity_evaluation", valid_representation
     )
-    real_task12_record = task12_eval._task12_record
+    real_release_evidence_record = release_evidence_eval._release_evidence_record
 
-    def valid_task12_record(*args, **kwargs):
+    def valid_release_evidence_record(*args, **kwargs):
         if args[1] == "equalized_odds.final.v1":
             kwargs["metadata"] = {
                 **kwargs.get("metadata", {}),
                 "role_hashes": final_role_hashes,
             }
-        record = real_task12_record(*args, **kwargs)
+        record = real_release_evidence_record(*args, **kwargs)
         if record.emitted_key != "equalized_odds.final.v1":
             support = dict(record.support or {})
             support.update(
@@ -951,15 +1194,34 @@ def test_run_evaluation_records_authoritative_final_task10_evidence(
             )
         return record
 
-    monkeypatch.setattr(task12_eval, "_task12_record", valid_task12_record)
+    monkeypatch.setattr(
+        release_evidence_eval, "_release_evidence_record", valid_release_evidence_record
+    )
     if finite_final_score:
         monkeypatch.setattr(
             "synthdata.evaluation.compute_release_score",
             lambda **kwargs: {
                 "status": "succeeded",
+                # Persisted release-score evidence uses finite ``score`` as
+                # its canonical value, while ``R_final`` documents formula
+                # terminology used by the authoritative Task10 contract.
+                "score": 0.42,
                 "R_final": 0.42,
                 "audit_only": True,
-                "dimensions": {"utility": 0.4, "privacy": 0.4, "fairness": 0.5},
+                "dimensions": {
+                    dimension: {
+                        "score": dimension_score,
+                        "components": {
+                            component: {"score": 0.4, "status": "succeeded"}
+                            for component in components
+                        },
+                    }
+                    for dimension, dimension_score, components in (
+                        ("utility", 0.4, ("tstr", "mmd", "jsd")),
+                        ("privacy", 0.4, ("k", "l", "dcr", "epsilon", "mia", "attribute")),
+                        ("fairness", 0.5, ("representation", "eo", "worst_log_disparity")),
+                    )
+                },
             },
         )
 
@@ -979,20 +1241,27 @@ def test_run_evaluation_records_authoritative_final_task10_evidence(
         "succeeded" if finite_final_score else "indeterminate"
     )
     if finite_final_score:
+        assert evidence["release_score"]["score"] == 0.42
         assert evidence["release_score"]["R_final"] == 0.42
         assert evidence["release_score"]["audit_only"] is True
     assert "dimensions" in evidence["release_score"]
-    release_score_evidence = artifacts.load_release_score_evidence(cfg.evaluation.output_dir)
-    assert release_score_evidence["models"]["model_a"] == evidence["release_score"]
+    if finite_final_score:
+        release_score_evidence = artifacts.load_release_score_evidence(cfg.evaluation.output_dir)
+        assert release_score_evidence["models"]["model_a"] == evidence["release_score"]
+    else:
+        with pytest.raises(ValueError, match="requires succeeded final-holdout evidence"):
+            artifacts.load_release_score_evidence(cfg.evaluation.output_dir)
     assert list(combined.index) == ["model_a"]
     assert tstr_calls == ["final_holdout"]
-    task12_records = evidence["frameworks"]["custom"]["task12_validation"]["model_a"]["records"]
-    assert [record["expected_key"] for record in task12_records] == [
+    release_evidence_records = evidence["frameworks"]["custom"]["release_evidence_validation"][
+        "model_a"
+    ]["records"]
+    assert [record["expected_key"] for record in release_evidence_records] == [
         "release_privacy.v1",
         "representation_evidence.v1",
         "equalized_odds.final.v1",
     ]
-    assert all(record["status"] == "succeeded" for record in task12_records)
+    assert all(record["status"] == "succeeded" for record in release_evidence_records)
 
 
 def test_run_evaluation_blocks_legacy_before_candidate_ranking(
@@ -1116,8 +1385,9 @@ def test_run_evaluation_persists_failed_final_framework_evidence(
     }
 
 
+@pytest.mark.parametrize("exception_type", [RuntimeError, ValueError, TypeError])
 def test_run_evaluation_persists_failed_final_syntheval_worker(
-    make_config, make_canonical_dataset, monkeypatch
+    make_config, make_canonical_dataset, monkeypatch, exception_type
 ):
     cfg = make_config()
     cfg.evaluation.synthcity.metrics = ["identifiability_score"]
@@ -1145,7 +1415,7 @@ def test_run_evaluation_persists_failed_final_syntheval_worker(
 
     def fake_run_syntheval_evaluation(*args, **kwargs):
         if kwargs.get("evaluation_role") == "final_holdout":
-            raise RuntimeError("worker failed; checkpoint=/candidate/model_a/status.json")
+            raise exception_type("worker failed; checkpoint=/candidate/model_a/status.json")
         return None, None, {}
 
     monkeypatch.setattr(synthcity_eval, "run_synthcity_evaluation", fake_run_synthcity_evaluation)
@@ -1168,8 +1438,14 @@ def test_run_evaluation_persists_failed_final_syntheval_worker(
         reason["framework"] == "syntheval"
         and reason["execution_pass"] == "main"
         and reason["model"] == "model_a"
-        and reason["exception_type"] == "RuntimeError"
-        and "worker failed" in reason["error"]
+        and reason["error_type"] == "SynthEvalExecutionError"
+        and reason["exception_type"] == exception_type.__name__
+        and reason["reason_code"] == "final_holdout_execution_failed"
+        and reason["failure_reason"] == "Final-holdout SynthEval execution failed."
+        for reason in evidence["failure_reasons"]
+    )
+    assert all(
+        "worker failed" not in str(reason) and "/candidate/model_a/status.json" not in str(reason)
         for reason in evidence["failure_reasons"]
     )
     assert extras["final_holdout_evidence"]["state"] == "failed"
@@ -1261,3 +1537,85 @@ def test_run_evaluation_passes_real_fit_to_final_binary_evidence(
         "negative_classes": [0],
         "encoding": {"positive": 1, "negative": 0},
     }
+
+
+@pytest.mark.parametrize("exception_type", [ValueError, TypeError])
+def test_run_evaluation_persists_failed_final_binary_syntheval_worker(
+    make_config, make_canonical_dataset, monkeypatch, exception_type
+):
+    cfg = make_config()
+    cfg.evaluation.synthcity.metrics = ["identifiability_score"]
+    cfg.evaluation.syntheval.enabled = True
+    cfg.evaluation.binary_target.enabled = True
+    cfg.evaluation.binary_target.positive_classes = [1]
+    cfg.evaluation.binary_target.negative_classes = [0]
+    cfg.evaluation.custom.enabled = False
+    cfg.evaluation.save_per_model_syntheval_plots = False
+    cfg.evaluation.generate_report = False
+    cfg.evaluation.privacy_gate.enabled = False
+
+    dataset = make_canonical_dataset()
+    synthetic = dataset.role_frame("train", imputed=True).copy()
+    synthcity_report = _dataframe(
+        {"mean": [0.25] * 4, "direction": ["minimize"] * 4},
+        index=[
+            "privacy.identifiability_score.score",
+            "privacy.identifiability_score.score_OC",
+            "privacy.identifiability_score.score_entropy_weighted",
+            "privacy.identifiability_score.score_OC_entropy_weighted",
+        ],
+    )
+
+    monkeypatch.setattr(
+        synthcity_eval,
+        "run_synthcity_evaluation",
+        lambda *args, **kwargs: {"model_a": synthcity_report},
+    )
+    monkeypatch.setattr(
+        syntheval_eval, "run_syntheval_evaluation", lambda *args, **kwargs: (None, None, {})
+    )
+
+    def fail_binary(*args, **kwargs):
+        if kwargs.get("evaluation_role") == "final_holdout":
+            raise exception_type("binary failed; checkpoint=/candidate/model_a/status.json")
+        return None, None, {}
+
+    monkeypatch.setattr(syntheval_eval, "run_binary_target_syntheval_evaluation", fail_binary)
+    monkeypatch.setattr(
+        generation_pipeline,
+        "refit_selected_model",
+        lambda *args, **kwargs: _fake_refit_metadata(synthetic, kwargs["output_dir"]),
+    )
+    monkeypatch.setattr(
+        "synthdata.evaluation._select_policy_model", lambda _combined: ("model_a", None)
+    )
+
+    _combined, extras = run_evaluation(cfg, dataset, {"model_a": synthetic})
+
+    evidence = artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)
+    assert evidence["state"] == "failed"
+    binary_failures = [
+        reason
+        for reason in evidence["failure_reasons"]
+        if reason.get("execution_pass") == "binary_target" and reason.get("status") == "failed"
+    ]
+    assert binary_failures == [
+        {
+            "stage": "final_holdout",
+            "framework": "syntheval",
+            "execution_pass": "binary_target",
+            "model": "model_a",
+            "status": "failed",
+            "policy_eligible": False,
+            "error_type": "SynthEvalExecutionError",
+            "exception_type": exception_type.__name__,
+            "reason_code": "final_holdout_execution_failed",
+            "failure_reason": "Final-holdout SynthEval execution failed.",
+        }
+    ]
+    assert all("binary failed" not in str(reason) for reason in evidence["failure_reasons"])
+    assert all(
+        "/candidate/model_a/status.json" not in str(reason)
+        for reason in evidence["failure_reasons"]
+    )
+    assert extras["final_holdout_evidence"]["state"] == "failed"

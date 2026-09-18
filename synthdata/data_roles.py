@@ -10,6 +10,10 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
+import stat
+import tempfile
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -76,14 +80,109 @@ def _opaque_group_token(value: Any, scope: str, *, token_secret: str | bytes) ->
     return hmac.new(key, message, hashlib.sha256).hexdigest()
 
 
-def _required_token_secret() -> str:
+def _required_token_secret(
+    key_path: Path | None = None,
+    *,
+    expected_fingerprint: str | None = None,
+) -> tuple[str, str]:
     secret = os.environ.get(PATIENT_ID_HMAC_KEY_ENV, "")
+    if not secret.strip():
+        if key_path is None:
+            raise ValueError(
+                f"Canonical patient_group identity requires non-empty {PATIENT_ID_HMAC_KEY_ENV}; "
+                "set this external secret or provide a bootstrap key path"
+            )
+        key_path = Path(key_path).expanduser()
+        if expected_fingerprint is not None and not key_path.exists():
+            raise ValueError(
+                "Patient identity key file is missing, but existing dataset manifest records a "
+                "key fingerprint. Restore the key file or rotate "
+                "identity explicitly; refusing to generate a replacement."
+            )
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+        if key_path.exists() or key_path.is_symlink():
+            secret = _read_local_key(key_path)
+        else:
+            generated = secrets.token_urlsafe(32)
+            temporary_path: Path | None = None
+            try:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{key_path.name}.", dir=key_path.parent
+                )
+                temporary_path = Path(temporary_name)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as key_file:
+                    fchmod = getattr(os, "fchmod", None)
+                    if fchmod is not None:
+                        try:
+                            fchmod(key_file.fileno(), 0o600)
+                        except (AttributeError, NotImplementedError, OSError):
+                            if os.name == "posix":
+                                raise
+                    elif os.name == "posix":
+                        raise OSError("secure key-file permissions are unsupported")
+                    key_file.write(generated)
+                    key_file.flush()
+                    os.fsync(key_file.fileno())
+                with suppress(FileExistsError):
+                    os.link(temporary_path, key_path)
+                if key_path.exists() or key_path.is_symlink():
+                    secret = _read_local_key(key_path)
+            finally:
+                if temporary_path is not None:
+                    with suppress(FileNotFoundError):
+                        temporary_path.unlink()
     if not secret.strip():
         raise ValueError(
             f"Canonical patient_group identity requires non-empty {PATIENT_ID_HMAC_KEY_ENV}; "
-            "set this external secret before loading patient-group data"
+            "set this external secret or provide a non-empty bootstrap key file"
         )
-    return secret
+    fingerprint = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    if expected_fingerprint is not None and fingerprint != expected_fingerprint:
+        raise ValueError(
+            "Patient identity HMAC key fingerprint does not match existing dataset manifest; "
+            "restore the original key or rotate identity explicitly."
+        )
+    return secret, fingerprint
+
+
+def _read_local_key(key_path: Path) -> str:
+    """Read local key only when it is a completed, owner-private regular file."""
+    try:
+        path_stat = key_path.lstat()
+    except OSError as exc:
+        raise ValueError("Patient identity key file cannot be inspected safely") from exc
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise ValueError("Patient identity key file must not be a symlink")
+    try:
+        descriptor = os.open(
+            key_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise ValueError(
+            "Patient identity key file cannot be opened safely; provide a regular, "
+            "owner-private key file or remove it to bootstrap a new key."
+        ) from exc
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError("Patient identity key file must be a regular file")
+        if os.name == "posix" and file_stat.st_mode & 0o077:
+            raise ValueError(
+                "Patient identity key file must be owner-private (mode 0600 or stricter); "
+                "repair permissions deliberately before retrying"
+            )
+        with os.fdopen(descriptor, "r", encoding="utf-8") as key_file:
+            descriptor = -1
+            value = key_file.read()
+    except UnicodeDecodeError as exc:
+        raise ValueError("Patient identity key file is not valid text") from exc
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+    if not value.strip() or value != value.strip():
+        raise ValueError("Patient identity key file is blank or malformed")
+    return value
 
 
 def _payload_fingerprint(payload: Any) -> str:
@@ -141,6 +240,8 @@ def resolve_population_identity(
     split: DataSplitConfig | None,
     *,
     token_scope: str = "default-population-scope",
+    token_key_path: Path | None = None,
+    expected_key_fingerprint: str | None = None,
 ) -> PopulationIdentity:
     """Resolve and remove the configured population identifier from ``df``."""
     row_keys = pd.Series(np.arange(len(df), dtype=np.int64), index=df.index, name="row_key")
@@ -163,7 +264,10 @@ def resolve_population_identity(
             "patient_id_column or an approved identity mapping sidecar"
         )
 
-    token_secret = _required_token_secret()
+    token_secret, key_fingerprint = _required_token_secret(
+        token_key_path,
+        expected_fingerprint=expected_key_fingerprint,
+    )
 
     if split.patient_id_column is not None:
         column = split.patient_id_column
@@ -189,6 +293,7 @@ def resolve_population_identity(
             "tokenization_algorithm": TOKENIZATION_ALGORITHM,
             "tokenization_version": TOKENIZATION_VERSION,
             "tokenization_scope_fingerprint": hashlib.sha256(token_scope.encode()).hexdigest(),
+            "hmac_key_fingerprint": key_fingerprint,
         }
         return PopulationIdentity(
             groups=normalized.rename("population_group"),
@@ -296,6 +401,7 @@ def resolve_population_identity(
         "tokenization_algorithm": TOKENIZATION_ALGORITHM,
         "tokenization_version": TOKENIZATION_VERSION,
         "tokenization_scope_fingerprint": hashlib.sha256(token_scope.encode()).hexdigest(),
+        "hmac_key_fingerprint": key_fingerprint,
     }
     return PopulationIdentity(
         groups=safe_groups.rename("population_group"),

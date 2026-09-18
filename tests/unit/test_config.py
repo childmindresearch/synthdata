@@ -1,5 +1,6 @@
 """Unit tests for synthdata.config: dataclass composition, validation, YAML loading."""
 
+import re
 from pathlib import Path
 from typing import cast
 
@@ -39,7 +40,7 @@ class TestFromDict:
         cfg = _from_dict(Config, {})
 
         assert cfg.generation.hpo.metric_config == {
-            "task12": [
+            "canonical_objectives": [
                 "tstr_macro_f1.v1",
                 "mixed_mmd.v1",
                 "elastic_net_jsd.v1",
@@ -84,6 +85,16 @@ class TestFromDict:
         assert cfg.generation.n_samples == 50
         # HPOConfig's other defaults are preserved.
         assert cfg.generation.hpo.n_iter_cap == 300
+
+    def test_synthcity_params_parse_with_empty_default(self):
+        cfg = _from_dict(Config, {})
+        assert cfg.generation.synthcity.params == {}
+
+        cfg = _from_dict(
+            Config,
+            {"generation": {"synthcity": {"params": {"ctgan": {"n_iter": 50}}}}},
+        )
+        assert cfg.generation.synthcity.params == {"ctgan": {"n_iter": 50}}
 
     def test_stage_a_hpo_config_builds_nested_dataclass(self):
         cfg = _from_dict(
@@ -155,7 +166,7 @@ class TestFromDict:
         metrics = [metric for values in metric_config.values() for metric in values]
 
         assert metric_config == {
-            "task12": [
+            "canonical_objectives": [
                 "tstr_macro_f1.v1",
                 "mixed_mmd.v1",
                 "elastic_net_jsd.v1",
@@ -651,9 +662,40 @@ class TestValidate:
 
 
 class TestLoadConfig:
+    def test_active_configs_use_semantic_tuning_labels(self):
+        root = Path(__file__).parents[2]
+        forbidden_plan_labels = re.compile(
+            r"Task\s*(?:6|10|13)|fixed[- ]?tuning|plan[- ]?\d+", re.IGNORECASE
+        )
+        config_paths = [
+            root / "configs" / name
+            for name in (
+                "config_loris.yaml",
+                "config_loris_evaluation_smoke.yaml",
+                "config_loris_generation_smoke.yaml",
+                "config_loris_protected_generation_n40.yaml",
+                "config_loris_protected_smoke.yaml",
+            )
+        ]
+
+        assert config_paths
+        for path in config_paths:
+            text = path.read_text()
+            assert forbidden_plan_labels.search(text) is None, path
+            loaded = yaml.safe_load(text)
+            hpo = loaded.get("generation", {}).get("hpo", {})
+            metric_config = hpo.get("metric_config", {})
+            assert "canonical_objectives" in metric_config, path
+            assert "task12" not in metric_config, path
+            assert "utility_policy_provenance" not in hpo, path
+
+        config_text = (root / "synthdata" / "config.py").read_text()
+        assert forbidden_plan_labels.search(config_text) is None
+        assert "utility_policy_provenance" not in config_text
+
     @staticmethod
     def _canonical_fixture() -> Config:
-        """Build canonical config with all fixed policy metadata populated."""
+        """Build canonical config with all policy metadata populated."""
         data = DataConfig(
             source="csv",
             path="x.csv",
@@ -664,7 +706,6 @@ class TestLoadConfig:
         )
         cfg = Config(data=data)
         cfg.imputation.method = "hyperimpute"
-        cfg.generation.hpo.utility_policy_provenance = "Task 13 consumes fixed utility_policy."
         cfg.evaluation.release_generalization.columns = {
             "Age": {
                 "intervals": [
@@ -688,16 +729,41 @@ class TestLoadConfig:
         assert cfg.evaluation.privacy_policy.mia_epsilon_repetitions == 10
         assert cfg.data.split is not None
         assert cfg.data.split.patient_id_column is None
-        assert cfg.generation.hpo.utility_policy_provenance is not None
-        assert cfg.generation.hpo.utility_policy_provenance.startswith("Task 13")
+        assert not hasattr(cfg.generation.hpo, "utility_policy_provenance")
 
-    def test_loris_hpo_policy_provenance_describes_fixed_fail_closed_policy(self):
-        cfg = load_config(Path(__file__).parents[2] / "configs" / "config_loris.yaml")
-        provenance = cfg.generation.hpo.utility_policy_provenance
-        assert provenance is not None
-        assert "consumes fixed generation.hpo.utility_policy" in provenance
-        assert "mismatches fail closed" in provenance
-        assert "not wired" not in provenance
+    def test_protected_profiles_align_ctgan_smoke_settings(self):
+        root = Path(__file__).parents[2]
+        evaluation = load_config(root / "configs/config_loris_protected_smoke.yaml")
+        generation = load_config(root / "configs/config_loris_protected_generation_n40.yaml")
+
+        assert evaluation.experiment.id is None
+        assert evaluation.data.version == generation.data.version == "2.0-protected-smoke"
+        assert evaluation.data.quasi_identifier_columns == [
+            "Age",
+            "Sex",
+            "region",
+            "PreInt_Demos_Fam__Child_Ethnicity",
+        ]
+        assert evaluation.data.protected_columns == [
+            "PreInt_TxHx__suicide",
+            "immigration_vismin",
+            "Sexual Orientation",
+        ]
+        assert evaluation.data.protected_columns == generation.data.protected_columns
+        assert evaluation.data.quasi_identifier_columns == generation.data.quasi_identifier_columns
+        assert (
+            evaluation.generation.synthcity.names
+            == generation.generation.synthcity.names
+            == ["ctgan"]
+        )
+        assert (
+            evaluation.generation.synthcity.params["ctgan"]["n_iter"]
+            == generation.generation.synthcity.params["ctgan"]["n_iter"]
+            == 40
+        )
+        assert evaluation.generation.n_samples == generation.generation.n_samples == 100
+        assert evaluation.generation.force_retrain is False
+        assert generation.generation.force_retrain is True
 
     def test_canonical_requires_direct_patient_id(self):
         cfg = Config(data=DataConfig(source="csv", path="x.csv", canonical=True))
@@ -722,6 +788,12 @@ class TestLoadConfig:
         cfg = self._canonical_fixture()
         cfg.data.quasi_identifier_columns = ["age"]
         cfg.data.protected_columns = ["age"]
+        _validate(cfg)
+
+    def test_canonical_protected_sensitive_overlap_is_allowed(self):
+        cfg = self._canonical_fixture()
+        cfg.data.protected_columns = ["age"]
+        cfg.data.sensitive_columns = ["age"]
         _validate(cfg)
 
     def test_canonical_rejects_malformed_release_intervals(self):
@@ -809,7 +881,6 @@ class TestLoadConfig:
             ("evaluation", "scoring_policy"),
             ("evaluation", "release_generalization"),
             ("generation", "hpo", "utility_policy"),
-            ("generation", "hpo", "utility_policy_provenance"),
         ],
     )
     def test_canonical_omitted_required_policy_fields_fail_closed(self, tmp_path, path_parts):
@@ -905,6 +976,16 @@ class TestLoadConfig:
         assert cfg.data.source == "csv"
         assert cfg.data.target_column == "outcome"
         assert cfg.config_path == yaml_path.resolve()
+
+    def test_null_drop_columns_loads_as_empty_list(self, tmp_path):
+        yaml_path = tmp_path / "config.yaml"
+        yaml_path.write_text(
+            "name: mydata\ndata:\n  source: csv\n  path: raw.csv\n  drop_columns: null\n"
+        )
+
+        cfg = load_config(yaml_path)
+
+        assert cfg.data.drop_columns == []
 
     def test_empty_yaml_raises_because_defaults_need_uci_id(self, tmp_path):
         # Config()'s default data.source is "uci" with no uci_id -- an empty

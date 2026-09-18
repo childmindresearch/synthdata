@@ -29,7 +29,7 @@ def _finite(value: Any) -> bool:
 def _raw(evidence: Any, *keys: str) -> Any:
     if isinstance(evidence, Mapping):
         status = evidence.get("status")
-        if status not in (None, "succeeded", "success", "ok", "valid"):
+        if status is not None and status != "succeeded":
             return None
         for key in keys:
             if key in evidence:
@@ -62,7 +62,9 @@ def normalize_component(
         "distance": ("score", "value", "ratio"),
         "jsd": ("distance", "jsd", "value", "score"),
     }
-    value = _raw(evidence, *aliases.get(kind, aliases["direct"]))
+    if kind not in aliases:
+        return None
+    value = _raw(evidence, *aliases[kind])
     if not _finite(value):
         return None
     if (
@@ -83,8 +85,59 @@ def _component_record(evidence: Any, score: float | None) -> dict[str, Any]:
     return {
         "score": score,
         "status": "succeeded" if score is not None else "indeterminate",
-        "evidence": evidence,
+        "evidence": _safe_evidence(evidence),
     }
+
+
+_SAFE_EVIDENCE_KEYS = frozenset(
+    {
+        "status",
+        "score",
+        "value",
+        "risk",
+        "gap",
+        "distance",
+        "jsd",
+        "positive_excess",
+        "effective_auc_advantage",
+        "metric",
+        "metric_name",
+        "contract_id",
+        "metric_id",
+        "metric_version",
+        "support",
+        "sample_size",
+        "observed_count",
+        "seed",
+        "reason_code",
+    }
+)
+_SAFE_EVIDENCE_ID_KEYS = frozenset(
+    {"metric", "metric_name", "contract_id", "metric_id", "metric_version", "reason_code"}
+)
+
+
+def _safe_evidence(value: Any, *, depth: int = 0) -> Any:
+    """Recursively retain only bounded, audit-safe evidence primitives."""
+    if depth > 4:
+        return {"reason_code": "unsafe_nested_evidence"}
+    if _finite(value):
+        return float(value)
+    if isinstance(value, str):
+        return value[:256]
+    if isinstance(value, list):
+        safe = [_safe_evidence(item, depth=depth + 1) for item in value[:32]]
+        return safe
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if key not in _SAFE_EVIDENCE_KEYS:
+                continue
+            if key in _SAFE_EVIDENCE_ID_KEYS and not isinstance(item, str):
+                continue
+            result[key] = _safe_evidence(item, depth=depth + 1)
+        return result
+    return {"reason_code": "unsafe_evidence_type"}
 
 
 def _get(mapping: Mapping[str, Any], name: str) -> Any:
@@ -263,7 +316,7 @@ def compute_release_score(
         "weights": {"utility": 0.45, "privacy": 0.30, "fairness": 0.25},
         "anchors": fixed,
         "indeterminate_dimensions": reasons,
-        "provenance": dict(provenance or {}),
+        "provenance": _safe_evidence(provenance or {}),
         "audit_only": True,
     }
 

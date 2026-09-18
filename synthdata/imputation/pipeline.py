@@ -20,6 +20,10 @@ from synthdata.data import (
     load_imputed_splits,
 )
 from synthdata.data_roles import ROLE_NAMES
+from synthdata.imputation.hyperimpute_backend import (
+    FIT_FRAME_FINGERPRINT_VERSION,
+    metadata_fingerprint,
+)
 from synthdata.utils import ensure_dir, get_logger, resolve_device
 
 logger = get_logger(__name__)
@@ -32,6 +36,12 @@ class RoleIsolationError(RuntimeError):
 #: Sidecar filename (under ``dataset.data_dir``) recording the config fields that
 #: determined the currently-cached imputed CSVs -- see :func:`_cache_key_record`.
 _CACHE_KEY_FILENAME = IMPUTATION_CACHE_KEY_FILENAME
+
+
+def _validate_phase(phase: str) -> None:
+    """Reject phase values that cannot be represented by cache metadata."""
+    if phase not in ("candidate", "final"):
+        raise ValueError(f"Invalid imputation phase {phase!r}; expected 'candidate' or 'final'")
 
 
 def _persist_decoded_imputed_splits(dataset: Dataset) -> None:
@@ -244,13 +254,17 @@ def _cache_key_payload(cfg: Config, dataset: Dataset, phase: str = "candidate") 
     included so a refreshed source export cannot reuse an imputation cache merely
     because its columns and resolved schema happen to be unchanged.
     """
+    _validate_phase(phase)
     imp_cfg = cfg.imputation
     payload = {
         "seed": cfg.seed,
         "target_column": dataset.target_column,
-        "feature_columns": sorted(dataset.feature_columns),
-        "nominal_columns": sorted(dataset.nominal_columns),
-        "ordinal_columns": sorted(dataset.ordinal_columns),
+        # These lists are order-sensitive: feature order controls model inputs,
+        # and categorical order controls backend encoding/imputer columns.
+        "feature_columns": list(dataset.feature_columns),
+        "categorical_columns": list(dataset.categorical_columns),
+        "nominal_columns": list(dataset.nominal_columns),
+        "ordinal_columns": list(dataset.ordinal_columns),
         "ordinal_orders": {
             column: entry["ordinal_order"]
             for column, entry in dataset.variable_schema.items()
@@ -379,6 +393,8 @@ def _canonical_hyperimpute_state_is_valid(
         return False
     if state.get("categorical_plugin") != "most_frequent":
         return False
+    if state.get("fit_frame_fingerprint_version") != FIT_FRAME_FINGERPRINT_VERSION:
+        return False
     fit_frame = (
         dataset.roles["train"]
         if phase == "candidate"
@@ -390,8 +406,10 @@ def _canonical_hyperimpute_state_is_valid(
         return False
     if state.get("categorical_columns") != list(dataset.categorical_columns):
         return False
-    from synthdata.imputation.hyperimpute_backend import metadata_fingerprint
-
+    if not isinstance(cached_record, dict):
+        return False
+    if cached_record.get("categorical_columns") != list(dataset.categorical_columns):
+        return False
     return state.get("state_fingerprint") == metadata_fingerprint(state)
 
 
@@ -410,6 +428,7 @@ def run_imputation(cfg: Config, dataset: Dataset, phase: str = "candidate") -> D
     rerunning correctly retrains instead of silently reusing stale imputed
     CSVs from before the change.
     """
+    _validate_phase(phase)
     if dataset.has_canonical_roles and cfg.imputation.method in {"tabimpute", "refidiff"}:
         raise RoleIsolationError(
             f"Canonical imputation method {cfg.imputation.method!r} is deferred: "
@@ -417,7 +436,17 @@ def run_imputation(cfg: Config, dataset: Dataset, phase: str = "candidate") -> D
             "Use canonical method='hyperimpute'."
         )
     paths = dataset.paths()
-    cache_key_path = dataset.data_dir / _CACHE_KEY_FILENAME
+    cache_dir = (
+        dataset.data_dir / "imputation_final"
+        if (dataset.has_canonical_roles and phase == "final")
+        else dataset.data_dir
+    )
+    cache_key_path = cache_dir / _CACHE_KEY_FILENAME
+    if dataset.has_canonical_roles and phase == "final":
+        paths = {
+            **paths,
+            **{f"{role}_imputed": cache_dir / f"{role}_imputed.csv" for role in ROLE_NAMES},
+        }
     cache_record = _cache_key_record(cfg, dataset, phase)
     current_key = cache_record["cache_key"]
     cached_record = _load_cache_record(cache_key_path)
@@ -432,7 +461,7 @@ def run_imputation(cfg: Config, dataset: Dataset, phase: str = "candidate") -> D
 
     if cfg.imputation.cache and cached_csvs_exist and cached_key == current_key:
         if _canonical_hyperimpute_state_is_valid(cfg, dataset, cached_record, phase):
-            dataset = load_imputed_splits(dataset, expected_cache_key=current_key)
+            dataset = load_imputed_splits(dataset, expected_cache_key=current_key, phase=phase)
             if dataset.full_imputed_df is not None:
                 _persist_decoded_imputed_splits(dataset)
                 logger.info(
@@ -540,7 +569,7 @@ def run_imputation(cfg: Config, dataset: Dataset, phase: str = "candidate") -> D
     if full_imputed is None:
         raise RuntimeError("Imputation did not produce a full model-space frame")
 
-    ensure_dir(dataset.data_dir)
+    ensure_dir(cache_dir)
     full_imputed.to_csv(paths["full_imputed"], index=False)
 
     if dataset.has_canonical_roles:

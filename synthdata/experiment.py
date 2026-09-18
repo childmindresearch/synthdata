@@ -98,6 +98,51 @@ class Experiment:
     role_context_fingerprint: str | None = None
     role_context: dict[str, Any] | None = None
 
+    def validate_generation_context(
+        self,
+        context: dict[str, Any],
+        fingerprint: str,
+        *,
+        full_context: dict[str, Any] | None = None,
+        full_fingerprint: str | None = None,
+    ) -> None:
+        """Reject generation cache context from a different dataset snapshot."""
+        if self.role_context_fingerprint is None or self.role_context is None:
+            return
+        if not fingerprint or not isinstance(context, dict):
+            raise RuntimeError("Generation requires a complete validated role context")
+        if full_context is not None and (
+            self.role_context != full_context or self.role_context_fingerprint != full_fingerprint
+        ):
+            raise RuntimeError(
+                "Generation dataset snapshot differs from experiment manifest lineage; "
+                "refusing model execution."
+            )
+        shared_fields = (
+            "dataset_name",
+            "dataset_version",
+            "assignment_policy_fingerprint",
+            "semantic_fingerprint",
+            "variable_schema_fingerprint",
+            "compatibility_mode",
+        )
+        mismatches = {
+            field: (self.role_context.get(field), context.get(field))
+            for field in shared_fields
+            if self.role_context.get(field) != context.get(field)
+        }
+        recorded_roles = self.role_context.get("roles", {})
+        current_roles = context.get("roles", {})
+        for role, current in current_roles.items():
+            recorded = recorded_roles.get(role)
+            if recorded != current:
+                mismatches[f"roles.{role}"] = (recorded, current)
+        if mismatches:
+            raise RuntimeError(
+                "Generation context differs from experiment dataset lineage; "
+                f"refusing model execution (mismatches={mismatches})."
+            )
+
     def record(self, stage: str, artifacts: dict[str, Any] | None = None, **extra: Any) -> None:
         """Append a stage entry to this experiment's manifest.json."""
         entry = {
@@ -142,7 +187,14 @@ class Experiment:
             json.dump(manifest, f, indent=2, default=str)
 
 
-def _build_experiment(experiment_id: str, cfg: Config, dataset=None) -> Experiment:
+def _build_experiment(
+    experiment_id: str,
+    cfg: Config,
+    dataset=None,
+    *,
+    allow_final_holdout_handoff: bool = False,
+    candidate_phase: bool = False,
+) -> Experiment:
     scope = dataset_version_scope(cfg)
     experiment_scope = f"exp_v_{experiment_id}"
     experiment_root = _experiments_root(cfg) / experiment_scope
@@ -151,8 +203,10 @@ def _build_experiment(experiment_id: str, cfg: Config, dataset=None) -> Experime
     role_context_digest = None
     if dataset is not None:
         role_names = ROLE_NAMES if dataset.has_canonical_roles else ("train", "final_holdout")
-        role_context = role_context_payload(dataset, role_names)
-        role_context_digest = role_context_fingerprint(dataset, role_names)
+        role_context = role_context_payload(dataset, role_names, candidate_phase=candidate_phase)
+        role_context_digest = role_context_fingerprint(
+            dataset, role_names, candidate_phase=candidate_phase
+        )
     if manifest_path.exists():
         with open(manifest_path) as f:
             manifest = json.load(f)
@@ -166,7 +220,24 @@ def _build_experiment(experiment_id: str, cfg: Config, dataset=None) -> Experime
             )
         if role_context_digest is not None:
             recorded_context = manifest.get("role_context_fingerprint")
-            if recorded_context != role_context_digest:
+            recorded_payload = manifest.get("role_context")
+            context_matches = recorded_context == role_context_digest
+            if (
+                not allow_final_holdout_handoff
+                and isinstance(recorded_payload, dict)
+                and dataset is not None
+                and dataset.has_canonical_roles
+                and dataset.role_frame("final_holdout", imputed=True) is not None
+                and _is_candidate_final_holdout_baseline(recorded_payload)
+            ):
+                context_matches = False
+            if (
+                allow_final_holdout_handoff
+                and isinstance(recorded_payload, dict)
+                and role_context is not None
+            ):
+                context_matches = _final_holdout_handoff_matches(recorded_payload, role_context)
+            if not context_matches:
                 raise ValueError(
                     f"Refusing to resume experiment '{experiment_id}' at {manifest_path}: "
                     "resolved dataset role context does not match the recorded context "
@@ -201,6 +272,64 @@ def _build_experiment(experiment_id: str, cfg: Config, dataset=None) -> Experime
     return experiment
 
 
+def _final_holdout_handoff_matches(recorded: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Return whether current context is the validated final-phase handoff.
+
+    Generation records candidate role imputations before final-phase imputation
+    exists. Evaluation may add only that derived final-holdout fingerprint;
+    every other context field must remain identical.
+    """
+    if recorded == current:
+        return True
+    if set(recorded) != set(current):
+        return False
+    for field, recorded_value in recorded.items():
+        current_value = current[field]
+        if field != "roles":
+            if recorded_value != current_value:
+                return False
+            continue
+        if not isinstance(recorded_value, dict) or not isinstance(current_value, dict):
+            return False
+        if set(recorded_value) != set(current_value):
+            return False
+        for role, recorded_role in recorded_value.items():
+            current_role = current_value[role]
+            if (
+                role != "final_holdout"
+                or not isinstance(recorded_role, dict)
+                or not isinstance(current_role, dict)
+            ):
+                if recorded_role != current_role:
+                    return False
+                continue
+            if set(recorded_role) != set(current_role):
+                return False
+            for role_field, recorded_field in recorded_role.items():
+                current_field = current_role[role_field]
+                if role_field == "imputed_fingerprint":
+                    raw_fingerprint = recorded_role.get("raw_fingerprint")
+                    baseline = {None, raw_fingerprint}
+                    if (
+                        recorded_field not in baseline
+                        or not isinstance(current_field, str)
+                        or not current_field
+                    ):
+                        return False
+                elif recorded_field != current_field:
+                    return False
+    return True
+
+
+def _is_candidate_final_holdout_baseline(context: dict[str, Any]) -> bool:
+    """Return whether context records the candidate final-holdout baseline."""
+    role = context.get("roles", {}).get("final_holdout", {})
+    return isinstance(role, dict) and role.get("imputed_fingerprint") in {
+        None,
+        role.get("raw_fingerprint"),
+    }
+
+
 def _write_latest_pointer(cfg: Config, experiment_id: str) -> None:
     path = ensure_dir(_experiments_root(cfg)) / _LATEST_FILENAME
     with open(path, "w") as f:
@@ -222,8 +351,16 @@ def start_experiment(cfg: Config, dataset=None) -> Experiment:
     (suffixed with ``cfg.experiment.tag`` if given) and recorded as the
     "latest" experiment for this dataset's output directory.
     """
-    experiment_id = cfg.experiment.id or _timestamp_id(cfg.experiment.tag)
-    experiment = _build_experiment(experiment_id, cfg, dataset=dataset)
+    if cfg.experiment.id:
+        experiment_id = cfg.experiment.id
+    else:
+        base_id = _timestamp_id(cfg.experiment.tag)
+        experiment_id = base_id
+        suffix = 1
+        while (_experiments_root(cfg) / f"exp_v_{experiment_id}").exists():
+            experiment_id = f"{base_id}_{suffix}"
+            suffix += 1
+    experiment = _build_experiment(experiment_id, cfg, dataset=dataset, candidate_phase=True)
     _write_latest_pointer(cfg, experiment_id)
     logger.info(
         "Experiment '%s' (tag=%s, dataset=%s@%s)",
@@ -235,7 +372,9 @@ def start_experiment(cfg: Config, dataset=None) -> Experiment:
     return experiment
 
 
-def load_experiment(cfg: Config, dataset=None) -> Experiment:
+def load_experiment(
+    cfg: Config, dataset=None, *, allow_final_holdout_handoff: bool = False
+) -> Experiment:
     """Load a previously-started experiment; used by `synthdata-evaluate`/`synthdata-plot`.
 
     Resolution order: ``cfg.experiment.id`` if explicitly set, else the
@@ -248,7 +387,12 @@ def load_experiment(cfg: Config, dataset=None) -> Experiment:
             "No experiment found to load. Run `synthdata-generate` first, or pass "
             "--experiment-id to target a specific past experiment."
         )
-    experiment = _build_experiment(experiment_id, cfg, dataset=dataset)
+    experiment = _build_experiment(
+        experiment_id,
+        cfg,
+        dataset=dataset,
+        allow_final_holdout_handoff=allow_final_holdout_handoff,
+    )
     logger.info(
         "Loaded experiment '%s' (tag=%s, dataset=%s@%s)",
         experiment.id,

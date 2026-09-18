@@ -95,12 +95,16 @@ class TestSynthcityFrames:
 
     def test_failed_model_excluded_not_raising(self):
         ok_result = _dataframe({"mean": [0.5], "direction": ["maximize"]}, index=["stats.ks_test"])
-        failed_result = _dataframe({"error": ["boom"], "error_type": ["ValueError"]})
+        sentinel = "category=patient/HMAC_deadbeef /private/traceback.py:7"
+        failed_result = _dataframe({"error": [sentinel], "error_type": ["ValueError"]})
         raw, oriented = _synthcity_frames(
             {"model_a": ok_result, "model_b": failed_result},
             model_names=["model_a", "model_b"],
         )
-        assert raw.loc["model_b", ("synthcity", "audit", "__model_error")] == "boom"
+        assert raw.loc["model_b", ("synthcity", "audit", "__model_error")] == (
+            "metric_evaluation_failed"
+        )
+        assert sentinel not in raw.to_string()
         assert raw.loc["model_b", ("synthcity", "audit", "__model_error_type")] == "ValueError"
         assert raw.loc["model_a", ("synthcity", "utility", "stats.ks_test")] == 0.5
 
@@ -138,7 +142,8 @@ class TestSynthcityFrames:
         assert oriented.empty
 
     def test_failed_model_keeps_expected_raw_columns_and_failure_state(self):
-        failed_result = _dataframe({"error": ["framework crashed"], "error_type": ["RuntimeError"]})
+        sentinel = "framework crashed at /private/traceback.py:7"
+        failed_result = _dataframe({"error": [sentinel], "error_type": ["RuntimeError"]})
         validation = validate_synthcity_report(
             "model_a",
             failed_result,
@@ -155,7 +160,10 @@ class TestSynthcityFrames:
         )
 
         assert pd.isna(raw.loc["model_a", ("synthcity", "utility", "stats.ks_test.marginal")])
-        assert raw.loc["model_a", ("synthcity", "audit", "__model_error")] == "framework crashed"
+        assert raw.loc["model_a", ("synthcity", "audit", "__model_error")] == (
+            "metric_evaluation_failed"
+        )
+        assert sentinel not in raw.to_string()
         assert (
             raw.loc["model_a", ("synthcity", "audit", "__model_synthcity_audit_status")]
             == "indeterminate"
@@ -166,8 +174,21 @@ class TestSynthcityFrames:
     def test_all_models_failed_returns_empty_frame(self):
         failed_result = _dataframe({"error": ["boom"], "error_type": ["ValueError"]})
         raw, oriented = _synthcity_frames({"model_a": failed_result}, model_names=["model_a"])
-        assert raw.loc["model_a", ("synthcity", "audit", "__model_error")] == "boom"
+        assert raw.loc["model_a", ("synthcity", "audit", "__model_error")] == (
+            "metric_evaluation_failed"
+        )
         assert oriented.empty
+
+    def test_preserves_safe_failure_reason_and_type(self):
+        failed_result = _dataframe(
+            {"error": ["synthcity_report_empty"], "error_type": ["ValueError"]}
+        )
+        raw, _ = _synthcity_frames({"model_a": failed_result}, model_names=["model_a"])
+
+        assert raw.loc["model_a", ("synthcity", "audit", "__model_error")] == (
+            "synthcity_report_empty"
+        )
+        assert raw.loc["model_a", ("synthcity", "audit", "__model_error_type")] == "ValueError"
 
     def test_redundant_naive_alpha_precision_submetrics_excluded(self):
         result = _dataframe(
@@ -414,6 +435,87 @@ class TestLogDisparityFrames:
 
 
 class TestBuildCombinedTable:
+    @pytest.mark.parametrize("policy_value", ["0.8", True, float("inf"), float("nan"), None])
+    def test_malformed_release_evidence_policy_value_is_not_ranked(self, policy_value):
+        records = tuple(
+            MetricStatusRecord(
+                model_name="model_a",
+                expected_key=metric,
+                framework="custom",
+                status="succeeded",
+                contract_id="test.task12",
+                raw_value=0.5,
+                policy_value=policy_value,
+                allowed_uses=frozenset({"audit", "policy_rank"}),
+                value_role="policy_scalar",
+                lifecycle_state="operational",
+            )
+            for metric in ("tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1")
+        )
+        validation = MetricValidationResult(
+            model_name="model_a",
+            requested_use="policy_rank",
+            contract_digest="test-digest",
+            records=records,
+        )
+
+        combined = build_combined_table(
+            {},
+            None,
+            None,
+            {},
+            model_names=["model_a"],
+            release_evidence_validations={"model_a": validation},
+        )
+
+        assert combined.loc["model_a", ("custom", "fairness", "tstr_macro_f1.v1")] == 0.5
+        assert not combined.loc[
+            "model_a", ("custom", "audit", "__model_custom_release_evidence_decision_eligible")
+        ]
+        assert (
+            combined.loc[
+                "model_a", ("custom", "audit", "__model_custom_release_evidence_decision_status")
+            ]
+            == "indeterminate"
+        )
+        assert pd.isna(combined.loc["model_a", ("__all__", "utility", "U_tuning")])
+        assert pd.isna(combined.loc["model_a", ("__all__", "overall", "rank")])
+
+    def test_valid_task12_policy_values_remain_rank_eligible(self):
+        records = tuple(
+            MetricStatusRecord(
+                model_name="model_a",
+                expected_key=metric,
+                framework="custom",
+                status="succeeded",
+                contract_id="test.task12",
+                raw_value=0.5,
+                policy_value=0.5,
+                allowed_uses=frozenset({"audit", "policy_rank"}),
+                value_role="policy_scalar",
+                lifecycle_state="operational",
+            )
+            for metric in ("tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1")
+        )
+        validation = MetricValidationResult(
+            model_name="model_a",
+            requested_use="policy_rank",
+            contract_digest="test-digest",
+            records=records,
+        )
+
+        combined = build_combined_table(
+            {},
+            None,
+            None,
+            {},
+            model_names=["model_a"],
+            release_evidence_validations={"model_a": validation},
+        )
+
+        assert combined.loc["model_a", ("__all__", "utility", "U_tuning")] == pytest.approx(0.5)
+        assert combined.loc["model_a", ("__all__", "overall", "rank")] == pytest.approx(0.5)
+
     def test_raises_when_nothing_to_combine(self):
         with pytest.raises(ValueError, match="No evaluation results"):
             build_combined_table({}, None, None, {}, model_names=["model_a"])

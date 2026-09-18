@@ -2,11 +2,14 @@
 generation from a combined table + extras dict.
 """
 
+import os
+from pathlib import Path
 from typing import cast
 
 import pandas as pd
 import pytest
 
+from synthdata.evaluation.artifacts import _model_artifact_id
 from synthdata.evaluation.report import build_evaluation_report, save_evaluation_report
 
 pytestmark = pytest.mark.unit
@@ -36,7 +39,109 @@ def _combined_table(with_gate: bool = False, all_pass: bool = True):
     return df
 
 
+def _successful_log_disparity_report() -> dict:
+    return {
+        "state": "succeeded",
+        "summary_stats": {
+            "mean_abs_log_disparity": 0.1,
+            "median_abs_log_disparity": 0.1,
+            "share_significant_bh": 0.0,
+        },
+        **{
+            table: pd.DataFrame({"value": [1]})
+            for table in (
+                "leaf_results",
+                "hierarchy_results",
+                "subgroup_table",
+                "leaf_equity_table",
+                "legend_table",
+                "label_counts",
+            )
+        },
+    }
+
+
 class TestBuildEvaluationReport:
+    def test_log_disparity_plot_link_requires_succeeded_state(self, make_config, make_dataset):
+        cfg = make_config()
+        dataset = make_dataset()
+        html_path = (
+            Path(cfg.plots.output_dir)
+            / "evaluation"
+            / "log_disparity"
+            / f"{_model_artifact_id('good')}.html"
+        )
+        html_path.parent.mkdir(parents=True)
+        html_path.write_text("<html></html>")
+
+        text = build_evaluation_report(
+            cfg,
+            dataset,
+            _combined_table(),
+            {
+                "log_disparity_reports": {
+                    "good": _successful_log_disparity_report(),
+                    "failed": {"state": "failed", "error": "boom"},
+                    "incomplete": {"state": "indeterminate", "reason": "missing tables"},
+                }
+            },
+        )
+
+        plots_section = text.split("## Plots", 1)[1]
+        assert "Log disparity report (good)" in plots_section
+        assert "Log disparity report (failed)" not in plots_section
+        assert "Log disparity report (incomplete)" not in plots_section
+
+    def test_plot_links_use_artifact_ids_and_include_existing_3d_plot(
+        self, make_config, make_dataset
+    ):
+        cfg = make_config()
+        dataset = make_dataset()
+        plots_dir = Path(cfg.plots.output_dir) / "evaluation"
+        plots_dir.mkdir(parents=True)
+        (plots_dir / "rank_tradeoff_3d.html").write_text("<html></html>")
+        model_name = "team/model: candidate"
+        html_path = plots_dir / "log_disparity" / f"{_model_artifact_id(model_name)}.html"
+        html_path.parent.mkdir(parents=True)
+        html_path.write_text("<html></html>")
+
+        text = build_evaluation_report(
+            cfg,
+            dataset,
+            _combined_table(),
+            {"log_disparity_reports": {model_name: _successful_log_disparity_report()}},
+        )
+
+        plots_section = text.split("## Plots", 1)[1]
+        assert "Utility, privacy, and fairness rank trade-off (3D)" in plots_section
+        assert f"Log disparity report ({model_name})" in plots_section
+        assert f"{_model_artifact_id(model_name)}.html" in plots_section
+
+    def test_plot_links_are_relative_to_report_and_only_existing_files(
+        self, make_config, make_dataset, tmp_path
+    ):
+        cfg = make_config()
+        cfg.plots.formats = ("svg",)
+        dataset = make_dataset()
+        plots_dir = Path(cfg.plots.output_dir) / "evaluation"
+        plots_dir.mkdir(parents=True)
+        (plots_dir / "utility_vs_privacy.svg").write_text("svg")
+        report_dir = tmp_path / "reports" / "nested"
+        text = build_evaluation_report(
+            cfg,
+            dataset,
+            _combined_table(),
+            {"log_disparity_reports": {}},
+            report_dir=report_dir,
+        )
+        plots_section = text.split("## Plots", 1)[1]
+        expected = os.path.relpath(plots_dir / "utility_vs_privacy.svg", report_dir).replace(
+            os.sep, "/"
+        )
+        assert f"]({expected})" in plots_section
+        assert "utility_vs_fairness" not in plots_section
+        assert str(cfg.plots.output_dir) not in plots_section
+
     def test_rejects_combined_table_without_overall_rank(self, make_config, make_dataset):
         cfg = make_config()
         dataset = make_dataset()
@@ -117,7 +222,7 @@ class TestBuildEvaluationReport:
         gate_section = text.split("## Privacy gate")[1].split("##")[0]
         assert "not run" in gate_section.lower()
 
-    def test_final_holdout_release_score_is_audit_only(self, make_config, make_dataset):
+    def test_incomplete_final_holdout_release_score_is_withheld(self, make_config, make_dataset):
         cfg = make_config()
         dataset = make_dataset()
         combined = _combined_table()
@@ -138,9 +243,10 @@ class TestBuildEvaluationReport:
             {"final_holdout_evidence": {"release_score": score}},
         )
         section = text.split("## Final-holdout release score audit")[1].split("##")[0]
-        assert "Audit-only" in section
-        assert "R_final: `0.7`" in section
-        assert "Identity safety: `0.5`" in section
+        assert "Status: `indeterminate`" in section
+        assert "Claimed success withheld" in section
+        assert "R_final" not in section
+        assert "0.8" not in section
 
     def test_indeterminate_release_score_is_rendered(self, make_config, make_dataset):
         cfg = make_config()
@@ -167,13 +273,7 @@ class TestBuildEvaluationReport:
         extras = {
             "selected_datasets": {"model_a": None, "model_b": None},
             "log_disparity_reports": {
-                "model_a": {
-                    "summary_stats": {
-                        "mean_abs_log_disparity": 0.2,
-                        "median_abs_log_disparity": 0.15,
-                        "share_significant_bh": 0.0,
-                    }
-                },
+                "model_a": _successful_log_disparity_report(),
                 "model_b": {"error": "boom", "error_type": "KeyError"},
             },
         }
@@ -181,6 +281,120 @@ class TestBuildEvaluationReport:
         fairness_section = text.split("## Fairness highlights")[1]
         assert "model_a" in fairness_section
         assert "model_b" in fairness_section
+
+    def test_log_disparity_indeterminate_state_is_rendered_without_plot_guidance(
+        self, make_config, make_dataset
+    ):
+        cfg = make_config()
+        dataset = make_dataset()
+        text = build_evaluation_report(
+            cfg,
+            dataset,
+            _combined_table(),
+            {
+                "log_disparity_reports": {
+                    "good": {
+                        **_successful_log_disparity_report(),
+                    },
+                    "incomplete": {
+                        "state": "indeterminate",
+                        "reason": "missing release provenance",
+                    },
+                    "failed": {"state": "failed", "error": "boom"},
+                }
+            },
+        )
+
+        fairness_section = text.split("## Fairness highlights")[1].split("## Plots")[0]
+        assert "incomplete" in fairness_section
+        assert "indeterminate" in fairness_section
+        assert "missing release provenance" in fairness_section
+        assert "failed" in fairness_section
+        assert "See the per-model interactive sunburst reports" not in fairness_section
+
+    def test_log_disparity_malformed_success_with_sentinel_is_withheld(
+        self, make_config, make_dataset
+    ):
+        text = build_evaluation_report(
+            make_config(),
+            make_dataset(),
+            _combined_table(),
+            {
+                "log_disparity_reports": {
+                    "tampered": {
+                        "state": "succeeded",
+                        "reason": "sentinel-secret",
+                        "summary_stats": {
+                            "mean_abs_log_disparity": 999.0,
+                            "median_abs_log_disparity": 999.0,
+                            "share_significant_bh": 1.0,
+                        },
+                    }
+                }
+            },
+        )
+        section = text.split("## Fairness highlights")[1].split("## Plots")[0]
+        assert "incomplete_report" in section
+        assert "999" not in section
+        assert "sentinel-secret" not in section
+
+    def test_log_disparity_indeterminate_reason_is_preserved_safely(
+        self, make_config, make_dataset
+    ):
+        text = build_evaluation_report(
+            make_config(),
+            make_dataset(),
+            _combined_table(),
+            {
+                "log_disparity_reports": {
+                    "model": {
+                        "state": "indeterminate",
+                        "reason": "missing release provenance",
+                    }
+                }
+            },
+        )
+        assert "missing release provenance" in text
+
+    def test_log_disparity_absent_or_unknown_state_is_indeterminate(
+        self, make_config, make_dataset
+    ):
+        cfg = make_config()
+        dataset = make_dataset()
+        text = build_evaluation_report(
+            cfg,
+            dataset,
+            _combined_table(),
+            {
+                "log_disparity_reports": {
+                    "absent": {"summary_stats": {"mean_abs_log_disparity": 0.1}},
+                    "unknown": {
+                        "state": "mystery",
+                        "summary_stats": {"mean_abs_log_disparity": 0.2},
+                    },
+                }
+            },
+        )
+        fairness_section = text.split("## Fairness highlights")[1].split("## Plots")[0]
+        assert "report_state_missing_or_unknown" in fairness_section
+        assert "0.1" not in fairness_section
+        assert "0.2" not in fairness_section
+        assert "See the per-model interactive sunburst reports" not in fairness_section
+
+    def test_final_holdout_unknown_state_withholds_metrics(self, make_config, make_dataset):
+        cfg = make_config()
+        dataset = make_dataset()
+        score = {"status": "succeeded", "score": 0.7, "dimensions": {"utility": {"score": 0.8}}}
+        text = build_evaluation_report(
+            cfg,
+            dataset,
+            _combined_table(),
+            {"final_holdout_evidence": {"state": "mystery", "release_score": score}},
+        )
+        section = text.split("## Final-holdout release score audit")[1].split("##")[0]
+        assert "Status: `indeterminate`" in section
+        assert "R_final" not in section
+        assert "0.8" not in section
 
     def test_experiment_id_included_when_provided(self, make_config, make_dataset):
         cfg = make_config()

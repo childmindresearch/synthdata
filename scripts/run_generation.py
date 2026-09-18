@@ -16,7 +16,11 @@ Requires imputed data (run `synthdata-impute` first).
 import argparse
 
 from synthdata.config import load_config
-from synthdata.data import load_dataset, load_imputed_splits
+from synthdata.data import (
+    load_dataset,
+    load_imputed_splits,
+    validate_imputation_cache_lineage,
+)
 from synthdata.experiment import start_experiment
 from synthdata.generation import run_generation
 from synthdata.generation.pipeline import needs_imputed_data
@@ -62,9 +66,15 @@ def main() -> None:
     set_global_seed(cfg.seed)
 
     dataset = load_dataset(cfg)
+    imputation_cache = _cache_key_record(cfg, dataset)
     dataset = load_imputed_splits(
         dataset,
-        expected_cache_key=_cache_key_record(cfg, dataset)["cache_key"],
+        expected_cache_key=imputation_cache["cache_key"],
+    )
+    validate_imputation_cache_lineage(
+        dataset,
+        imputation_cache,
+        required=needs_imputed_data(cfg.generation),
     )
     if dataset.role_frame("train", imputed=True) is None and needs_imputed_data(cfg.generation):
         raise SystemExit("No imputed data found. Run `synthdata-impute --config <path>` first.")

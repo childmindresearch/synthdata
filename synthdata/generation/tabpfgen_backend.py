@@ -468,7 +468,11 @@ def build_tabpfgen_standard_objective(
                     stage_a_contract,
                     exc,
                 )
-            logger.warning("tabpfgen_standard trial %d failed: %s", trial.number, exc)
+            logger.warning(
+                "tabpfgen_standard trial %d failed; reason_code=hpo_trial_failed exception_type=%s",
+                trial.number,
+                type(exc).__name__,
+            )
             raise optuna.TrialPruned() from exc
         if stage_a_contract is not None:
             screen_stage_a_trial(
@@ -601,7 +605,11 @@ def build_tabpfgen_custom_objective(
                     stage_a_contract,
                     exc,
                 )
-            logger.warning("tabpfgen_custom trial %d failed: %s", trial.number, exc)
+            logger.warning(
+                "tabpfgen_custom trial %d failed; reason_code=hpo_trial_failed exception_type=%s",
+                trial.number,
+                type(exc).__name__,
+            )
             raise optuna.TrialPruned() from exc
         if stage_a_contract is not None:
             screen_stage_a_trial(

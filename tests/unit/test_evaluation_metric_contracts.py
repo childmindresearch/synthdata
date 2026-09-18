@@ -48,10 +48,12 @@ from synthdata.evaluation.metric_contracts import (
     MetricContractRegistry,
     MetricEvaluationContext,
     MetricObservation,
+    MetricStatusRecord,
     MetricValidationResult,
     UnknownMetricContractError,
     is_verified_task10_tstr,
     resolve_metric_observations,
+    safe_metric_metadata,
 )
 
 pytestmark = pytest.mark.unit
@@ -117,6 +119,55 @@ class TestDefaultRegistry:
         }
 
         assert set(SYNTHCITY_METRIC_DIRECTIONS) == selected_keys
+
+
+def test_metric_status_metadata_is_recursively_redacted_but_safe_values_remain():
+    sentinel = "SECRET /var/lib/patient_id=42 traceback HMAC key-material"
+    metadata = {
+        "safe_bool": True,
+        "safe_number": 1.25,
+        "safe_enum": "indeterminate",
+        "safe_digest": "a" * 64,
+        "nested": {"unsafe": sentinel, "valid": 3},
+        "items": ["valid", sentinel],
+    }
+    record = MetricStatusRecord(
+        model_name="model_a",
+        expected_key="test.metric",
+        framework="test",
+        status="succeeded",
+        contract_id="test.metric",
+        is_expected=True,
+        raw_value=0.5,
+        policy_value=0.5,
+        uncertainty=None,
+        sample_size=4,
+        observed_count=4,
+        source_metadata=metadata,
+        result_metadata=metadata,
+        support=metadata,
+        bandwidth=metadata,
+        provenance=metadata,
+    )
+
+    persisted = record.to_dict()
+    serialized = str(persisted)
+    assert sentinel not in serialized
+    for field in ("source_metadata", "result_metadata", "support", "bandwidth", "provenance"):
+        assert persisted[field]["safe_bool"] is True
+        assert persisted[field]["safe_number"] == 1.25
+        assert persisted[field]["safe_enum"] == "indeterminate"
+        assert persisted[field]["safe_digest"] == "a" * 64
+        assert persisted[field]["nested"] == {"valid": 3}
+        assert persisted[field]["items"] == ["valid"]
+
+
+def test_safe_metric_metadata_strict_rejects_adversarial_sentinel():
+    with pytest.raises(ValueError, match="unsafe metadata"):
+        safe_metric_metadata(
+            {"safe": 1, "diagnostic": "RuntimeError: SECRET /absolute/path patient_id"},
+            strict=True,
+        )
 
     @pytest.mark.parametrize(
         ("emitted_key", "native_direction"),
@@ -688,6 +739,30 @@ class TestResolveMetricObservations:
         assert result.complete is False
         assert result.decision_eligible is False
 
+    def test_failure_error_is_redacted_to_reason_and_exception_type(self):
+        registry = MetricContractRegistry([_contract()])
+        result = resolve_metric_observations(
+            registry=registry,
+            model_name="model_a",
+            framework="test",
+            expected_keys=["test.metric"],
+            observations=[
+                MetricObservation(
+                    "model_a",
+                    "test",
+                    "test.metric",
+                    0.1,
+                    error="ValueError: SECRET /tmp/private-id",
+                )
+            ],
+            context=_context(),
+        )
+
+        error = result.to_dict()["records"][0]["error"]
+        assert error == "reason_code=metric_evaluation_failed; exception_type=ValueError"
+        assert "SECRET" not in error
+        assert "/tmp/private-id" not in error
+
     def test_disallowed_use_is_blocked_without_disappearing(self):
         registry = MetricContractRegistry(
             [
@@ -817,7 +892,7 @@ class TestResolveMetricObservations:
         assert result.complete is False
         assert result.expected_records[0].status == "succeeded"
         assert result.expected_records[1].status == "failed"
-        assert result.expected_records[1].error == "diagnostic failed"
+        assert result.expected_records[1].error == "reason_code=metric_evaluation_failed"
         assert result.indeterminate_keys == ("test.diagnostic",)
         assert result.decision_eligible is False
 

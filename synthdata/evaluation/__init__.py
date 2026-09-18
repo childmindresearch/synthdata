@@ -24,10 +24,10 @@ from synthdata.evaluation import (
     combine,
     custom_eval,
     privacy_gate,
+    release_evidence_eval,
     report,
     synthcity_eval,
     syntheval_eval,
-    task12_eval,
 )
 from synthdata.evaluation.catalog import (
     syntheval_execution_keys_by_framework,
@@ -36,7 +36,7 @@ from synthdata.evaluation.catalog import (
 from synthdata.evaluation.metric_contracts import (
     DEFAULT_METRIC_CONTRACT_REGISTRY,
     MetricEvaluationContext,
-    is_verified_task10_tstr,
+    is_verified_authoritative_tstr,
 )
 from synthdata.evaluation.release import transform_release_roles
 from synthdata.evaluation.release_score import compute_release_score
@@ -51,13 +51,13 @@ def _authoritative_tstr_results(
     *,
     trusted_role_hashes: dict[str, str] | None = None,
 ) -> dict[str, dict]:
-    """Extract Task 10-owned TSTR records without calculating TSTR here."""
+    """Extract authoritative TSTR records without calculating TSTR here."""
     results = {}
 
     def verified(report: object) -> bool:
         if not isinstance(report, dict):
             return False
-        return is_verified_task10_tstr(report, trusted_role_hashes=trusted_role_hashes)
+        return is_verified_authoritative_tstr(report, trusted_role_hashes=trusted_role_hashes)
 
     def blocked(reason: str) -> dict:
         return {
@@ -71,13 +71,17 @@ def _authoritative_tstr_results(
             payload = getattr(payload, "report", {})
         if not isinstance(payload, dict):
             continue
-        for candidate in (payload.get("task10_tstr"), payload.get("tstr_result")):
+        for candidate in (
+            payload.get("authoritative_tstr"),
+            payload.get("tstr_result"),
+            payload.get("task10_tstr"),
+        ):
             if isinstance(candidate, dict):
                 if verified(candidate):
                     results[model_name] = candidate
                 else:
                     results[model_name] = blocked(
-                        "Task 10 TSTR producer metadata or artifact is unverified"
+                        "authoritative TSTR producer metadata or artifact is unverified"
                     )
                 break
         if model_name in results:
@@ -92,7 +96,7 @@ def _authoritative_tstr_results(
                 metadata = row.get("result_metadata", row.get("metadata", {}))
                 if not isinstance(metadata, dict):
                     metadata = {}
-                # Task 10 stores its durable fairness artifact either in row
+                # Authoritative TSTR stores its durable fairness artifact either in row
                 # metadata or directly beside normalized metric values.
                 if "prediction_artifact" not in metadata and isinstance(
                     row.get("prediction_artifact"), dict
@@ -116,7 +120,9 @@ def _authoritative_tstr_results(
                     "result_metadata": metadata,
                 }
         if model_name not in results:
-            results[model_name] = blocked("Task 10 TSTR producer result is unavailable or untagged")
+            results[model_name] = blocked(
+                "authoritative TSTR producer result is unavailable or untagged"
+            )
     return results
 
 
@@ -167,11 +173,18 @@ def _generation_metadata(cfg: Config, model_names: list[str]) -> dict[str, dict]
     for model_name in model_names:
         metadata_path = generation_dir / f"{model_name}.cache.json"
         data_path = generation_dir / f"{model_name}.csv"
+        # ``source_generation_root`` is persisted separately and is the root
+        # used by the artifact bundler for relative source paths.  Persist
+        # only names here; storing ``generation_dir / name`` would make the
+        # bundler resolve the generation root twice when output_dir is
+        # relative.
+        metadata_source = f"{model_name}.cache.json"
+        data_source = f"{model_name}.csv"
         if not metadata_path.exists():
             metadata_by_model[model_name] = {
                 "state": "missing",
-                "metadata_path": str(metadata_path),
-                "data_path": str(data_path),
+                "metadata_path": metadata_source,
+                "data_path": data_source,
             }
             continue
         try:
@@ -197,8 +210,8 @@ def _generation_metadata(cfg: Config, model_names: list[str]) -> dict[str, dict]
         )
         entry = {
             "state": state,
-            "metadata_path": str(metadata_path),
-            "data_path": str(data_path),
+            "metadata_path": metadata_source,
+            "data_path": data_source,
             "metadata_sha256": artifacts._file_digest(metadata_path),
             "data_sha256": artifacts._file_digest(data_path) if data_path.is_file() else None,
             "metadata": generator_metadata,
@@ -218,8 +231,9 @@ def select_models(
         return synthetic_datasets
     missing = [m for m in cfg.evaluation.models if m not in synthetic_datasets]
     if missing:
-        logger.warning(
-            "Requested evaluation models not found among generated datasets: %s", missing
+        raise ValueError(
+            "Requested evaluation models are missing from generated datasets: "
+            f"{missing}. Regenerate or remove missing models before evaluation."
         )
     return {k: v for k, v in synthetic_datasets.items() if k in cfg.evaluation.models}
 
@@ -261,11 +275,21 @@ def _synthcity_semantic_context(dataset: Dataset, selection_cfg) -> dict:
         )
     if len(dataset_qis) != len(set(dataset_qis)):
         raise ValueError(f"Dataset quasi_identifier_columns must be unique: {dataset_qis!r}")
-    sensitive_overlap = sorted(set(dataset_qis) & set(dataset.protected_columns))
+    sensitive_overlap = sorted(set(dataset_qis) & set(dataset.sensitive_columns))
     if sensitive_overlap:
         raise ValueError(
-            "Dataset quasi_identifier_columns must exclude protected target columns: "
+            "Dataset sensitive_columns must not overlap quasi_identifier_columns: "
             f"{sensitive_overlap}"
+        )
+    target_overlap = sorted(set(dataset_qis) & {dataset.target_column})
+    if target_overlap:
+        raise ValueError(
+            f"Dataset quasi_identifier_columns must not overlap target_column: {target_overlap}"
+        )
+    sensitive_target_overlap = sorted(set(dataset.sensitive_columns) & {dataset.target_column})
+    if sensitive_target_overlap:
+        raise ValueError(
+            f"Dataset sensitive_columns must not overlap target_column: {sensitive_target_overlap}"
         )
     missing_qis = sorted(set(dataset_qis) - set(dataset.feature_columns))
     if missing_qis:
@@ -304,7 +328,7 @@ def _select_policy_model(combined: pd.DataFrame) -> tuple[str | None, str | None
 def _release_score_inputs(validations: dict) -> tuple[dict, dict, dict]:
     """Adapt validated final evidence into release-score component inputs.
 
-    Task 12 deliberately emits aggregate records.  Keep those records as the
+    Release evidence deliberately emits aggregate records. Keep those records as the
     evidence attached to each adapter; never derive a component from a
     candidate-relative value or from an unsuccessful record.
     """
@@ -597,10 +621,10 @@ def _run_final_holdout_evidence(
     # All final evidence consumers share this exact release-form object.  Do not
     # let individual metric adapters transform or normalize independent copies.
     selected_dataset = released_final_dataset
-    task10_results = {}
+    authoritative_tstr_results = {}
     if eval_cfg.custom.enabled:
         for model_name in selected_dataset:
-            task10_results[model_name] = run_tstr_evaluation(
+            authoritative_tstr_results[model_name] = run_tstr_evaluation(
                 released_final_dataset[model_name],
                 released_final_roles["final_holdout"],
                 target_column=dataset.target_column,
@@ -683,23 +707,27 @@ def _run_final_holdout_evidence(
                 released_final_holdout_frame=released_final_roles["final_holdout"],
                 released_synthetic_datasets=released_final_dataset,
             )
-        except RuntimeError as exc:
-            checkpoint_root = output_dir / "syntheval_final_holdout"
+        except Exception as exc:  # noqa: BLE001 - preserve process-control exceptions
+            exception_type = type(exc).__name__
             logger.error(
-                "[final holdout] SynthEval main pass failed for selected model=%s; checkpoint_root=%s: %s",
+                "[final holdout] SynthEval main pass failed for selected model=%s; "
+                "reason_code=%s; exception_type=%s",
                 selected_model,
-                checkpoint_root,
-                exc,
+                "final_holdout_execution_failed",
+                exception_type,
             )
             final_execution_failures.append(
                 {
+                    "stage": "final_holdout",
                     "framework": "syntheval",
                     "execution_pass": "main",
                     "model": selected_model,
                     "status": "failed",
-                    "exception_type": type(exc).__name__,
-                    "error": str(exc),
-                    "checkpoint_root": str(checkpoint_root),
+                    "policy_eligible": False,
+                    "error_type": "SynthEvalExecutionError",
+                    "exception_type": exception_type,
+                    "reason_code": "final_holdout_execution_failed",
+                    "failure_reason": "Final-holdout SynthEval execution failed.",
                 }
             )
             final_syntheval_output = (None, None, {})
@@ -720,7 +748,7 @@ def _run_final_holdout_evidence(
             final_syntheval_preset,
             include_holdout_outputs=True,
             target_columns=[dataset.target_column],
-            protected_columns=dataset.sensitive_columns,
+            protected_columns=dataset.protected_columns,
         )
         final_syntheval_validations = syntheval_eval.validate_syntheval_results(
             final_benchmark_results,
@@ -764,24 +792,27 @@ def _run_final_holdout_evidence(
                 released_final_holdout_frame=released_final_roles["final_holdout"],
                 released_synthetic_datasets=released_final_dataset,
             )
-        except RuntimeError as exc:
-            checkpoint_root = output_dir / "syntheval_final_holdout"
+        except Exception as exc:  # noqa: BLE001 - preserve process-control exceptions
+            exception_type = type(exc).__name__
             logger.error(
                 "[final holdout] SynthEval binary-target pass failed for selected model=%s; "
-                "checkpoint_root=%s: %s",
+                "reason_code=%s; exception_type=%s",
                 selected_model,
-                checkpoint_root,
-                exc,
+                "final_holdout_execution_failed",
+                exception_type,
             )
             final_execution_failures.append(
                 {
+                    "stage": "final_holdout",
                     "framework": "syntheval",
                     "execution_pass": "binary_target",
                     "model": selected_model,
                     "status": "failed",
-                    "exception_type": type(exc).__name__,
-                    "error": str(exc),
-                    "checkpoint_root": str(checkpoint_root),
+                    "policy_eligible": False,
+                    "error_type": "SynthEvalExecutionError",
+                    "exception_type": exception_type,
+                    "reason_code": "final_holdout_execution_failed",
+                    "failure_reason": "Final-holdout SynthEval execution failed.",
                 }
             )
             final_binary_output = (None, None, {})
@@ -794,7 +825,7 @@ def _run_final_holdout_evidence(
             final_binary_preset,
             include_holdout_outputs=True,
             target_columns=[dataset.target_column],
-            protected_columns=dataset.sensitive_columns,
+            protected_columns=dataset.protected_columns,
         )
         final_binary_expected_keys = syntheval_eval.extend_syntheval_expected_diagnostics(
             syntheval_execution_keys_by_framework(final_binary_manifest),
@@ -835,6 +866,7 @@ def _run_final_holdout_evidence(
         eval_cfg.log_disparity,
         eval_cfg.custom,
         evaluation_role="final_holdout",
+        reference_frame=released_final_roles.get("final_holdout"),
     )
     final_custom_validations = (
         custom_eval.validate_log_disparity_results(
@@ -850,7 +882,7 @@ def _run_final_holdout_evidence(
         if final_custom_reports
         else {}
     )
-    final_task12_observations = task12_eval.run_task12_custom_evaluation(
+    final_release_evidence_observations = release_evidence_eval.run_release_evidence_evaluation(
         selected_dataset,
         dataset,
         evaluation_role="final_holdout",
@@ -859,7 +891,7 @@ def _run_final_holdout_evidence(
         sensitive_fields=list(dataset.sensitive_columns),
         protected_columns=list(dataset.protected_columns),
         role_hashes=final_custom_role_hashes,
-        tstr_results=task10_results,
+        tstr_results=authoritative_tstr_results,
         seed=cfg.seed,
         release_form_inputs=(
             released_final_synthetic,
@@ -867,8 +899,8 @@ def _run_final_holdout_evidence(
             release_transform_metadata,
         ),
     )
-    final_task12_validations = task12_eval.validate_task12_custom_results(
-        final_task12_observations,
+    final_release_evidence_validations = release_evidence_eval.validate_release_evidence_results(
+        final_release_evidence_observations,
         role_hashes=final_custom_role_hashes,
         evaluation_role="final_holdout",
         population_unit=population_unit,
@@ -898,7 +930,7 @@ def _run_final_holdout_evidence(
     )
     if eval_cfg.custom.enabled:
         final_validation_failures.extend(
-            _incomplete_validation_records("custom", final_task12_validations)
+            _incomplete_validation_records("custom", final_release_evidence_validations)
         )
 
     rank_value = combined.loc[selected_model, ("__all__", "overall", "rank")]
@@ -918,7 +950,7 @@ def _run_final_holdout_evidence(
         ("synthcity", "main"): final_synthcity_validations,
         **final_syntheval_validations,
         ("custom", "log_disparity"): final_custom_validations,
-        ("custom", "task12"): final_task12_validations,
+        ("custom", "release_evidence"): final_release_evidence_validations,
     }
     utility_evidence, privacy_evidence, fairness_evidence = _release_score_inputs(
         final_score_validations
@@ -1006,7 +1038,9 @@ def _run_final_holdout_evidence(
             },
             "custom": {
                 "validation": _single_framework_validation_payload(final_custom_validations),
-                "task12_validation": _single_framework_validation_payload(final_task12_validations),
+                "release_evidence_validation": _single_framework_validation_payload(
+                    final_release_evidence_validations
+                ),
                 "summary": {
                     name: report.get("summary_stats", report)
                     for name, report in final_custom_reports.items()
@@ -1029,7 +1063,16 @@ def _run_blocked_legacy_evaluation(
 ) -> tuple[pd.DataFrame, dict]:
     """Persist an auditable blocked result without evaluating legacy roles."""
     eval_cfg = cfg.evaluation
-    output_dir = ensure_dir(eval_cfg.output_dir)
+    output_dir, attempt_metadata = artifacts.select_evaluation_attempt(
+        eval_cfg.output_dir, experiment_id=getattr(experiment, "id", None)
+    )
+    output_dir = ensure_dir(output_dir)
+    eval_cfg.output_dir = str(output_dir)
+    attempt_metadata["source_generation_root"] = str(cfg.generation.output_dir)
+    if experiment is not None:
+        experiment.evaluation_dir = output_dir
+        experiment.plots_dir = output_dir / "plots"
+        cfg.plots.output_dir = str(experiment.plots_dir)
     requested_datasets = select_models(cfg, synthetic_datasets)
     legacy_semantic_context = semantic_context_payload(
         dataset,
@@ -1104,6 +1147,7 @@ def _run_blocked_legacy_evaluation(
         generator_metadata=generator_metadata,
         semantic_context=legacy_semantic_context,
         final_holdout_evidence=final_holdout_evidence,
+        attempt_metadata=attempt_metadata,
     )
     extras = {
         "selected_datasets": {},
@@ -1126,17 +1170,21 @@ def _run_blocked_legacy_evaluation(
     }
     if eval_cfg.generate_report:
         try:
-            report_path = report.save_evaluation_report(cfg, dataset, combined, extras, experiment)
+            report.save_evaluation_report(cfg, dataset, combined, extras, experiment)
         except ValueError as exc:
             # Legacy bundles intentionally lack canonical tuning provenance;
             # retain durable blocked artifacts instead of inventing report context.
-            logger.warning("[evaluation] blocked legacy report omitted: %s", exc)
+            logger.warning(
+                "[evaluation] blocked legacy report omitted; "
+                "reason_code=legacy_report_context_missing exception_type=%s",
+                type(exc).__name__,
+            )
             (output_dir / "report.md").write_text(
                 "# Evaluation report\n\nStatus: blocked\n\n"
                 "Legacy two-role dataset has no canonical tuning evidence.\n"
             )
         else:
-            extras["report_path"] = str(report_path)
+            extras["report_path"] = "report.md"
     return combined, extras
 
 
@@ -1165,7 +1213,16 @@ def run_evaluation(
         return _run_blocked_legacy_evaluation(cfg, dataset, synthetic_datasets, experiment)
 
     eval_cfg = cfg.evaluation
-    output_dir = ensure_dir(eval_cfg.output_dir)
+    output_dir, attempt_metadata = artifacts.select_evaluation_attempt(
+        eval_cfg.output_dir, experiment_id=getattr(experiment, "id", None)
+    )
+    output_dir = ensure_dir(output_dir)
+    eval_cfg.output_dir = str(output_dir)
+    attempt_metadata["source_generation_root"] = str(cfg.generation.output_dir)
+    if experiment is not None:
+        experiment.evaluation_dir = output_dir
+        experiment.plots_dir = output_dir / "plots"
+        cfg.plots.output_dir = str(experiment.plots_dir)
     synthcity_semantics = _synthcity_semantic_context(dataset, eval_cfg.synthcity)
 
     selected_datasets = select_models(cfg, synthetic_datasets)
@@ -1207,6 +1264,14 @@ def run_evaluation(
     candidate_role_hashes = {
         "train": dataframe_fingerprint(train_frame),
         "tuning": dataframe_fingerprint(tuning_frame),
+    }
+    raw_train_frame = dataset.role_frame("train", imputed=False)
+    raw_tuning_frame = dataset.role_frame("tuning", imputed=False)
+    if raw_train_frame is None or raw_tuning_frame is None:
+        raise RuntimeError("Evaluation requires populated raw train and tuning role frames")
+    raw_candidate_role_hashes = {
+        "train": dataframe_fingerprint(raw_train_frame),
+        "tuning": dataframe_fingerprint(raw_tuning_frame),
     }
     role_hashes = {
         **candidate_role_hashes,
@@ -1289,7 +1354,7 @@ def run_evaluation(
             syntheval_preset,
             include_holdout_outputs=tuning_frame is not None,
             target_columns=[dataset.target_column],
-            protected_columns=dataset.sensitive_columns,
+            protected_columns=dataset.protected_columns,
         )
         syntheval_expected_keys = syntheval_eval.extend_syntheval_expected_diagnostics(
             syntheval_execution_keys_by_framework(syntheval_manifest),
@@ -1301,6 +1366,10 @@ def run_evaluation(
             benchmark_ranks,
             syntheval_expected_keys,
             role_hashes=candidate_role_hashes,
+            role_hashes_by_framework={
+                "syntheval": candidate_role_hashes,
+                "custom": raw_candidate_role_hashes,
+            },
             model_names=model_names,
             requested_use="audit",
             structured_executions=syntheval_executions,
@@ -1334,7 +1403,7 @@ def run_evaluation(
             binary_preset,
             include_holdout_outputs=tuning_frame is not None,
             target_columns=[dataset.target_column],
-            protected_columns=dataset.sensitive_columns,
+            protected_columns=dataset.protected_columns,
         )
         binary_expected_keys = syntheval_eval.extend_syntheval_expected_diagnostics(
             syntheval_execution_keys_by_framework(binary_manifest),
@@ -1346,6 +1415,10 @@ def run_evaluation(
             binary_ranks,
             binary_expected_keys,
             role_hashes=candidate_role_hashes,
+            role_hashes_by_framework={
+                "syntheval": candidate_role_hashes,
+                "custom": raw_candidate_role_hashes,
+            },
             model_names=model_names,
             execution_pass="binary_target",
             target_view="binary_collapsed",
@@ -1379,19 +1452,12 @@ def run_evaluation(
         if eval_cfg.custom.enabled
         else {}
     )
-    raw_train_frame = dataset.role_frame("train", imputed=False)
-    raw_tuning_frame = dataset.role_frame("tuning", imputed=False)
-    if raw_train_frame is None or raw_tuning_frame is None:
-        raise RuntimeError("Evaluation requires populated raw train and tuning role frames")
-    raw_candidate_role_hashes = {
-        "train": dataframe_fingerprint(raw_train_frame),
-        "tuning": dataframe_fingerprint(raw_tuning_frame),
-    }
     custom_validations = (
         custom_eval.validate_log_disparity_results(
             log_disparity_reports,
             model_names,
-            role_hashes=raw_candidate_role_hashes,
+            role_hashes=dict(raw_candidate_role_hashes),
+            expected_role_hashes=dict(raw_candidate_role_hashes),
             requested_use="audit",
             population_unit=population_unit,
             group_mode=group_mode,
@@ -1403,9 +1469,9 @@ def run_evaluation(
         if log_disparity_reports
         else None
     )
-    task12_observations = {}
+    release_evidence_observations = {}
     if eval_cfg.custom.enabled:
-        task12_observations = task12_eval.run_task12_custom_evaluation(
+        release_evidence_observations = release_evidence_eval.run_release_evidence_evaluation(
             selected_datasets,
             dataset,
             evaluation_role="tuning",
@@ -1413,33 +1479,34 @@ def run_evaluation(
             quasi_identifiers=list(dataset.quasi_identifier_columns),
             sensitive_fields=list(dataset.sensitive_columns),
             protected_columns=list(dataset.protected_columns),
-            role_hashes=raw_candidate_role_hashes,
+            role_hashes=dict(raw_candidate_role_hashes),
             seed=cfg.seed,
         )
     candidate_release_digest = None
-    if task12_observations:
-        first_observations = next(iter(task12_observations.values()), ())
+    if release_evidence_observations:
+        first_observations = next(iter(release_evidence_observations.values()), ())
         for observation in first_observations:
             if observation.emitted_key == "release_privacy.v1":
                 candidate_release_digest = observation.result_metadata.get(
                     "release_transform_digest"
                 )
                 break
-    task12_validations = {}
+    release_evidence_validations = {}
     if eval_cfg.custom.enabled:
-        task12_validations = task12_eval.validate_task12_custom_results(
-            task12_observations,
-            role_hashes=raw_candidate_role_hashes,
+        release_evidence_validations = release_evidence_eval.validate_release_evidence_results(
+            release_evidence_observations,
+            role_hashes=dict(raw_candidate_role_hashes),
             evaluation_role="tuning",
             population_unit=population_unit,
             group_mode=group_mode,
             requested_use="audit",
         )
     if candidate_release_digest is not None:
-        raw_candidate_role_hashes["__release_transform_digest__"] = candidate_release_digest
-        task12_validations = task12_eval.validate_task12_custom_results(
-            task12_observations,
-            role_hashes=raw_candidate_role_hashes,
+        release_role_hashes = dict(raw_candidate_role_hashes)
+        release_role_hashes["__release_transform_digest__"] = candidate_release_digest
+        release_evidence_validations = release_evidence_eval.validate_release_evidence_results(
+            release_evidence_observations,
+            role_hashes=release_role_hashes,
             evaluation_role="tuning",
             population_unit=population_unit,
             group_mode=group_mode,
@@ -1458,7 +1525,7 @@ def run_evaluation(
         syntheval_validations=syntheval_validations,
         metric_execution_passes=metric_execution_passes,
         custom_validations=custom_validations,
-        task12_validations=task12_validations,
+        release_evidence_validations=release_evidence_validations,
     )
 
     gate_validation_results = {
@@ -1467,8 +1534,8 @@ def run_evaluation(
     }
     if custom_validations is not None:
         gate_validation_results[("custom", "main")] = custom_validations
-    if task12_validations:
-        gate_validation_results[("custom", "main")] = task12_validations
+    if release_evidence_validations:
+        gate_validation_results[("custom", "main")] = release_evidence_validations
     gate_result = privacy_gate.evaluate_privacy_gate(
         combined,
         eval_cfg.privacy_gate,
@@ -1540,6 +1607,7 @@ def run_evaluation(
         semantic_context=synthcity_semantics,
         final_holdout_evidence=final_holdout_evidence,
         release_score_evidence=release_score_evidence,
+        attempt_metadata=attempt_metadata,
     )
 
     extras = {
@@ -1566,8 +1634,8 @@ def run_evaluation(
         "custom_validation": {
             name: validation.to_dict() for name, validation in (custom_validations or {}).items()
         },
-        "task12_validation": {
-            name: validation.to_dict() for name, validation in task12_validations.items()
+        "release_evidence_validation": {
+            name: validation.to_dict() for name, validation in release_evidence_validations.items()
         },
         "syntheval_benchmark_results": benchmark_results,
         "syntheval_benchmark_ranks": benchmark_ranks,

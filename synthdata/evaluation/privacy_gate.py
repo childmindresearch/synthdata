@@ -270,8 +270,8 @@ def _resolve_gate_contract(
             return None, "threshold contract_id must be a non-empty string", None, "main", None
         try:
             contract = registry.get(contract_id)
-        except UnknownMetricContractError as exc:
-            return None, str(exc), None, "main", requested_framework
+        except UnknownMetricContractError:
+            return None, "unknown_metric_contract", None, "main", requested_framework
         if requested_framework is not None and requested_framework != contract.framework:
             return (
                 contract,
@@ -374,8 +374,14 @@ def _resolve_gate_contract(
                     emitted_key=emitted_key,
                     execution_pass=execution_pass,
                 )
-            except (UnknownMetricContractError, AmbiguousMetricContractError) as exc:
-                return None, str(exc), None, execution_pass, requested_framework
+            except (UnknownMetricContractError, AmbiguousMetricContractError):
+                return (
+                    None,
+                    "No metric contract resolved for threshold",
+                    None,
+                    execution_pass,
+                    requested_framework,
+                )
 
     if contract is None:
         return None, f"no contract resolved for threshold {metric_name!r}", None, "main", None

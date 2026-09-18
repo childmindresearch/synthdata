@@ -3,6 +3,8 @@ comparisons and Optuna HPO diagnostic plots (optimization history, parameter
 importances, slice plots).
 """
 
+import hashlib
+import re
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +12,7 @@ import pandas as pd
 
 from synthdata.config import Config
 from synthdata.data import Dataset
+from synthdata.evaluation.syntheval_eval import _safe_output_directory
 from synthdata.generation.hpo import (
     HPO_CONTEXT_SCHEMA_VERSION,
     contextual_study_name,
@@ -25,6 +28,14 @@ from synthdata.plotting import (
 from synthdata.utils import get_logger, load_json
 
 logger = get_logger(__name__)
+
+_PLOT_FAILURE_REASON = "plot_generation_failed"
+
+
+def _model_artifact_id(model_name: str) -> str:
+    """Return canonical bounded ID used for model-specific plot paths."""
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", model_name).strip("-") or "model"
+    return f"{slug}-{hashlib.sha256(model_name.encode()).hexdigest()[:12]}"
 
 
 def _category_value_counts(series: pd.Series) -> pd.Series:
@@ -119,7 +130,7 @@ def save_generation_plots(
     """
     import matplotlib.pyplot as plt
 
-    output_dir = Path(output_dir) / "generation"
+    output_dir = _safe_output_directory(Path(output_dir), "generation", "Generation plot output")
     real_model_df = dataset.role_frame("train", imputed=True)
     if real_model_df is None:
         raise RuntimeError("save_generation_plots() requires imputed training data")
@@ -137,9 +148,19 @@ def save_generation_plots(
                 categorical,
                 category_orders=dataset.ordinal_category_orders,
             )
-            save_matplotlib_figure(fig, output_dir / name, cfg.plots.dpi, cfg.plots.formats)
+            model_path = output_dir / _model_artifact_id(name)
+            for fmt in cfg.plots.formats:
+                output_path = model_path.with_suffix(f".{fmt}")
+                if output_path.is_symlink():
+                    raise ValueError("Generation plot output must not be a symlink")
+            save_matplotlib_figure(fig, model_path, cfg.plots.dpi, cfg.plots.formats)
         except (ValueError, TypeError, OSError, RuntimeError) as exc:
-            logger.warning("real-vs-synthetic plot failed for %s: %s", name, exc)
+            logger.warning(
+                "real-vs-synthetic plot failed for model=%s reason=%s exception_type=%s",
+                name,
+                _PLOT_FAILURE_REASON,
+                type(exc).__name__,
+            )
         finally:
             plt.close("all")
 
@@ -212,7 +233,7 @@ def save_hpo_plots(
             )
 
     storage = gen_cfg.hpo.storage or default_storage_url(gen_cfg.output_dir)
-    output_dir = Path(output_dir) / "hpo"
+    output_dir = _safe_output_directory(Path(output_dir), "hpo", "HPO plot output")
 
     study_names = []
     if gen_cfg.synthcity.enabled:
@@ -238,14 +259,29 @@ def save_hpo_plots(
                 f"HPO study {study_name!r} context does not match the persisted generation context"
             )
         try:
+            model_id = _model_artifact_id(study_name)
+            output_paths = [
+                output_dir / f"{model_id}_history.html",
+                output_dir / f"{model_id}_param_importances.html",
+                output_dir / f"{model_id}_slice.html",
+            ]
+            if any(path.is_symlink() for path in output_paths):
+                raise ValueError("HPO plot output must not be a symlink")
             save_plotly_figure(
-                plot_optimization_history(study), output_dir / f"{study_name}_history", ("html",)
+                plot_optimization_history(study),
+                output_dir / f"{model_id}_history",
+                ("html",),
             )
             save_plotly_figure(
                 plot_param_importances(study),
-                output_dir / f"{study_name}_param_importances",
+                output_dir / f"{model_id}_param_importances",
                 ("html",),
             )
-            save_plotly_figure(plot_slice(study), output_dir / f"{study_name}_slice", ("html",))
+            save_plotly_figure(plot_slice(study), output_dir / f"{model_id}_slice", ("html",))
         except (ValueError, RuntimeError, OSError) as exc:
-            logger.warning("HPO plots failed for %s: %s", study_name, exc)
+            logger.warning(
+                "HPO plots failed for model=%s reason=%s exception_type=%s",
+                study_name,
+                _PLOT_FAILURE_REASON,
+                type(exc).__name__,
+            )

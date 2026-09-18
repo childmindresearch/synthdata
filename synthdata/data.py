@@ -14,8 +14,11 @@ downstream stage (imputation, generation, evaluation, plotting).
 import dataclasses
 import hashlib
 import json
+import os
+import tempfile
 import types
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -61,8 +64,18 @@ def file_fingerprint(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def role_context_payload(dataset, roles: tuple[str, ...] = ROLE_NAMES) -> dict:
-    """Describe the named role inputs and provenance used by one operation."""
+def role_context_payload(
+    dataset,
+    roles: tuple[str, ...] = ROLE_NAMES,
+    *,
+    candidate_phase: bool = False,
+) -> dict:
+    """Describe named role inputs and provenance used by one operation.
+
+    Candidate contexts deliberately record ``final_holdout`` as raw-equivalent:
+    final-phase imputation has not yet been validated and must not become part
+    of generation experiment lineage.
+    """
     role_set = set(roles)
     assignment_fingerprint = None
     assignment = dataset.assignment
@@ -82,7 +95,9 @@ def role_context_payload(dataset, roles: tuple[str, ...] = ROLE_NAMES) -> dict:
                 dataframe_fingerprint(raw_frame) if raw_frame is not None else None
             ),
             "imputed_fingerprint": (
-                dataframe_fingerprint(imputed_frame) if imputed_frame is not None else None
+                dataframe_fingerprint(raw_frame)
+                if candidate_phase and role == "final_holdout" and raw_frame is not None
+                else (dataframe_fingerprint(imputed_frame) if imputed_frame is not None else None)
             ),
             "rows": int(len(frame)),
         }
@@ -106,11 +121,116 @@ def role_context_payload(dataset, roles: tuple[str, ...] = ROLE_NAMES) -> dict:
     }
 
 
-def role_context_fingerprint(dataset, roles: tuple[str, ...] = ROLE_NAMES) -> str:
-    """Hash the exact role inputs and split/schema provenance for an operation."""
-    payload = role_context_payload(dataset, roles)
+def role_context_fingerprint(
+    dataset,
+    roles: tuple[str, ...] = ROLE_NAMES,
+    *,
+    candidate_phase: bool = False,
+) -> str:
+    """Hash exact role inputs and split/schema provenance for an operation."""
+    payload = role_context_payload(dataset, roles, candidate_phase=candidate_phase)
     encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
     return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def validate_imputation_cache_lineage(
+    dataset,
+    cache_record: Mapping[str, object] | None,
+    *,
+    required: bool = False,
+) -> None:
+    """Fail closed when candidate imputation metadata is stale or incomplete.
+
+    This validation is intentionally separate from :func:`load_imputed_splits`,
+    which historically treats stale CSVs as a cache miss. Generation must not
+    proceed on that permissive path because its experiment lineage would then
+    be ambiguous.
+    """
+    if cache_record is None:
+        if required:
+            raise RuntimeError(
+                "Candidate imputation lineage is unavailable; rerun imputation before generation."
+            )
+        return
+    if not dataset.has_canonical_roles:
+        return
+    persisted_path = dataset.data_dir / IMPUTATION_CACHE_KEY_FILENAME
+    try:
+        with persisted_path.open() as cache_file:
+            persisted_record = json.load(cache_file)
+    except (OSError, json.JSONDecodeError) as exc:
+        if required:
+            raise RuntimeError(
+                "Candidate imputation lineage metadata is unreadable; "
+                "rerun imputation before generation."
+            ) from exc
+        return
+    if not isinstance(persisted_record, dict):
+        raise RuntimeError("Candidate imputation lineage metadata is not an object")
+    expected_cache_key = cache_record.get("cache_key")
+    if persisted_record.get("cache_key") != expected_cache_key:
+        raise RuntimeError(
+            "Candidate imputation cache key does not match current dataset lineage; "
+            "rerun imputation before generation."
+        )
+    expected = {
+        "dataset_version": dataset.version,
+        "variable_schema_fingerprint": dataset.variable_schema_fingerprint,
+        "assignment_fingerprint": dataset.assignment_fingerprint,
+        "assignment_policy_fingerprint": dataset.assignment_policy_fingerprint,
+        "identity_fingerprint": dataset.role_metadata.get("identity", {}).get(
+            "identity_fingerprint"
+        ),
+        "semantic_fingerprint": dataset.semantic_fingerprint,
+        "role_fingerprints": dataset.role_fingerprints,
+    }
+    mismatches = {
+        field: (persisted_record.get(field), value)
+        for field, value in expected.items()
+        if persisted_record.get(field) != value
+    }
+    if mismatches:
+        raise RuntimeError(
+            "Candidate imputation cache lineage does not match current dataset; "
+            f"rerun imputation before generation (mismatches={mismatches})."
+        )
+    if (
+        persisted_record.get("cache_contract") == "canonical_roles_v1"
+        and persisted_record.get("imputation_method") == "hyperimpute"
+        and not _canonical_candidate_fit_state_is_valid(dataset, persisted_record)
+    ):
+        raise RuntimeError(
+            "Candidate HyperImpute fit state is missing or invalid; "
+            "rerun imputation before generation."
+        )
+
+
+def _canonical_candidate_fit_state_is_valid(dataset, cache_record: Mapping[str, object]) -> bool:
+    """Validate persisted candidate HyperImpute state before generation."""
+    state = cache_record.get("fit_state")
+    if not isinstance(state, dict):
+        return False
+    if state.get("status") not in {"fitted", "not_required", "disabled"}:
+        return False
+    if state.get("backend") != "hyperimpute":
+        return False
+    if state.get("fit_frame_fingerprint_version") != "dataframe_fingerprint_v1":
+        return False
+    if state.get("fit_roles") != ["train"] or state.get("transform_roles") != ["train", "tuning"]:
+        return False
+    if state.get("continuous_plugin") != cache_record.get("continuous_plugin"):
+        return False
+    if state.get("categorical_plugin") != "most_frequent":
+        return False
+    if state.get("fit_frame_fingerprint") != dataframe_fingerprint(dataset.roles["train"]):
+        return False
+    if state.get("feature_columns") != list(dataset.feature_columns):
+        return False
+    if state.get("categorical_columns") != list(dataset.categorical_columns):
+        return False
+    from synthdata.imputation.hyperimpute_backend import metadata_fingerprint
+
+    return state.get("state_fingerprint") == metadata_fingerprint(state)
 
 
 SEMANTIC_CONTEXT_SCHEMA_VERSION = "semantic-context-v1"
@@ -163,6 +283,7 @@ def semantic_context_payload(
         "tokenization_algorithm": identity_metadata.get("tokenization_algorithm"),
         "tokenization_version": identity_metadata.get("tokenization_version"),
         "tokenization_scope_fingerprint": identity_metadata.get("tokenization_scope_fingerprint"),
+        "hmac_key_fingerprint": identity_metadata.get("hmac_key_fingerprint"),
     }
     payload = {
         "schema_version": SEMANTIC_CONTEXT_SCHEMA_VERSION,
@@ -380,13 +501,28 @@ def validate_semantic_context(
         raise ValueError("semantic_context sensitive_columns contain unknown modeling columns")
     if not isinstance(context["release_generalization"], Mapping):
         raise ValueError("semantic_context.release_generalization must be an object")
+    sensitive_qi_overlap = sorted(
+        set(context["sensitive_columns"]) & set(context["quasi_identifier_columns"])
+    )
+    if sensitive_qi_overlap:
+        raise ValueError(
+            "semantic_context sensitive_columns must not overlap quasi_identifier_columns: "
+            f"{sensitive_qi_overlap}"
+        )
+    sensitive_target_overlap = sorted(set(context["sensitive_columns"]) & {target_column})
+    if sensitive_target_overlap:
+        raise ValueError(
+            "semantic_context sensitive_columns must not overlap target_column: "
+            f"{sensitive_target_overlap}"
+        )
+    qi_target_overlap = sorted(set(context["quasi_identifier_columns"]) & {target_column})
+    if qi_target_overlap:
+        raise ValueError(
+            "semantic_context quasi_identifier_columns must not overlap target_column: "
+            f"{qi_target_overlap}"
+        )
     if not set(context["quasi_identifier_columns"]) <= set(expected_features):
         raise ValueError("semantic_context quasi_identifier_columns contain non-feature columns")
-    overlap = sorted(set(context["quasi_identifier_columns"]) & set(context["protected_columns"]))
-    if overlap:
-        raise ValueError(
-            f"semantic_context quasi_identifier_columns overlap protected_columns: {overlap}"
-        )
 
     feature_types = dict(context["feature_types"])
     if set(feature_types) != set(model_columns):
@@ -628,7 +764,7 @@ class Dataset:
 
     @property
     def categorical_columns(self) -> list:
-        """All categorical-encoded feature columns: nominal + ordinal.
+        """All categorical-encoded feature columns in feature-column order.
 
         Every backend that discretely encodes categorical columns (bit-encoding
         in refidiff, one-hot in tabimpute, etc.) doesn't itself need to
@@ -639,7 +775,8 @@ class Dataset:
         So most call sites want this combined list; use ``nominal_columns``/
         ``ordinal_columns`` directly only when the distinction actually matters.
         """
-        return list(self.nominal_columns) + list(self.ordinal_columns)
+        categorical = set(self.nominal_columns) | set(self.ordinal_columns)
+        return [column for column in self.feature_columns if column in categorical]
 
     @property
     def ordinal_category_orders(self) -> dict:
@@ -1532,7 +1669,7 @@ def _persist_role_assignment(dataset: Dataset, assignment: RoleAssignment) -> No
                 {
                     "assignment_fingerprint": assignment.assignment_fingerprint,
                     "assignment_policy_fingerprint": assignment.assignment_policy_fingerprint,
-                    "assignment_path": str(assignment_path),
+                    "assignment_path": str(assignment_path.relative_to(dataset.data_dir)),
                     "metadata": assignment.metadata,
                     "created_at": datetime.now(UTC).isoformat(),
                     "git_commit": git_commit(),
@@ -1548,7 +1685,7 @@ def _persist_role_assignment(dataset: Dataset, assignment: RoleAssignment) -> No
                 "assignment_fingerprint": assignment.assignment_fingerprint,
                 "assignment_policy_fingerprint": assignment.assignment_policy_fingerprint,
                 "assignment_id": assignment_id,
-                "assignment_manifest": str(manifest_path),
+                "assignment_manifest": str(manifest_path.relative_to(dataset.data_dir)),
             },
             pointer_file,
             indent=2,
@@ -1574,6 +1711,7 @@ def _validate_loader_column_declarations(
     target_column: str,
     split_cfg,
 ) -> dict[str, list[str]]:
+    drop_columns = [] if cfg.data.drop_columns is None else cfg.data.drop_columns
     declarations = {
         "protected_columns": list(cfg.data.protected_columns),
         "sensitive_columns": list(cfg.data.sensitive_columns),
@@ -1582,17 +1720,17 @@ def _validate_loader_column_declarations(
     identity_columns = _configured_identity_columns(split_cfg)
     conflicts = {
         "target/identity": sorted({target_column} & identity_columns),
-        "target/drop": sorted({target_column} & set(cfg.data.drop_columns)),
+        "target/drop": sorted({target_column} & set(drop_columns)),
     }
     for declaration_name, columns in declarations.items():
         conflicts[f"{declaration_name}/identity"] = sorted(set(columns) & identity_columns)
-        conflicts[f"{declaration_name}/drop"] = sorted(set(columns) & set(cfg.data.drop_columns))
+        conflicts[f"{declaration_name}/drop"] = sorted(set(columns) & set(drop_columns))
 
     encounter_column = split_cfg.encounter_label_column if split_cfg is not None else None
     if encounter_column is not None:
         conflicts["encounter/target"] = sorted({encounter_column} & {target_column})
         conflicts["encounter/identity"] = sorted({encounter_column} & identity_columns)
-        conflicts["encounter/drop"] = sorted({encounter_column} & set(cfg.data.drop_columns))
+        conflicts["encounter/drop"] = sorted({encounter_column} & set(drop_columns))
         for declaration_name, columns in declarations.items():
             conflicts[f"encounter/{declaration_name}"] = sorted({encounter_column} & set(columns))
 
@@ -1653,7 +1791,10 @@ def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
                 "assignment_policy_fingerprint": dataset.assignment_policy_fingerprint,
                 "semantic_fingerprint": dataset.semantic_fingerprint,
                 "n_roles": {role: int(len(dataset.roles[role])) for role in ROLE_NAMES},
-                "role_paths": {role: str(dataset.paths()[role]) for role in ROLE_NAMES},
+                "role_paths": {
+                    role: str(dataset.paths()[role].relative_to(dataset.data_dir))
+                    for role in ROLE_NAMES
+                },
             }
         )
     else:
@@ -1671,8 +1812,31 @@ def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
                 ],
             }
         )
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2, default=str)
+    key_fingerprint = dataset.role_metadata.get("identity", {}).get("hmac_key_fingerprint")
+    if key_fingerprint is not None:
+        manifest["hmac_key_fingerprint"] = key_fingerprint
+    temporary_path: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{manifest_path.name}.", dir=manifest_path.parent
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as manifest_file:
+            json.dump(manifest, manifest_file, indent=2, default=str)
+            manifest_file.flush()
+            os.fsync(manifest_file.fileno())
+        os.replace(temporary_path, manifest_path)
+        temporary_path = None
+        if os.name == "posix":
+            directory_fd = os.open(manifest_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if temporary_path is not None:
+            with suppress(FileNotFoundError):
+                temporary_path.unlink()
 
 
 def load_dataset(cfg: Config) -> Dataset:
@@ -1685,6 +1849,26 @@ def load_dataset(cfg: Config) -> Dataset:
     data_dir_base = Path(cfg.data.data_dir)
     data_version_scope = f"data_v_{cfg.data.version}" if cfg.data.version else "data_v_unversioned"
     data_dir = ensure_dir(data_dir_base / data_version_scope)
+    prior_manifest_path = data_dir / "dataset_manifest.json"
+    expected_key_fingerprint = None
+    if prior_manifest_path.exists():
+        try:
+            prior_manifest = json.loads(prior_manifest_path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ValueError("Dataset manifest read failed: io_error") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError("Dataset manifest read failed: invalid_json") from exc
+        if not isinstance(prior_manifest, dict):
+            raise ValueError("Dataset manifest validation failed: invalid_structure")
+        if set(prior_manifest.get("role_names", ())) == set(ROLE_NAMES) and (
+            "hmac_key_fingerprint" not in prior_manifest
+        ):
+            raise ValueError(
+                "Existing canonical dataset manifest has no patient identity key fingerprint; "
+                "refusing to bootstrap or rewrite identity. Perform an explicit identity "
+                "migration or rotation before loading this dataset."
+            )
+        expected_key_fingerprint = prior_manifest.get("hmac_key_fingerprint")
 
     if cfg.data.source == "uci":
         df, variable_types = _load_uci(cfg, data_dir)
@@ -1760,7 +1944,13 @@ def load_dataset(cfg: Config) -> Dataset:
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
-    identity = resolve_population_identity(df, split_cfg, token_scope=token_scope)
+    identity = resolve_population_identity(
+        df,
+        split_cfg,
+        token_scope=token_scope,
+        token_key_path=data_dir_base / ".patient_id_hmac_key",
+        expected_key_fingerprint=expected_key_fingerprint,
+    )
     df = identity.model_frame
     groups = identity.groups
     if identity.identity_sidecar is not None:
@@ -1999,21 +2189,37 @@ def load_dataset(cfg: Config) -> Dataset:
 def load_imputed_splits(
     dataset: Dataset,
     expected_cache_key: str | None = None,
+    phase: str = "candidate",
 ) -> Dataset:
-    """Attach imputed role CSVs only when their provenance still matches."""
+    """Attach imputed role CSVs only when their provenance still matches.
+
+    Canonical caches carry phase-aware fit/transform metadata.  ``candidate``
+    is the default because generation and downstream candidate evaluation use
+    the train-fitted cache; final refits can request ``phase="final"``.
+    """
+    if phase not in {"candidate", "final"}:
+        raise ValueError(f"Unsupported imputation cache phase: {phase!r}")
     paths = dataset.paths()
-    if dataset.has_canonical_roles:
-        imputed_paths = {role: paths[f"{role}_imputed"] for role in ROLE_NAMES}
+    if dataset.has_canonical_roles and phase == "final":
+        # Final refit artifacts must coexist with candidate artifacts. Keeping
+        # them phase-specific prevents final evaluation from invalidating the
+        # train-fitted cache used by generation.
+        final_dir = dataset.data_dir / "imputation_final"
+        imputed_paths = {role: final_dir / f"{role}_imputed.csv" for role in ROLE_NAMES}
+        provenance_path = final_dir / IMPUTATION_CACHE_KEY_FILENAME
     else:
-        imputed_paths = {
-            "full": paths["full_imputed"],
-            "train": paths["train_imputed"],
-            "test": paths["test_imputed"],
-        }
+        provenance_path = dataset.data_dir / IMPUTATION_CACHE_KEY_FILENAME
+        if dataset.has_canonical_roles:
+            imputed_paths = {role: paths[f"{role}_imputed"] for role in ROLE_NAMES}
+        else:
+            imputed_paths = {
+                "full": paths["full_imputed"],
+                "train": paths["train_imputed"],
+                "test": paths["test_imputed"],
+            }
     if not all(path.exists() for path in imputed_paths.values()):
         return dataset
 
-    provenance_path = dataset.data_dir / IMPUTATION_CACHE_KEY_FILENAME
     if not provenance_path.exists():
         logger.warning(
             "Ignoring imputed CSVs under %s because provenance file %s is missing; "
@@ -2046,6 +2252,13 @@ def load_imputed_splits(
         return dataset
 
     if dataset.has_canonical_roles:
+        fit_roles = ["train"] if phase == "candidate" else ["train", "tuning"]
+        transform_roles = ["train", "tuning"] if phase == "candidate" else ["final_holdout"]
+        fit_frame = (
+            dataset.roles["train"]
+            if phase == "candidate"
+            else pd.concat([dataset.roles["train"], dataset.roles["tuning"]], axis=0)
+        )
         expected_provenance = {
             "cache_contract": "canonical_roles_v1",
             "source_fingerprint": dataset.source_fingerprint,
@@ -2054,8 +2267,10 @@ def load_imputed_splits(
             "role_fingerprints": dataset.role_fingerprints,
             "assignment_fingerprint": dataset.assignment_fingerprint,
             "semantic_fingerprint": dataset.semantic_fingerprint,
-            "fit_role": "train",
-            "fit_role_fingerprint": dataset.role_fingerprints["train"],
+            "phase": phase,
+            "fit_roles": fit_roles,
+            "transform_roles": transform_roles,
+            "fit_frame_fingerprint": dataframe_fingerprint(fit_frame),
         }
     else:
         assert dataset.train_df is not None

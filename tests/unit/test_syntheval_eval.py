@@ -37,10 +37,17 @@ from synthdata.evaluation.syntheval_eval import (
     _failed_execution_payload,
     _frame_fingerprint,
     _load_syntheval_cache,
+    _load_syntheval_execution_sidecars,
+    _native_plot_dir,
     _run_resumable_syntheval,
+    _safe_failure_evidence,
+    _safe_value_digest,
+    _sanitize_execution_payload,
     _save_syntheval_cache,
     _shutdown_nested_joblib_executor,
     _structured_observations,
+    _synthetic_unseen_categorical_values,
+    _validated_cached_syntheval_tables,
     build_binary_preset,
     build_binary_target_series,
     build_group_context,
@@ -56,6 +63,79 @@ from synthdata.evaluation.syntheval_eval import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_safe_failure_evidence_discards_untrusted_exception_and_exit_details():
+    evidence = _safe_failure_evidence(
+        exception_type="ValueError: /secret/checkpoint/status.json",
+        reason="worker exploded; traceback=/secret/traceback",
+        exit_code="1",
+    )
+
+    assert evidence["error_type"] == "WorkerExit"
+    assert evidence["reason_code"] == "unknown_exception"
+    assert evidence["failure_reason"] == "SynthEval worker failed with an unknown error."
+    assert evidence["exit_code"] is None
+    assert evidence["reason_detail_digest"] == _safe_value_digest(
+        "worker exploded; traceback=/secret/traceback"
+    )
+
+
+def test_runtime_unknown_category_exception_is_classified_and_redacted():
+    sentinel = "sentinel-unknown-category"
+    evidence = _safe_failure_evidence(
+        exception_type="ValueError",
+        reason=f"Found unknown categories: {sentinel}",
+        exit_code=1,
+    )
+
+    serialized = json.dumps(evidence)
+    assert evidence["reason_code"] == "synthetic_unknown_category"
+    assert evidence["reason_detail_digest"] == _safe_value_digest(
+        f"Found unknown categories: {sentinel}"
+    )
+    assert sentinel not in serialized
+
+
+def test_safe_failure_evidence_preserves_safe_classification_only():
+    evidence = _safe_failure_evidence(
+        exception_type="ValueError", reason="unknown target in /secret/input.csv", exit_code=1
+    )
+
+    assert evidence["error_type"] == "ValueError"
+    assert evidence["reason_code"] == "unknown_target"
+    assert evidence["failure_reason"] == "Synthetic data failed target validation."
+    assert evidence["exit_code"] == 1
+
+
+def test_sanitize_execution_payload_recursively_removes_nested_worker_evidence():
+    payload = {
+        "model_name": "model_a",
+        "metric_executions": [
+            {
+                "status": {
+                    "state": "failed",
+                    "exception": "sentinel exception body",
+                    "exception_traceback": "sentinel traceback",
+                    "failure_reason": "sentinel /secret/checkpoint.json",
+                    "checkpoint_path": "/secret/checkpoint.json",
+                    "nested": {
+                        "traceback": "sentinel nested traceback",
+                        "path": "/secret/nested.json",
+                    },
+                }
+            }
+        ],
+    }
+
+    sanitized = _sanitize_execution_payload(payload)
+    serialized = json.dumps(sanitized)
+
+    assert "sentinel" not in serialized
+    assert "/secret" not in serialized
+    status = sanitized["metric_executions"][0]["status"]
+    assert status["reason_code"] == "unknown_exception"
+    assert status["failure_reason"] == "SynthEval worker failed with an unknown error."
 
 
 def _model_index(*names: str) -> pd.Index:
@@ -103,6 +183,14 @@ class TestJoblibCleanup:
         with pytest.raises(ValueError, match="CGAS_class"):
             build_binary_target_series(series, positive_classes=[0], negative_classes=[2])
 
+    def test_native_plot_dir_uses_bounded_model_id(self, tmp_path):
+        model_name = "../team/model: candidate"
+
+        plot_dir = _native_plot_dir(tmp_path, model_name)
+
+        assert plot_dir.parent == tmp_path.resolve()
+        assert plot_dir.resolve().parent == tmp_path.resolve()
+
     def test_unmapped_value_message_lists_offending_value(self):
         series = pd.Series([0, 1, 2], name="t")
         with pytest.raises(ValueError, match=r"\[1\]"):
@@ -145,6 +233,648 @@ class TestBuildPreset:
 
 
 class TestEvaluationRoleContext:
+    def test_binary_mixed_inventory_survives_fresh_and_cached_paths(
+        self, make_canonical_dataset, tmp_path, monkeypatch
+    ):
+        dataset = make_canonical_dataset()
+        valid = dataset.role_frame("train", imputed=True).copy()
+        valid.loc[valid.index[:4], "target"] = [0, 1, 2, 2]
+        invalid = valid.drop(columns=["target"])
+        selection = FrameworkSelectionConfig(metrics=["auroc_diff"])
+        binary_cfg = SimpleNamespace(column="target", positive_classes=[1], negative_classes=[0, 2])
+        worker_inputs = []
+
+        valid_execution = {
+            "model_name": "valid_model",
+            "schema_version": "syntheval-execution-v1",
+            "execution_complete": True,
+            "execution_succeeded": True,
+            "policy_eligible": True,
+            "metric_executions": [
+                {
+                    "method": "auroc_diff",
+                    "status": {
+                        "method": "auroc_diff",
+                        "state": "succeeded",
+                        "expected_keys": ["auroc_v2"],
+                        "observed_keys": ["auroc_v2"],
+                        "completed_keys": ["auroc_v2"],
+                        "failed_keys": [],
+                        "missing_keys": [],
+                        "duplicate_keys": [],
+                        "non_finite_keys": [],
+                        "unexpected_keys": [],
+                    },
+                    "normalized_rows_v2": [
+                        {
+                            "metric": "auroc_v2",
+                            "dim": "u",
+                            "val": 0.2,
+                            "err": 0.0,
+                            "n_val": 0.8,
+                            "n_err": 0.0,
+                            "raw_value": 0.2,
+                            "normalized_value": 0.8,
+                            "metric_version": "v2",
+                        }
+                    ],
+                    "normalized_rows": [],
+                }
+            ],
+        }
+
+        class FakeProcess:
+            def __init__(self, target, args, **_kwargs):
+                self.target = target
+                self.args = args
+                self.exitcode = None
+                self.pid = 1
+
+            def start(self):
+                worker_inputs.append({self.args[0]})
+                self.target(*self.args)
+                self.exitcode = 0
+
+            def is_alive(self):
+                return False
+
+            def join(self):
+                return None
+
+        class FakeContext:
+            Process = FakeProcess
+
+        def fake_model_worker(
+            model_name,
+            frame,
+            _real_frame,
+            _holdout_frame,
+            _cat_cols,
+            _target_column,
+            _sensitive_columns,
+            _protected_columns,
+            _preset_path,
+            checkpoint_root,
+            pass_name,
+            expected_output_manifest,
+            target_view,
+            expected_manifest_digest,
+            context_fingerprint,
+            model_fingerprint,
+            *_unused,
+        ):
+            checkpoint_root = Path(checkpoint_root)
+            execution = {**valid_execution, "model_name": model_name}
+            execution["model_fingerprint"] = model_fingerprint
+            execution["pass_id"] = pass_name
+            execution["target_view"] = target_view
+            execution["expected_manifest_digest"] = expected_manifest_digest
+            execution["context_fingerprint"] = context_fingerprint
+            expected_keys = list(expected_output_manifest["auroc_diff"])
+            execution["metric_executions"][0]["status"].update(
+                {
+                    "expected_keys": expected_keys,
+                    "observed_keys": expected_keys,
+                    "completed_keys": expected_keys,
+                }
+            )
+            model_dir, status_path, result_path = _checkpoint_paths(
+                checkpoint_root, pass_name, model_name
+            )
+            model_dir.mkdir(parents=True, exist_ok=True)
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "state": "succeeded",
+                        "model_name": model_name,
+                        "context_fingerprint": context_fingerprint,
+                        "model_fingerprint": model_fingerprint,
+                        "expected_manifest_digest": expected_manifest_digest,
+                        "plots_completed": False,
+                    }
+                )
+            )
+            result, ranks = build_syntheval_tables_from_executions(
+                {model_name: execution}, [model_name], "linear"
+            )
+            result.to_parquet(result_path)
+            (model_dir / "execution.json").write_text(json.dumps(execution))
+
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval.multiprocessing.get_context",
+            lambda _method: FakeContext(),
+        )
+        monkeypatch.setattr("synthdata.evaluation.syntheval_eval._model_worker", fake_model_worker)
+
+        first_results, first_ranks, first_executions = run_binary_target_syntheval_evaluation(
+            {"valid_model": valid, "invalid_model": invalid},
+            dataset,
+            selection,
+            binary_cfg,
+            preset_dir=tmp_path,
+            output_folder=tmp_path / "binary",
+            return_execution=True,
+        )
+
+        assert worker_inputs == [{"valid_model"}]
+        assert list(first_results.index) == ["valid_model", "invalid_model"]
+        assert list(first_ranks.index) == ["valid_model", "invalid_model"]
+        assert pd.notna(first_results.loc["valid_model", ("auroc_v2", "value")])
+        assert pd.isna(first_results.loc["invalid_model", ("auroc_v2", "value")])
+        assert pd.isna(first_ranks.loc["invalid_model", "auroc_v2"])
+        assert first_executions["invalid_model"]["execution_succeeded"] is False
+        assert first_executions["invalid_model"]["policy_eligible"] is False
+        assert (
+            first_executions["invalid_model"]["worker_exit"]["reason_code"]
+            == "synthetic_binary_target_invalid"
+        )
+        assert first_executions["invalid_model"]["worker_exit"]["state"] == "failed"
+        sidecar_path = (
+            tmp_path
+            / "binary"
+            / "checkpoints-v1"
+            / "binary_target"
+            / _checkpoint_paths(tmp_path / "binary", "binary_target", "valid_model")[0].name
+            / "execution.json"
+        )
+        assert json.loads(sidecar_path.read_text())["model_fingerprint"] == _frame_fingerprint(
+            valid
+        )
+        assert (
+            _load_syntheval_execution_sidecars(
+                tmp_path / "binary",
+                "binary_target",
+                ["valid_model", "invalid_model"],
+                first_executions["valid_model"]["expected_manifest_digest"],
+                first_executions["valid_model"]["context_fingerprint"],
+                expected_manifest={"auroc_diff": ("auroc_v2",)},
+                expected_target_view="binary_collapsed",
+                model_fingerprints={
+                    "valid_model": _frame_fingerprint(valid),
+                    "invalid_model": _frame_fingerprint(invalid),
+                },
+            )
+            is not None
+        )
+
+        def fail_if_worker_runs(*args, **kwargs):
+            raise AssertionError("cached binary aggregate must not reschedule workers")
+
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval._run_resumable_syntheval",
+            fail_if_worker_runs,
+        )
+        second_results, second_ranks, second_executions = run_binary_target_syntheval_evaluation(
+            {"valid_model": valid, "invalid_model": invalid},
+            dataset,
+            selection,
+            binary_cfg,
+            preset_dir=tmp_path,
+            output_folder=tmp_path / "binary",
+            return_execution=True,
+        )
+
+        pd.testing.assert_frame_equal(first_results, second_results, check_dtype=False)
+        pd.testing.assert_frame_equal(first_ranks, second_ranks, check_dtype=False)
+        assert set(second_executions) == {"valid_model", "invalid_model"}
+        assert second_executions["invalid_model"]["policy_eligible"] is False
+
+    def test_binary_preprocessing_failure_uses_complete_inventory_in_fresh_path(
+        self, make_canonical_dataset, tmp_path, monkeypatch
+    ):
+        dataset = make_canonical_dataset()
+        bad = dataset.role_frame("train", imputed=True).copy()
+        bad["target"] = 99
+        process_boundary_calls = []
+
+        def fail_if_process_boundary_runs(_method):
+            process_boundary_calls.append(_method)
+            raise AssertionError("all-failed binary input must not reach process boundary")
+
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval.multiprocessing.get_context",
+            fail_if_process_boundary_runs,
+        )
+
+        first_results, first_ranks, first_executions = run_binary_target_syntheval_evaluation(
+            {"bad_model": bad},
+            dataset,
+            FrameworkSelectionConfig(),
+            SimpleNamespace(column="target", positive_classes=[1], negative_classes=[0]),
+            preset_dir=tmp_path,
+            output_folder=tmp_path / "binary",
+            return_execution=True,
+        )
+
+        second_results, second_ranks, second_executions = run_binary_target_syntheval_evaluation(
+            {"bad_model": bad},
+            dataset,
+            FrameworkSelectionConfig(),
+            SimpleNamespace(column="target", positive_classes=[1], negative_classes=[0]),
+            preset_dir=tmp_path,
+            output_folder=tmp_path / "binary",
+            return_execution=True,
+        )
+
+        assert process_boundary_calls == []
+        for results, ranks, executions in (
+            (first_results, first_ranks, first_executions),
+            (second_results, second_ranks, second_executions),
+        ):
+            assert list(results.index) == ["bad_model"]
+            assert list(ranks.index) == ["bad_model"]
+            assert executions["bad_model"]["execution_succeeded"] is False
+            assert executions["bad_model"]["policy_eligible"] is False
+            assert (
+                executions["bad_model"]["worker_exit"]["reason_code"]
+                == "synthetic_binary_target_invalid"
+            )
+
+        model_dir, _status_path, _result_path = _checkpoint_paths(
+            tmp_path / "binary", "binary_target", "bad_model"
+        )
+        assert json.loads((model_dir / "execution.json").read_text())["model_fingerprint"] == (
+            _frame_fingerprint(bad)
+        )
+
+    def test_binary_valid_only_reuses_complete_cache_without_worker(
+        self, make_canonical_dataset, tmp_path, monkeypatch
+    ):
+        dataset = make_canonical_dataset()
+        valid = dataset.role_frame("train", imputed=True).copy()
+        valid.loc[valid.index[:4], "target"] = [0, 1, 2, 2]
+        selection = FrameworkSelectionConfig(metrics=["auroc_diff"])
+        binary_cfg = SimpleNamespace(column="target", positive_classes=[1], negative_classes=[0, 2])
+        worker_calls = []
+        process_boundary_calls = []
+
+        class FakeProcess:
+            def __init__(self, target, args, **_kwargs):
+                self.target = target
+                self.args = args
+                self.exitcode = None
+                self.pid = 1
+
+            def start(self):
+                worker_calls.append(self.args[0])
+                self.target(*self.args)
+                self.exitcode = 0
+
+            def is_alive(self):
+                return False
+
+            def join(self):
+                return None
+
+        class FakeContext:
+            Process = FakeProcess
+
+        def fake_model_worker(
+            model_name,
+            _frame,
+            _real_frame,
+            _holdout_frame,
+            _cat_cols,
+            _target_column,
+            _sensitive_columns,
+            _protected_columns,
+            _preset_path,
+            checkpoint_root,
+            pass_name,
+            expected_output_manifest,
+            target_view,
+            expected_manifest_digest,
+            context_fingerprint,
+            model_fingerprint,
+            *_unused,
+        ):
+            expected_keys = list(expected_output_manifest["auroc_diff"])
+            execution = {
+                "model_name": model_name,
+                "schema_version": "syntheval-execution-v1",
+                "pass_id": pass_name,
+                "target_view": target_view,
+                "expected_manifest_digest": expected_manifest_digest,
+                "context_fingerprint": context_fingerprint,
+                "model_fingerprint": model_fingerprint,
+                "execution_complete": True,
+                "execution_succeeded": True,
+                "policy_eligible": True,
+                "metric_executions": [
+                    {
+                        "method": "auroc_diff",
+                        "status": {
+                            "method": "auroc_diff",
+                            "state": "succeeded",
+                            "expected_keys": expected_keys,
+                            "observed_keys": expected_keys,
+                            "completed_keys": expected_keys,
+                            "failed_keys": [],
+                            "missing_keys": [],
+                            "duplicate_keys": [],
+                            "non_finite_keys": [],
+                            "unexpected_keys": [],
+                        },
+                        "normalized_rows": [],
+                        "normalized_rows_v2": [
+                            {
+                                "metric": key,
+                                "dim": "u",
+                                "val": 0.2,
+                                "err": 0.0,
+                                "n_val": 0.8,
+                                "n_err": 0.0,
+                                "raw_value": 0.2,
+                                "normalized_value": 0.8,
+                                "metric_version": "v2",
+                            }
+                            for key in expected_keys
+                        ],
+                    }
+                ],
+            }
+            model_dir, status_path, result_path = _checkpoint_paths(
+                Path(checkpoint_root), pass_name, model_name
+            )
+            model_dir.mkdir(parents=True, exist_ok=True)
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "state": "succeeded",
+                        "model_name": model_name,
+                        "context_fingerprint": context_fingerprint,
+                        "model_fingerprint": model_fingerprint,
+                        "expected_manifest_digest": expected_manifest_digest,
+                        "plots_completed": False,
+                    }
+                )
+            )
+            result, _ranks = build_syntheval_tables_from_executions(
+                {model_name: execution}, [model_name], "linear"
+            )
+            result.to_parquet(result_path)
+            (model_dir / "execution.json").write_text(json.dumps(execution))
+
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval.multiprocessing.get_context",
+            lambda _method: process_boundary_calls.append(_method) or FakeContext(),
+        )
+        monkeypatch.setattr("synthdata.evaluation.syntheval_eval._model_worker", fake_model_worker)
+
+        first = run_binary_target_syntheval_evaluation(
+            {"valid_model": valid},
+            dataset,
+            selection,
+            binary_cfg,
+            preset_dir=tmp_path,
+            output_folder=tmp_path / "binary",
+            return_execution=True,
+        )
+        model_dir, _status_path, _result_path = _checkpoint_paths(
+            tmp_path / "binary", "binary_target", "valid_model"
+        )
+        sidecar_path = model_dir / "execution.json"
+        source_fingerprint = _frame_fingerprint(valid)
+        assert worker_calls == ["valid_model"]
+        assert pd.notna(first[0].loc["valid_model", ("auroc_v2", "value")])
+        assert pd.notna(first[1].loc["valid_model", "auroc_v2"])
+        assert json.loads(sidecar_path.read_text())["model_fingerprint"] == source_fingerprint
+
+        second = run_binary_target_syntheval_evaluation(
+            {"valid_model": valid},
+            dataset,
+            selection,
+            binary_cfg,
+            preset_dir=tmp_path,
+            output_folder=tmp_path / "binary",
+            return_execution=True,
+        )
+        pd.testing.assert_frame_equal(first[0], second[0], check_dtype=False)
+        pd.testing.assert_frame_equal(first[1], second[1], check_dtype=False)
+        assert second[2]["valid_model"]["model_fingerprint"] == source_fingerprint
+        assert json.loads(sidecar_path.read_text())["model_fingerprint"] == source_fingerprint
+        assert worker_calls == ["valid_model"]
+        assert len(process_boundary_calls) == 1
+
+    def test_binary_invalid_source_change_rejects_failed_cache(
+        self, make_canonical_dataset, tmp_path, monkeypatch
+    ):
+        dataset = make_canonical_dataset()
+        invalid = dataset.role_frame("train", imputed=True).copy()
+        invalid["target"] = 99
+        cfg = FrameworkSelectionConfig(metrics=["auroc_diff"])
+        binary_cfg = SimpleNamespace(column="target", positive_classes=[1], negative_classes=[0])
+
+        process_boundary_calls = []
+
+        def fail_if_process_boundary_runs(_method):
+            process_boundary_calls.append(_method)
+            raise AssertionError("invalid binary model must never reach worker")
+
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval.multiprocessing.get_context",
+            fail_if_process_boundary_runs,
+        )
+        first = run_binary_target_syntheval_evaluation(
+            {"invalid": invalid},
+            dataset,
+            cfg,
+            binary_cfg,
+            preset_dir=tmp_path,
+            output_folder=tmp_path / "binary",
+            return_execution=True,
+        )
+        meta_path = tmp_path / "binary" / "binary_target_cache_meta.json"
+        first_meta = json.loads(meta_path.read_text())
+        first_model_dir, _status_path, _result_path = _checkpoint_paths(
+            tmp_path / "binary", "binary_target", "invalid"
+        )
+        first_sidecar = json.loads((first_model_dir / "execution.json").read_text())
+        artifact_path = tmp_path / "binary" / "binary_target_results.parquet"
+        first_artifact_identity = (
+            artifact_path.stat().st_ino,
+            artifact_path.stat().st_mtime_ns,
+        )
+        invalid.loc[0, "feature"] += 1
+        second = run_binary_target_syntheval_evaluation(
+            {"invalid": invalid},
+            dataset,
+            cfg,
+            binary_cfg,
+            preset_dir=tmp_path,
+            output_folder=tmp_path / "binary",
+            return_execution=True,
+        )
+        second_meta = json.loads(meta_path.read_text())
+        second_sidecar = json.loads((first_model_dir / "execution.json").read_text())
+        second_artifact_identity = (
+            artifact_path.stat().st_ino,
+            artifact_path.stat().st_mtime_ns,
+        )
+
+        assert process_boundary_calls == []
+        assert first_meta["cache_key"] != second_meta["cache_key"]
+        assert first_sidecar["model_fingerprint"] != second_sidecar["model_fingerprint"]
+        assert first_artifact_identity != second_artifact_identity
+        assert second[2]["invalid"]["model_fingerprint"] == _frame_fingerprint(invalid)
+        assert list(first[0].index) == ["invalid"]
+        assert list(second[0].index) == ["invalid"]
+        assert pd.isna(second[0].loc["invalid", ("auroc_v2", "value")])
+        assert pd.isna(second[1].loc["invalid", "auroc_v2"])
+        assert second[2]["invalid"]["policy_eligible"] is False
+
+    def test_main_source_change_reprocesses_stale_cache(
+        self, make_canonical_dataset, tmp_path, monkeypatch
+    ):
+        dataset = make_canonical_dataset()
+        synthetic = dataset.role_frame("train", imputed=True).copy()
+        worker_calls = []
+
+        class FakeProcess:
+            def __init__(self, target, args, **_kwargs):
+                self.target = target
+                self.args = args
+                self.exitcode = None
+                self.pid = 1
+
+            def start(self):
+                worker_calls.append(self.args[0])
+                self.target(*self.args)
+                self.exitcode = 0
+
+            def is_alive(self):
+                return False
+
+            def join(self):
+                return None
+
+        class FakeContext:
+            Process = FakeProcess
+
+        def fake_model_worker(
+            model_name,
+            _frame,
+            _real_frame,
+            _holdout_frame,
+            _cat_cols,
+            _target_column,
+            _sensitive_columns,
+            _protected_columns,
+            _preset_path,
+            checkpoint_root,
+            pass_name,
+            expected_output_manifest,
+            target_view,
+            expected_manifest_digest,
+            context_fingerprint,
+            model_fingerprint,
+            *_unused,
+        ):
+            execution = {
+                "model_name": model_name,
+                "schema_version": "syntheval-execution-v1",
+                "pass_id": pass_name,
+                "target_view": target_view,
+                "expected_manifest_digest": expected_manifest_digest,
+                "context_fingerprint": context_fingerprint,
+                "model_fingerprint": model_fingerprint,
+                "execution_complete": True,
+                "execution_succeeded": True,
+                "policy_eligible": True,
+                "metric_executions": [
+                    {
+                        "method": "dwm",
+                        "status": {
+                            "method": "dwm",
+                            "state": "succeeded",
+                            "expected_keys": list(expected_output_manifest["dwm"]),
+                            "observed_keys": list(expected_output_manifest["dwm"]),
+                            "completed_keys": list(expected_output_manifest["dwm"]),
+                            "failed_keys": [],
+                            "missing_keys": [],
+                            "duplicate_keys": [],
+                            "non_finite_keys": [],
+                            "unexpected_keys": [],
+                        },
+                        "normalized_rows": [
+                            {
+                                "metric": key,
+                                "dim": "u",
+                                "val": 0.5,
+                                "err": 0.0,
+                                "n_val": 0.5,
+                                "n_err": 0.0,
+                            }
+                            for key in expected_output_manifest["dwm"]
+                        ],
+                        "normalized_rows_v2": [],
+                    }
+                ],
+            }
+            model_dir, status_path, result_path = _checkpoint_paths(
+                Path(checkpoint_root), pass_name, model_name
+            )
+            model_dir.mkdir(parents=True, exist_ok=True)
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "state": "succeeded",
+                        "model_name": model_name,
+                        "context_fingerprint": context_fingerprint,
+                        "model_fingerprint": model_fingerprint,
+                        "expected_manifest_digest": expected_manifest_digest,
+                        "plots_completed": False,
+                    }
+                )
+            )
+            result, ranks = build_syntheval_tables_from_executions(
+                {model_name: execution}, [model_name], "linear"
+            )
+            result.to_parquet(result_path)
+            (model_dir / "execution.json").write_text(json.dumps(execution))
+
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval.multiprocessing.get_context",
+            lambda _method: FakeContext(),
+        )
+        monkeypatch.setattr("synthdata.evaluation.syntheval_eval._model_worker", fake_model_worker)
+        cfg = FrameworkSelectionConfig(metrics=["dwm"])
+
+        first = run_syntheval_evaluation(
+            {"model_a": synthetic},
+            dataset,
+            cfg,
+            preset_dir=tmp_path,
+            output_folder=tmp_path / "main",
+            return_execution=True,
+        )
+        sidecar_path = _checkpoint_paths(tmp_path / "main", "main", "model_a")[0] / "execution.json"
+        first_sidecar = json.loads(sidecar_path.read_text())
+        status_path = _checkpoint_paths(tmp_path / "main", "main", "model_a")[1]
+        current_status = json.loads(status_path.read_text())
+        tampered_sidecar = {**first_sidecar, "model_fingerprint": "stale-or-tampered"}
+        sidecar_path.write_text(json.dumps(tampered_sidecar))
+
+        second = run_syntheval_evaluation(
+            {"model_a": synthetic},
+            dataset,
+            cfg,
+            preset_dir=tmp_path,
+            output_folder=tmp_path / "main",
+            return_execution=True,
+        )
+        second_sidecar = json.loads(sidecar_path.read_text())
+
+        assert worker_calls == ["model_a", "model_a"]
+        assert json.loads(status_path.read_text()) == current_status
+        assert tampered_sidecar["model_fingerprint"] != current_status["model_fingerprint"]
+        assert second_sidecar["model_fingerprint"] == _frame_fingerprint(synthetic)
+        assert second[2]["model_a"]["model_fingerprint"] == _frame_fingerprint(synthetic)
+        assert first[2]["model_a"]["model_fingerprint"] == second[2]["model_a"]["model_fingerprint"]
+
     def test_main_final_holdout_requires_both_released_inputs(
         self, make_canonical_dataset, tmp_path
     ):
@@ -267,6 +997,37 @@ class TestEvaluationRoleContext:
         )
         assert candidate_after == candidate_before
 
+    @pytest.mark.parametrize(
+        "values",
+        [["never-seen"], [["never-seen"]], [{"secret": "never-seen"}]],
+    )
+    def test_unseen_categorical_values_are_safe_for_unhashable_values(self, values):
+        fit = pd.DataFrame({"category": ["known"]})
+        synthetic = pd.DataFrame({"category": pd.Series(values, dtype=object)})
+
+        violations = _synthetic_unseen_categorical_values(synthetic, fit, ["category"])
+
+        assert violations["category"]["count"] == 1
+        assert violations["category"]["distinct_count"] == 1
+        assert len(violations["category"]["value_digests"][0]) == 64
+        assert "never-seen" not in json.dumps(violations)
+
+    def test_unseen_vocabulary_uses_fit_frame_only(self):
+        train = pd.DataFrame({"category": ["train-only"]})
+        tuning = pd.DataFrame({"category": ["tuning-only"]})
+        final = pd.DataFrame({"category": ["final-only"]})
+        candidate = pd.DataFrame({"category": ["tuning-only"]})
+        final_candidate = pd.DataFrame({"category": ["final-only"]})
+
+        assert _synthetic_unseen_categorical_values(candidate, train, ["category"])
+        assert _synthetic_unseen_categorical_values(
+            final_candidate, pd.concat([train, tuning]), ["category"]
+        )
+        assert not _synthetic_unseen_categorical_values(
+            tuning, pd.concat([train, tuning]), ["category"]
+        )
+        assert _synthetic_unseen_categorical_values(final, pd.concat([train, tuning]), ["category"])
+
     def test_semantic_context_changes_evaluation_cache_identity(self, make_canonical_dataset):
         dataset = make_canonical_dataset()
         train_frame, tuning = _evaluation_role_frames(dataset, "tuning")
@@ -308,6 +1069,130 @@ class TestEvaluationRoleContext:
             )
             != first
         )
+
+    def test_unseen_synthetic_category_persists_failed_checkpoint_without_worker(
+        self, make_canonical_dataset, tmp_path, monkeypatch
+    ):
+        dataset = make_canonical_dataset()
+        fit_frame, tuning_frame = _evaluation_role_frames(dataset, "tuning")
+        column = dataset.all_categorical_columns[0]
+        synthetic = dataset.role_frame("train", imputed=True).copy()
+        raw_value = "category-never-seen"
+        synthetic[column] = raw_value
+
+        def fail_if_worker_starts(_method):
+            raise AssertionError("preprocessing rejection must skip worker creation")
+
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval.multiprocessing.get_context", fail_if_worker_starts
+        )
+        cfg = SynthEvalExecutionConfig(model_workers=1, max_model_workers=1, cores_per_model=1)
+        _results, _ranks, executions = _run_resumable_syntheval(
+            {"bad_model": synthetic},
+            dataset,
+            {},
+            tmp_path / "preset.json",
+            tmp_path / "checkpoints",
+            "linear",
+            cfg,
+            "main",
+            expected_output_manifest={"metric_method": ("metric_a",)},
+            fit_frame=fit_frame,
+            tuning_frame=tuning_frame,
+            semantic_context={
+                "schema_version": "semantic-context-v1",
+                "task_type": "classification",
+            },
+        )
+
+        payload = executions["bad_model"]
+        assert payload["execution_succeeded"] is False
+        assert payload["policy_eligible"] is False
+        assert payload["semantic_context"] is not None
+        assert payload["semantic_context_digest"] == semantic_context_digest(
+            payload["semantic_context"]
+        )
+        assert payload["worker_exit"]["exception_type"] == ("SyntheticPreprocessingValidationError")
+        assert payload["preprocessing_metadata"]["reason_code"] == "synthetic_unknown_category"
+        assert payload["preprocessing_metadata"]["legacy_reason_code"] == (
+            "synthetic_unseen_categorical_values"
+        )
+        assert payload["preprocessing_metadata"]["columns"][column]["count"] == len(synthetic)
+        assert payload["preprocessing_metadata"]["failure_class"] == "synthetic_unknown_category"
+        assert raw_value not in json.dumps(payload)
+        model_dir, status_path, _result_path = _checkpoint_paths(
+            tmp_path / "checkpoints", "main", "bad_model"
+        )
+        assert status_path.exists()
+        assert (model_dir / "execution.json").exists()
+
+    def test_failed_execution_rows_are_null_and_excluded_from_ranks(self):
+        def payload(model_name, succeeded):
+            return {
+                "model_name": model_name,
+                "execution_succeeded": succeeded,
+                "policy_eligible": succeeded,
+                "metric_executions": [
+                    {
+                        "status": {"expected_keys": ["metric_a"]},
+                        "normalized_rows": (
+                            [
+                                {
+                                    "metric": "metric_a",
+                                    "dim": "u",
+                                    "val": 0.5,
+                                    "err": 0.0,
+                                    "n_val": 0.5,
+                                    "n_err": 0.0,
+                                }
+                            ]
+                            if succeeded
+                            else []
+                        ),
+                    }
+                ],
+            }
+
+        results, ranks = build_syntheval_tables_from_executions(
+            {"good": payload("good", True), "bad": payload("bad", False)},
+            ["good", "bad"],
+            "linear",
+        )
+
+        assert pd.notna(results.loc["good", ("metric_a", "value")])
+        assert pd.isna(results.loc["bad", ("metric_a", "value")])
+        assert pd.notna(ranks.loc["good", "metric_a"])
+        assert pd.isna(ranks.loc["bad", "metric_a"])
+
+    def test_all_failed_execution_tables_are_schema_compatible_and_null(self):
+        payload = {
+            "execution_succeeded": False,
+            "policy_eligible": False,
+            "metric_executions": [
+                {"status": {"expected_keys": ["metric_a"]}, "normalized_rows": []}
+            ],
+        }
+
+        results, ranks = build_syntheval_tables_from_executions({"bad": payload}, ["bad"], "linear")
+
+        assert results.loc["bad"].isna().all()
+        assert ranks.loc["bad"].isna().all()
+
+    def test_preprocessing_contract_changes_context_identity(self, make_canonical_dataset):
+        dataset = make_canonical_dataset()
+        fit_frame, tuning_frame = _evaluation_role_frames(dataset, "tuning")
+        first = _evaluation_context_fingerprint(
+            dataset, {}, "main", False, fit_frame=fit_frame, tuning_frame=tuning_frame
+        )
+        altered = _evaluation_context_fingerprint(
+            dataset,
+            {"preprocessing_contract": "changed"},
+            "main",
+            False,
+            fit_frame=fit_frame,
+            tuning_frame=tuning_frame,
+        )
+        assert altered != first
 
     def test_main_resumable_evaluation_receives_semantic_context(
         self, make_canonical_dataset, monkeypatch, tmp_path
@@ -590,7 +1475,6 @@ class TestSynthEvalMetricValidation:
             group_context=None,
             failure_status={"exit_code": 1, "failure_reason": "worker failed"},
         )
-
         assert _execution_payload_failed(
             payload,
             expected_manifest={"metric_method": ("metric_a",)},
@@ -601,6 +1485,46 @@ class TestSynthEvalMetricValidation:
         status = payload["metric_executions"][0]["status"]
         assert status["failed_keys"] == ["metric_a"]
         assert status["missing_keys"] == ["metric_a"]
+
+    def test_mixed_framework_structured_observations_use_framework_role_hashes(self):
+        executions = {
+            "model_a": {
+                "pass_id": "main",
+                "target_view": "native",
+                "metric_executions": [
+                    {
+                        "method": "fairness",
+                        "status": {"state": "succeeded", "failed_keys": []},
+                        "normalized_rows_v2": [
+                            {"metric": "avg_dwm_diff", "val": 0.1, "n_val": 0.1},
+                            {"metric": "equalized_odds", "val": 0.2, "n_val": 0.2},
+                        ],
+                    }
+                ],
+            }
+        }
+        validations = validate_syntheval_results(
+            None,
+            None,
+            {"syntheval": ["avg_dwm_diff"], "custom": ["equalized_odds"]},
+            role_hashes={"train": "train-imputed", "tuning": "tuning-imputed"},
+            role_hashes_by_framework={
+                "syntheval": {"train": "train-imputed", "tuning": "tuning-imputed"},
+                "custom": {"train": "train-raw", "tuning": "tuning-raw"},
+            },
+            model_names=["model_a"],
+            requested_use="audit",
+            structured_executions=executions,
+        )
+
+        assert validations[("syntheval", "main")]["model_a"].evaluation_context.role_hashes == {
+            "train": "train-imputed",
+            "tuning": "tuning-imputed",
+        }
+        assert validations[("custom", "main")]["model_a"].evaluation_context.role_hashes == {
+            "train": "train-raw",
+            "tuning": "tuning-raw",
+        }
 
     def test_known_qualified_diagnostics_remain_successful_at_root_boundary(self):
         execution = build_metric_execution(
@@ -1247,6 +2171,59 @@ class TestComputeCacheKey:
         k2 = _compute_cache_key(preset, ["m1", "m2"], "linear")
         assert k1 != k2
 
+    def test_binary_cache_identity_uses_complete_model_inventory(self):
+        preset = {"auroc_diff": {}}
+        executable_models = ["valid_model"]
+        all_models = ["valid_model", "invalid_model"]
+
+        executable_key = _compute_cache_key(preset, executable_models, "linear")
+        filtered_key = _compute_cache_key(preset, all_models, "linear")
+
+        # Invalid preprocessing evidence remains part of binary aggregate-cache
+        # identity, even though it is excluded from worker scheduling.
+        assert executable_key != filtered_key
+
+    def test_failed_binary_sibling_remains_failed_inventory_row(self):
+        successful = {
+            "model_name": "valid_model",
+            "metric_executions": [
+                {
+                    "status": {"expected_keys": ["metric_a"]},
+                    "normalized_rows": [
+                        {
+                            "metric": "metric_a",
+                            "dim": "u",
+                            "val": 0.5,
+                            "err": None,
+                            "n_val": 0.5,
+                            "n_err": None,
+                        }
+                    ],
+                }
+            ],
+        }
+        failed = {
+            "model_name": "invalid_model",
+            "metric_executions": [
+                {
+                    "status": {
+                        "expected_keys": ["metric_a"],
+                        "failed_keys": ["metric_a"],
+                    },
+                    "normalized_rows": [],
+                }
+            ],
+        }
+
+        results, _ranks = build_syntheval_tables_from_executions(
+            {"valid_model": successful, "invalid_model": failed},
+            ["valid_model", "invalid_model"],
+            "linear",
+        )
+
+        assert list(results.index) == ["valid_model", "invalid_model"]
+        assert pd.isna(results.loc["invalid_model", ("metric_a", "value")])
+
     def test_different_preset_different_key(self):
         k1 = _compute_cache_key({"dwm": {}}, ["m1"], "linear")
         k2 = _compute_cache_key({"cls_acc": {}}, ["m1"], "linear")
@@ -1263,6 +2240,23 @@ class TestComputeCacheKey:
         k2 = _compute_cache_key({"dwm": {}}, ["m1"], "linear", "real-data-b")
         assert k1 != k2
 
+    def test_binary_failure_payload_changes_cache_identity(self):
+        base = {"context": "same", "models": {"invalid": "frame"}}
+        changed = {
+            **base,
+            "preprocessing_failures": {"invalid": "different-failure"},
+        }
+        k1 = _compute_cache_key(
+            {"auroc_diff": {}}, ["valid", "invalid"], "linear", json.dumps(base, sort_keys=True)
+        )
+        k2 = _compute_cache_key(
+            {"auroc_diff": {}},
+            ["valid", "invalid"],
+            "linear",
+            json.dumps(changed, sort_keys=True),
+        )
+        assert k1 != k2
+
     def test_returns_hex_string(self):
         key = _compute_cache_key({"dwm": {}}, ["m1"], "linear")
         assert isinstance(key, str)
@@ -1270,6 +2264,106 @@ class TestComputeCacheKey:
 
 
 class TestSaveLoadSynthevalCache:
+    def test_binary_failed_model_survives_aggregate_cache_reload(self, tmp_path):
+        manifest = {"metric_a": ["metric_a"]}
+        failed = _failed_execution_payload(
+            model_name="invalid_model",
+            pass_name="binary_target",
+            target_view="binary_collapsed",
+            expected_manifest_digest="manifest-digest",
+            expected_output_manifest=manifest,
+            context_fingerprint="context",
+            role_context={},
+            group_context=None,
+            failure_status={
+                "exception_type": "SyntheticPreprocessingValidationError",
+                "reason_code": "synthetic_binary_target_invalid",
+            },
+        )
+        successful = {
+            "model_name": "valid_model",
+            "schema_version": "syntheval-execution-v1",
+            "pass_id": "binary_target",
+            "target_view": "binary_collapsed",
+            "expected_manifest_digest": "manifest-digest",
+            "context_fingerprint": "context",
+            "execution_complete": True,
+            "execution_succeeded": True,
+            "policy_eligible": True,
+            "metric_executions": [
+                {
+                    "method": "metric_a",
+                    "status": {
+                        "method": "metric_a",
+                        "state": "succeeded",
+                        "expected_keys": ["metric_a"],
+                        "observed_keys": ["metric_a"],
+                        "completed_keys": ["metric_a"],
+                        "failed_keys": [],
+                        "missing_keys": [],
+                        "duplicate_keys": [],
+                        "non_finite_keys": [],
+                        "unexpected_keys": [],
+                    },
+                    "normalized_rows": [
+                        {
+                            "metric": "metric_a",
+                            "dim": "u",
+                            "val": 0.5,
+                            "err": None,
+                            "n_val": 0.5,
+                            "n_err": None,
+                        }
+                    ],
+                }
+            ],
+        }
+        executions = {"valid_model": successful, "invalid_model": failed}
+        results, ranks = build_syntheval_tables_from_executions(
+            executions, ["valid_model", "invalid_model"], "linear"
+        )
+        key = _compute_cache_key({"auroc_diff": {}}, list(executions), "linear", "failure-bound")
+        _save_syntheval_cache(results, ranks, tmp_path, "binary_target", key)
+        for model_name, execution in executions.items():
+            model_dir, _status_path, _result_path = _checkpoint_paths(
+                tmp_path, "binary_target", model_name
+            )
+            model_dir.mkdir(parents=True, exist_ok=True)
+            (model_dir / "execution.json").write_text(json.dumps(execution))
+
+        loaded = _load_syntheval_cache(tmp_path, "binary_target", key)
+        assert loaded is not None
+        loaded_executions = _load_syntheval_execution_sidecars(
+            tmp_path,
+            "binary_target",
+            ["valid_model", "invalid_model"],
+            "manifest-digest",
+            "context",
+            expected_manifest=manifest,
+            expected_target_view="binary_collapsed",
+        )
+        assert loaded_executions is not None
+        assert loaded_executions["valid_model"]["execution_succeeded"] is not False
+        assert loaded_executions["invalid_model"]["execution_succeeded"] is False
+        assert loaded_executions["invalid_model"]["policy_eligible"] is False
+        validated = _validated_cached_syntheval_tables(
+            loaded[0],
+            loaded[1],
+            executions,
+            ["valid_model", "invalid_model"],
+            "linear",
+            "binary-target",
+        )
+        assert validated is not None
+        assert list(validated[0].index) == ["valid_model", "invalid_model"]
+        assert pd.isna(validated[0].loc["invalid_model", ("metric_a", "value")])
+        assert pd.isna(validated[1].loc["invalid_model", "metric_a"])
+
+        tampered_key = _compute_cache_key(
+            {"auroc_diff": {}}, ["valid_model"], "linear", "failure-bound"
+        )
+        assert _load_syntheval_cache(tmp_path, "binary_target", tampered_key) is None
+
     def test_roundtrip_results_and_ranks(self, tmp_path):
         results = _make_results()
         ranks = _make_ranks()
@@ -1494,6 +2588,7 @@ class TestCheckpointPaths:
                 "model_name": "model_cached",
                 "context_fingerprint": context_fingerprint,
                 "expected_manifest_digest": expected_manifest_digest,
+                "model_fingerprint": _frame_fingerprint(pd.DataFrame({"metric": ["cached"]})),
             }
         )
         (cached_dir / "execution.json").write_text(json.dumps(cached_execution))
@@ -1612,6 +2707,7 @@ class TestCheckpointPaths:
                     "model_partial",
                     context_fingerprint=context_fingerprint,
                     role_context={},
+                    model_fingerprint=_frame_fingerprint(pd.DataFrame({"metric": ["partial"]})),
                 )
             )
         )
@@ -1664,15 +2760,17 @@ class TestCheckpointPaths:
         assert not _execution_payload_succeeded(payload)
         assert payload["worker_exit"]["exit_code"] == 1
         methods = {item["method"]: item for item in payload["metric_executions"]}
-        assert methods["statistics"]["status"]["state"] == "succeeded"
+        assert methods["statistics"]["status"]["state"] == "failed"
+        assert methods["statistics"]["normalized_rows"] == []
+        assert methods["statistics"]["normalized_rows_v2"] == []
         assert methods["ks_test"]["status"]["failed_keys"] == ["ks_tvd_stat_v2"]
-        assert results.loc["model_partial", ("avg_dwm_diff", "value")] == 0.2
+        assert pd.isna(results.loc["model_partial", ("avg_dwm_diff", "value")])
         assert pd.isna(results.loc["model_partial", ("ks_tvd_stat_v2", "value")])
 
         observations = _structured_observations(executions, role_hashes={})
         observed = {item.emitted_key: item for item in observations["model_partial"]}
-        assert observed["avg_dwm_diff"].raw_value == 0.2
-        assert observed["ks_tvd_stat_v2"].error == "invalid support"
+        assert observed["avg_dwm_diff"].raw_value is None
+        assert observed["ks_tvd_stat_v2"].error == "SynthEval worker failed with an unknown error."
 
         validations = validate_syntheval_results(
             results,
@@ -1686,6 +2784,127 @@ class TestCheckpointPaths:
         validation = validations[("syntheval", "main")]["model_partial"]
         assert validation.complete is False
         assert validation.decision_eligible is False
+
+    def test_worker_failure_replaces_stale_child_execution_evidence(
+        self, tmp_path, make_canonical_dataset, monkeypatch
+    ):
+        dataset = make_canonical_dataset()
+        fit_frame, tuning_frame = _evaluation_role_frames(dataset, "tuning")
+        manifest = {"statistics": ("avg_dwm_diff",)}
+        model_name = "model_stale"
+        model_frame = pd.DataFrame({"metric": ["current"]})
+        current_fingerprint = _frame_fingerprint(model_frame)
+        context_fingerprint = _evaluation_context_fingerprint(
+            dataset,
+            {},
+            "main",
+            False,
+            expected_output_manifest=manifest,
+            fit_frame=fit_frame,
+            tuning_frame=tuning_frame,
+        )
+        checkpoint_root = tmp_path / "checkpoints"
+        model_dir, _status_path, _result_path = _checkpoint_paths(
+            checkpoint_root, "main", model_name
+        )
+        model_dir.mkdir(parents=True)
+        (model_dir / "execution.json").write_text(
+            json.dumps(
+                {
+                    "model_name": model_name,
+                    "model_fingerprint": "stale-fingerprint",
+                    "schema_version": "syntheval-execution-v1",
+                    "pass_id": "main",
+                    "target_view": "native",
+                    "expected_manifest_digest": "manifest-hash",
+                    "context_fingerprint": context_fingerprint,
+                    "execution_complete": True,
+                    "execution_succeeded": False,
+                    "policy_eligible": False,
+                    "metric_executions": [
+                        {
+                            "method": "statistics",
+                            "status": {
+                                "state": "failed",
+                                "failed_keys": [],
+                                "expected_keys": ["avg_dwm_diff"],
+                                "observed_keys": ["avg_dwm_diff"],
+                            },
+                            "normalized_rows": [
+                                {
+                                    "metric": "avg_dwm_diff",
+                                    "dim": "u",
+                                    "val": 0.99,
+                                    "n_val": 0.99,
+                                    "raw_value": 0.99,
+                                    "normalized_value": 0.99,
+                                }
+                            ],
+                            "normalized_rows_v2": [
+                                {
+                                    "metric": "avg_dwm_diff",
+                                    "dim": "u",
+                                    "val": 0.99,
+                                    "n_val": 0.99,
+                                    "raw_value": 0.99,
+                                    "normalized_value": 0.99,
+                                    "metric_version": "v2",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+        )
+
+        class FailedProcess:
+            pid = 123
+            exitcode = 1
+
+            def start(self):
+                return None
+
+            def is_alive(self):
+                return False
+
+            def join(self):
+                return None
+
+        class FailedContext:
+            def Process(self, **_kwargs):
+                return FailedProcess()
+
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval.multiprocessing.get_context",
+            lambda _method: FailedContext(),
+        )
+        cfg = SynthEvalExecutionConfig(model_workers=1, max_model_workers=1, cores_per_model=1)
+        results, ranks, executions = _run_resumable_syntheval(
+            {model_name: model_frame},
+            dataset,
+            {},
+            tmp_path / "preset.json",
+            checkpoint_root,
+            "summation",
+            cfg,
+            "main",
+            expected_output_manifest=manifest,
+            expected_manifest_digest="manifest-hash",
+            fit_frame=fit_frame,
+            tuning_frame=tuning_frame,
+        )
+
+        payload = executions[model_name]
+        assert payload["model_fingerprint"] == current_fingerprint
+        assert payload["execution_succeeded"] is False
+        assert payload["policy_eligible"] is False
+        assert payload["metric_executions"][0]["normalized_rows"] == []
+        assert payload["metric_executions"][0]["normalized_rows_v2"] == []
+        status = json.loads(_checkpoint_paths(checkpoint_root, "main", model_name)[1].read_text())
+        assert status["model_fingerprint"] == current_fingerprint
+        assert status["state"] == "failed"
+        assert pd.isna(results.loc[model_name, ("avg_dwm_diff", "value")])
+        assert pd.isna(ranks.loc[model_name, "avg_dwm_diff"])
 
     def test_failed_execution_sidecar_invalidates_checkpoint(self, tmp_path):
         checkpoint_root = tmp_path / "evaluation" / "syntheval_benchmark"
@@ -1757,6 +2976,32 @@ class TestCheckpointPaths:
                 ["model_a"],
                 "manifest-hash",
                 "context-hash",
+            )
+            is None
+        )
+
+    def test_sidecar_loader_rejects_source_fingerprint_mismatch(self, tmp_path):
+        model_dir, _status_path, _result_path = _checkpoint_paths(tmp_path, "main", "model_a")
+        model_dir.mkdir(parents=True)
+        payload = self._execution_payload()
+        payload.update(
+            {
+                "model_name": "model_a",
+                "expected_manifest_digest": "manifest-hash",
+                "context_fingerprint": "context-hash",
+                "model_fingerprint": "stored-source-hash",
+            }
+        )
+        (model_dir / "execution.json").write_text(json.dumps(payload))
+
+        assert (
+            _load_syntheval_execution_sidecars(
+                tmp_path,
+                "main",
+                ["model_a"],
+                "manifest-hash",
+                "context-hash",
+                model_fingerprints={"model_a": "current-source-hash"},
             )
             is None
         )

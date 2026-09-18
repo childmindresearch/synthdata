@@ -10,10 +10,11 @@ import json
 import math
 import multiprocessing
 import os
+import re
 import socket
 import time
-import traceback
 import uuid
+from collections import Counter
 from collections.abc import Callable, Mapping
 from numbers import Real
 from pathlib import Path
@@ -38,7 +39,7 @@ from synthdata.evaluation.metric_contracts import (
     MetricObservation,
     MetricValidationResult,
     UnknownMetricContractError,
-    is_verified_task10_tstr,
+    is_verified_authoritative_tstr,
     resolve_metric_observations,
 )
 from synthdata.utils import ensure_dir, get_logger, save_json
@@ -47,12 +48,51 @@ logger = get_logger(__name__)
 
 _RANK_COLUMNS = {"rank", "u_rank", "p_rank", "f_rank"}
 _CHECKPOINT_SCHEMA_VERSION = 1
+_PREPROCESSING_CONTRACT = "syntheval-fit-role-v3-categorical-support-audit"
+
+
+def _model_artifact_id(model_name: str) -> str:
+    """Return canonical bounded ID used for model-specific plot paths."""
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", model_name).strip("-") or "model"
+    return f"{slug}-{hashlib.sha256(model_name.encode()).hexdigest()[:12]}"
+
+
+def _native_plot_dir(plots_output_dir: str | Path, model_name: str) -> Path:
+    """Return contained native SynthEval plot directory for one model."""
+    return _safe_output_directory(
+        Path(plots_output_dir), _model_artifact_id(model_name), "SynthEval native plot output"
+    )
+
+
+def _safe_output_directory(root: Path, relative: str | Path, label: str) -> Path:
+    """Create contained directory while rejecting lexical symlink and escape paths."""
+    root = root.absolute()
+    current = Path(root.anchor)
+    for component in root.parts[1:]:
+        current /= component
+        if current.is_symlink():
+            raise ValueError(f"{label} contains a symlink component")
+    current = root
+    for component in Path(relative).parts:
+        if component in {"", "."}:
+            continue
+        if component == "..":
+            current = current.parent
+        else:
+            current /= component
+        if current.is_symlink():
+            raise ValueError(f"{label} contains a symlink component")
+        try:
+            current.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"{label} escapes its root") from exc
+    return ensure_dir(current)
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
     """Atomically replace a JSON sidecar in its destination directory."""
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str))
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True))
     os.replace(temporary, path)
 
 
@@ -69,8 +109,262 @@ def _frame_fingerprint(frame: pd.DataFrame) -> str:
     digest.update(
         repr([(str(column), str(dtype)) for column, dtype in frame.dtypes.items()]).encode()
     )
-    digest.update(pd.util.hash_pandas_object(frame, index=True).values.tobytes())
+    try:
+        digest.update(pd.util.hash_pandas_object(frame, index=True).values.tobytes())
+    except (TypeError, ValueError):
+        # pandas cannot hash nested object values (for example list-valued
+        # categorical cells).  Hash their typed canonical representation
+        # instead.  Only the digest is retained, never the values themselves.
+        rows = [
+            [_canonical_value(value) for value in row]
+            for row in frame.itertuples(index=False, name=None)
+        ]
+        digest.update(_canonical_value_bytes(rows))
+        digest.update(_canonical_value_bytes(frame.index.tolist()))
     return digest.hexdigest()
+
+
+def _safe_value_digest(value: Any) -> str:
+    """Hash one observed value so failure evidence cannot disclose raw data."""
+    return hashlib.sha256(_canonical_value_bytes(value)).hexdigest()
+
+
+_SAFE_FAILURE_MESSAGES = {
+    "synthetic_unseen_categorical_values": "Synthetic data failed categorical support validation.",
+    "synthetic_unknown_category": "Synthetic data failed categorical support validation.",
+    "synthetic_binary_target_invalid": "Synthetic data failed binary target validation.",
+    "preprocessing_failure": "Synthetic data failed preprocessing validation.",
+    "unknown_target": "Synthetic data failed target validation.",
+    "unknown_exception": "SynthEval worker failed with an unknown error.",
+}
+
+_CANONICAL_FAILURE_CODES = {
+    "synthetic_unseen_categorical_values": "synthetic_unknown_category",
+}
+
+
+def _safe_failure_evidence(
+    *, exception_type: object = None, reason: object = None, exit_code: object = None
+) -> dict[str, object]:
+    """Convert process-local failure details into fixed, non-sensitive evidence."""
+    text = reason.casefold() if isinstance(reason, str) else ""
+    if text in _SAFE_FAILURE_MESSAGES:
+        reason_code = _CANONICAL_FAILURE_CODES.get(text, text)
+    elif "categor" in text and ("unseen" in text or "unknown" in text):
+        reason_code = "synthetic_unknown_category"
+    elif "unknown target" in text or "target" in text and "unknown" in text:
+        reason_code = "unknown_target"
+    elif "preprocess" in text:
+        reason_code = "preprocessing_failure"
+    else:
+        reason_code = "unknown_exception"
+    safe_type = (
+        exception_type
+        if isinstance(exception_type, str)
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", exception_type)
+        else "WorkerExit"
+    )
+    safe_exit_code = (
+        exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None
+    )
+    evidence = {
+        "error_type": safe_type,
+        "reason_code": reason_code,
+        "failure_reason": _SAFE_FAILURE_MESSAGES[reason_code],
+        "exit_code": safe_exit_code,
+    }
+    if isinstance(reason, str) and reason:
+        evidence["reason_detail_digest"] = _safe_value_digest(reason)
+    return evidence
+
+
+def _safe_metric_status(status: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove exception bodies from one metric status before persistence."""
+    sanitized = {
+        key: value
+        for key, value in status.items()
+        if key
+        not in {
+            "exception",
+            "exception_message",
+            "exception_traceback",
+            "traceback",
+            "path",
+            "checkpoint_path",
+            "checkpoint_root",
+        }
+    }
+    if status.get("state") in {"failed", "timed_out", "blocked"}:
+        evidence = _safe_failure_evidence(
+            exception_type=status.get("exception_type"),
+            reason=(
+                status.get("reason_code")
+                or status.get("failure_reason")
+                or status.get("exception_message")
+            ),
+        )
+        sanitized.update(
+            {
+                "exception_type": evidence["error_type"],
+                "reason_code": evidence["reason_code"],
+                "failure_reason": evidence["failure_reason"],
+            }
+        )
+    return sanitized
+
+
+def _sanitize_execution_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove raw metric diagnostics from retained child execution evidence."""
+    removed_keys = {
+        "exception",
+        "exception_message",
+        "exception_traceback",
+        "traceback",
+        "path",
+        "checkpoint_path",
+        "checkpoint_root",
+    }
+
+    def sanitize(value: Any) -> Any:
+        if isinstance(value, dict):
+            failure_reason = (
+                value.get("reason_code")
+                or value.get("failure_reason")
+                or value.get("exception_message")
+            )
+            result = {key: sanitize(item) for key, item in value.items() if key not in removed_keys}
+            if result.get("state") in {"failed", "timed_out", "blocked"}:
+                evidence = _safe_failure_evidence(
+                    exception_type=result.get("exception_type") or result.get("error_type"),
+                    reason=failure_reason,
+                    exit_code=result.get("exit_code"),
+                )
+                result.update(
+                    {
+                        "exception_type": evidence["error_type"],
+                        "reason_code": evidence["reason_code"],
+                        "failure_reason": evidence["failure_reason"],
+                    }
+                )
+                if "error_type" in result:
+                    result["error_type"] = evidence["error_type"]
+                if "exit_code" in result:
+                    result["exit_code"] = evidence["exit_code"]
+            return result
+        if isinstance(value, list):
+            return [sanitize(item) for item in value]
+        return value
+
+    return sanitize(copy.deepcopy(payload))
+
+
+def _canonical_value(value: Any) -> Any:
+    """Return type-tagged, JSON-safe representation of possibly nested data."""
+    if value is None:
+        return ["none"]
+    if isinstance(value, bool):
+        return ["bool", value]
+    if isinstance(value, (int, float, str)):
+        return [type(value).__name__, value]
+    if isinstance(value, Mapping):
+        items = [(_canonical_value(key), _canonical_value(item)) for key, item in value.items()]
+        return ["mapping", sorted(items, key=lambda item: repr(item[0]))]
+    if isinstance(value, (list, tuple)):
+        return [type(value).__name__, [_canonical_value(item) for item in value]]
+    if isinstance(value, set):
+        return ["set", sorted((_canonical_value(item) for item in value), key=repr)]
+    if isinstance(value, np.generic):
+        return [type(value).__name__, _canonical_value(value.item())]
+    return [f"{type(value).__module__}.{type(value).__qualname__}", repr(value)]
+
+
+def _canonical_value_bytes(value: Any) -> bytes:
+    return json.dumps(
+        _canonical_value(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+
+
+def _is_missing_value(value: Any) -> bool:
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(missing, (bool, np.bool_)) and bool(missing)
+
+
+def _synthetic_unseen_categorical_values(
+    synthetic_frame: pd.DataFrame,
+    fit_frame: pd.DataFrame,
+    categorical_columns: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Return audit-safe synthetic values absent from real fit-role support."""
+    violations: dict[str, dict[str, Any]] = {}
+    for column in categorical_columns:
+        if column not in synthetic_frame or column not in fit_frame:
+            continue
+        fit_digests = {
+            _safe_value_digest(value)
+            for value in fit_frame[column].tolist()
+            if not _is_missing_value(value)
+        }
+        synthetic_counts = Counter(
+            _safe_value_digest(value)
+            for value in synthetic_frame[column].tolist()
+            if not _is_missing_value(value)
+        )
+        unseen_digests = sorted(set(synthetic_counts) - fit_digests)
+        if unseen_digests:
+            violations[column] = {
+                "count": int(sum(synthetic_counts[digest] for digest in unseen_digests)),
+                "distinct_count": len(unseen_digests),
+                "value_digests": unseen_digests,
+            }
+    return violations
+
+
+def _preprocessing_failure(
+    *,
+    model_name: str,
+    pass_name: str,
+    target_view: str,
+    expected_manifest_digest: str,
+    expected_output_manifest: dict,
+    context_fingerprint: str,
+    model_fingerprint: str | None = None,
+    role_context: dict,
+    group_context: dict | None,
+    semantic_context: Mapping[str, Any] | None,
+    metadata: dict[str, Any],
+    reason: str,
+) -> dict:
+    """Build failed model evidence for deterministic parent-side preprocessing rejection."""
+    payload = _failed_execution_payload(
+        model_name=model_name,
+        pass_name=pass_name,
+        target_view=target_view,
+        expected_manifest_digest=expected_manifest_digest,
+        expected_output_manifest=expected_output_manifest,
+        context_fingerprint=context_fingerprint,
+        model_fingerprint=model_fingerprint,
+        role_context=role_context,
+        group_context=group_context,
+        semantic_context=semantic_context,
+        failure_status={
+            "state": "failed",
+            "exception_type": "SyntheticPreprocessingValidationError",
+            "reason_code": metadata.get("reason_code", "preprocessing_failure"),
+        },
+    )
+    payload["preprocessing_metadata"] = dict(metadata)
+    if metadata.get("reason_code") == "synthetic_unseen_categorical_values":
+        payload["preprocessing_metadata"]["legacy_reason_code"] = metadata["reason_code"]
+        payload["preprocessing_metadata"]["reason_code"] = "synthetic_unknown_category"
+    if payload["preprocessing_metadata"].get("reason_code") == "synthetic_unknown_category":
+        payload["preprocessing_metadata"]["failure_class"] = "synthetic_unknown_category"
+    payload["preprocessing_fingerprint"] = hashlib.sha256(
+        json.dumps(metadata, sort_keys=True).encode()
+    ).hexdigest()
+    return payload
 
 
 def _candidate_role_frames(dataset: Dataset) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -493,11 +787,10 @@ def _execution_payload_succeeded(
 def _valid_worker_exit_record(value: object) -> bool:
     if not isinstance(value, dict) or value.get("state") != "failed":
         return False
-    for field in ("exception_type", "exception_message"):
+    for field in ("error_type", "reason_code", "failure_reason"):
         if not isinstance(value.get(field), str) or not value[field].strip():
             return False
-    traceback_value = value.get("traceback")
-    if traceback_value is not None and not isinstance(traceback_value, str):
+    if any(field in value for field in ("exception", "exception_message", "traceback")):
         return False
     exit_code = value.get("exit_code")
     if exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)):
@@ -614,12 +907,14 @@ def _execution_payload_failed(
             status_keys[field] for field in ("duplicate_keys", "non_finite_keys", "unexpected_keys")
         ):
             return False
-        for field in ("exception_type", "exception_message"):
+        for field in ("error_type", "reason_code", "failure_reason"):
             value = status.get(field)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 return False
-        traceback_value = status.get("exception_traceback")
-        if traceback_value is not None and not isinstance(traceback_value, str):
+        if any(
+            field in status
+            for field in ("exception", "exception_message", "exception_traceback", "traceback")
+        ):
             return False
         versioned = any("_v2" in key for key in expected)
         field = "normalized_rows_v2" if versioned else "normalized_rows"
@@ -670,10 +965,12 @@ def _execution_sidecar_payload(
     context_fingerprint: str | None = None,
     role_context: dict | None = None,
     semantic_context: Mapping[str, Any] | None = None,
+    model_fingerprint: str | None = None,
 ) -> dict:
     """Serialize structured execution evidence without embedding large raw objects."""
     return {
         "model_name": model_name,
+        "model_fingerprint": model_fingerprint,
         "group_context": group_context,
         "context_fingerprint": context_fingerprint,
         "role_context": role_context,
@@ -693,7 +990,7 @@ def _execution_sidecar_payload(
         "metric_executions": [
             {
                 "method": item.method,
-                "status": item.status.to_dict(),
+                "status": _safe_metric_status(item.status.to_dict()),
                 "normalized_rows": [
                     _execution_metric_row_payload(row) for row in item.normalized_rows
                 ],
@@ -714,29 +1011,37 @@ def _failed_execution_payload(
     expected_manifest_digest: str,
     expected_output_manifest: dict,
     context_fingerprint: str,
+    model_fingerprint: str | None = None,
     role_context: dict,
     group_context: dict | None,
     semantic_context: Mapping[str, Any] | None = None,
     failure_status: dict,
     existing_execution: dict | None = None,
+    worker_status: dict | None = None,
 ) -> dict:
     """Serialize explicit failed execution evidence for a worker exit."""
-    failure_reason = failure_status.get("exception") or failure_status.get("failure_reason")
-    if not isinstance(failure_reason, str) or not failure_reason:
-        failure_reason = f"SynthEval worker exited with code {failure_status.get('exit_code')}"
-    exception_type = failure_status.get("exception_type") or "WorkerExit"
-    exception_traceback = failure_status.get("traceback")
+    evidence = _safe_failure_evidence(
+        exception_type=failure_status.get("exception_type") or failure_status.get("error_type"),
+        reason=failure_status.get("reason_code") or failure_status.get("failure_reason"),
+        exit_code=failure_status.get("exit_code"),
+    )
+    failure_reason = evidence["failure_reason"]
+    exception_type = evidence["error_type"]
     worker_exit = {
         "state": "failed",
-        "exit_code": failure_status.get("exit_code"),
-        "exception_type": str(exception_type),
-        "exception_message": failure_reason,
-        "traceback": exception_traceback,
+        "exit_code": evidence["exit_code"],
+        "error_type": exception_type,
+        "exception_type": exception_type,
+        "reason_code": evidence["reason_code"],
+        "failure_reason": failure_reason,
         "failed_at": failure_status.get("failed_at"),
     }
 
     if isinstance(existing_execution, dict):
-        retained = copy.deepcopy(existing_execution)
+        retained = _sanitize_execution_payload(existing_execution)
+        status_model_fingerprint = (
+            worker_status.get("model_fingerprint") if isinstance(worker_status, dict) else None
+        )
         retained.update(
             {
                 "execution_succeeded": False,
@@ -752,6 +1057,19 @@ def _failed_execution_payload(
             and retained.get("target_view") == target_view
             and retained.get("expected_manifest_digest") == expected_manifest_digest
             and retained.get("context_fingerprint") == context_fingerprint
+            and retained.get("model_fingerprint") == model_fingerprint
+            and isinstance(worker_status, dict)
+            and "model_fingerprint" in worker_status
+            and status_model_fingerprint == model_fingerprint
+            and worker_status.get("schema_version") == _CHECKPOINT_SCHEMA_VERSION
+            and worker_status.get("model_name") == model_name
+            and worker_status.get("target_view") == target_view
+            and worker_status.get("expected_manifest_digest") == expected_manifest_digest
+            and worker_status.get("context_fingerprint") == context_fingerprint
+            and worker_status.get("model_fingerprint") == model_fingerprint
+            and worker_status.get("pass_id") == pass_name
+            and worker_status.get("role_context") == role_context
+            and worker_status.get("semantic_context") == semantic_context
             and _execution_payload_failed(
                 retained,
                 expected_manifest=expected_output_manifest,
@@ -790,9 +1108,9 @@ def _failed_execution_payload(
                     "non_finite_keys": [],
                     "unexpected_keys": [],
                     "warnings": [],
-                    "exception_type": str(exception_type),
-                    "exception_message": failure_reason,
-                    "exception_traceback": exception_traceback,
+                    "error_type": exception_type,
+                    "reason_code": evidence["reason_code"],
+                    "failure_reason": failure_reason,
                     "started_at": failure_status.get("started_at"),
                     "completed_at": None,
                     "elapsed_seconds": failure_status.get("elapsed_seconds"),
@@ -805,7 +1123,12 @@ def _failed_execution_payload(
         "model_name": model_name,
         "group_context": group_context,
         "context_fingerprint": context_fingerprint,
+        "model_fingerprint": model_fingerprint,
         "role_context": role_context,
+        "semantic_context": (dict(semantic_context) if semantic_context is not None else None),
+        "semantic_context_digest": (
+            semantic_context_digest(semantic_context) if semantic_context is not None else None
+        ),
         "schema_version": "syntheval-execution-v1",
         "pass_id": pass_name,
         "target_view": target_view,
@@ -879,6 +1202,7 @@ def _valid_checkpoint(
         if (
             execution.get("schema_version") != "syntheval-execution-v1"
             or execution.get("context_fingerprint") != context_fingerprint
+            or execution.get("model_fingerprint") != model_fingerprint
             or (
                 expected_manifest_digest is not None
                 and execution.get("expected_manifest_digest") != expected_manifest_digest
@@ -927,6 +1251,7 @@ def _model_worker(
     cat_cols: list,
     target_column: str,
     sensitive_columns: list,
+    protected_columns: list,
     preset_path: str,
     checkpoint_root: str,
     pass_name: str,
@@ -961,6 +1286,7 @@ def _model_worker(
             "schema_version": _CHECKPOINT_SCHEMA_VERSION,
             "state": "running",
             "model_name": model_name,
+            "pass_id": pass_name,
             "target_view": target_view,
             "expected_manifest_digest": expected_manifest_digest,
             "context_fingerprint": context_fingerprint,
@@ -983,14 +1309,25 @@ def _model_worker(
             dataset=real_frame,
             target_vars=target_column,
             confounder_vars=None,
+            # Disclosure and fairness roles are intentionally separate.
             sensitive_vars=sensitive_columns,
+            protected_vars=protected_columns,
         )
+        fairness_context = {
+            **(group_context or {}),
+            "protected_columns": list(
+                (group_context or {}).get("protected_columns", protected_columns)
+            ),
+        }
         plot_dir = None
         if plots_output_dir is not None:
             # Resolve before changing the worker's directory. SynthEval writes
             # native diagnostics relative to CWD; retaining an absolute path
             # lets us accurately inventory the files after evaluation.
-            plot_dir = ensure_dir(Path(plots_output_dir).resolve() / model_name)
+            plot_dir = _native_plot_dir(plots_output_dir, model_name)
+            for existing in plot_dir.rglob("*"):
+                if existing.is_symlink():
+                    raise ValueError("SynthEval native plot output contains a symlink component")
             os.chdir(plot_dir)
         se = SynthEval(
             real_frame,
@@ -1011,7 +1348,7 @@ def _model_worker(
             pass_id=pass_name,
             target_view=target_view,
             expected_manifest_digest=expected_manifest_digest,
-            group_context=group_context,
+            group_context=fairness_context,
         )
         if execution.normalized_table is None:
             raise RuntimeError("SynthEval returned no legacy normalized metric results")
@@ -1025,6 +1362,7 @@ def _model_worker(
                 context_fingerprint=context_fingerprint,
                 role_context=role_context,
                 semantic_context=semantic_context,
+                model_fingerprint=model_fingerprint,
             ),
         )
         if not execution.succeeded:
@@ -1076,12 +1414,10 @@ def _model_worker(
         )
     except Exception as exc:  # noqa: BLE001 -- process boundary must persist any worker failure before re-raising
         logger.error(
-            "[syntheval] worker failed for model=%s pass=%s; persisting failure at %s: %s: %s",
+            "[syntheval] worker failed for model=%s pass=%s reason=worker_failed exception_type=%s",
             model_name,
             pass_name,
-            status_path,
             type(exc).__name__,
-            exc,
         )
         _atomic_json(
             status_path,
@@ -1107,9 +1443,7 @@ def _model_worker(
                 "started_at": start,
                 "failed_at": time.time(),
                 "elapsed_seconds": time.time() - start,
-                "exception_type": type(exc).__name__,
-                "exception": str(exc),
-                "traceback": traceback.format_exc(),
+                **_safe_failure_evidence(exception_type=type(exc).__name__, reason=str(exc)),
                 "shape": list(synthetic_frame.shape),
                 "plots_completed": False,
             },
@@ -1186,7 +1520,7 @@ def _save_syntheval_cache(
     _atomic_json(
         meta_path,
         {
-            "schema_version": "syntheval-cache-v1",
+            "schema_version": "syntheval-cache-v2",
             "cache_key": cache_key,
             "context_fingerprint": context_fingerprint,
             "role_context": role_context,
@@ -1240,7 +1574,7 @@ def _load_syntheval_cache(
         )
         return None
     if context_fingerprint is not None and (
-        meta.get("schema_version") != "syntheval-cache-v1"
+        meta.get("schema_version") != "syntheval-cache-v2"
         or meta.get("context_fingerprint") != context_fingerprint
     ):
         logger.info(
@@ -1287,6 +1621,7 @@ def _load_syntheval_execution_sidecars(
     *,
     expected_manifest: dict | None = None,
     expected_target_view: str | None = None,
+    model_fingerprints: Mapping[str, str] | None = None,
 ) -> dict[str, dict] | None:
     """Load manifest-bound structured execution evidence for a cached pass."""
     executions = {}
@@ -1313,11 +1648,23 @@ def _load_syntheval_execution_sidecars(
                 context_fingerprint is not None
                 and payload.get("context_fingerprint") != context_fingerprint
             )
-            or not _execution_payload_succeeded(
-                payload,
-                expected_manifest=expected_manifest,
-                expected_pass_id=pass_name,
-                expected_target_view=expected_target_view,
+            or (
+                model_fingerprints is not None
+                and payload.get("model_fingerprint") != model_fingerprints.get(model_name)
+            )
+            or not (
+                _execution_payload_succeeded(
+                    payload,
+                    expected_manifest=expected_manifest,
+                    expected_pass_id=pass_name,
+                    expected_target_view=expected_target_view,
+                )
+                or _execution_payload_failed(
+                    payload,
+                    expected_manifest=expected_manifest,
+                    expected_pass_id=pass_name,
+                    expected_target_view=expected_target_view,
+                )
             )
         ):
             logger.warning(
@@ -1416,13 +1763,14 @@ def _evaluation_context_fingerprint(
         "dataset_version": dataset.version,
         "target_column": dataset.target_column,
         "sensitive_columns": dataset.sensitive_columns,
+        "protected_columns": dataset.protected_columns,
         "categorical_columns": dataset.all_categorical_columns,
         "role_context": role_context,
         "plots_enabled": plots_enabled,
         "expected_output_manifest": expected_output_manifest,
         "group_context": group_context,
         "registry_digest": DEFAULT_METRIC_CONTRACT_REGISTRY.digest(),
-        "preprocessing_contract": "syntheval-fit-role-v2",
+        "preprocessing_contract": _PREPROCESSING_CONTRACT,
         "target_view_context": dict(target_view_context or {}),
         "semantic_context": dict(semantic_context) if semantic_context is not None else None,
         "semantic_context_digest": (
@@ -1498,6 +1846,7 @@ def _run_resumable_syntheval(
     fit_roles: tuple[str, ...] = ("train",),
     target_view_context: Mapping[str, Any] | None = None,
     semantic_context: Mapping[str, Any] | None = None,
+    model_fingerprints: Mapping[str, str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, dict]]:
     """Evaluate models in disposable bounded processes and resume checkpoints.
 
@@ -1544,7 +1893,67 @@ def _run_resumable_syntheval(
     executions: dict[str, dict] = {}
     pending: list[tuple[str, pd.DataFrame, str]] = []
     for model_name, frame in synthetic_datasets.items():
-        model_fingerprint = _frame_fingerprint(frame)
+        model_fingerprint = (model_fingerprints or {}).get(model_name, _frame_fingerprint(frame))
+        preprocessing_violations = _synthetic_unseen_categorical_values(
+            frame, fit_frame, dataset.all_categorical_columns
+        )
+        if preprocessing_violations:
+            reason = (
+                "Synthetic categorical support is absent from real fit-role vocabulary; "
+                "evaluation rejected before SynthEval worker"
+            )
+            executions[model_name] = _preprocessing_failure(
+                model_name=model_name,
+                pass_name=pass_name,
+                target_view=target_view,
+                expected_manifest_digest=expected_manifest_digest,
+                expected_output_manifest=expected_output_manifest,
+                context_fingerprint=context_fingerprint,
+                model_fingerprint=model_fingerprint,
+                role_context=role_context,
+                group_context=group_context,
+                semantic_context=semantic_context,
+                metadata={
+                    "contract": _PREPROCESSING_CONTRACT,
+                    "reason_code": "synthetic_unseen_categorical_values",
+                    "columns": preprocessing_violations,
+                },
+                reason=reason,
+            )
+            model_dir, status_path, _result_path = _checkpoint_paths(
+                checkpoint_root, pass_name, model_name
+            )
+            ensure_dir(model_dir)
+            _atomic_json(
+                status_path,
+                {
+                    "schema_version": _CHECKPOINT_SCHEMA_VERSION,
+                    "state": "failed",
+                    "model_name": model_name,
+                    "target_view": target_view,
+                    "expected_manifest_digest": expected_manifest_digest,
+                    "context_fingerprint": context_fingerprint,
+                    "model_fingerprint": model_fingerprint,
+                    "exception_type": "SyntheticPreprocessingValidationError",
+                    "error_type": "SyntheticPreprocessingValidationError",
+                    "reason_code": executions[model_name]["preprocessing_metadata"].get(
+                        "reason_code", "preprocessing_failure"
+                    ),
+                    "failure_reason": "Synthetic data failed preprocessing validation.",
+                    "preprocessing_metadata": executions[model_name]["preprocessing_metadata"],
+                    "failure_class": executions[model_name]["preprocessing_metadata"].get(
+                        "failure_class"
+                    ),
+                },
+            )
+            _atomic_json(_execution_checkpoint_path(model_dir), executions[model_name])
+            logger.error(
+                "[syntheval] %s model=%s rejected synthetic categorical support in %d column(s)",
+                pass_name,
+                model_name,
+                len(preprocessing_violations),
+            )
+            continue
         cached = _valid_checkpoint(
             checkpoint_root,
             pass_name,
@@ -1601,6 +2010,7 @@ def _run_resumable_syntheval(
                         dataset.all_categorical_columns,
                         dataset.target_column,
                         dataset.sensitive_columns,
+                        dataset.protected_columns,
                         str(preset_path.resolve()),
                         str(checkpoint_root),
                         pass_name,
@@ -1642,7 +2052,9 @@ def _run_resumable_syntheval(
                 continue
             for model_name, exitcode in completed:
                 del active[model_name]
-                model_fingerprint = _frame_fingerprint(synthetic_datasets[model_name])
+                model_fingerprint = (model_fingerprints or {}).get(
+                    model_name, _frame_fingerprint(synthetic_datasets[model_name])
+                )
                 cached = _valid_checkpoint(
                     checkpoint_root,
                     pass_name,
@@ -1670,18 +2082,17 @@ def _run_resumable_syntheval(
                             worker_status = loaded_status
                     except (OSError, json.JSONDecodeError) as exc:
                         logger.warning(
-                            "[syntheval] failed to read worker status for model=%s at %s: %s",
+                            "[syntheval] failed to read worker status for model=%s; evidence=%s",
                             model_name,
-                            status_path,
-                            exc,
+                            type(exc).__name__,
                         )
-                    failure_reason = worker_status.get("exception") or worker_status.get(
-                        "failure_reason"
+                    worker_evidence = _safe_failure_evidence(
+                        exception_type=worker_status.get("exception_type")
+                        or worker_status.get("error_type"),
+                        reason=worker_status.get("reason_code")
+                        or worker_status.get("failure_reason"),
+                        exit_code=exitcode,
                     )
-                    if not isinstance(failure_reason, str) or not failure_reason:
-                        failure_reason = (
-                            f"worker exited without a valid succeeded checkpoint (exit={exitcode})"
-                        )
                     failure_status = {
                         "schema_version": _CHECKPOINT_SCHEMA_VERSION,
                         "state": "failed",
@@ -1691,12 +2102,9 @@ def _run_resumable_syntheval(
                         "context_fingerprint": context_fingerprint,
                         "role_context": role_context,
                         "model_fingerprint": model_fingerprint,
-                        "exit_code": exitcode,
+                        "exit_code": worker_evidence["exit_code"],
                         "failed_at": time.time(),
-                        "failure_reason": failure_reason,
-                        "exception_type": worker_status.get("exception_type") or "WorkerExit",
-                        "exception": failure_reason,
-                        "traceback": worker_status.get("traceback"),
+                        **worker_evidence,
                     }
                     execution_path = _execution_checkpoint_path(model_dir)
                     existing_execution = None
@@ -1708,10 +2116,9 @@ def _run_resumable_syntheval(
                         if execution_path.exists():
                             logger.warning(
                                 "[syntheval] failed to read child execution evidence for model=%s "
-                                "at %s: %s",
+                                "; evidence=%s",
                                 model_name,
-                                execution_path,
-                                exc,
+                                type(exc).__name__,
                             )
                     _atomic_json(status_path, failure_status)
                     _atomic_json(
@@ -1723,31 +2130,31 @@ def _run_resumable_syntheval(
                             expected_manifest_digest=expected_manifest_digest,
                             expected_output_manifest=expected_output_manifest,
                             context_fingerprint=context_fingerprint,
+                            model_fingerprint=model_fingerprint,
                             role_context=role_context,
                             group_context=group_context,
                             semantic_context=semantic_context,
                             failure_status=failure_status,
                             existing_execution=existing_execution,
+                            worker_status=worker_status,
                         ),
                     )
                     executions[model_name] = json.loads(execution_path.read_text())
-                    failures.append(f"{model_name} (exit={exitcode}, status={status_path})")
+                    failures.append(f"{model_name} (exit={worker_evidence['exit_code']})")
                     logger.error(
-                        "[syntheval] %s model=%s exited %s; failure evidence persisted at %s",
+                        "[syntheval] %s model=%s exited %s; safe failure evidence persisted",
                         pass_name,
                         model_name,
-                        exitcode,
-                        _execution_checkpoint_path(model_dir),
+                        worker_evidence["exit_code"],
                     )
                 start_next()
         if failures:
             logger.error(
                 "[syntheval] %s returned partial results after %d failed model(s): %s. "
-                "Completed model checkpoints remain resumable under %s",
+                "Completed model checkpoints remain resumable",
                 pass_name,
                 len(failures),
                 ", ".join(failures),
-                checkpoint_root,
             )
 
     ordered_executions = {name: executions[name] for name in synthetic_datasets}
@@ -1853,7 +2260,7 @@ def run_syntheval_evaluation(
         preset,
         include_holdout_outputs=tuning_frame is not None,
         target_columns=[dataset.target_column],
-        protected_columns=dataset.sensitive_columns,
+        protected_columns=dataset.protected_columns,
     )
     expected_manifest_digest = _execution_manifest_digest(expected_output_manifest)
 
@@ -1916,6 +2323,7 @@ def run_syntheval_evaluation(
             context_fingerprint,
             expected_manifest=expected_output_manifest,
             expected_target_view="native",
+            model_fingerprints=model_fingerprints,
         )
         if executions is not None:
             validated_cached = _validated_cached_syntheval_tables(
@@ -2141,7 +2549,21 @@ def run_binary_target_syntheval_evaluation(
     binary_tuning_frame = _binarize(tuning_frame)
     binary_final_holdout_frame = _binarize(final_holdout_frame)
     binary_evidence_frame = _binarize(evidence_frame)
-    binary_synthetic_datasets = {name: _binarize(df) for name, df in synthetic_datasets.items()}
+    binary_synthetic_datasets: dict[str, pd.DataFrame] = {}
+    binary_preprocessing_failures: dict[str, dict] = {}
+    for name, frame in synthetic_datasets.items():
+        try:
+            binary_synthetic_datasets[name] = _binarize(frame)
+        except (KeyError, TypeError, ValueError) as exc:
+            # Keep strict target conversion for real evidence, but reject one
+            # synthetic model locally so valid sibling models still run.
+            binary_preprocessing_failures[name] = {
+                "contract": _PREPROCESSING_CONTRACT,
+                "reason_code": "synthetic_binary_target_invalid",
+                "column": column,
+                "error_type": type(exc).__name__,
+                "reason_digest": _safe_value_digest(str(exc)),
+            }
     binary_target_context = {
         "column": column,
         "positive_classes": list(positive_classes),
@@ -2191,7 +2613,7 @@ def run_binary_target_syntheval_evaluation(
         preset,
         include_holdout_outputs=evidence_frame is not None,
         target_columns=[binary_dataset.target_column],
-        protected_columns=binary_dataset.sensitive_columns,
+        protected_columns=binary_dataset.protected_columns,
     )
     expected_manifest_digest = _execution_manifest_digest(expected_output_manifest)
     cache_dir = (
@@ -2223,19 +2645,58 @@ def run_binary_target_syntheval_evaluation(
         target_view_context=binary_target_context,
         semantic_context=binary_semantic_context,
     )
+
+    def _preprocessing_failure_executions() -> dict[str, dict]:
+        return {
+            name: _preprocessing_failure(
+                model_name=name,
+                pass_name="binary_target",
+                target_view="binary_collapsed",
+                expected_manifest_digest=expected_manifest_digest,
+                expected_output_manifest=expected_output_manifest,
+                context_fingerprint=context_fingerprint,
+                model_fingerprint=_frame_fingerprint(synthetic_datasets[name]),
+                role_context=role_context,
+                group_context=group_context,
+                semantic_context=binary_semantic_context,
+                metadata=metadata,
+                reason="Synthetic binary target contains an unmapped or missing value",
+            )
+            for name, metadata in binary_preprocessing_failures.items()
+        }
+
+    preprocessing_failure_executions = _preprocessing_failure_executions()
+    # Inventory is the complete requested input inventory, not only models that
+    # reached metric workers. Failed preprocessing models must remain visible in
+    # cache identity, execution sidecars, and aggregate tables as ineligible rows.
+    model_inventory = list(synthetic_datasets)
+    # One source-frame fingerprint contract applies to every model. It is
+    # computed before binary transformation, passed into worker checkpoints,
+    # and retained for preprocessing-invalid evidence.
     model_fingerprints = {
-        name: _frame_fingerprint(frame) for name, frame in binary_synthetic_datasets.items()
+        name: _frame_fingerprint(frame) for name, frame in synthetic_datasets.items()
+    }
+    failure_fingerprints = {
+        name: hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        for name, payload in preprocessing_failure_executions.items()
     }
     cache_key = _compute_cache_key(
         preset,
-        list(binary_synthetic_datasets.keys()),
+        model_inventory,
         ranking_strategy,
         hashlib.sha256(
             json.dumps(
-                {"context": context_fingerprint, "models": model_fingerprints}, sort_keys=True
+                {
+                    "context": context_fingerprint,
+                    "models": model_fingerprints,
+                    "preprocessing_failures": failure_fingerprints,
+                },
+                sort_keys=True,
             ).encode()
         ).hexdigest(),
     )
+    # Invalid synthetic target models are excluded from worker scheduling, but
+    # remain part of aggregate identity and are persisted as failed evidence.
     cached = _load_syntheval_cache(
         cache_dir,
         "binary_target",
@@ -2249,18 +2710,19 @@ def run_binary_target_syntheval_evaluation(
         executions = _load_syntheval_execution_sidecars(
             cache_dir,
             "binary_target",
-            list(binary_synthetic_datasets),
+            model_inventory,
             expected_manifest_digest,
             context_fingerprint,
             expected_manifest=expected_output_manifest,
             expected_target_view="binary_collapsed",
+            model_fingerprints=model_fingerprints,
         )
         if executions is not None:
             validated_cached = _validated_cached_syntheval_tables(
                 cached[0],
                 cached[1],
                 executions,
-                list(binary_synthetic_datasets),
+                model_inventory,
                 ranking_strategy,
                 "binary-target",
             )
@@ -2284,25 +2746,68 @@ def run_binary_target_syntheval_evaluation(
         positive_classes,
         negative_classes,
     )
-    benchmark_results, benchmark_ranks, executions = _run_resumable_syntheval(
-        binary_synthetic_datasets,
-        binary_dataset,
-        preset,
-        preset_path,
-        cache_dir,
-        ranking_strategy,
-        execution_cfg,
-        "binary_target",
-        expected_output_manifest=expected_output_manifest,
-        target_view="binary_collapsed",
-        expected_manifest_digest=expected_manifest_digest,
-        group_context=group_context,
-        fit_frame=binary_fit_frame,
-        tuning_frame=binary_evidence_frame,
-        evaluation_role=evaluation_role,
-        fit_roles=fit_roles,
-        semantic_context=binary_semantic_context,
-    )
+    executable_datasets = {
+        name: frame
+        for name, frame in binary_synthetic_datasets.items()
+        if name not in binary_preprocessing_failures
+    }
+    if executable_datasets:
+        benchmark_results, benchmark_ranks, executions = _run_resumable_syntheval(
+            executable_datasets,
+            binary_dataset,
+            preset,
+            preset_path,
+            cache_dir,
+            ranking_strategy,
+            execution_cfg,
+            "binary_target",
+            expected_output_manifest=expected_output_manifest,
+            target_view="binary_collapsed",
+            expected_manifest_digest=expected_manifest_digest,
+            group_context=group_context,
+            fit_frame=binary_fit_frame,
+            tuning_frame=binary_evidence_frame,
+            evaluation_role=evaluation_role,
+            fit_roles=fit_roles,
+            target_view_context=binary_target_context,
+            semantic_context=binary_semantic_context,
+            model_fingerprints=model_fingerprints,
+        )
+    else:
+        benchmark_results, benchmark_ranks, executions = None, None, {}
+    executions.update(preprocessing_failure_executions)
+    for model_name, execution in preprocessing_failure_executions.items():
+        model_dir, status_path, _result_path = _checkpoint_paths(
+            cache_dir, "binary_target", model_name
+        )
+        ensure_dir(model_dir)
+        metadata = execution["preprocessing_metadata"]
+        _atomic_json(
+            status_path,
+            {
+                "schema_version": _CHECKPOINT_SCHEMA_VERSION,
+                "state": "failed",
+                "model_name": model_name,
+                "target_view": "binary_collapsed",
+                "expected_manifest_digest": expected_manifest_digest,
+                "context_fingerprint": context_fingerprint,
+                "model_fingerprint": model_fingerprints.get(model_name),
+                "exception_type": "SyntheticPreprocessingValidationError",
+                "error_type": "SyntheticPreprocessingValidationError",
+                "reason_code": metadata.get("reason_code", "preprocessing_failure"),
+                "failure_reason": execution["failure_reason"],
+                "preprocessing_metadata": metadata,
+            },
+        )
+        _atomic_json(_execution_checkpoint_path(model_dir), execution)
+    if binary_preprocessing_failures:
+        benchmark_results, benchmark_ranks = build_syntheval_tables_from_executions(
+            executions,
+            model_inventory,
+            ranking_strategy,
+        )
+    assert benchmark_results is not None
+    assert benchmark_ranks is not None
     _save_syntheval_cache(
         benchmark_results,
         benchmark_ranks,
@@ -2519,6 +3024,7 @@ def build_syntheval_tables_from_executions(
         raise ValueError("SynthEval execution payloads contain no structured metric rows")
 
     benchmark_frames = {}
+    eligible_models = []
     for model_name in model_names:
         records = []
         for emitted_key in metric_keys:
@@ -2551,7 +3057,38 @@ def build_syntheval_tables_from_executions(
             records,
             columns=["metric", "dim", "val", "err", "n_val", "n_err"],
         )
-    return aggregate_benchmark_results(benchmark_frames, ranking_strategy)
+        execution = executions[model_name]
+        if (
+            execution.get("execution_succeeded") is not False
+            and execution.get("policy_eligible") is not False
+        ):
+            eligible_models.append(model_name)
+
+    if not eligible_models:
+        result_columns = pd.MultiIndex.from_tuples(
+            [(metric, level) for metric in metric_keys for level in ("value", "error")]
+            + [(level, "") for level in ("rank", "u_rank")]
+        )
+        rank_columns = pd.Index([*metric_keys, "rank", "u_rank", "p_rank", "f_rank"])
+        return (
+            pd.DataFrame(index=pd.Index(model_names), columns=result_columns, dtype=float),
+            pd.DataFrame(index=pd.Index(model_names), columns=rank_columns, dtype=float),
+        )
+
+    eligible_results, eligible_ranks = aggregate_benchmark_results(
+        {model_name: benchmark_frames[model_name] for model_name in eligible_models},
+        ranking_strategy,
+    )
+    # SynthEval assigns zero ranks to all-NaN input frames. Reindexing the
+    # complete inventory after excluding failed/ineligible executions prevents
+    # those rows from becoming rankable while retaining their audit presence.
+    benchmark_results = eligible_results.reindex(model_names)
+    benchmark_ranks = eligible_ranks.reindex(model_names)
+    failed_models = [model_name for model_name in model_names if model_name not in eligible_models]
+    if failed_models:
+        benchmark_results.loc[failed_models, :] = np.nan
+        benchmark_ranks.loc[failed_models, :] = np.nan
+    return benchmark_results, benchmark_ranks
 
 
 def _validated_cached_syntheval_tables(
@@ -2579,8 +3116,11 @@ def _validated_cached_syntheval_tables(
         return None
 
     try:
-        pd.testing.assert_frame_equal(cached_results, rebuilt_results)
-        pd.testing.assert_frame_equal(cached_ranks, rebuilt_ranks)
+        # Parquet normalizes all-NaN failed-model columns to float; rebuilding
+        # from structured evidence can retain object dtype for those columns.
+        # Values and labels remain strict while dtype normalization is benign.
+        pd.testing.assert_frame_equal(cached_results, rebuilt_results, check_dtype=False)
+        pd.testing.assert_frame_equal(cached_ranks, rebuilt_ranks, check_dtype=False)
     except AssertionError as exc:
         logger.warning(
             "[syntheval] %s aggregate cache differs from structured execution tables (%s); "
@@ -2596,6 +3136,7 @@ def _structured_observations(
     executions: dict[str, dict],
     *,
     role_hashes: dict[str, str],
+    role_hashes_by_framework: Mapping[str, Mapping[str, str]] | None = None,
 ) -> dict[str, list[MetricObservation]]:
     """Project durable fork execution payloads into root contract observations."""
     observations = {model_name: [] for model_name in executions}
@@ -2612,9 +3153,9 @@ def _structured_observations(
                 if emitted_key == "None":
                     continue
                 metadata = _result_metadata_payload(row)
-                # A producer cannot self-label a row canonical. The Task 10
+                # A producer cannot self-label a row canonical. The authoritative
                 # envelope must verify before identity enters shared resolver.
-                if emitted_key == "tstr_macro_f1.v1" and not is_verified_task10_tstr(
+                if emitted_key == "tstr_macro_f1.v1" and not is_verified_authoritative_tstr(
                     {**row, "result_metadata": metadata}
                 ):
                     emitted_key = "syntheval.tstr_macro_f1.v1.legacy"
@@ -2628,7 +3169,7 @@ def _structured_observations(
                 if (
                     item.get("method") in {"tstr", "tstr_macro_f1", "tstr_evaluation"}
                     and (emitted_key in {"macro_f1", "tstr_macro_f1"} or "macro_f1" in row)
-                    and is_verified_task10_tstr({**row, "result_metadata": metadata})
+                    and is_verified_authoritative_tstr({**row, "result_metadata": metadata})
                 ):
                     emitted_key = "tstr_macro_f1.v1"
                 observed_keys.add(emitted_key)
@@ -2640,9 +3181,13 @@ def _structured_observations(
                 sample_size = _structured_sample_size(row, sample_size_field)
                 error = None
                 if emitted_key in failed_keys:
-                    error = status.get("exception_message") or (
-                        f"SynthEval method {item.get('method', '<unknown>')} reported "
-                        f"terminal state {status.get('state', 'failed')}"
+                    error = (
+                        status.get("failure_reason")
+                        or status.get("exception_message")
+                        or (
+                            f"SynthEval method {item.get('method', '<unknown>')} reported "
+                            f"terminal state {status.get('state', 'failed')}"
+                        )
                     )
                 observations[model_name].append(
                     MetricObservation(
@@ -2655,7 +3200,11 @@ def _structured_observations(
                         uncertainty=uncertainty,
                         sample_size=sample_size,
                         error=error,
-                        role_hashes=role_hashes,
+                        role_hashes=dict(
+                            (role_hashes_by_framework or {}).get(
+                                syntheval_framework_for_emitted_key(emitted_key), role_hashes
+                            )
+                        ),
                         source_metadata={
                             "method": item.get("method"),
                             "normalized_value": normalized_value,
@@ -2683,10 +3232,15 @@ def _structured_observations(
                         raw_value=None,
                         execution_pass=execution_pass,
                         target_view=target_view,
-                        error=status.get("exception_message")
+                        error=status.get("failure_reason")
+                        or status.get("exception_message")
                         or f"SynthEval method {item.get('method', '<unknown>')} reported "
                         f"terminal state {status.get('state', 'failed')}",
-                        role_hashes=role_hashes,
+                        role_hashes=dict(
+                            (role_hashes_by_framework or {}).get(
+                                syntheval_framework_for_emitted_key(failed_key), role_hashes
+                            )
+                        ),
                         source_metadata={
                             "method": item.get("method"),
                             "execution_state": status.get("state"),
@@ -2721,6 +3275,7 @@ def validate_syntheval_results(
     expected_keys_by_framework: dict[str, list[str]],
     *,
     role_hashes: dict[str, str],
+    role_hashes_by_framework: Mapping[str, Mapping[str, str]] | None = None,
     model_names: list[str],
     execution_pass: str = "main",
     target_view: str = "native",
@@ -2747,7 +3302,11 @@ def validate_syntheval_results(
         for framework in expected_keys_by_framework
     }
     structured_by_model = (
-        _structured_observations(structured_executions, role_hashes=role_hashes)
+        _structured_observations(
+            structured_executions,
+            role_hashes=role_hashes,
+            role_hashes_by_framework=role_hashes_by_framework,
+        )
         if structured_executions is not None
         else None
     )
@@ -2769,7 +3328,7 @@ def validate_syntheval_results(
                             execution_pass=execution_pass,
                             target_view=target_view,
                             role_hashes=role_hashes,
-                            error="Task 10 TSTR producer result/provenance is unavailable",
+                            error="authoritative TSTR producer result/provenance is unavailable",
                             provenance={"tstr_producer_available": False},
                         )
                     )
@@ -2799,7 +3358,7 @@ def validate_syntheval_results(
                     target_view=target_view,
                     uncertainty=float(uncertainty) if uncertainty is not None else None,
                     error=error,
-                    role_hashes=role_hashes,
+                    role_hashes=dict((role_hashes_by_framework or {}).get(framework, role_hashes)),
                     source_metadata={
                         "normalized_value": rank_value,
                         "normalized_value_present": rank_value is not None,
@@ -2811,7 +3370,7 @@ def validate_syntheval_results(
             )
 
     # A canonical TSTR expectation must never be satisfied by native cls_acc.
-    # If Task 10 did not provide its durable result, retain an explicit blocked
+    # If authoritative TSTR did not provide its durable result, retain an explicit blocked
     # observation instead of allowing a missing row to look like success.
     if "tstr_macro_f1.v1" in expected_keys_by_framework.get("syntheval", ()):
         for model_name in model_names:
@@ -2827,25 +3386,27 @@ def validate_syntheval_results(
                         raw_value=None,
                         execution_pass=execution_pass,
                         target_view=target_view,
-                        role_hashes=role_hashes,
-                        error="Task 10 TSTR producer result/provenance is unavailable",
+                        role_hashes=dict(
+                            (role_hashes_by_framework or {}).get("syntheval", role_hashes)
+                        ),
+                        error="authoritative TSTR producer result/provenance is unavailable",
                         provenance={"tstr_producer_available": False},
                     )
                 )
 
-    context = MetricEvaluationContext(
-        execution_pass=execution_pass,
-        target_view=target_view,
-        evaluation_role=evaluation_role,
-        population_unit=population_unit,
-        group_mode=group_mode,
-        role_hashes=role_hashes,
-        resolved_configuration=resolved_configuration or {},
-    )
     validations: dict[tuple[str, str], dict[str, MetricValidationResult]] = {}
     for framework, expected_keys in expected_keys_by_framework.items():
         if not expected_keys:
             continue
+        context = MetricEvaluationContext(
+            execution_pass=execution_pass,
+            target_view=target_view,
+            evaluation_role=evaluation_role,
+            population_unit=population_unit,
+            group_mode=group_mode,
+            role_hashes=dict((role_hashes_by_framework or {}).get(framework, role_hashes)),
+            resolved_configuration=resolved_configuration or {},
+        )
         validations[(framework, execution_pass)] = {
             model_name: resolve_metric_observations(
                 registry=DEFAULT_METRIC_CONTRACT_REGISTRY,

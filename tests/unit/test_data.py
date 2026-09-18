@@ -1,7 +1,10 @@
 """Unit tests for the pure column-typing/transform helpers in synthdata.data."""
 
+import hashlib
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import cast
 
 import numpy as np
@@ -24,10 +27,100 @@ from synthdata.data import (
     schema_column_roles,
     semantic_context_fingerprint,
     semantic_context_payload,
+    validate_imputation_cache_lineage,
     warn_non_numeric_feature_columns,
+    write_dataset_manifest,
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_candidate_imputation_lineage_rejects_stale_assignment_and_identity(
+    make_config, make_canonical_dataset
+):
+    from synthdata.imputation.pipeline import _cache_key_record
+
+    dataset = make_canonical_dataset()
+    cfg = make_config()
+    record = _cache_key_record(cfg, dataset)
+    record["assignment_fingerprint"] = "stale-assignment"
+    record["identity_fingerprint"] = "stale-identity"
+    (dataset.data_dir / ".imputation_cache_key.json").write_text(json.dumps(record))
+
+    with pytest.raises(RuntimeError, match="rerun imputation before generation"):
+        validate_imputation_cache_lineage(dataset, record, required=True)
+
+
+def test_candidate_imputation_lineage_rejects_persisted_cache_key_mismatch(
+    make_config, make_canonical_dataset
+):
+    from synthdata.imputation.pipeline import _cache_key_record
+
+    dataset = make_canonical_dataset()
+    record = _cache_key_record(make_config(), dataset)
+    persisted = dict(record, cache_key="old-lineage")
+    (dataset.data_dir / ".imputation_cache_key.json").write_text(json.dumps(persisted))
+
+    with pytest.raises(RuntimeError, match="cache key does not match"):
+        validate_imputation_cache_lineage(dataset, record, required=True)
+
+
+def test_candidate_imputation_lineage_accepts_current_cache(make_config, make_canonical_dataset):
+    from synthdata.imputation.pipeline import _cache_key_record, run_imputation
+
+    dataset = make_canonical_dataset()
+    record = _cache_key_record(make_config(), dataset)
+    run_imputation(make_config(), dataset)
+    record = json.loads((dataset.data_dir / ".imputation_cache_key.json").read_text())
+    (dataset.data_dir / ".imputation_cache_key.json").write_text(json.dumps(record))
+    validate_imputation_cache_lineage(dataset, record, required=True)
+
+
+def test_candidate_imputation_lineage_rejects_absent_fit_state(make_config, make_canonical_dataset):
+    from synthdata.imputation.pipeline import run_imputation
+
+    dataset = make_canonical_dataset()
+    run_imputation(make_config(), dataset)
+    path = dataset.data_dir / ".imputation_cache_key.json"
+    record = json.loads(path.read_text())
+    del record["fit_state"]
+    path.write_text(json.dumps(record))
+
+    with pytest.raises(RuntimeError, match="fit state is missing or invalid"):
+        validate_imputation_cache_lineage(dataset, record, required=True)
+
+
+def test_candidate_imputation_lineage_rejects_mismatched_fit_state(
+    make_config, make_canonical_dataset
+):
+    from synthdata.imputation.pipeline import run_imputation
+
+    dataset = make_canonical_dataset()
+    run_imputation(make_config(), dataset)
+    path = dataset.data_dir / ".imputation_cache_key.json"
+    record = json.loads(path.read_text())
+    record["fit_state"]["fit_frame_fingerprint"] = "stale"
+    path.write_text(json.dumps(record))
+
+    with pytest.raises(RuntimeError, match="fit state is missing or invalid"):
+        validate_imputation_cache_lineage(dataset, record, required=True)
+
+
+def test_candidate_imputation_lineage_rejects_old_fingerprint_contract(
+    make_config, make_canonical_dataset
+):
+    from synthdata.imputation.pipeline import run_imputation
+
+    dataset = make_canonical_dataset()
+    run_imputation(make_config(), dataset)
+    path = dataset.data_dir / ".imputation_cache_key.json"
+    record = json.loads(path.read_text())
+    del record["fit_state"]["fit_frame_fingerprint_version"]
+    record["fit_state"]["state_fingerprint"] = "stale"
+    path.write_text(json.dumps(record))
+
+    with pytest.raises(RuntimeError, match="fit state is missing or invalid"):
+        validate_imputation_cache_lineage(dataset, record, required=True)
 
 
 class TestInferNominalColumns:
@@ -202,7 +295,7 @@ class TestVariableSchema:
         assert dataset.nominal_columns == ["site"]
         assert dataset.ordinal_columns == ["severity"]
         assert dataset.target_is_categorical is True
-        assert dataset.all_categorical_columns == ["site", "severity", "target"]
+        assert dataset.all_categorical_columns == ["severity", "site", "target"]
         assert dataset.full_df["severity"].tolist() == [0.0, 2.0, 1.0, 0.0]
         assert dataset.variable_schema_fingerprint
         manifest = json.loads((dataset.data_dir / "dataset_manifest.json").read_text())
@@ -351,17 +444,112 @@ class TestVariableSchema:
             assert "unit-test-only-patient-id-secret" not in path.read_text()
         assert "unit-test-only-patient-id-secret" not in json.dumps(manifest)
         assert "unit-test-only-patient-id-secret" not in json.dumps(payload)
+        assert all(
+            not Path(role_path).is_absolute() for role_path in manifest["role_paths"].values()
+        )
+        assert all(
+            (dataset.data_dir / role_path).exists() for role_path in manifest["role_paths"].values()
+        )
+        assert str(dataset.data_dir) not in json.dumps(manifest)
 
-    @pytest.mark.parametrize("secret", [None, "   "])
-    def test_canonical_loader_requires_external_identity_hmac_secret(
-        self, tmp_path, monkeypatch, secret
+    def test_canonical_loader_sanitizes_manifest_read_errors(self, tmp_path):
+        cfg = self._write_canonical_inputs(tmp_path)
+        dataset_dir = tmp_path / "derived" / "data_v_unversioned"
+        dataset_dir.mkdir(parents=True)
+        sentinel = "manifest-error-sentinel"
+        (dataset_dir / "dataset_manifest.json").write_text('{"broken": "' + sentinel + '"')
+
+        with pytest.raises(ValueError, match="Dataset manifest read failed: invalid_json") as error:
+            load_dataset(cfg)
+
+        assert sentinel not in str(error.value)
+        assert str(dataset_dir) not in str(error.value)
+
+    def test_canonical_loader_bootstraps_and_reuses_identity_key(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", raising=False)
+        cfg = self._write_canonical_inputs(tmp_path)
+        first = load_dataset(cfg)
+        key_path = tmp_path / "derived" / ".patient_id_hmac_key"
+        assert key_path.exists()
+        assert key_path.stat().st_mode & 0o777 == 0o600
+        key = key_path.read_text()
+        first_tokens = first.assignment["population_group_hash"].tolist()
+        first_manifest = json.loads((first.data_dir / "dataset_manifest.json").read_text())
+
+        second = load_dataset(cfg)
+        assert key_path.read_text() == key
+        assert second.assignment["population_group_hash"].tolist() == first_tokens
+        assert (
+            second.role_metadata["identity"]["hmac_key_fingerprint"]
+            == first_manifest["hmac_key_fingerprint"]
+        )
+        assert key not in json.dumps(first_manifest)
+
+    def test_canonical_loader_env_key_overrides_bootstrap(self, tmp_path, monkeypatch):
+        key_path = tmp_path / "derived" / ".patient_id_hmac_key"
+        key_path.parent.mkdir()
+        key_path.write_text("file-secret")
+        monkeypatch.setenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", "environment-secret")
+        dataset = load_dataset(self._write_canonical_inputs(tmp_path))
+        expected = hashlib.sha256(b"environment-secret").hexdigest()
+        assert dataset.role_metadata["identity"]["hmac_key_fingerprint"] == expected
+        assert key_path.read_text() == "file-secret"
+
+    def test_concurrent_manifest_publication_leaves_valid_manifest_and_no_temps(self, tmp_path):
+        dataset = load_dataset(self._write_canonical_inputs(tmp_path))
+        cfg = self._write_canonical_inputs(tmp_path)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            list(executor.map(lambda _: write_dataset_manifest(cfg, dataset), range(2)))
+
+        manifest_path = dataset.data_dir / "dataset_manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        assert (
+            manifest["hmac_key_fingerprint"]
+            == dataset.role_metadata["identity"]["hmac_key_fingerprint"]
+        )
+        assert list(dataset.data_dir.glob(f".{manifest_path.name}.*")) == []
+
+    def test_canonical_loader_rejects_key_lineage_mismatch(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", raising=False)
+        cfg = self._write_canonical_inputs(tmp_path)
+        load_dataset(cfg)
+        (tmp_path / "derived" / ".patient_id_hmac_key").write_text("rotated")
+        with pytest.raises(ValueError, match="fingerprint does not match"):
+            load_dataset(cfg)
+
+    def test_canonical_loader_rejects_different_environment_key_and_preserves_local_key(
+        self, tmp_path, monkeypatch
     ):
-        if secret is None:
-            monkeypatch.delenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", raising=False)
-        else:
-            monkeypatch.setenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", secret)
-        with pytest.raises(ValueError, match="SYNTHDATA_PATIENT_ID_HMAC_KEY"):
-            load_dataset(self._write_canonical_inputs(tmp_path))
+        monkeypatch.delenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", raising=False)
+        cfg = self._write_canonical_inputs(tmp_path)
+        load_dataset(cfg)
+        key_path = tmp_path / "derived" / ".patient_id_hmac_key"
+        original_key = key_path.read_text()
+        monkeypatch.setenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", "different-environment-secret")
+
+        with pytest.raises(ValueError, match="fingerprint does not match"):
+            load_dataset(cfg)
+        assert key_path.read_text() == original_key
+
+    def test_canonical_loader_rejects_old_manifest_without_key_fingerprint(self, tmp_path):
+        cfg = self._write_canonical_inputs(tmp_path)
+        dataset = load_dataset(cfg)
+        manifest_path = dataset.data_dir / "dataset_manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest.pop("hmac_key_fingerprint")
+        manifest_path.write_text(json.dumps(manifest))
+
+        with pytest.raises(ValueError, match="no patient identity key fingerprint"):
+            load_dataset(cfg)
+
+    def test_canonical_loader_rejects_missing_key_with_prior_lineage(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", raising=False)
+        cfg = self._write_canonical_inputs(tmp_path)
+        load_dataset(cfg)
+        (tmp_path / "derived" / ".patient_id_hmac_key").unlink()
+        with pytest.raises(ValueError, match="refusing to generate a replacement"):
+            load_dataset(cfg)
 
     def test_canonical_loader_propagates_distinct_sensitive_and_protected_roles(self, tmp_path):
         dataset = load_dataset(self._write_canonical_inputs(tmp_path))
@@ -437,6 +625,34 @@ class TestVariableSchema:
 
         with pytest.raises(ValueError, match="encounter/drop"):
             load_dataset(cfg)
+
+    def test_loader_accepts_none_drop_columns(self, tmp_path):
+        raw_path = tmp_path / "raw.csv"
+        pd.DataFrame(
+            {
+                "feature": [1, 2, 3, 4],
+                "target": [0, 1, 0, 1],
+            }
+        ).to_csv(raw_path, index=False)
+        schema_path = tmp_path / "schema.csv"
+        schema_path.write_text("column,kind\nfeature,continuous\ntarget,categorical\n")
+        cfg = Config(
+            name="none_drop_columns",
+            data=DataConfig(
+                source="csv",
+                path=str(raw_path),
+                target_column="target",
+                variable_schema_path=str(schema_path),
+                data_dir=str(tmp_path / "derived"),
+                legacy_two_role=True,
+            ),
+        )
+        cfg.data.drop_columns = None
+
+        dataset = load_dataset(cfg)
+
+        assert "feature" in dataset.full_df.columns
+        assert "target" in dataset.full_df.columns
 
     def test_loader_rejects_mapping_patient_key_overlap_with_protected_column(self, tmp_path):
         raw_path = tmp_path / "raw.csv"

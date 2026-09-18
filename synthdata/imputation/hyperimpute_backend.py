@@ -9,9 +9,14 @@ from typing import Any
 
 import pandas as pd
 
+from synthdata.data import dataframe_fingerprint
+
 
 class HyperImputeError(RuntimeError):
     """Raised when fixed-plugin imputation cannot satisfy its contract."""
+
+
+FIT_FRAME_FINGERPRINT_VERSION = "dataframe_fingerprint_v1"
 
 
 @dataclass
@@ -29,8 +34,8 @@ class HyperImputeState:
 
 
 def _fingerprint(frame: pd.DataFrame) -> str:
-    values = pd.util.hash_pandas_object(frame, index=True).to_numpy().tobytes()
-    return hashlib.sha256(values).hexdigest()
+    """Return canonical fingerprint used by persisted fit-state validation."""
+    return dataframe_fingerprint(frame)
 
 
 def metadata_fingerprint(metadata: dict) -> str:
@@ -79,6 +84,9 @@ def fit_dataframe(
         if frame[column].dropna().empty:
             raise HyperImputeError(f"Cannot impute feature {column!r}: no observed training value.")
     numeric_columns = [column for column in feature_columns if column not in categorical]
+    # Persist the same canonical feature-filtered order used by Dataset. Never
+    # serialize caller/schema role order here: cache and generation validation
+    # require exact ordering, not set equivalence.
     categorical_columns = [column for column in feature_columns if column in categorical]
     numeric_imputer: Any = _plugin(continuous_plugin, random_state) if numeric_columns else None
     categorical_imputer: Any = (
@@ -141,6 +149,7 @@ def state_metadata(
             "status": status,
             "fit_roles": fit_roles or ["train"],
             "fit_frame_fingerprint": fit_frame_fingerprint,
+            "fit_frame_fingerprint_version": FIT_FRAME_FINGERPRINT_VERSION,
             "transform_roles": transform_roles or ["train", "tuning", "final_holdout"],
         }
         payload["feature_columns"] = feature_columns or []
@@ -154,6 +163,7 @@ def state_metadata(
         "status": status,
         "fit_roles": list(state.fit_roles),
         "fit_frame_fingerprint": state.fit_fingerprint,
+        "fit_frame_fingerprint_version": FIT_FRAME_FINGERPRINT_VERSION,
         "feature_columns": list(state.feature_columns),
         "categorical_columns": list(state.categorical_columns),
         "continuous_plugin": state.continuous_plugin,

@@ -22,10 +22,10 @@ import pandas as pd
 
 from synthdata.data import semantic_context_digest
 from synthdata.evaluation.catalog import (
+    SYNTHCITY_CANONICAL_MANIFEST,
     SYNTHCITY_CATEGORY_TO_TYPE,
     SYNTHCITY_EMITTED_KEY_SUFFIXES,
     SYNTHCITY_METRIC_CONFIG,
-    SYNTHCITY_TASK12_MANIFEST,
     emitted_keys_for_synthcity_metrics,
     is_known_synthcity_emitted_key,
     resolve_selection,
@@ -148,12 +148,12 @@ def _declared_expected_keys(
         resolved = []
     if len(resolved) != len(set(resolved)):
         raise ValueError("SynthCity expected emitted metric keys must be unique")
-    task12_keys = set(SYNTHCITY_TASK12_MANIFEST)
-    unsafe_task12 = [key for key in resolved if key in task12_keys]
-    if unsafe_task12:
+    canonical_keys = set(SYNTHCITY_CANONICAL_MANIFEST)
+    unsafe_canonical = [key for key in resolved if key in canonical_keys]
+    if unsafe_canonical:
         raise ValueError(
-            "SynthCity Task 12 identities require canonical metric producers, not native report aliases: "
-            + ", ".join(unsafe_task12)
+            "SynthCity canonical identities require canonical metric producers, not native report aliases: "
+            + ", ".join(unsafe_canonical)
         )
     return resolved
 
@@ -179,14 +179,11 @@ def _row_error(row: pd.Series) -> str | None:
     if not error_messages and not error_types and not errors:
         return None
 
-    parts = []
     if error_types:
-        parts.append(f"type={error_types}")
-    if error_messages:
-        parts.append(f"message={error_messages}")
-    if errors and not parts:
-        parts.append(f"error_count={errors}")
-    return "; ".join(parts)
+        return f"metric_evaluation_failed; exception_type={error_types}"
+    if errors:
+        return "metric_evaluation_failed"
+    return "metric_evaluation_failed"
 
 
 def _row_sample_size(row: pd.Series, field: str | None = "rounds") -> int | None:
@@ -277,11 +274,12 @@ def build_synthcity_observations(
 
     has_native_values = "mean" in report.columns or "direction" in report.columns
     if report.empty or not has_native_values:
-        error = _row_value(report.iloc[0], "error") if not report.empty else None
         error_type = _row_value(report.iloc[0], "error_type") if not report.empty else None
-        if error_type:
-            error = f"type={error_type}; message={error}"
-        error = error or "SynthCity emitted no metric rows"
+        error = (
+            f"metric_evaluation_failed; exception_type={error_type}"
+            if error_type
+            else "synthcity_report_empty"
+        )
         observations = tuple(
             MetricObservation(
                 model_name=model_name,
@@ -348,7 +346,7 @@ def build_synthcity_observations(
                     "errors": _row_value(row, "errors"),
                     "durations": _row_value(row, "durations"),
                     "error_types": _row_value(row, "error_types"),
-                    "error_messages": _row_value(row, "error_messages"),
+                    "error_messages": None,
                     "result_metadata": result_metadata,
                 },
                 result_metadata=result_metadata,
@@ -363,7 +361,7 @@ def build_synthcity_observations(
     return expected_keys, tuple(observations)
 
 
-def build_task12_synthcity_observations(
+def build_canonical_synthcity_observations(
     model_name: str,
     values: Mapping[str, Any],
     *,
@@ -373,14 +371,14 @@ def build_task12_synthcity_observations(
     provenance: Mapping[str, Any] | None = None,
     role_hashes: Mapping[str, str] | None = None,
 ) -> tuple[str, tuple[MetricObservation, ...]]:
-    """Build one canonical Task 12 SynthCity observation per declared value.
+    """Build one canonical SynthCity observation per declared value.
 
     This narrow adapter accepts only canonical HPO identities; native report
     rows cannot expand or rename this manifest.
     """
     expected = tuple(values)
-    if set(expected) != set(SYNTHCITY_TASK12_MANIFEST):
-        raise ValueError("Task 12 SynthCity values must contain exactly canonical HPO identities")
+    if set(expected) != set(SYNTHCITY_CANONICAL_MANIFEST):
+        raise ValueError("Canonical SynthCity values must contain exactly approved HPO identities")
     metadata = dict(provenance or {})
     metadata.update({"fit_roles": list(fit_roles), "support": support, "bandwidth": bandwidth})
     observations = tuple(
@@ -397,9 +395,13 @@ def build_task12_synthcity_observations(
             source_metadata=metadata,
             result_metadata=metadata,
         )
-        for key in SYNTHCITY_TASK12_MANIFEST
+        for key in SYNTHCITY_CANONICAL_MANIFEST
     )
     return model_name, observations
+
+
+# Deprecated compatibility alias for historical callers.
+build_task12_synthcity_observations = build_canonical_synthcity_observations
 
 
 def validate_synthcity_report(
@@ -816,6 +818,16 @@ def run_synthcity_evaluation(
                 released_reference_df=released_reference_frame,
             )
         except (TypeError, ValueError, RuntimeError) as exc:
-            logger.warning("[synthcity] evaluation failed for %s: %s", name, exc)
-            results[name] = pd.DataFrame({"error": [str(exc)], "error_type": [type(exc).__name__]})
+            logger.warning(
+                "[synthcity] evaluation failed for %s; reason_code=metric_evaluation_failed "
+                "exception_type=%s",
+                name,
+                type(exc).__name__,
+            )
+            results[name] = pd.DataFrame(
+                {
+                    "error": ["SynthCity metric evaluation failed."],
+                    "error_type": [type(exc).__name__],
+                }
+            )
     return results

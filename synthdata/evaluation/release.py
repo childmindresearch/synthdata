@@ -17,7 +17,8 @@ import numpy as np
 import pandas as pd
 
 PROTOCOL_VERSION = "release-privacy-v1"
-TASK12_PROTOCOL_VERSION = "task12-evaluation-v1"
+RELEASE_EVIDENCE_PROTOCOL_VERSION = "release-evidence-v2"
+LEGACY_TASK12_PROTOCOL_VERSION = "task12-evaluation-v1"
 
 
 def release_privacy_evidence(
@@ -31,6 +32,7 @@ def release_privacy_evidence(
     seed: int = 0,
     role_population_floor: int = 20,
     protected_slice_floor: int = 5,
+    patient_id_column: str | None = None,
 ) -> dict[str, Any]:
     """Return one durable, release-form privacy observation.
 
@@ -56,24 +58,32 @@ def release_privacy_evidence(
     }
     result: dict[str, Any] = {
         "metric": "release_privacy.v1",
-        "protocol_version": TASK12_PROTOCOL_VERSION,
+        "protocol_version": RELEASE_EVIDENCE_PROTOCOL_VERSION,
         "producer_protocol_version": PROTOCOL_VERSION,
         "status": "indeterminate",
         "support": support,
         "invalid_reasons": [],
-        "producer": "task12_release_privacy",
+        "producer": "release_evidence_privacy",
         "seed": seed,
         "support_contract": "declared_support_v1",
         "fit_roles": [],
         "role_hashes": {},
         "population_identity": {},
         "release_support": support,
+        "error_types": [],
     }
+    identity_error = _identity_column_error(
+        (synthetic, reference), patient_id_column=patient_id_column
+    )
+    if identity_error is not None:
+        result["invalid_reasons"].append(identity_error)
+        return result
     try:
         synthetic_provenance = _validate_frame_provenance(synthetic)
         reference_provenance = _validate_frame_provenance(reference)
     except ValueError as exc:
-        result["invalid_reasons"].append(str(exc))
+        result["invalid_reasons"].append("release_provenance_invalid")
+        result["error_types"].append(type(exc).__name__)
         return result
     result["fit_roles"] = (
         ["train"]
@@ -137,7 +147,7 @@ def release_privacy_evidence(
     }
     result.update(
         {
-            "protocol_version": TASK12_PROTOCOL_VERSION,
+            "protocol_version": RELEASE_EVIDENCE_PROTOCOL_VERSION,
             "producer_protocol_version": PROTOCOL_VERSION,
             "release_transform_digest": synthetic_provenance.get("release_transform_digest"),
             "common_protocol_digest": synthetic_provenance["common_protocol_digest"],
@@ -163,7 +173,8 @@ def release_privacy_evidence(
         k_result = k_anonymity(synthetic, quasi_identifiers, required=k_required)
         l_result = l_diversity(synthetic, quasi_identifiers, sensitive_fields, required=l_required)
     except (KeyError, ValueError) as exc:
-        result["invalid_reasons"].append(str(exc))
+        result["invalid_reasons"].append("release_privacy_metric_invalid")
+        result["error_types"].append(type(exc).__name__)
         return result
     result.update(
         {
@@ -246,6 +257,51 @@ def _validate_frame_provenance(frame: pd.DataFrame) -> dict[str, Any]:
     if _digest({**metadata, "role_hash": provenance["role_hash"]}) != provenance["digest"]:
         raise ValueError("release provenance digest does not match frame metadata")
     return provenance
+
+
+_KNOWN_IDENTITY_COLUMNS = frozenset(
+    {
+        "patient_id",
+        "patientid",
+        "patient_identifier",
+        "person_id",
+        "subject_id",
+    }
+)
+
+
+def _declared_identity_columns(frame: pd.DataFrame) -> set[str]:
+    """Return identity columns declared by a frame's canonical metadata."""
+    declared: set[str] = set()
+    for metadata in (frame.attrs, frame.attrs.get("identity_metadata", {})):
+        if not isinstance(metadata, Mapping):
+            continue
+        for key in ("identity_column", "patient_id_column"):
+            value = metadata.get(key)
+            if isinstance(value, str):
+                declared.add(value)
+        values = metadata.get("identity_columns")
+        if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+            declared.update(value for value in values if isinstance(value, str))
+        if metadata.get("raw_identifier_persisted") is True:
+            declared.update(_KNOWN_IDENTITY_COLUMNS & set(frame.columns))
+    return declared
+
+
+def _identity_column_error(
+    frames: Sequence[pd.DataFrame], *, patient_id_column: str | None
+) -> str | None:
+    """Reject identity-bearing frames at canonical release/privacy boundaries."""
+    for frame in frames:
+        identity_columns = _declared_identity_columns(frame)
+        if patient_id_column is not None:
+            identity_columns.add(patient_id_column)
+        identity_columns.update(_KNOWN_IDENTITY_COLUMNS & set(frame.columns))
+        present = identity_columns & set(frame.columns)
+        if present:
+            columns = ", ".join(sorted(present))
+            return f"patient ID cannot be present in canonical release frames: {columns}"
+    return None
 
 
 def _specs(generalization: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -341,6 +397,11 @@ def transform_release_roles(
     common protocol digest, allowing downstream callers to verify that all
     evidence used the same release rules.
     """
+    identity_error = _identity_column_error(
+        (synthetic, *real_roles.values()), patient_id_column=patient_id_column
+    )
+    if identity_error is not None:
+        raise ValueError(identity_error)
     syn, syn_meta = transform_release(
         synthetic,
         generalization,
@@ -956,7 +1017,8 @@ def attribute_disclosure(
                 results[field] = {
                     "status": "indeterminate",
                     "risk": math.nan,
-                    "reason": str(exc),
+                    "reason": "attribute_disclosure_categorical_error",
+                    "error_type": type(exc).__name__,
                     "support": len(final_holdout),
                 }
         elif kind == "continuous":
@@ -987,7 +1049,8 @@ def attribute_disclosure(
                 results[field] = {
                     "status": "indeterminate",
                     "risk": math.nan,
-                    "reason": str(exc),
+                    "reason": "attribute_disclosure_continuous_error",
+                    "error_type": type(exc).__name__,
                     "support": len(final_holdout),
                 }
         else:

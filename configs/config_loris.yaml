@@ -6,42 +6,39 @@ seed: 42
 device: auto
 
 experiment:
-  tag: retry_all_models_hpo_4h_nitro
-  id: "0.5"
+  tag: refactored_loris_v2
+  id: "1.0"
 
 data:
   # Source and schema
   source: csv
   path: data/loris/loris_v2_664_features_us_id.csv # Input file; canonical load stage; invalid/missing path fails closed.
-  version: "1.2"
-  variable_schema_path: data/loris/variable_schema.csv
+  version: "2.0"
+  variable_schema_path: data/loris/loris_v2_variable_schema_us.csv
 
   # Modeling columns
   target_column: CGAS_class # Outcome; modeling/evaluation stage; missing target fails closed.
   canonical: true # Enables strict leakage-safe policy; validation failures abort loading.
   patient_id_column: patient_id # Direct patient identity; split stage only; missing/indirect identity fails closed.
-  quasi_identifier_columns: [Age, Sex, region, PreInt_Demos_Fam__Child_Ethnicity] # Release QIs; privacy stage; absent/overlapping QIs fail closed.
-  sensitive_columns: [Income, PreInt_TxHx__suicide, Diagnosis_Cat__Anxiety_Disorders] # Disclosure targets; privacy stage; invalid role declarations fail closed.
-  protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Ethnicity] # Fairness slices; fairness stage; invalid role declarations fail closed.
+  # QIs are attacker-observable predictors and release equivalence-class fields;
+  # they must not overlap sensitive fields, target, or patient ID. They may
+  # overlap protected fields. Attribute inference uses QIs as predictors.
+  quasi_identifier_columns: [
+      Age,
+      Sex,
+      region,
+      PreInt_Demos_Fam__Child_Ethnicity,
+    ] # Release QIs; privacy stage; absent/overlapping QIs fail closed.
+  sensitive_columns: [
+      Income,
+      PreInt_TxHx__suicide,
+      Diagnosis_Cat__Anxiety_Disorders,
+    ] # Sensitive disclosure/attribute-inference targets; must not overlap QIs or target.
+  # Protected fields define fairness groups. Explicit overlap with QIs or
+  # sensitive fields is allowed; protected fields are not inferred from either.
+  protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Ethnicity] # Fairness slices; invalid role declarations fail closed.
   drop_rows_missing_target: true
-  drop_columns:
-    - subject_id
-    - CGAS__CGAS_Score # Deterministically defines CGAS_class.
-    # High-cardinality diagnosis fields; DSM-category flags are retained instead.
-    - Diagnosis_ClinicianConsensus__DX_01
-    - Diagnosis_ClinicianConsensus__DX_01_Code
-    - Diagnosis_ClinicianConsensus__DX_01_Cat
-    - Diagnosis_ClinicianConsensus__DX_01_ByHx
-    - Diagnosis_ClinicianConsensus__DX_02
-    - Diagnosis_ClinicianConsensus__DX_02_Code
-    - Diagnosis_ClinicianConsensus__DX_02_Cat
-    - Diagnosis_ClinicianConsensus__DX_03
-    - Diagnosis_ClinicianConsensus__DX_03_Code
-    - Diagnosis_ClinicianConsensus__DX_03_Cat
-    # Sparse raw medication text; derived medication flags are retained instead.
-    - DailyMeds__med_type_01
-    - DailyMeds__med_type_02
-    - DailyMeds__med_type_03
+  drop_columns: null
 
   # Source normalization and canonical population roles
   uppercase_columns: false
@@ -61,37 +58,37 @@ data:
 
 imputation:
   enabled: true
-  method: hyperimpute # Canonical imputation backend; Task 6 runtime support; unsupported methods fail closed.
+  method: hyperimpute # Canonical imputation backend; unsupported methods fail closed.
   device: auto
   cache: true
   validation_margin: 0.2
   round_to_int_default: false
   round_rules: {}
-  refidiff:
-    hidden_dim: 32
-    epochs: 10001
-    early_stopping_patience: 500
-    batch_size: 8192
-    num_steps: 50
-    num_trials: 10
-    denoiser: auto
-    checkpoint_every: 1000
-    catboost_warmup_iterations: 1000
+  # refidiff:
+  #   hidden_dim: 32
+  #   epochs: 10001
+  #   early_stopping_patience: 500
+  #   batch_size: 8192
+  #   num_steps: 50
+  #   num_trials: 10
+  #   denoiser: auto
+  #   checkpoint_every: 1000
+  #   catboost_warmup_iterations: 1000
   benchmark:
     enabled: false
-    output_dir: output/loris/imputation
-    mask_fraction: 0.3
-    n_masks: 3
-    mechanisms: [mcar]
-    hpo:
-      enabled: false
-      n_trials: 12
-      timeout_seconds: null
-      hidden_dims: [16, 32, 64]
-      num_steps: [10, 25, 50]
-      num_trials: [1, 3, 5]
-      epochs: [1000, 3000]
-      early_stopping_patience: [100, 250]
+    # output_dir: output/loris/imputation
+    # mask_fraction: 0.3
+    # n_masks: 3
+    # mechanisms: [mcar]
+    # hpo:
+    #   enabled: false
+    #   n_trials: 12
+    #   timeout_seconds: null
+    #   hidden_dims: [16, 32, 64]
+    #   num_steps: [10, 25, 50]
+    #   num_trials: [1, 3, 5]
+    #   epochs: [1000, 3000]
+    #   early_stopping_patience: [100, 250]
 
 generation:
   output_dir: output/loris/synthetic_data
@@ -122,7 +119,7 @@ generation:
     model_iter_caps: { pategan: 30 }
     sgld_step_cap: 2000
     metric_config:
-      task12: [tstr_macro_f1.v1, mixed_mmd.v1, elastic_net_jsd.v1]
+      canonical_objectives: [tstr_macro_f1.v1, mixed_mmd.v1, elastic_net_jsd.v1]
     stage_a:
       minimum_class_count: 1
       minimum_protected_group_count: 1
@@ -132,10 +129,9 @@ generation:
     best_params_path: null
     final_n_iter_override: null
     utility_policy:
-      # Fixed equal-thirds utility policy; Task 13 HPO stage must consume this metadata; mismatches fail closed.
+      # Canonical equal-thirds utility policy; canonical HPO policy must consume this metadata; mismatches fail closed.
       metrics: [tstr_macro_f1.v1, mixed_mmd.v1, elastic_net_jsd.v1]
       weights: [0.3333333333333333, 0.3333333333333333, 0.3333333333333333]
-    utility_policy_provenance: "Task 13 consumes fixed generation.hpo.utility_policy; mismatches fail closed."
 
 evaluation:
   output_dir: output/loris/evaluation
@@ -153,6 +149,8 @@ evaluation:
     categories: null
     metrics: null
     classification_score: balanced_accuracy
+    # Attribute inference: QIs are predictors and sensitive fields are targets;
+    # membership/re-identification/structural screens retain distinct threats.
     structural_n_clusters: [2, 5, 10, 15]
     structural_min_rows_per_cluster: 10
   syntheval: { enabled: true, categories: null, metrics: null }
@@ -170,13 +168,16 @@ evaluation:
       Age:
         # Bounds are years; lower inclusive and upper exclusive except open ends.
         intervals:
-          - {label: "<18", lower: null, upper: 18}
-          - {label: "18-30", lower: 18, upper: 31}
-          - {label: "31-45", lower: 31, upper: 46}
-          - {label: "46-60", lower: 46, upper: 61}
-          - {label: ">60", lower: 61, upper: null}
+          - { label: "<18", lower: null, upper: 18 }
+          - { label: "18-30", lower: 18, upper: 31 }
+          - { label: "31-45", lower: 31, upper: 46 }
+          - { label: "46-60", lower: 46, upper: 61 }
+          - { label: ">60", lower: 61, upper: null }
 
   # Formal release thresholds; privacy stage; invalid values fail closed.
+  # Unsupported synthetic categorical values are never coerced: affected
+  # evidence is failed or indeterminate, never succeeded. Succeeded requires
+  # all required tables; only succeeded evidence supplies metrics/plots/ranking.
   privacy_policy:
     k_required: 5 # Equivalence-class rows; release privacy; lower values fail closed.
     l_required: 2 # Distinct sensitive values; release privacy; lower values fail closed.

@@ -1,7 +1,7 @@
 """Custom fairness evaluation: log disparity (Bhanot et al. 2021) summary metrics.
 
-This module owns log disparity, which has no SynthEval equivalent. Task 12
-custom evidence is implemented in :mod:`synthdata.evaluation.task12_eval`.
+This module owns log disparity, which has no SynthEval equivalent. Historical
+release-evidence compatibility remains isolated in its deprecated shim.
 """
 
 import hashlib
@@ -24,6 +24,59 @@ from synthdata.utils import get_logger
 logger = get_logger(__name__)
 
 _LOG_DISPARITY_NAME = "log_disparity"
+_LOG_REPORT_TABLES = (
+    "leaf_results",
+    "hierarchy_results",
+    "subgroup_table",
+    "leaf_equity_table",
+    "legend_table",
+    "label_counts",
+)
+_LOG_DISPARITY_STATES = frozenset({"succeeded", "failed", "indeterminate"})
+_UNKNOWN_STATE_REASON = "report_state_missing_or_unknown"
+
+
+def _indeterminate_report(reason: str, **metadata: object) -> dict:
+    """Build explicit metadata-only evidence for an incomplete report."""
+    result_metadata = {
+        **metadata,
+        "release_evidence_state": "indeterminate",
+        "release_evidence_reason": reason,
+    }
+    return {
+        "state": "indeterminate",
+        "reason": reason,
+        "missing_tables": metadata.get("missing_tables", list(_LOG_REPORT_TABLES)),
+        "result_metadata": result_metadata,
+    }
+
+
+def _report_missing_tables(report: Mapping[str, object]) -> list[str]:
+    """Return required report tables absent from an evaluator report."""
+    return [table for table in _LOG_REPORT_TABLES if table not in report]
+
+
+def _normalized_report_state(report: Mapping[str, object] | None) -> str:
+    """Return canonical state, failing closed for absent or unknown values."""
+    state = report.get("state") if isinstance(report, Mapping) else None
+    return state if isinstance(state, str) and state in _LOG_DISPARITY_STATES else "indeterminate"
+
+
+def _failed_report(exc: Exception) -> dict:
+    """Build failure evidence without persisting exception details or raw data."""
+    error_type = type(exc).__name__
+    return {
+        "state": "failed",
+        "reason": "evaluator_exception",
+        "error": "log-disparity evaluator raised an unexpected exception",
+        "error_type": error_type,
+        "missing_tables": list(_LOG_REPORT_TABLES),
+        "result_metadata": {
+            "release_evidence_state": "failed",
+            "release_evidence_reason": "evaluator_exception",
+            "error_type": error_type,
+        },
+    }
 
 
 def _release_provenance(
@@ -57,7 +110,9 @@ def _release_provenance(
     if source_role not in expected_source_roles:
         return None
     expected_public_roles = (
-        {"release"} if synthetic else ({"tuning"} if evaluation_role == "tuning" else {"final"})
+        {"release"}
+        if synthetic
+        else ({"tuning"} if evaluation_role == "tuning" else {"final", "final_holdout"})
     )
     if value["role"] not in expected_public_roles:
         return None
@@ -145,6 +200,7 @@ def run_log_disparity_evaluation(
     selection_cfg,
     *,
     evaluation_role: str = "tuning",
+    reference_frame: pd.DataFrame | None = None,
 ) -> dict[str, dict]:
     """Compute a log-disparity fairness report for every synthetic dataset.
 
@@ -174,14 +230,7 @@ def run_log_disparity_evaluation(
         logger.warning("[custom] log_disparity requires protected columns; skipping")
         return {
             name: {
-                "summary_stats": {
-                    "representation_safety": float("nan"),
-                    "worst_abs_log_disparity": float("nan"),
-                },
-                "result_metadata": {
-                    "release_evidence_state": "indeterminate",
-                    "release_evidence_reason": "missing_declared_protected_fields",
-                },
+                **_indeterminate_report("missing_declared_protected_fields"),
             }
             for name in synthetic_datasets
         }
@@ -190,35 +239,46 @@ def run_log_disparity_evaluation(
     if not set(protected_cols).issubset(declared_protected):
         return {
             name: {
-                "summary_stats": {
-                    "representation_safety": float("nan"),
-                    "worst_abs_log_disparity": float("nan"),
-                },
-                "result_metadata": {
-                    "declared_protected_columns": declared_protected,
-                    "configured_protected_columns": protected_cols,
-                    "release_evidence_state": "indeterminate",
-                    "release_evidence_reason": "undeclared_protected_fields",
-                },
+                **_indeterminate_report(
+                    "undeclared_protected_fields",
+                    declared_protected_columns=declared_protected,
+                    configured_protected_columns=protected_cols,
+                ),
             }
             for name in synthetic_datasets
         }
-    real_data = dataset.role_frame(evaluation_role, imputed=False)
+    if evaluation_role == "final_holdout":
+        if reference_frame is None:
+            raise ValueError(
+                "Final-holdout log-disparity requires an explicit released reference frame"
+            )
+        if not isinstance(reference_frame, pd.DataFrame):
+            raise TypeError("Explicit log-disparity reference frame must be a pandas DataFrame")
+        expected_columns = list(dataset.full_df.columns)
+        if list(reference_frame.columns) != expected_columns:
+            raise ValueError(
+                "Explicit log-disparity reference frame columns do not match the dataset schema"
+            )
+        raw_role = dataset.role_frame(evaluation_role, imputed=False)
+        if raw_role is None:
+            raise ValueError("Final-holdout log-disparity reference role is missing")
+        if len(reference_frame) != len(raw_role):
+            raise ValueError(
+                "Explicit log-disparity reference frame row count does not match final_holdout"
+            )
+        real_data = reference_frame
+    else:
+        real_data = dataset.role_frame(evaluation_role, imputed=False)
     if real_data is None:
         return {
             name: {
-                "summary_stats": {
-                    "representation_safety": float("nan"),
-                    "worst_abs_log_disparity": float("nan"),
-                },
-                "result_metadata": {
-                    "declared_protected_columns": protected_cols,
-                    "real_evidence_role": evaluation_role,
-                    "synthetic_input_form": "unverified",
-                    "release_evidence_state": "indeterminate",
-                    "release_evidence_reason": "missing_requested_evaluation_role",
-                    "test_family": "representation::target_by_protected_leaf",
-                },
+                **_indeterminate_report(
+                    "missing_requested_evaluation_role",
+                    declared_protected_columns=protected_cols,
+                    real_evidence_role=evaluation_role,
+                    synthetic_input_form="unverified",
+                    test_family="representation::target_by_protected_leaf",
+                ),
             }
             for name in synthetic_datasets
         }
@@ -253,38 +313,24 @@ def run_log_disparity_evaluation(
                     provenance = None
             if canonical and (provenance is None or real_provenance is None):
                 reports[name] = {
-                    "summary_stats": {
-                        "representation_safety": float("nan"),
-                        "worst_abs_log_disparity": float("nan"),
-                    },
-                    "result_metadata": {
-                        "declared_protected_columns": protected_cols,
-                        "real_evidence_role": evaluation_role,
-                        "synthetic_input_form": "unverified",
-                        "release_evidence_state": "indeterminate",
-                        "release_evidence_reason": (
-                            "missing_or_invalid_release_provenance"
-                            if provenance is None
-                            else "missing_real_evidence_provenance"
-                        ),
-                        "test_family": "representation::target_by_protected_leaf",
-                        "representation_safety": float("nan"),
-                        "worst_abs_log_disparity": float("nan"),
-                    },
+                    **_indeterminate_report(
+                        "missing_or_invalid_release_provenance"
+                        if provenance is None
+                        else "missing_real_evidence_provenance",
+                        declared_protected_columns=protected_cols,
+                        real_evidence_role=evaluation_role,
+                        synthetic_input_form="unverified",
+                        test_family="representation::target_by_protected_leaf",
+                        representation_safety=float("nan"),
+                        worst_abs_log_disparity=float("nan"),
+                    ),
                 }
                 continue
             synthetic_digest = provenance["population_digest"]
             real_digest = real_provenance["population_digest"]
             if synthetic_digest == real_digest:
                 reports[name] = {
-                    "summary_stats": {
-                        "representation_safety": float("nan"),
-                        "worst_abs_log_disparity": float("nan"),
-                    },
-                    "result_metadata": {
-                        "release_evidence_state": "indeterminate",
-                        "release_evidence_reason": "synthetic_real_population_alias",
-                    },
+                    **_indeterminate_report("synthetic_real_population_alias"),
                 }
                 continue
             reports[name] = compute_log_disparity_report(
@@ -297,6 +343,7 @@ def run_log_disparity_evaluation(
                 protected_map=log_disparity_cfg.protected_map,
                 protected_bins=log_disparity_cfg.protected_bins,
             )
+            reports[name]["state"] = "succeeded"
             reports[name]["result_metadata"] = {
                 "declared_protected_columns": protected_cols,
                 "real_evidence_role": evaluation_role,
@@ -315,9 +362,9 @@ def run_log_disparity_evaluation(
                 "synthetic_role_hash": provenance["role_hash"],
                 "real_role_hash": real_provenance["role_hash"],
             }
-        except (KeyError, ValueError) as exc:
-            logger.warning("[custom] log_disparity failed for %s: %s", name, exc)
-            reports[name] = {"error": str(exc), "error_type": type(exc).__name__}
+        except Exception as exc:  # noqa: BLE001 - evaluator failures are per-model evidence
+            logger.warning("[custom] log_disparity failed for %s (%s)", name, type(exc).__name__)
+            reports[name] = _failed_report(exc)
     return reports
 
 
@@ -330,7 +377,7 @@ def build_log_disparity_summary_table(reports: dict[str, dict]) -> pd.DataFrame:
     """
     rows = {}
     for name, report in reports.items():
-        if "error" in report:
+        if _normalized_report_state(report) != "succeeded":
             rows[name] = {
                 "log_disparity_mean_abs": None,
                 "log_disparity_median_abs": None,
@@ -339,7 +386,7 @@ def build_log_disparity_summary_table(reports: dict[str, dict]) -> pd.DataFrame:
                 "log_disparity_worst_abs": None,
             }
             continue
-        stats = report["summary_stats"]
+        stats = report.get("summary_stats", {})
         rows[name] = {
             "log_disparity_mean_abs": stats.get("mean_abs_log_disparity"),
             "log_disparity_median_abs": stats.get("median_abs_log_disparity"),
@@ -364,8 +411,11 @@ def validate_log_disparity_results(
     group_mode: str = "row",
     resolved_configuration: dict | None = None,
     evaluation_role: str = "tuning",
+    expected_role_hashes: Mapping[str, str] | None = None,
 ) -> dict[str, MetricValidationResult]:
     """Validate log-disparity summaries without dropping failed reports."""
+    if expected_role_hashes is not None and dict(role_hashes) != dict(expected_role_hashes):
+        raise ValueError("Custom log-disparity role hashes do not match the declared raw role map")
     expected_keys = [
         "log_disparity_mean_abs",
         "log_disparity_median_abs",
@@ -382,37 +432,25 @@ def validate_log_disparity_results(
     for model_name in model_names:
         report = reports.get(model_name)
         observations = []
-        if report is not None and "error" not in report:
+        state = _normalized_report_state(report)
+        if state == "indeterminate":
+            known_state = (
+                isinstance(report, Mapping) and report.get("state") in _LOG_DISPARITY_STATES
+            )
+            reason = report.get("reason") if known_state else _UNKNOWN_STATE_REASON
+            malformed = dict(report) if isinstance(report, Mapping) else {}
+            malformed.setdefault("reason", reason)
             result_metadata = _log_disparity_result_metadata(
-                report,
+                malformed,
                 role_hashes=role_hashes,
                 evaluation_role=evaluation_role,
-                state="succeeded",
+                state="indeterminate",
             )
-            stats = report.get("summary_stats", {})
-            values = {
-                "log_disparity_mean_abs": stats.get("mean_abs_log_disparity"),
-                "log_disparity_median_abs": stats.get("median_abs_log_disparity"),
-                "log_disparity_share_significant": stats.get("share_significant_bh"),
-            }
-            observations = [
-                MetricObservation(
-                    model_name=model_name,
-                    framework="custom",
-                    emitted_key=key,
-                    raw_value=value,
-                    role_hashes=role_hashes,
-                    source_metadata={
-                        "report_state": "succeeded",
-                        "result_metadata": result_metadata,
-                    },
-                    result_metadata=result_metadata,
-                )
-                for key, value in values.items()
-            ]
-        elif report is not None:
+            observations = []
+        elif state == "failed":
+            failed_report = report if isinstance(report, Mapping) else {}
             result_metadata = _log_disparity_result_metadata(
-                report,
+                failed_report,
                 role_hashes=role_hashes,
                 evaluation_role=evaluation_role,
                 state="failed",
@@ -423,7 +461,10 @@ def validate_log_disparity_results(
                     framework="custom",
                     emitted_key=key,
                     raw_value=None,
-                    error=f"{report.get('error_type', 'UnknownError')}: {report.get('error', 'log-disparity failed')}",
+                    error=(
+                        f"{failed_report.get('error_type', 'UnknownError')}: "
+                        f"{failed_report.get('reason', 'log-disparity failed')}"
+                    ),
                     role_hashes=role_hashes,
                     source_metadata={
                         "report_state": "failed",
@@ -433,6 +474,56 @@ def validate_log_disparity_results(
                 )
                 for key in expected_keys
             ]
+        else:
+            missing_tables = (
+                _report_missing_tables(report)
+                if isinstance(report, Mapping)
+                else list(_LOG_REPORT_TABLES)
+            )
+            summary_stats = report.get("summary_stats") if isinstance(report, Mapping) else None
+            if missing_tables or not isinstance(summary_stats, Mapping):
+                reason = (
+                    "malformed_report" if not isinstance(report, Mapping) else "incomplete_report"
+                )
+                malformed = _indeterminate_report(
+                    reason,
+                    missing_tables=missing_tables,
+                    report_state=report.get("state") if isinstance(report, Mapping) else None,
+                )
+                result_metadata = _log_disparity_result_metadata(
+                    malformed,
+                    role_hashes=role_hashes,
+                    evaluation_role=evaluation_role,
+                    state="indeterminate",
+                )
+                observations = []
+            else:
+                result_metadata = _log_disparity_result_metadata(
+                    report,
+                    role_hashes=role_hashes,
+                    evaluation_role=evaluation_role,
+                    state="succeeded",
+                )
+                values = {
+                    "log_disparity_mean_abs": summary_stats.get("mean_abs_log_disparity"),
+                    "log_disparity_median_abs": summary_stats.get("median_abs_log_disparity"),
+                    "log_disparity_share_significant": summary_stats.get("share_significant_bh"),
+                }
+                observations = [
+                    MetricObservation(
+                        model_name=model_name,
+                        framework="custom",
+                        emitted_key=key,
+                        raw_value=value,
+                        role_hashes=role_hashes,
+                        source_metadata={
+                            "report_state": "succeeded",
+                            "result_metadata": result_metadata,
+                        },
+                        result_metadata=result_metadata,
+                    )
+                    for key, value in values.items()
+                ]
         validations[model_name] = resolve_metric_observations(
             registry=DEFAULT_METRIC_CONTRACT_REGISTRY,
             model_name=model_name,

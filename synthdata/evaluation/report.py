@@ -13,6 +13,11 @@ import pandas as pd
 from synthdata.config import Config
 from synthdata.data import Dataset
 from synthdata.evaluation.artifacts import (
+    _LOG_REPORT_TABLES,
+    _SAFE_LOG_DISPARITY_REASONS,
+    _model_artifact_id,
+    _validate_release_score_binding,
+    _validate_release_score_record,
     artifact_bundle_dir,
     expected_evaluation_context,
     validate_evaluation_bundle,
@@ -25,6 +30,34 @@ logger = get_logger(__name__)
 _GATE_PASS_COL = ("__all__", "privacy_gate", "pass")
 _GATE_VIOLATIONS_COL = ("__all__", "privacy_gate", "violations")
 _TUNING_UTILITY_COL = ("__all__", "utility", "U_tuning")
+
+
+def _valid_log_disparity_success(report: object) -> bool:
+    """Return whether report contains complete, safe success evidence."""
+    if not isinstance(report, dict) or report.get("state") != "succeeded":
+        return False
+    if any(not isinstance(report.get(table), pd.DataFrame) for table in _LOG_REPORT_TABLES):
+        return False
+    stats = report.get("summary_stats")
+    if not isinstance(stats, dict):
+        return False
+    metric_names = (
+        "mean_abs_log_disparity",
+        "median_abs_log_disparity",
+        "share_significant_bh",
+    )
+    return all(
+        isinstance(stats.get(name), (int, float))
+        and not isinstance(stats.get(name), bool)
+        and math.isfinite(float(stats[name]))
+        for name in metric_names
+    )
+
+
+def _safe_log_disparity_reason(report: dict, fallback: str) -> str:
+    """Return persisted allowlisted reason, never arbitrary report input."""
+    reason = report.get("reason")
+    return reason if isinstance(reason, str) and reason in _SAFE_LOG_DISPARITY_REASONS else fallback
 
 
 def _dataframe_to_markdown(df: pd.DataFrame) -> str:
@@ -141,11 +174,32 @@ def _release_score_section(extras: dict) -> str:
         lines.append("No final-holdout release score was recorded.")
         return "\n".join(lines)
 
+    # Never print numeric success from an unbound or incomplete decomposition.
+    # Failed/indeterminate states remain useful audit output.
+    evidence_state = evidence.get("state", score.get("status"))
+    if score.get("status") == "succeeded":
+        try:
+            if evidence.get("state") != "succeeded":
+                raise ValueError("missing successful final-holdout evidence state")
+            _validate_release_score_record(
+                score, model_name=str(evidence.get("selected_model")), path=Path("<report>")
+            )
+            _validate_release_score_binding(score, evidence, label="Report release score")
+        except ValueError:
+            lines.append("- Status: `indeterminate`")
+            lines.append(
+                "- Claimed success withheld: final-holdout evidence is incomplete or tampered."
+            )
+            return "\n".join(lines)
+
     lines.append(
         "**Audit-only:** this score is computed after candidate selection and is not used to rerank models."
     )
     lines.append("")
-    lines.append(f"- Status: `{score.get('status', 'unknown')}`")
+    state = evidence_state
+    if state not in {"succeeded", "failed", "indeterminate"}:
+        state = "indeterminate"
+    lines.append(f"- Status: `{state}`")
     for field in (
         "evidence_execution_state",
         "metric_completeness_state",
@@ -154,6 +208,16 @@ def _release_score_section(extras: dict) -> str:
     ):
         if field in evidence:
             lines.append(f"- {field.replace('_', ' ').capitalize()}: `{evidence[field]}`")
+    indeterminate = score.get("indeterminate_dimensions") or []
+    if indeterminate:
+        lines.append(
+            "- Indeterminate dimensions: " + ", ".join(f"`{item}`" for item in indeterminate)
+        )
+    if state != "succeeded":
+        lines.append(
+            "- Metrics and plots are withheld because final-holdout evidence is audit-only."
+        )
+        return "\n".join(lines)
     lines.append(f"- R_final: `{_fmt_metric(score.get('score'))}`")
     dimensions = score.get("dimensions") or {}
     for name in ("utility", "privacy", "fairness"):
@@ -161,11 +225,6 @@ def _release_score_section(extras: dict) -> str:
         lines.append(f"- {name.capitalize()}: `{_fmt_metric(dimension.get('score'))}`")
     if "identity" in (dimensions.get("privacy") or {}):
         lines.append(f"- Identity safety: `{_fmt_metric(dimensions['privacy'].get('identity'))}`")
-    indeterminate = score.get("indeterminate_dimensions") or []
-    if indeterminate:
-        lines.append(
-            "- Indeterminate dimensions: " + ", ".join(f"`{item}`" for item in indeterminate)
-        )
     lines.append(f"- Audit-only label: `{bool(score.get('audit_only', True))}`")
     return "\n".join(lines)
 
@@ -210,11 +269,13 @@ def _fairness_highlights_section(combined: pd.DataFrame, extras: dict) -> str:
         "significance testing). Lower is better for every number below."
     )
     lines.append("")
-    task12 = extras.get("task12_validation") or {}
-    if task12:
-        lines.append("### Task 12 release evidence")
+    release_evidence = (
+        extras.get("release_evidence_validation") or extras.get("task12_validation") or {}
+    )
+    if release_evidence:
+        lines.append("### Canonical release evidence")
         lines.append("")
-        for model, validation in sorted(task12.items()):
+        for model, validation in sorted(release_evidence.items()):
             status = validation.get("decision_status", validation.get("status", "unknown"))
             lines.append(f"- `{model}`: `{status}` (canonical release/fairness evidence)")
         lines.append("")
@@ -256,9 +317,53 @@ def _fairness_highlights_section(combined: pd.DataFrame, extras: dict) -> str:
         )
         lines.append("")
         rows = []
+        has_incomplete = False
         for model, report in sorted(log_disparity_reports.items()):
-            if "error" in report:
-                rows.append({"model": model, "error": report["error"]})
+            if not isinstance(report, dict):
+                report = {}
+            state = report.get("state")
+            if state not in {"succeeded", "failed", "indeterminate"}:
+                has_incomplete = True
+                rows.append(
+                    {
+                        "model": model,
+                        "state": "indeterminate",
+                        "reason": "report_state_missing_or_unknown",
+                    }
+                )
+                continue
+            if state == "failed" or "error" in report:
+                rows.append(
+                    {
+                        "model": model,
+                        "state": "failed",
+                        "reason": _safe_log_disparity_reason(
+                            report, "log_disparity_evaluation_failed"
+                        ),
+                    }
+                )
+                continue
+            if state == "indeterminate":
+                has_incomplete = True
+                rows.append(
+                    {
+                        "model": model,
+                        "state": "indeterminate",
+                        "reason": _safe_log_disparity_reason(
+                            report, "log_disparity_evaluation_indeterminate"
+                        ),
+                    }
+                )
+                continue
+            if not _valid_log_disparity_success(report):
+                has_incomplete = True
+                rows.append(
+                    {
+                        "model": model,
+                        "state": "indeterminate",
+                        "reason": "incomplete_report",
+                    }
+                )
                 continue
             stats = report["summary_stats"]
             rows.append(
@@ -271,10 +376,11 @@ def _fairness_highlights_section(combined: pd.DataFrame, extras: dict) -> str:
             )
         lines.append(_dataframe_to_markdown(pd.DataFrame(rows)))
         lines.append("")
-        lines.append(
-            "See the per-model interactive sunburst reports linked under Plots below for a "
-            "subgroup-by-subgroup breakdown (which subgroups are over/under-represented)."
-        )
+        if not has_incomplete:
+            lines.append(
+                "See the per-model interactive sunburst reports linked under Plots below for a "
+                "subgroup-by-subgroup breakdown (which subgroups are over/under-represented)."
+            )
     else:
         lines.append("Log disparity was not computed this run.")
     return "\n".join(lines)
@@ -283,36 +389,53 @@ def _fairness_highlights_section(combined: pd.DataFrame, extras: dict) -> str:
 def _plot_links_section(report_dir: Path, cfg: Config, log_disparity_reports: dict) -> str:
     """List links to evaluation plots, relative to where ``report.md`` is written.
 
-    ``report.md`` lives under ``cfg.evaluation.output_dir`` while plots live under
-    the separate ``cfg.plots.output_dir`` tree (both nested under the same
-    ``<experiment_id>/``) -- so links must be computed relative to ``report_dir``
-    itself via ``os.path.relpath``, not assumed to share a common ancestor at a
-    fixed number of ``..`` hops up.
+    Plot links use portable artifact identifiers rather than exposing configured paths.
     """
     plots_dir = Path(cfg.plots.output_dir) / "evaluation"
+    formats = tuple(str(fmt).lstrip(".") for fmt in cfg.plots.formats)
+
+    def _portable_link(path: Path) -> str:
+        """Return an existence-checked, report-relative Markdown target."""
+        return Path(os.path.relpath(path, report_dir)).as_posix()
+
+    def _first_existing(stem: Path) -> Path | None:
+        return next(
+            (
+                stem.with_suffix(f".{fmt}")
+                for fmt in formats
+                if stem.with_suffix(f".{fmt}").is_file()
+            ),
+            None,
+        )
+
     lines = ["## Plots", ""]
     candidates = [
-        ("Utility vs privacy trade-off", plots_dir / "utility_vs_privacy.png"),
-        ("Utility vs fairness trade-off", plots_dir / "utility_vs_fairness.png"),
-        ("Privacy vs fairness trade-off", plots_dir / "privacy_vs_fairness.png"),
+        ("Utility, privacy, and fairness rank trade-off (3D)", plots_dir / "rank_tradeoff_3d.html"),
     ]
+    for label, stem in (
+        ("Utility vs privacy trade-off", plots_dir / "utility_vs_privacy"),
+        ("Utility vs fairness trade-off", plots_dir / "utility_vs_fairness"),
+        ("Privacy vs fairness trade-off", plots_dir / "privacy_vs_fairness"),
+    ):
+        if path := _first_existing(stem):
+            candidates.append((label, path))
     found_any = False
     for label, path in candidates:
         if path.exists():
             found_any = True
-            lines.append(f"- [{label}]({os.path.relpath(path, report_dir)})")
+            lines.append(f"- [{label}]({_portable_link(path)})")
     for model in sorted(log_disparity_reports):
-        html_path = plots_dir / "log_disparity" / f"{model}.html"
+        report = log_disparity_reports[model]
+        if not _valid_log_disparity_success(report):
+            continue
+        html_path = plots_dir / "log_disparity" / f"{_model_artifact_id(model)}.html"
         if html_path.exists():
             found_any = True
-            lines.append(
-                f"- [Log disparity report ({model})]({os.path.relpath(html_path, report_dir)})"
-            )
+            lines.append(f"- [Log disparity report ({model})]({_portable_link(html_path)})")
     if not found_any:
         lines.append(
-            "No plots were found under `"
-            + str(plots_dir)
-            + "` (run `synthdata-plot` to render recorded plot artifacts)."
+            "No plots were found under `plots/evaluation/` "
+            "(run `synthdata-plot` to render recorded plot artifacts)."
         )
     return "\n".join(lines)
 
@@ -394,5 +517,5 @@ def save_evaluation_report(
     )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(report_text)
-    logger.info("[report] wrote evaluation report to %s", report_path)
+    logger.info("[report] wrote evaluation report artifact report.md")
     return report_path

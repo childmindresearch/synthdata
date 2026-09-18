@@ -15,25 +15,32 @@ Requires generated synthetic data (run `synthdata-generate` first).
 import argparse
 from pathlib import Path
 
-import pandas as pd
-
 from synthdata.config import load_config
-from synthdata.data import load_dataset, load_imputed_splits
-from synthdata.evaluation import run_evaluation
+from synthdata.data import (
+    load_dataset,
+    load_imputed_splits,
+    validate_imputation_cache_lineage,
+)
+from synthdata.evaluation import artifacts, run_evaluation
 from synthdata.evaluation.combine import simple_rank_summary
 from synthdata.experiment import load_experiment
-from synthdata.imputation.pipeline import _cache_key_record
+from synthdata.imputation.pipeline import _cache_key_record, run_imputation
 from synthdata.utils import get_logger, set_global_seed
 
 logger = get_logger("run_evaluation")
 
 
-def _load_synthetic_datasets(cfg) -> dict:
-    output_dir = Path(cfg.generation.output_dir)
-    datasets = {}
-    for path in sorted(output_dir.glob("*.csv")):
-        datasets[path.stem] = pd.read_csv(path)
-    return datasets
+def _load_synthetic_datasets(cfg, dataset=None) -> dict:
+    """Load generated inputs after strict canonical cache preflight."""
+    if dataset is None:
+        raise ValueError("Canonical evaluation requires candidate dataset context for preflight")
+    configured_models = list(cfg.evaluation.models) if cfg.evaluation.models else None
+    return artifacts.load_validated_generated_datasets(
+        cfg.generation.output_dir,
+        dataset,
+        model_names=configured_models,
+        classification_score=cfg.evaluation.synthcity.classification_score,
+    )
 
 
 def main() -> None:
@@ -66,20 +73,54 @@ def main() -> None:
         cfg.data.version = args.dataset_version
     set_global_seed(cfg.seed)
 
-    dataset = load_dataset(cfg)
-    dataset = load_imputed_splits(
-        dataset,
-        expected_cache_key=_cache_key_record(cfg, dataset)["cache_key"],
+    candidate_dataset = load_dataset(cfg)
+    candidate_dataset = load_imputed_splits(
+        candidate_dataset,
+        expected_cache_key=_cache_key_record(cfg, candidate_dataset)["cache_key"],
     )
-    if dataset.role_frame("train", imputed=True) is None:
-        raise SystemExit("No imputed data found. Run `synthdata-impute --config <path>` first.")
+    validate_imputation_cache_lineage(
+        candidate_dataset,
+        _cache_key_record(cfg, candidate_dataset),
+        required=True,
+    )
+    if any(
+        candidate_dataset.role_frame(role, imputed=True) is None for role in ("train", "tuning")
+    ):
+        raise SystemExit(
+            "No validated candidate imputation found. Run `synthdata-impute --config <path>` first."
+        )
 
-    experiment = load_experiment(cfg, dataset=dataset)
+    final_dataset = load_dataset(cfg)
+    final_dataset = run_imputation(cfg, final_dataset, phase="final")
+    final_dataset = load_imputed_splits(
+        final_dataset,
+        expected_cache_key=_cache_key_record(cfg, final_dataset, phase="final")["cache_key"],
+        phase="final",
+    )
+    final_holdout = final_dataset.role_frame("final_holdout", imputed=True)
+    if final_holdout is None:
+        raise SystemExit(
+            "No validated final-phase imputation found; refusing to evaluate raw final_holdout."
+        )
+    train = candidate_dataset.role_frame("train", imputed=True)
+    tuning = candidate_dataset.role_frame("tuning", imputed=True)
+    if train is None or tuning is None:
+        raise SystemExit("Validated candidate imputation is incomplete; refusing evaluation.")
+    candidate_dataset.set_imputed_roles(
+        {
+            "train": train,
+            "tuning": tuning,
+            "final_holdout": final_holdout,
+        }
+    )
+    dataset = candidate_dataset
+
+    experiment = load_experiment(cfg, dataset=dataset, allow_final_holdout_handoff=True)
     cfg.generation.output_dir = str(experiment.generation_dir)
     cfg.evaluation.output_dir = str(experiment.evaluation_dir)
     cfg.plots.output_dir = str(experiment.plots_dir)
 
-    synthetic_datasets = _load_synthetic_datasets(cfg)
+    synthetic_datasets = _load_synthetic_datasets(cfg, dataset)
     if not synthetic_datasets:
         raise SystemExit(
             f"No synthetic datasets found in {cfg.generation.output_dir}. "

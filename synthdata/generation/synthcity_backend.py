@@ -20,6 +20,7 @@ from synthdata.generation.hpo import (
     HPO_GENERATOR_METADATA_SCHEMA_VERSION,
     StageAScreenContract,
     _resolve_utility_policy,
+    _safe_exception_message,
     evaluate_canonical_hpo_metrics,
     hpo_score,
     persist_stage_a_trial_exception,
@@ -591,12 +592,16 @@ def build_synthcity_objective(
                     exc,
                 )
             logger.warning(
-                "[%s] Stage A candidate construction failed for trial %d: %s",
+                "[%s] Stage A candidate construction failed for trial %d: %s (%s)",
                 name,
                 trial.number,
-                exc,
+                "stage_a_screen_exception",
+                type(exc).__name__,
             )
-            raise optuna.TrialPruned(str(exc)) from exc
+            raise optuna.TrialPruned(
+                f"stage_a_screen_exception: {_safe_exception_message('stage_a_screen_exception')} "
+                f"[{type(exc).__name__}]"
+            ) from exc
 
         trial_id = f"trial_{trial.number}"
         candidate_screen = None
@@ -681,26 +686,24 @@ def build_synthcity_objective(
                 metric_report = report[trial_id]
             group_safety = getattr(metric_report, "attrs", {}).get("group_safety")
             if isinstance(group_safety, Mapping) and group_safety.get("status") == "group_unsafe":
-                reason = str(
-                    group_safety.get(
-                        "reason", "SynthCity HPO candidate is not safe for patient-group evaluation"
-                    )
-                )
+                reason_code = "group_unsafe"
                 set_trial_attr(
                     trial,
                     "hpo_outcome",
                     {
                         "status": "group_unsafe",
-                        "group_safety": dict(group_safety),
+                        "group_safety": {"status": "group_unsafe", "reason_code": reason_code},
                     },
                 )
                 logger.warning(
                     "[%s] pruning trial %d because grouped evaluation is unsafe: %s",
                     name,
                     trial.number,
-                    reason,
+                    reason_code,
                 )
-                raise optuna.TrialPruned(reason)
+                raise optuna.TrialPruned(
+                    "group_unsafe: Grouped evaluation unsafe; details suppressed."
+                )
             metric_metadata = metric_report.attrs.get("metric_metadata", {})
             if metric_metadata:
                 set_trial_attr(trial, "metric_metadata", metric_metadata)
@@ -735,7 +738,16 @@ def build_synthcity_objective(
                     stage_a_contract,
                     exc,
                 )
-            logger.warning("[%s] trial %d failed: %s", name, trial.number, exc)
-            raise optuna.TrialPruned(str(exc)) from exc
+            reason_code = "hpo_trial_exception"
+            logger.warning(
+                "[%s] trial %d failed: %s (%s)",
+                name,
+                trial.number,
+                reason_code,
+                type(exc).__name__,
+            )
+            raise optuna.TrialPruned(
+                f"{reason_code}: {_safe_exception_message(reason_code)} [{type(exc).__name__}]"
+            ) from exc
 
     return objective

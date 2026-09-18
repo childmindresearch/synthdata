@@ -50,6 +50,19 @@ disjoint assignment, and removed from model
 frames. Raw identity remains only in local role-assignment metadata; it is
 never a feature or release-form evaluation field.
 
+Patient-group tokenization uses a local HMAC key. Without
+`SYNTHDATA_PATIENT_ID_HMAC_KEY`, the loader creates and reuses
+`<data.data_dir>/.patient_id_hmac_key` (outside versioned `data_v_*` directories)
+with owner-only permissions where supported. CI and production should provision
+the non-empty environment variable; it overrides the local file and is never
+overwritten. Manifests record only a SHA-256 key fingerprint. If that
+fingerprint changes, loading fails closed; restore the original key or perform
+an explicit identity rotation. Losing the local key likewise requires recovery
+or deliberate rotation. Keys are random rather than derived from dataset
+contents, so patient namespaces remain secret and cannot be reconstructed from
+published data; reproducibility requires retaining the key or providing the
+same external secret.
+
 Dataset roles are separate: **patient ID** identifies a person across
 encounters; **target** is the outcome evaluated for utility/fairness;
 **quasi-identifiers (QIs)** are explicitly declared linkage/attacker fields;
@@ -58,6 +71,24 @@ attacks; and **protected attributes** define fairness subgroups for
 representation, EO, and log-disparity evidence. Sensitive attributes are not
 automatically QIs or protected attributes, and protected attributes are not
 inferred from sensitive fields. Patient ID is none of these model roles.
+
+### Role overlap and threat-model boundaries
+
+Role declarations are explicit and are not inferred from one another. Use this
+matrix when reviewing a profile:
+
+| Role | Meaning | May overlap | Must not overlap |
+| --- | --- | --- | --- |
+| Protected fields | Fairness groups for representation, EO, and disparity evidence | QIs or sensitive fields, when explicitly declared | — |
+| QIs | Attacker-observable predictors and release equivalence-class fields | Protected fields | Sensitive fields, target, or patient ID |
+| Sensitive fields | Disclosure/attribute-inference targets | Protected fields | QIs or target |
+| Target | Utility/fairness outcome | Protected fields may also be used as fairness groups | — |
+| Patient ID | Identity used for patient grouping and split assignment | — | QIs, sensitive fields, target, and protected fields |
+
+Attribute inference uses only declared QIs as predictors and sensitive fields as
+targets. Membership inference, re-identification, structural privacy screens,
+and other attacks retain their own distinct threat models; their inputs and
+claims must not be described as attribute inference by default.
 
 Historical `train`/`test` artifacts are supported only when the profile sets
 `data.legacy_two_role: true`. They remain readable for compatibility, but
@@ -146,6 +177,15 @@ audit utility compares selected release-form synthetic data with
 Attribute-disclosure attackers fit on synthetic QIs and score `final_holdout`.
 Representation, EO, and worst log disparity use final evidence. Invalid
 required evidence is indeterminate, not silently substituted or reweighted.
+
+Synthetic categorical values outside source support are not silently coerced.
+The affected evaluation records failed or indeterminate evidence, as
+appropriate to whether execution errored or required evidence is incomplete;
+it never records that evidence as succeeded. Evidence states have strict
+meaning: `succeeded` requires every required table; `failed` means execution
+or an evaluation error; `indeterminate` means required evidence is insufficient
+or incomplete. Only `succeeded` evidence contributes metric values, plots, or
+policy ranking. Failed and indeterminate records remain visible for audit.
 
 Formal release-form privacy metrics use transformed QIs and sensitive fields:
 `S_k` and `S_l` are formal k-anonymity and l-diversity scores, with `S_DCR`

@@ -56,7 +56,11 @@ def add_histogram_with_kde(
     try:
         density = gaussian_kde(numeric_values)
     except (np.linalg.LinAlgError, ValueError) as exc:
-        logger.warning("Skipping KDE for %s: %s", label or "series", exc)
+        logger.warning(
+            "Skipping KDE for %s; reason_code=kde_estimation_failed exception_type=%s",
+            label or "series",
+            type(exc).__name__,
+        )
         return
 
     x_values = np.linspace(numeric_values.min(), numeric_values.max(), 200)
@@ -93,10 +97,10 @@ def save_plotly_figure(fig, path: str | Path, formats=("html",)) -> None:
             logger.info("Saved figure: %s", out)
         except (ValueError, ImportError) as exc:
             logger.warning(
-                "Could not save %s (%s); falling back to HTML. Install 'kaleido' for "
+                "Could not save figure; reason_code=plot_export_failed exception_type=%s; "
+                "falling back to HTML. Install 'kaleido' for "
                 "static image export of Plotly figures.",
-                out,
-                exc,
+                type(exc).__name__,
             )
             fallback = path.with_suffix(".html")
             fig.write_html(str(fallback))
