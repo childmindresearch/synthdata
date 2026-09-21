@@ -36,6 +36,7 @@ from synthdata.generation.hpo import (
     prepare_stage_a_screen,
     sanitize_hpo_metric_metadata,
     screen_stage_a_trial,
+    validate_existing_stage_a_trial_result,
     validate_hpo_metric_config,
 )
 from synthdata.utils import get_logger
@@ -841,13 +842,22 @@ def build_synthcity_objective(
             if stage_a_contract is not None:
                 if stage_a_root is None or study_name is None:
                     raise RuntimeError("Stage A screening context is incomplete") from exc
-                persist_stage_a_trial_exception(
-                    trial,
-                    stage_a_root,
-                    study_name,
-                    stage_a_contract,
-                    exc,
-                )
+                if not validate_existing_stage_a_trial_result(
+                    stage_a_root, study_name, trial.number, stage_a_contract
+                ):
+                    persist_stage_a_trial_exception(
+                        trial,
+                        stage_a_root,
+                        study_name,
+                        stage_a_contract,
+                        exc,
+                    )
+                else:
+                    logger.info(
+                        "[%s] preserving existing Stage A result for trial %d",
+                        name,
+                        trial.number,
+                    )
             logger.warning(
                 "[%s] Stage A candidate construction failed for trial %d: %s (%s)",
                 name,
@@ -1050,17 +1060,11 @@ def build_synthcity_objective(
         except (TypeError, ValueError, RuntimeError) as exc:
             if getattr(trial, "user_attrs", {}).get("generator_metadata_state") != "present":
                 set_trial_attr(trial, "generator_metadata_state", "missing")
-            if stage_a_contract is not None and not getattr(trial, "user_attrs", {}).get(
-                "stage_a_state"
-            ):
-                if stage_a_root is None or study_name is None:
-                    raise RuntimeError("Stage A screening context is incomplete") from exc
-                persist_stage_a_trial_exception(
+            if not getattr(trial, "user_attrs", {}).get("hpo_error_provenance"):
+                set_trial_attr(
                     trial,
-                    stage_a_root,
-                    study_name,
-                    stage_a_contract,
-                    exc,
+                    "hpo_error_provenance",
+                    hpo_exception_provenance(exc, location="synthcity_objective"),
                 )
             reason_code = getattr(exc, "reason_code", "hpo_trial_exception")
             if reason_code not in {
@@ -1070,12 +1074,27 @@ def build_synthcity_objective(
                 "hpo_trial_exception",
             }:
                 reason_code = "hpo_trial_exception"
-            if not getattr(trial, "user_attrs", {}).get("hpo_error_provenance"):
-                set_trial_attr(
-                    trial,
-                    "hpo_error_provenance",
-                    hpo_exception_provenance(exc, location="synthcity_objective"),
-                )
+            if stage_a_contract is not None and not getattr(trial, "user_attrs", {}).get(
+                "stage_a_state"
+            ):
+                if stage_a_root is None or study_name is None:
+                    raise RuntimeError("Stage A screening context is incomplete") from exc
+                if not validate_existing_stage_a_trial_result(
+                    stage_a_root, study_name, trial.number, stage_a_contract
+                ):
+                    persist_stage_a_trial_exception(
+                        trial,
+                        stage_a_root,
+                        study_name,
+                        stage_a_contract,
+                        exc,
+                    )
+                else:
+                    logger.info(
+                        "[%s] preserving existing Stage A result for trial %d",
+                        name,
+                        trial.number,
+                    )
             logger.warning(
                 "[%s] trial %d failed: %s (%s)",
                 name,

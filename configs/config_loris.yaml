@@ -101,15 +101,15 @@ generation:
     names: [ctgan, tvae, adsgan, pategan, rtvae]
     params:
       ctgan:
-        n_iter: 40
+        n_iter: 10
       tvae:
-        n_iter: 40
+        n_iter: 10
       adsgan:
-        n_iter: 40
+        n_iter: 10
       pategan:
-        n_iter: 40
+        n_iter: 10
       rtvae:
-        n_iter: 40
+        n_iter: 10
   tabpfn:
     enabled: true
     variants: [standard, custom]
@@ -124,9 +124,9 @@ generation:
   hpo:
     enabled: true
     n_trials: 5
-    timeout_seconds: 144
-    n_iter_cap: 100
-    model_iter_caps: { pategan: 30 }
+    timeout_seconds: 300
+    n_iter_cap: 10
+    model_iter_caps: { pategan: 5 }
     sgld_step_cap: 2000
     metric_config:
       canonical_objectives: [tstr_macro_f1.v1, mixed_mmd.v1, elastic_net_jsd.v1]

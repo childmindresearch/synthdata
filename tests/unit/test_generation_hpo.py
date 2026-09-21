@@ -36,6 +36,7 @@ from synthdata.generation.hpo import (
     run_study,
     screen_stage_a,
     screen_stage_a_trial,
+    validate_existing_stage_a_trial_result,
     validate_hpo_metric_config,
 )
 from synthdata.generation.synthcity_backend import (
@@ -1146,6 +1147,20 @@ def test_stage_a_exception_artifact_roundtrips_with_null_fingerprint(tmp_path):
     assert payload["candidate_frame_fingerprint"] is None
 
 
+def test_stage_a_result_persistence_accepts_relative_result_path(tmp_path):
+    source = _stage_a_source()
+    contract = _stage_a_contract(source)
+    result = hpo_module._stage_a_exception_result(None, contract, ValueError("hidden"))
+    root = tmp_path.resolve()
+    result_path = root / "relative_result" / "trial-0" / "result.json"
+    relative_path = result_path.relative_to(Path.cwd())
+    result_path.parent.mkdir(parents=True)
+    payload = {"study_name": "relative_result", "trial_number": 0, **result.to_dict()}
+    result_path.write_text(json.dumps(payload))
+
+    assert hpo_module._read_stage_a_json_pinned(root, relative_path) == payload
+
+
 def test_stage_a_first_write_validates_persisted_artifact(tmp_path, mocker):
     source = _stage_a_source()
     contract = _stage_a_contract(source)
@@ -1264,6 +1279,141 @@ def test_stage_a_artifact_rejects_cross_trial_and_malformed_bounded_fields(tmp_p
             expected_study_name="identity-study",
             expected_trial_number=2,
         )
+
+
+def test_stage_a_artifact_accepts_realistic_wide_schema(tmp_path):
+    columns = [f"feature_{index}" for index in range(665)]
+    payload = {
+        "schema_version": hpo_module.STAGE_A_SCREEN_SCHEMA_VERSION,
+        "study_name": "wide-study",
+        "trial_number": 0,
+        "contract_digest": "stage-a",
+        "candidate_shape": [40, 665],
+        "candidate_columns": columns,
+        "candidate_frame_fingerprint": "a" * 64,
+        "state": "passed",
+        "passed": True,
+        "pruned": False,
+        "checks": [],
+        "prune_reasons": [],
+    }
+    result_path = tmp_path / "wide-study" / "trial-0" / "result.json"
+    result_path.parent.mkdir(parents=True)
+    result_path.write_text(json.dumps(payload))
+
+    hpo_module._validate_stage_a_result_artifact(
+        {
+            "state": "passed",
+            "contract_digest": "stage-a",
+            "result_path": "wide-study/trial-0/result.json",
+        },
+        root=tmp_path,
+        context={},
+        expected_study_name="wide-study",
+        expected_trial_number=0,
+    )
+
+
+def test_stage_a_artifact_accepts_slash_containing_categorical_checks(tmp_path):
+    payload = {
+        "schema_version": hpo_module.STAGE_A_SCREEN_SCHEMA_VERSION,
+        "study_name": "r4-shaped",
+        "trial_number": 0,
+        "contract_digest": "stage-a",
+        "candidate_shape": [2, 1],
+        "candidate_columns": ["shelter"],
+        "candidate_frame_fingerprint": "a" * 64,
+        "state": "passed",
+        "passed": True,
+        "pruned": False,
+        "checks": [
+            {
+                "screen": "shape_schema",
+                "passed": True,
+                "expected": {"categories": ["Shelter/Hostel"]},
+                "observed": {"categories": ["Group Home/Assisted Living"]},
+            }
+        ],
+        "prune_reasons": [],
+    }
+    result_path = tmp_path / "r4-shaped" / "trial-0" / "result.json"
+    result_path.parent.mkdir(parents=True)
+    result_path.write_text(json.dumps(payload))
+
+    hpo_module._validate_stage_a_result_artifact(
+        {
+            "state": "passed",
+            "contract_digest": "stage-a",
+            "result_path": "r4-shaped/trial-0/result.json",
+        },
+        root=tmp_path,
+        context={},
+        expected_study_name="r4-shaped",
+        expected_trial_number=0,
+    )
+
+
+def test_stage_a_artifact_rejects_unsafe_nested_check_path_values(tmp_path):
+    payload = {
+        "schema_version": hpo_module.STAGE_A_SCREEN_SCHEMA_VERSION,
+        "study_name": "unsafe-check",
+        "trial_number": 0,
+        "contract_digest": "stage-a",
+        "candidate_shape": [2, 1],
+        "candidate_columns": ["shelter"],
+        "candidate_frame_fingerprint": "a" * 64,
+        "state": "passed",
+        "passed": True,
+        "pruned": False,
+        "checks": [
+            {
+                "screen": "shape_schema",
+                "passed": True,
+                "observed": {"category": "../outside"},
+            }
+        ],
+        "prune_reasons": [],
+    }
+    result_path = tmp_path / "unsafe-check" / "trial-0" / "result.json"
+    result_path.parent.mkdir(parents=True)
+    result_path.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match="not normalized JSON"):
+        hpo_module._validate_stage_a_result_artifact(
+            {
+                "state": "passed",
+                "contract_digest": "stage-a",
+                "result_path": "unsafe-check/trial-0/result.json",
+            },
+            root=tmp_path,
+            context={},
+            expected_study_name="unsafe-check",
+            expected_trial_number=0,
+        )
+
+
+def test_stage_a_artifact_keeps_result_path_safety_validation(tmp_path):
+    with pytest.raises(RuntimeError, match="result_path is unsafe"):
+        hpo_module._validate_stage_a_result_artifact(
+            {
+                "state": "passed",
+                "contract_digest": "stage-a",
+                "result_path": "../outside/result.json",
+            },
+            root=tmp_path,
+            context={},
+        )
+
+
+def test_existing_stage_a_result_is_validated_without_overwrite(tmp_path):
+    source = _stage_a_source()
+    contract = _stage_a_contract(source)
+    original = hpo_module._stage_a_exception_result(None, contract, ValueError("first"))
+    result_path = hpo_module.persist_stage_a_result(tmp_path, "immutable", 0, original)
+    before = result_path.read_bytes()
+
+    assert validate_existing_stage_a_trial_result(tmp_path, "immutable", 0, contract)
+    assert result_path.read_bytes() == before
 
 
 def test_stage_a_result_path_in_checkpoint_is_relative_and_safe(tmp_path):
@@ -2055,6 +2205,138 @@ def test_metric_failure_metadata_and_provenance_survive_checkpoint(tmp_path):
     assert metadata["metric_metadata"]["mixed_mmd.v1"]["evaluation_role"] == "tuning"
     assert "SECRET" not in json.dumps(checkpoint)
     assert "/tmp" not in json.dumps(checkpoint)
+
+
+def test_tracked_objective_persists_provenance_for_canonical_prune(tmp_path):
+    context = _hpo_context(
+        metric_config={
+            "canonical_objectives": [
+                "tstr_macro_f1.v1",
+                "mixed_mmd.v1",
+                "elastic_net_jsd.v1",
+            ]
+        }
+    )
+
+    def objective(trial):
+        metadata = _canonical_metric_metadata(failed=True)
+        trial.set_user_attr("metric_metadata", metadata)
+        trial.set_user_attr("result_metadata", dict(metadata))
+        raise optuna.TrialPruned("stage A failed")
+
+    with pytest.raises(RuntimeError, match="no completed trials"):
+        run_study(
+            "canonical_tracked_prune",
+            objective,
+            HPOConfig(n_trials=1),
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+        )
+
+    checkpoint = load_hpo_trial_checkpoint(
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name("canonical_tracked_prune", context)
+        / "trial-0"
+        / "checkpoint.json",
+        hpo_context=context,
+    )
+    provenance = checkpoint["metadata"]["hpo_error_provenance"]
+    assert provenance["error_reason_code"] == "hpo_trial_exception"
+    assert checkpoint["metadata"]["outcome"] == {
+        **provenance,
+        "state": "pruned",
+    }
+
+
+def test_stage_a_prune_through_tracked_objective_preserves_evidence(tmp_path):
+    source = _stage_a_source()
+    contract = _stage_a_contract(source)
+    context = _hpo_context(stage_a_contract_digest=contract.digest)
+    persisted_study_name = contextual_study_name("stage_a_tracked_prune", context)
+
+    def objective(trial):
+        screen_stage_a_trial(
+            trial,
+            source.copy(),
+            contract,
+            source,
+            tmp_path,
+            persisted_study_name,
+        )
+        return 0.0
+
+    with pytest.raises(RuntimeError, match="no completed trials"):
+        run_study(
+            "stage_a_tracked_prune",
+            objective,
+            HPOConfig(n_trials=1),
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+            stage_a_root=tmp_path,
+        )
+
+    checkpoint = load_hpo_trial_checkpoint(
+        tmp_path / "hpo_checkpoints" / persisted_study_name / "trial-0" / "checkpoint.json",
+        hpo_context=context,
+        stage_a_root=tmp_path,
+    )
+    metadata = checkpoint["metadata"]
+    assert checkpoint["state"] == "pruned"
+    assert metadata["stage_a"]["state"] == "pruned"
+    assert metadata["stage_a"]["result_path"] == (f"{persisted_study_name}/trial-0/result.json")
+    assert metadata["stage_a"]["prune_reasons"]
+    assert metadata["hpo_error_provenance"]["error_reason_code"] == "hpo_trial_exception"
+    assert metadata["outcome"]["state"] == "pruned"
+
+
+def test_uncaught_objective_exception_produces_valid_fail_checkpoint(tmp_path):
+    context = _hpo_context()
+
+    def objective(_trial):
+        raise KeyError("secret /tmp/path")
+
+    with pytest.raises(KeyError):
+        run_study(
+            "uncaught_key_error",
+            objective,
+            HPOConfig(n_trials=1),
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+        )
+
+    checkpoint = load_hpo_trial_checkpoint(
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name("uncaught_key_error", context)
+        / "trial-0"
+        / "checkpoint.json",
+        hpo_context=context,
+    )
+    assert checkpoint["state"] == "failed"
+    assert checkpoint["metadata"]["hpo_error_provenance"]["error_type"] == "KeyError"
+    assert checkpoint["metadata"]["outcome"]["state"] == "failed"
+
+
+def test_hpo_exception_provenance_sanitizes_unusual_exception_type():
+    class UnusualException(Exception):
+        pass
+
+    UnusualException.__name__ = "9 unsafe/" + ("x" * 200)
+    provenance = hpo_module.hpo_exception_provenance(
+        UnusualException(), location="unsafe location/" + ("x" * 200)
+    )
+
+    assert len(provenance["error_type"]) <= 128
+    assert provenance["error_type"].startswith("Exception_")
+    assert provenance["error_location"] == "unknown"
+    assert hpo_module._validate_hpo_error_provenance(provenance) == provenance
 
 
 def test_mixed_metric_failure_reasons_survive_checkpoint_validation(tmp_path):

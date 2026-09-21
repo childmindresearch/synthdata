@@ -58,6 +58,10 @@ HPO_CONTEXT_SCHEMA_VERSION = "hpo-context-v2"
 HPO_TRIAL_CHECKPOINT_SCHEMA_VERSION = "hpo-trial-checkpoint-v1"
 LEGACY_GENERATOR_METADATA_SCHEMA_VERSION = "generator-metadata-v1"
 HPO_GENERATOR_METADATA_SCHEMA_VERSION = "generator-metadata-v2"
+# Production datasets can be substantially wider than the historical unit-test
+# fixtures, but checkpoint metadata must still have a bounded schema surface.
+_MAX_STAGE_A_RESULT_COLUMNS = 4096
+_MAX_STAGE_A_CHECK_BYTES = 131072
 HPO_METADATA_SERIALIZATION_REASON_CODE = "hpo_metadata_serialization_failure"
 STAGE_A_SCREEN_IDS = (
     "shape_schema",
@@ -297,7 +301,12 @@ class HPOMetadataSerializationError(TypeError):
 
 
 def normalize_hpo_metadata(value: Any, *, location: str = "metadata") -> Any:
-    """Convert supported runtime values to deterministic JSON-compatible values."""
+    """Convert supported runtime values to deterministic JSON-compatible values.
+
+    Mapping keys and fields ending in ``result_path`` remain protected.  Ordinary
+    slash-bearing strings are valid values; unsafe absolute and traversal paths
+    remain rejected.
+    """
     if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, str):
@@ -318,7 +327,10 @@ def normalize_hpo_metadata(value: Any, *, location: str = "metadata") -> Any:
         return normalize_hpo_metadata(value.item(), location=location)
     if isinstance(value, np.ndarray):
         return [
-            normalize_hpo_metadata(item, location=f"{location}[{index}]")
+            normalize_hpo_metadata(
+                item,
+                location=f"{location}[{index}]",
+            )
             for index, item in enumerate(value.tolist())
         ]
     if type(value).__module__.startswith("torch") and type(value).__name__ == "device":
@@ -339,12 +351,16 @@ def normalize_hpo_metadata(value: Any, *, location: str = "metadata") -> Any:
             if normalized_key in result:
                 raise HPOMetadataSerializationError(value, location)
             result[normalized_key] = normalize_hpo_metadata(
-                item, location=f"{location}.{normalized_key}"
+                item,
+                location=f"{location}.{normalized_key}",
             )
         return result
     if isinstance(value, (list, tuple)):
         return [
-            normalize_hpo_metadata(item, location=f"{location}[{index}]")
+            normalize_hpo_metadata(
+                item,
+                location=f"{location}[{index}]",
+            )
             for index, item in enumerate(value)
         ]
     if isinstance(value, (set, frozenset)):
@@ -355,18 +371,41 @@ def normalize_hpo_metadata(value: Any, *, location: str = "metadata") -> Any:
     raise HPOMetadataSerializationError(value, location)
 
 
+def _safe_exception_type(error: BaseException) -> str:
+    """Return an exception type identifier accepted by checkpoint validation."""
+    raw_type = type(error).__name__
+    if not isinstance(raw_type, str):
+        return "Exception"
+    safe_type = re.sub(r"[^A-Za-z0-9_.-]", "_", raw_type)
+    if not safe_type or not re.match(r"^[A-Za-z_]", safe_type):
+        safe_type = f"Exception_{safe_type}"
+    return safe_type[:128] or "Exception"
+
+
+def _safe_exception_location(location: str) -> str:
+    """Return a bounded location identifier accepted by checkpoint validation."""
+    if (
+        isinstance(location, str)
+        and len(location) <= 128
+        and _SAFE_ERROR_LOCATION.fullmatch(location)
+    ):
+        return location
+    return "unknown"
+
+
 def hpo_exception_provenance(error: BaseException, *, location: str) -> dict[str, str]:
     """Return safe, stable diagnostics without preserving exception text."""
     reason_code = getattr(error, "reason_code", "hpo_trial_exception")
     if reason_code not in _SAFE_EXCEPTION_MESSAGES:
         reason_code = "hpo_trial_exception"
-    error_type = type(error).__name__
-    fingerprint = hashlib.sha256(f"{reason_code}:{error_type}:{location}".encode()).hexdigest()
+    error_type = _safe_exception_type(error)
+    safe_location = _safe_exception_location(location)
+    fingerprint = hashlib.sha256(f"{reason_code}:{error_type}:{safe_location}".encode()).hexdigest()
     return {
         "error_type": error_type,
         "error_message": _safe_exception_message(reason_code),
         "error_reason_code": reason_code,
-        "error_location": location,
+        "error_location": safe_location,
         "error_fingerprint": fingerprint,
     }
 
@@ -591,7 +630,7 @@ def _validate_stage_a_result_artifact(
         raise RuntimeError("HPO checkpoint Stage A result has invalid bounded fields")
     if (
         not isinstance(columns, list)
-        or len(columns) > 256
+        or len(columns) > _MAX_STAGE_A_RESULT_COLUMNS
         or not all(
             isinstance(value, str)
             and 0 < len(value) <= 128
@@ -627,10 +666,13 @@ def _validate_stage_a_result_artifact(
         ):
             raise RuntimeError("HPO checkpoint Stage A check reason is unbounded")
         try:
-            normalized_check = _json_document(check)
+            normalized_check = _stage_a_check_json_document(check)
         except (TypeError, ValueError, OverflowError, HPOMetadataSerializationError) as exc:
             raise RuntimeError("HPO checkpoint Stage A check is not bounded JSON") from exc
-        if normalized_check != check or len(json.dumps(check, separators=(",", ":"))) > 32768:
+        if (
+            normalized_check != check
+            or len(json.dumps(check, separators=(",", ":"))) > _MAX_STAGE_A_CHECK_BYTES
+        ):
             raise RuntimeError("HPO checkpoint Stage A check is not bounded JSON")
     screens = [check.get("screen") for check in checks]
     if len(screens) != len(set(screens)):
@@ -1647,9 +1689,13 @@ def _locked_read_stage_a_json(
 
 def _read_stage_a_json_pinned(root: str | Path, path: Path) -> dict[str, Any]:
     """Read Stage A JSON through descriptors pinned to its workspace."""
-    root_path = Path(root).resolve()
+    # Normalize both operands lexically.  ``resolve`` must not be used here:
+    # the descriptor walk below is deliberately responsible for rejecting
+    # symlink components rather than following them during path validation.
+    root_path = Path(os.path.abspath(root))
+    result_path = Path(os.path.abspath(path))
     try:
-        relative = path.relative_to(root_path)
+        relative = result_path.relative_to(root_path)
     except ValueError as exc:
         raise RuntimeError(f"Stage A result at {path} is outside its workspace") from exc
     parts = relative.parts
@@ -1739,6 +1785,43 @@ def persist_stage_a_result(
         expected_trial_number=trial_number,
     )
     return path
+
+
+def validate_existing_stage_a_trial_result(
+    root: str | Path,
+    study_name: str,
+    trial_number: int,
+    contract: StageAScreenContract,
+) -> bool:
+    """Validate an already-persisted trial result without replacing it.
+
+    Return ``False`` only when the expected result does not exist.  Any
+    present artifact is read through pinned descriptors and validated against
+    the trial identity and Stage A contract, so malformed or divergent
+    evidence remains an explicit failure rather than being overwritten.
+    """
+    if isinstance(trial_number, bool) or not isinstance(trial_number, int) or trial_number < 0:
+        raise ValueError("Stage A trial_number must be a non-negative integer")
+    study_name = _validate_study_name(study_name)
+    path = Path(root) / study_name / f"trial-{trial_number}" / "result.json"
+    try:
+        payload = _read_stage_a_json_pinned(root, path)
+    except RuntimeError as exc:
+        if str(exc).endswith(" is missing"):
+            return False
+        raise
+    _validate_stage_a_result_artifact(
+        {
+            "state": payload.get("state"),
+            "contract_digest": payload.get("contract_digest"),
+            "result_path": _safe_stage_a_result_identifier(root, path),
+        },
+        root=root,
+        context={"stage_a_contract_digest": contract.digest},
+        expected_study_name=study_name,
+        expected_trial_number=trial_number,
+    )
+    return True
 
 
 def prepare_stage_a_screen(
@@ -3318,6 +3401,11 @@ def _json_document(payload: Any) -> Any:
     return normalize_hpo_metadata(payload)
 
 
+def _stage_a_check_json_document(payload: Any) -> Any:
+    """Normalize Stage-A check data with standard bounded JSON protections."""
+    return _json_document(payload)
+
+
 def _validate_hpo_trial_checkpoint(
     payload: Any,
     *,
@@ -3816,10 +3904,14 @@ def run_study(
         outcome["state"] = state
         if error is not None:
             provenance = getattr(trial, "user_attrs", {}).get("hpo_error_provenance")
-            if isinstance(provenance, Mapping):
-                outcome.update(provenance)
-            else:
-                outcome.update(hpo_exception_provenance(error, location="tracked_objective"))
+            try:
+                if not isinstance(provenance, Mapping):
+                    raise RuntimeError("missing HPO error provenance")
+                _validate_hpo_error_provenance(provenance)
+            except RuntimeError:
+                provenance = hpo_exception_provenance(error, location="tracked_objective")
+                trial.set_user_attr("hpo_error_provenance", provenance)
+            outcome.update(provenance)
         trial.set_user_attr("hpo_outcome", outcome)
 
     def _tracked_objective(trial: optuna.Trial) -> float:
@@ -3829,6 +3921,9 @@ def run_study(
             _set_outcome(trial, "pruned", exc)
             raise
         except (TypeError, ValueError, RuntimeError) as exc:
+            _set_outcome(trial, "failed", exc)
+            raise
+        except Exception as exc:
             _set_outcome(trial, "failed", exc)
             raise
         if (
