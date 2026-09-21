@@ -15,17 +15,25 @@ Provides:
 
 import dataclasses
 import enum
+import errno
 import hashlib
 import json
 import math
 import os
 import re
+import stat
 import unicodedata
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from numbers import Real
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised only on non-POSIX systems
+    fcntl = None  # type: ignore[assignment]
 
 import numpy as np
 import optuna
@@ -64,7 +72,9 @@ _SAFE_EXCEPTION_MESSAGES = {
     "stage_a_screen_exception": "Stage A screen failed; exception details suppressed.",
     "metric_evaluation_exception": "Metric evaluation failed; exception details suppressed.",
     "hpo_trial_exception": "HPO trial failed; exception details suppressed.",
+    "hpo_metric_not_eligible": "HPO metric report was not eligible; exception details suppressed.",
     HPO_METADATA_SERIALIZATION_REASON_CODE: "HPO metadata serialization failed; exception details suppressed.",
+    "group_unsafe": "Grouped evaluation was unsafe; exception details suppressed.",
 }
 _SAFE_ERROR_LOCATION = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$")
 _SAFE_ERROR_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
@@ -74,6 +84,187 @@ def _safe_exception_message(reason_code: str) -> str:
     return _SAFE_EXCEPTION_MESSAGES.get(
         reason_code, _SAFE_EXCEPTION_MESSAGES["hpo_trial_exception"]
     )
+
+
+class HPOMetricNotEligibleError(ValueError):
+    """Raised when canonical metric evidence cannot produce an HPO score."""
+
+    reason_code = "hpo_metric_not_eligible"
+
+
+class HPOMetricEvaluationError(ValueError):
+    """Raised when canonical metric computation emits failed evidence."""
+
+    reason_code = "metric_evaluation_exception"
+
+
+class HPOGroupUnsafeError(ValueError):
+    """Raised when grouped evaluation cannot safely produce HPO evidence."""
+
+    reason_code = "group_unsafe"
+
+
+_CANONICAL_HPO_METRIC_KEYS = frozenset({"tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"})
+_SAFE_METRIC_METADATA_FIELDS = frozenset(
+    {
+        "metric_name",
+        "status",
+        "direction",
+        "finite",
+        "eligible",
+        "error_reason_code",
+        "fit_roles",
+        "evaluation_role",
+    }
+)
+_REQUIRED_CANONICAL_RAW_METRIC_FIELDS = frozenset(
+    {
+        "metric_name",
+        "status",
+        "direction",
+        "mean",
+        "errors",
+        "error_reason_code",
+        "fit_roles",
+        "evaluation_role",
+    }
+)
+_CANONICAL_METRIC_ERROR_CODES = frozenset(
+    {None, "metric_evaluation_exception", "hpo_metric_not_eligible", "hpo_trial_exception"}
+)
+
+
+def is_canonical_hpo_context(
+    metric_config: Mapping[str, Sequence[str]] | None,
+    *,
+    expected_keys: Sequence[str] | None = None,
+    utility_policy: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return whether resolved HPO identities exactly match canonical utility."""
+    if not isinstance(metric_config, Mapping):
+        return False
+    configured_keys = [
+        str(metric_name)
+        for metric_names in metric_config.values()
+        if isinstance(metric_names, (list, tuple))
+        for metric_name in metric_names
+    ]
+    try:
+        policy = _resolve_utility_policy(utility_policy)
+    except (TypeError, ValueError):
+        return False
+    resolved_expected = (
+        list(expected_keys) if expected_keys is not None else list(policy["metrics"])
+    )
+    return (
+        len(configured_keys) == len(set(configured_keys))
+        and set(configured_keys) == _CANONICAL_HPO_METRIC_KEYS
+        and resolved_expected == list(policy["metrics"])
+        and list(policy["metrics"])
+        == [
+            "tstr_macro_f1.v1",
+            "mixed_mmd.v1",
+            "elastic_net_jsd.v1",
+        ]
+    )
+
+
+def sanitize_hpo_metric_metadata(
+    value: Any, *, allowed_keys: Sequence[str] | None = None
+) -> dict[str, dict[str, Any]]:
+    """Keep bounded per-metric status and role provenance for HPO artifacts."""
+    expected = frozenset(allowed_keys or _CANONICAL_HPO_METRIC_KEYS)
+    if not isinstance(value, Mapping):
+        raise HPOMetricNotEligibleError("canonical metric metadata is not a mapping")
+    if set(value) != expected:
+        raise HPOMetricNotEligibleError("canonical metric metadata has incomplete identities")
+    safe: dict[str, dict[str, Any]] = {}
+    for metric_name, raw in value.items():
+        if not isinstance(raw, Mapping):
+            raise HPOMetricNotEligibleError("canonical metric metadata has an invalid value")
+        if not _REQUIRED_CANONICAL_RAW_METRIC_FIELDS.issubset(raw):
+            raise HPOMetricNotEligibleError("canonical metric metadata has missing fields")
+        if raw["metric_name"] != metric_name:
+            raise HPOMetricNotEligibleError("canonical metric metadata identity mismatch")
+        if raw["fit_roles"] != ["train"] or raw["evaluation_role"] != "tuning":
+            raise HPOMetricNotEligibleError("canonical metric metadata roles are invalid")
+        expected_direction = "maximize" if metric_name == "tstr_macro_f1.v1" else "minimize"
+        direction = raw.get("direction")
+        if direction != expected_direction:
+            raise HPOMetricNotEligibleError("canonical metric metadata direction is invalid")
+        error_reason = raw["error_reason_code"]
+        if error_reason not in _CANONICAL_METRIC_ERROR_CODES:
+            raise HPOMetricNotEligibleError("canonical metric metadata error code is invalid")
+        finite = (
+            not isinstance(raw["mean"], bool)
+            and isinstance(raw["mean"], (int, float, np.number))
+            and math.isfinite(float(raw["mean"]))
+        )
+        errors = raw["errors"]
+        if (
+            isinstance(errors, bool)
+            or not isinstance(errors, (int, float, np.number))
+            or not math.isfinite(float(errors))
+            or float(errors) < 0
+            or float(errors) != int(float(errors))
+        ):
+            raise HPOMetricNotEligibleError("canonical metric metadata errors are invalid")
+        status = raw["status"]
+        if status not in {"complete", "failed"}:
+            raise HPOMetricNotEligibleError("canonical metric metadata status is invalid")
+        if status == "complete" and (not finite or errors != 0 or error_reason is not None):
+            raise HPOMetricNotEligibleError("complete canonical metric metadata is inconsistent")
+        if status == "failed" and (finite or error_reason is None):
+            raise HPOMetricNotEligibleError("failed canonical metric metadata is inconsistent")
+        safe[metric_name] = {
+            "metric_name": metric_name,
+            "status": status,
+            "direction": direction,
+            "finite": finite,
+            "eligible": status == "complete" and finite,
+            "error_reason_code": error_reason,
+            "fit_roles": ["train"],
+            "evaluation_role": "tuning",
+        }
+    return safe
+
+
+def _validate_bounded_hpo_metric_metadata(
+    value: Any, *, expected_keys: Sequence[str] | None = None
+) -> dict[str, dict[str, Any]] | None:
+    """Validate normalized canonical metric metadata at the durable boundary."""
+    if value is None:
+        return None
+    expected = frozenset(expected_keys or _CANONICAL_HPO_METRIC_KEYS)
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise RuntimeError("HPO trial checkpoint metric metadata is unbounded or empty")
+    validated: dict[str, dict[str, Any]] = {}
+    for metric_name, raw in value.items():
+        if metric_name not in expected or not isinstance(raw, Mapping):
+            raise RuntimeError("HPO trial checkpoint metric metadata has unsafe identity")
+        if set(raw) != _SAFE_METRIC_METADATA_FIELDS:
+            raise RuntimeError("HPO trial checkpoint metric metadata has unsafe fields")
+        if raw["metric_name"] != metric_name:
+            raise RuntimeError("HPO trial checkpoint metric metadata identity mismatch")
+        if raw["status"] not in {"complete", "failed"}:
+            raise RuntimeError("HPO trial checkpoint metric metadata has unsafe status")
+        expected_direction = "maximize" if metric_name == "tstr_macro_f1.v1" else "minimize"
+        if raw["direction"] != expected_direction:
+            raise RuntimeError("HPO trial checkpoint metric metadata has unsafe direction")
+        if not isinstance(raw["finite"], bool) or not isinstance(raw["eligible"], bool):
+            raise RuntimeError("HPO trial checkpoint metric metadata has unsafe flags")
+        if raw["fit_roles"] != ["train"] or raw["evaluation_role"] != "tuning":
+            raise RuntimeError("HPO trial checkpoint metric metadata has unsafe roles")
+        error_code = raw["error_reason_code"]
+        if error_code not in _CANONICAL_METRIC_ERROR_CODES:
+            raise RuntimeError("HPO trial checkpoint metric metadata has unsafe error code")
+        if raw["status"] == "complete":
+            if error_code is not None or not raw["finite"] or not raw["eligible"]:
+                raise RuntimeError("Complete HPO metric metadata is not eligible")
+        elif raw["eligible"] or raw["finite"] or error_code is None:
+            raise RuntimeError("Failed HPO metric metadata is inconsistent")
+        validated[metric_name] = dict(raw)
+    return validated
 
 
 def _reject_unsafe_metadata_path(value: str | Path, location: str) -> str:
@@ -254,11 +445,205 @@ def _safe_stage_a_result_identifier(root: str | Path, path: str | Path) -> str:
 
 def _checkpoint_stage_a_result_identifier(value: Any) -> str | None:
     """Keep only safe relative Stage A identifiers in durable checkpoints."""
-    if not isinstance(value, str) or not value:
+    if value is None:
         return None
-    if _looks_like_unsafe_path(value):
-        return None
+    if not isinstance(value, str) or not value or _looks_like_unsafe_path(value):
+        raise RuntimeError("HPO trial checkpoint stage_a result_path is unsafe")
     return value.replace("\\", "/")
+
+
+def _validate_stage_a_result_artifact(
+    stage_a: Mapping[str, Any],
+    *,
+    root: str | Path | None,
+    context: Mapping[str, Any],
+    expected_study_name: str | None = None,
+    expected_trial_number: int | None = None,
+) -> None:
+    """Validate referenced Stage A evidence at both checkpoint boundaries."""
+    result_path = _checkpoint_stage_a_result_identifier(stage_a.get("result_path"))
+    if result_path is None:
+        return
+    if root is None:
+        raise RuntimeError("HPO checkpoint Stage A result artifact root is unavailable")
+    root_path = Path(root).resolve()
+    result_parts = Path(result_path).parts
+    # Keep the workspace and every path component pinned by descriptors.  In
+    # particular, do not validate with Path.resolve() and then reopen by name:
+    # either the parent or the file could be replaced between those operations.
+    try:
+        workspace_fd = os.open(root_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise RuntimeError("HPO checkpoint Stage A result artifact root is unavailable") from exc
+    result_fd = -1
+    try:
+        directory_fd = workspace_fd
+        for part in result_parts[:-1]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            if directory_fd != workspace_fd:
+                os.close(directory_fd)
+            directory_fd = next_fd
+        result_fd = os.open(
+            result_parts[-1],
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        result_stat = os.fstat(result_fd)
+        if not stat.S_ISREG(result_stat.st_mode):
+            raise RuntimeError("HPO checkpoint Stage A result artifact is not a regular file")
+        with os.fdopen(result_fd, "r", encoding="utf-8") as result_stream:
+            result_fd = -1
+            result = json.load(result_stream)
+    except FileNotFoundError as exc:
+        raise RuntimeError("HPO checkpoint Stage A result artifact is missing") from exc
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise RuntimeError(
+                "HPO checkpoint Stage A result artifact uses a symlink path"
+            ) from exc
+        raise RuntimeError("HPO checkpoint Stage A result is unreadable") from exc
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("HPO checkpoint Stage A result is unreadable") from exc
+    finally:
+        if result_fd != -1:
+            os.close(result_fd)
+        if directory_fd != workspace_fd:
+            os.close(directory_fd)
+        os.close(workspace_fd)
+    if not isinstance(result, Mapping):
+        raise RuntimeError("HPO checkpoint Stage A result is invalid")
+    try:
+        normalized = _json_document(result)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("HPO checkpoint Stage A result is not normalized JSON") from exc
+    if normalized != result:
+        raise RuntimeError("HPO checkpoint Stage A result is not normalized JSON")
+    required = {
+        "schema_version",
+        "study_name",
+        "trial_number",
+        "contract_digest",
+        "candidate_shape",
+        "candidate_columns",
+        "candidate_frame_fingerprint",
+        "state",
+        "passed",
+        "pruned",
+        "checks",
+        "prune_reasons",
+    }
+    if set(result) != required:
+        raise RuntimeError("HPO checkpoint Stage A result has an invalid schema")
+    if result["schema_version"] != STAGE_A_SCREEN_SCHEMA_VERSION:
+        raise RuntimeError("HPO checkpoint Stage A result has an unsupported schema")
+    if expected_study_name is not None and result["study_name"] != expected_study_name:
+        raise RuntimeError("HPO checkpoint Stage A study_name does not match checkpoint")
+    if expected_trial_number is not None and result["trial_number"] != expected_trial_number:
+        raise RuntimeError("HPO checkpoint Stage A trial_number does not match checkpoint")
+    if not isinstance(result["study_name"], str) or not result["study_name"]:
+        raise RuntimeError("HPO checkpoint Stage A study_name is invalid")
+    if (
+        isinstance(result["trial_number"], bool)
+        or not isinstance(result["trial_number"], int)
+        or result["trial_number"] < 0
+    ):
+        raise RuntimeError("HPO checkpoint Stage A trial_number is invalid")
+    checkpoint_state = stage_a.get("state")
+    checkpoint_digest = stage_a.get("contract_digest")
+    if checkpoint_state not in {"passed", "pruned"} or not isinstance(checkpoint_digest, str):
+        raise RuntimeError("HPO checkpoint Stage A evidence is incomplete")
+    if result["state"] != checkpoint_state:
+        raise RuntimeError("HPO checkpoint Stage A state does not match result")
+    if result["contract_digest"] != checkpoint_digest:
+        raise RuntimeError("HPO checkpoint Stage A contract digest does not match result")
+    expected_digest = context.get("stage_a_contract_digest")
+    if expected_digest is not None and checkpoint_digest != expected_digest:
+        raise RuntimeError("HPO checkpoint Stage A contract digest does not match context")
+    exception_result = (
+        result["state"] == "pruned"
+        and len(result["checks"]) == 1
+        and isinstance(result["checks"][0], Mapping)
+        and result["checks"][0].get("screen") == "stage_a_exception"
+    )
+    fingerprint = result["candidate_frame_fingerprint"]
+    if fingerprint is None:
+        if not exception_result:
+            raise RuntimeError("HPO checkpoint Stage A candidate fingerprint is invalid")
+    elif not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        raise RuntimeError("HPO checkpoint Stage A candidate fingerprint is invalid")
+    if result["passed"] != (checkpoint_state == "passed") or result["pruned"] != (
+        checkpoint_state == "pruned"
+    ):
+        raise RuntimeError("HPO checkpoint Stage A state flags are inconsistent")
+    shape = result["candidate_shape"]
+    columns = result["candidate_columns"]
+    if (
+        not isinstance(shape, list)
+        or len(shape) != 2
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in shape
+        )
+    ):
+        raise RuntimeError("HPO checkpoint Stage A result has invalid bounded fields")
+    if (
+        not isinstance(columns, list)
+        or len(columns) > 256
+        or not all(
+            isinstance(value, str)
+            and 0 < len(value) <= 128
+            and not _looks_like_unsafe_path(value)
+            and not any(unicodedata.category(char).startswith("C") for char in value)
+            for value in columns
+        )
+        or len(columns) != len(set(columns))
+    ):
+        raise RuntimeError("HPO checkpoint Stage A result has invalid bounded fields")
+    if shape[1] != len(columns) or (not exception_result and (shape[0] < 1 or shape[1] < 1)):
+        raise RuntimeError("HPO checkpoint Stage A candidate shape is inconsistent")
+    checks = result["checks"]
+    reasons = result["prune_reasons"]
+    if (
+        not isinstance(checks, list)
+        or len(checks) > len(STAGE_A_SCREEN_IDS)
+        or not isinstance(reasons, list)
+        or len(reasons) > len(STAGE_A_SCREEN_IDS)
+    ):
+        raise RuntimeError("HPO checkpoint Stage A result has invalid bounded fields")
+    allowed_check_keys = {"screen", "passed", "expected", "observed", "reason"}
+    for check in checks:
+        if not isinstance(check, Mapping) or not set(check) <= allowed_check_keys:
+            raise RuntimeError("HPO checkpoint Stage A check has an invalid schema")
+        screen = check.get("screen")
+        if screen not in (*STAGE_A_SCREEN_IDS, "stage_a_exception"):
+            raise RuntimeError("HPO checkpoint Stage A check has an unknown screen")
+        if not isinstance(check.get("passed"), bool):
+            raise RuntimeError("HPO checkpoint Stage A check has an invalid status")
+        if "reason" in check and (
+            not isinstance(check["reason"], str) or len(check["reason"]) > 4096
+        ):
+            raise RuntimeError("HPO checkpoint Stage A check reason is unbounded")
+        try:
+            normalized_check = _json_document(check)
+        except (TypeError, ValueError, OverflowError, HPOMetadataSerializationError) as exc:
+            raise RuntimeError("HPO checkpoint Stage A check is not bounded JSON") from exc
+        if normalized_check != check or len(json.dumps(check, separators=(",", ":"))) > 32768:
+            raise RuntimeError("HPO checkpoint Stage A check is not bounded JSON")
+    screens = [check.get("screen") for check in checks]
+    if len(screens) != len(set(screens)):
+        raise RuntimeError("HPO checkpoint Stage A checks contain duplicate screens")
+    if "stage_a_exception" in screens and (len(screens) != 1 or result["state"] != "pruned"):
+        raise RuntimeError("HPO checkpoint Stage A exception screen is not exclusive")
+    if not all(isinstance(reason, str) and 0 < len(reason) <= 4096 for reason in reasons):
+        raise RuntimeError("HPO checkpoint Stage A prune reasons are unbounded")
+    if any(
+        reason not in {check.get("reason") for check in checks if "reason" in check}
+        for reason in reasons
+    ):
+        raise RuntimeError("HPO checkpoint Stage A prune reasons do not match checks")
 
 
 def _is_missing_scalar(value: Any) -> bool:
@@ -970,21 +1355,19 @@ def persist_stage_a_exception(
     error: TypeError | ValueError | RuntimeError,
 ) -> Path:
     """Persist a pre-trial Stage A construction failure for study diagnostics."""
+    _require_stage_a_locking()
     study_name = _validate_study_name(study_name)
     result = _stage_a_exception_result(None, contract, error)
     path = Path(root) / study_name / "construction-failure.json"
     payload = {"study_name": study_name, "trial_number": None, **result.to_dict()}
-    if path.exists():
-        try:
-            cached = load_json(path)
-        except (OSError, ValueError) as exc:
-            raise RuntimeError(f"Stage A construction failure at {path} is unreadable") from exc
-        if cached != payload:
-            raise RuntimeError(
-                f"Stage A construction failure at {path} does not match the current failure"
-            )
-        return path
-    _atomic_stage_a_json(path, payload)
+    _locked_stage_a_json(
+        Path(root),
+        (study_name,),
+        "construction-failure.json",
+        payload,
+        path,
+        artifact_label="construction failure",
+    )
     return path
 
 
@@ -1028,26 +1411,299 @@ def screen_stage_a_trial(
     return result
 
 
-def _atomic_stage_a_json(path: Path, payload: dict[str, Any]) -> None:
-    ensure_dir(path.parent)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str))
-    os.replace(temporary, path)
+def _require_stage_a_locking() -> Any:
+    """Require POSIX advisory locking; unsupported platforms fail explicitly."""
+    missing: list[str] = []
+    if fcntl is None:
+        missing.append("fcntl")
+    else:
+        if not callable(getattr(fcntl, "flock", None)):
+            missing.append("fcntl.flock")
+        if getattr(fcntl, "LOCK_EX", None) is None:
+            missing.append("fcntl.LOCK_EX")
+    for capability in ("O_DIRECTORY", "O_NOFOLLOW"):
+        if getattr(os, capability, None) is None:
+            missing.append(f"os.{capability}")
+    if missing:
+        raise RuntimeError(
+            "Stage A persistence requires POSIX descriptor locking capabilities; "
+            f"missing: {', '.join(missing)}"
+        )
+    return fcntl
+
+
+def _open_stage_a_directory(root: Path, parts: Sequence[str], *, create: bool) -> int:
+    """Open directory chain with no-follow descriptors, optionally creating it."""
+    root = Path(root)
+    # Do not resolve or create root by path.  Walk every existing component from
+    # a pinned descriptor, so neither root nor an ancestor can be substituted by
+    # a symlink during setup.  Callers must create the workspace root first.
+    if root.is_absolute():
+        directory_fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        root_parts = root.parts[1:]
+    else:
+        directory_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        root_parts = root.parts
+    if any(part in {".", ".."} for part in root_parts):
+        os.close(directory_fd)
+        raise ValueError("Stage A workspace path contains traversal")
+    try:
+        for part in root_parts:
+            try:
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, 0o700, dir_fd=directory_fd)
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        for part in parts:
+            try:
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, 0o700, dir_fd=directory_fd)
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def _read_stage_a_json_fd(
+    directory_fd: int, name: str, path: Path, *, artifact_label: str = "result"
+) -> dict[str, Any]:
+    _, value = _read_stage_a_json_bytes_fd(directory_fd, name, path, artifact_label=artifact_label)
+    return value
+
+
+def _read_stage_a_json_bytes_fd(
+    directory_fd: int, name: str, path: Path, *, artifact_label: str = "result"
+) -> tuple[bytes, dict[str, Any]]:
+    file_fd = -1
+    try:
+        file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            raise RuntimeError(f"Stage A {artifact_label} at {path} is not a regular file")
+        with os.fdopen(file_fd, "rb") as stream:
+            file_fd = -1
+            encoded = stream.read()
+            value = json.loads(encoded)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Stage A {artifact_label} at {path} is missing") from exc
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise RuntimeError(f"Stage A {artifact_label} at {path} uses a symlink path") from exc
+        raise RuntimeError(f"Stage A {artifact_label} at {path} is unreadable") from exc
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Stage A {artifact_label} at {path} is unreadable") from exc
+    finally:
+        if file_fd != -1:
+            os.close(file_fd)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Stage A {artifact_label} at {path} is invalid")
+    return encoded, value
+
+
+def _stage_a_json_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, indent=2, sort_keys=True, default=str).encode()
+
+
+def _atomic_stage_a_json_fd(directory_fd: int, name: str, payload: dict[str, Any]) -> None:
+    """Publish JSON using only pinned directory descriptors."""
+    encoded = _stage_a_json_bytes(payload)
+    temporary_name = f".{name}.{uuid.uuid4().hex}.tmp"
+    file_fd = os.open(
+        temporary_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        view = memoryview(encoded)
+        written = 0
+        while written < len(encoded):
+            count = os.write(file_fd, view[written:])
+            if count <= 0:
+                raise OSError("short write while persisting Stage A JSON")
+            written += count
+        if written != len(encoded):
+            raise OSError("incomplete write while persisting Stage A JSON")
+        os.fsync(file_fd)
+    except BaseException:
+        os.close(file_fd)
+        with suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        raise
+    else:
+        os.close(file_fd)
+    try:
+        os.replace(temporary_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    except BaseException:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        raise
+
+
+def _locked_stage_a_json(
+    root: Path,
+    parts: Sequence[str],
+    name: str,
+    payload: dict[str, Any],
+    path: Path,
+    *,
+    artifact_label: str = "result",
+) -> None:
+    """Create/read/publish one append-only JSON evidence file under one lock."""
+    lock = _require_stage_a_locking()
+    try:
+        directory_fd = _open_stage_a_directory(root, parts, create=True)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise RuntimeError(f"Stage A {artifact_label} at {path} uses a symlink path") from exc
+        raise RuntimeError(f"Stage A {artifact_label} at {path} is unreadable") from exc
+    lock_fd = -1
+    try:
+        lock_fd = os.open(
+            ".stage-a.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd
+        )
+        lock.flock(lock_fd, lock.LOCK_EX)
+        try:
+            cached_bytes, cached = _read_stage_a_json_bytes_fd(
+                directory_fd, name, path, artifact_label=artifact_label
+            )
+        except RuntimeError as exc:
+            if " is missing" not in str(exc):
+                raise
+            cached = None
+            cached_bytes = None
+        if cached is not None and (
+            cached_bytes != _stage_a_json_bytes(payload) or cached != payload
+        ):
+            raise RuntimeError(
+                f"Stage A {artifact_label} at {path} does not match the current {artifact_label}"
+            )
+        if cached is None:
+            _atomic_stage_a_json_fd(directory_fd, name, payload)
+        persisted_bytes, persisted = _read_stage_a_json_bytes_fd(
+            directory_fd, name, path, artifact_label=artifact_label
+        )
+        if persisted_bytes != _stage_a_json_bytes(payload) or persisted != payload:
+            raise RuntimeError(
+                f"Stage A {artifact_label} at {path} does not match the current {artifact_label}"
+            )
+    finally:
+        if lock_fd != -1:
+            os.close(lock_fd)
+        os.close(directory_fd)
+
+
+def _locked_read_stage_a_json(
+    root: Path,
+    parts: Sequence[str],
+    name: str,
+    path: Path,
+    *,
+    artifact_label: str,
+) -> dict[str, Any]:
+    lock = _require_stage_a_locking()
+    directory_fd = _open_stage_a_directory(root, parts, create=False)
+    lock_fd = -1
+    try:
+        lock_fd = os.open(
+            ".stage-a.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd
+        )
+        lock.flock(lock_fd, lock.LOCK_EX)
+        _, payload = _read_stage_a_json_bytes_fd(
+            directory_fd, name, path, artifact_label=artifact_label
+        )
+        return payload
+    finally:
+        if lock_fd != -1:
+            os.close(lock_fd)
+        os.close(directory_fd)
+
+
+def _read_stage_a_json_pinned(root: str | Path, path: Path) -> dict[str, Any]:
+    """Read Stage A JSON through descriptors pinned to its workspace."""
+    root_path = Path(root).resolve()
+    try:
+        relative = path.relative_to(root_path)
+    except ValueError as exc:
+        raise RuntimeError(f"Stage A result at {path} is outside its workspace") from exc
+    parts = relative.parts
+    if not parts:
+        raise RuntimeError(f"Stage A result at {path} is unreadable")
+    workspace_fd = -1
+    directory_fd = -1
+    result_fd = -1
+    try:
+        workspace_fd = os.open(root_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        directory_fd = workspace_fd
+        for part in parts[:-1]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            if directory_fd != workspace_fd:
+                os.close(directory_fd)
+            directory_fd = next_fd
+        result_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        result_stat = os.fstat(result_fd)
+        if not stat.S_ISREG(result_stat.st_mode):
+            raise RuntimeError(f"Stage A result at {path} is not a regular file")
+        with os.fdopen(result_fd, "r", encoding="utf-8") as result_stream:
+            result_fd = -1
+            result = json.load(result_stream)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Stage A result at {path} is missing") from exc
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise RuntimeError(f"Stage A result at {path} uses a symlink path") from exc
+        raise RuntimeError(f"Stage A result at {path} is unreadable") from exc
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Stage A result at {path} is unreadable") from exc
+    finally:
+        if result_fd != -1:
+            os.close(result_fd)
+        if directory_fd != -1 and directory_fd != workspace_fd:
+            os.close(directory_fd)
+        if workspace_fd != -1:
+            os.close(workspace_fd)
+    if not isinstance(result, dict):
+        raise RuntimeError(f"Stage A result at {path} is invalid")
+    return result
 
 
 def persist_stage_a_contract(root: str | Path, contract: StageAScreenContract) -> Path:
     """Persist the resolved Stage A contract atomically for a study."""
-    path = Path(root) / "contract.json"
+    _require_stage_a_locking()
+    root_path = Path(root)
+    path = root_path / "contract.json"
     payload = {**contract.to_dict(), "digest": contract.digest}
-    if path.exists():
-        try:
-            cached = load_json(path)
-        except (OSError, ValueError) as exc:
-            raise RuntimeError(f"Stage A contract at {path} is unreadable") from exc
-        if cached != payload:
-            raise RuntimeError(f"Stage A contract at {path} does not match the current contract")
-        return path
-    _atomic_stage_a_json(path, payload)
+    _locked_stage_a_json(root_path, (), "contract.json", payload, path, artifact_label="contract")
     return path
 
 
@@ -1058,20 +1714,30 @@ def persist_stage_a_result(
     result: StageAScreenResult,
 ) -> Path:
     """Persist one Stage A outcome per trial so prunes are resumable and auditable."""
+    _require_stage_a_locking()
     study_name = _validate_study_name(study_name)
-    if isinstance(trial_number, bool) or trial_number < 0:
+    if isinstance(trial_number, bool) or not isinstance(trial_number, int) or trial_number < 0:
         raise ValueError("Stage A trial_number must be a non-negative integer")
     path = Path(root) / study_name / f"trial-{trial_number}" / "result.json"
     payload = {"study_name": study_name, "trial_number": trial_number, **result.to_dict()}
-    if path.exists():
-        try:
-            cached = load_json(path)
-        except (OSError, ValueError) as exc:
-            raise RuntimeError(f"Stage A result at {path} is unreadable") from exc
-        if cached != payload:
-            raise RuntimeError(f"Stage A result at {path} does not match the current result")
-        return path
-    _atomic_stage_a_json(path, payload)
+    artifact_reference = {
+        "state": result.state,
+        "contract_digest": result.contract_digest,
+        "result_path": _safe_stage_a_result_identifier(root, path),
+    }
+    _locked_stage_a_json(
+        Path(root), (study_name, f"trial-{trial_number}"), "result.json", payload, path
+    )
+    persisted = _read_stage_a_json_pinned(root, path)
+    if persisted != payload:
+        raise RuntimeError(f"Stage A result at {path} does not match the current result")
+    _validate_stage_a_result_artifact(
+        artifact_reference,
+        root=root,
+        context={"stage_a_contract_digest": result.contract_digest},
+        expected_study_name=study_name,
+        expected_trial_number=trial_number,
+    )
     return path
 
 
@@ -1089,6 +1755,7 @@ def prepare_stage_a_screen(
         return
     if source_df is None or root is None or study_name is None:
         raise ValueError("Stage A contract requires source_df, root, and non-empty study_name")
+    _require_stage_a_locking()
     _validate_study_name(study_name)
     persist_stage_a_contract(Path(root) / study_name, contract)
 
@@ -1223,6 +1890,9 @@ def evaluate_canonical_hpo_metrics(
     seed: int = 0,
     release_generalization: Mapping[str, Any] | None = None,
     utility_policy: Mapping[str, Any] | None = None,
+    group_context: Mapping[str, Any] | None = None,
+    train_group_ids: Any | None = None,
+    tuning_group_ids: Any | None = None,
 ) -> pd.DataFrame:
     """Evaluate approved HPO identities without native metric aliases.
 
@@ -1231,6 +1901,48 @@ def evaluate_canonical_hpo_metrics(
     failed row rather than being replaced by a row-level approximation.
     """
     validate_hpo_metric_config(dict(metric_config))
+    policy = _resolve_utility_policy(utility_policy)
+
+    group_mode = group_context.get("group_mode", "row") if group_context else "row"
+    group_safety: dict[str, Any] | None = None
+    if group_mode == "patient_group":
+        if not isinstance(group_context, Mapping) or not isinstance(
+            group_context.get("roles"), Mapping
+        ):
+            raise HPOGroupUnsafeError("patient-group contract is missing")
+        if train_group_ids is None or tuning_group_ids is None:
+            raise HPOGroupUnsafeError("patient-group IDs are missing")
+        try:
+            train_ids = _validate_aligned_group_ids(train_df, train_group_ids, "train")
+            tuning_ids = _validate_aligned_group_ids(tuning_df, tuning_group_ids, "tuning")
+            role_values = {"train": train_ids, "tuning": tuning_ids}
+            role_contract: dict[str, Any] = {}
+            for role, values in role_values.items():
+                declared = group_context["roles"].get(role)
+                if not isinstance(declared, Mapping):
+                    raise HPOGroupUnsafeError("patient-group role contract is missing")
+                fingerprint = dataframe_fingerprint(pd.DataFrame({"group_id": values}))
+                if (
+                    declared.get("rows") != len(values)
+                    or declared.get("groups") != len(set(values))
+                    or declared.get("fingerprint") != fingerprint
+                    or declared.get("source") != "dataset_role_groups"
+                ):
+                    raise HPOGroupUnsafeError("patient-group role contract is contradictory")
+                role_contract[role] = {
+                    "rows": len(values),
+                    "groups": len(set(values)),
+                    "fingerprint": fingerprint,
+                    "source": "dataset_role_groups",
+                }
+            group_safety = {
+                "schema_version": "group-safety-v1",
+                "status": "group_safe",
+                "group_mode": "patient_group",
+                "roles": role_contract,
+            }
+        except (TypeError, ValueError, KeyError) as exc:
+            raise HPOGroupUnsafeError("patient-group contract is malformed") from exc
 
     def _validate_release_generalization(value: Mapping[str, Any] | None) -> None:
         """Reject release metadata that can alter HPO population semantics."""
@@ -1321,7 +2033,6 @@ def evaluate_canonical_hpo_metrics(
     ):
         _validate_input_provenance(role, frame)
 
-    policy = _resolve_utility_policy(utility_policy)
     keys = list(policy["metrics"])
     rows: dict[str, dict[str, Any]] = {}
 
@@ -1345,6 +2056,7 @@ def evaluate_canonical_hpo_metrics(
         metadata: dict[str, Any] = {
             "producer": key,
             "framework": framework,
+            "error_reason_code": None,
             "fit_roles": ["train"],
             "evaluation_role": "tuning",
             "objective_version": TUNING_OBJECTIVE_VERSION,
@@ -1468,27 +2180,74 @@ def evaluate_canonical_hpo_metrics(
             rows[key] = {
                 "mean": float(value),
                 "direction": "maximize" if key == "tstr_macro_f1.v1" else "minimize",
+                "errors": 0,
                 **metadata,
             }
-        except (ImportError, KeyError, TypeError, ValueError, RuntimeError) as exc:
-            reason_code = "metric_evaluation_exception"
+        except HPOMetricNotEligibleError as exc:
+            reason_code = "hpo_metric_not_eligible"
             rows[key] = {
+                **metadata,
                 "mean": float("nan"),
                 "direction": "maximize" if key == "tstr_macro_f1.v1" else "minimize",
                 "errors": 1,
                 "error_type": type(exc).__name__,
                 "error_messages": _safe_exception_message(reason_code),
                 "error_reason_code": reason_code,
+            }
+        except (ImportError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+            reason_code = "metric_evaluation_exception"
+            rows[key] = {
                 **metadata,
+                "mean": float("nan"),
+                "direction": "maximize" if key == "tstr_macro_f1.v1" else "minimize",
+                "errors": 1,
+                "error_type": type(exc).__name__,
+                "error_messages": _safe_exception_message(reason_code),
+                "error_reason_code": reason_code,
             }
     report = pd.DataFrame.from_dict(rows, orient="index")
     report.attrs["canonical_hpo"] = True
     report.attrs["canonical_hpo_keys"] = tuple(keys)
+    if group_safety is not None:
+        report.attrs["group_safety"] = group_safety
+    successful_provenance = [
+        row.get("provenance")
+        for row in rows.values()
+        if row.get("errors", 0) == 0 and isinstance(row.get("provenance"), Mapping)
+    ]
+    if successful_provenance:
+
+        def provenance_part(item: Any) -> dict[str, Any]:
+            return {
+                field: item.get(field)
+                for field in ("release_transform_digest", "common_protocol_digest", "role_hashes")
+            }
+
+        provenance_signature = json.dumps(
+            provenance_part(successful_provenance[0]),
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        )
+        if any(
+            json.dumps(
+                provenance_part(item),
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            )
+            != provenance_signature
+            for item in successful_provenance[1:]
+        ):
+            raise HPOMetricNotEligibleError(
+                "Canonical HPO metrics have inconsistent report provenance"
+            )
     first_provenance = next(
         (
             row.get("provenance")
             for row in rows.values()
             if isinstance(row.get("provenance"), Mapping)
+            and isinstance(row.get("provenance", {}).get("role_hashes"), Mapping)
         ),
         None,
     )
@@ -1512,8 +2271,15 @@ def evaluate_canonical_hpo_metrics(
             },
             "objective_version": TUNING_OBJECTIVE_VERSION,
         }
-        report.attrs["metric_metadata"] = {key: dict(row) for key, row in rows.items()}
-        report.attrs["result_metadata"] = dict(report.attrs["metric_metadata"])
+    report.attrs["metric_metadata"] = {
+        key: {
+            **dict(row),
+            "metric_name": key,
+            "status": "failed" if row.get("errors") else "complete",
+        }
+        for key, row in rows.items()
+    }
+    report.attrs["result_metadata"] = dict(report.attrs["metric_metadata"])
     return report
 
 
@@ -1776,6 +2542,12 @@ def build_hpo_context(
         "objective_version": objective_version,
         "utility_policy": policy,
     }
+    context["canonical_hpo"] = is_canonical_hpo_context(
+        resolved_metric_config,
+        expected_keys=policy["metrics"],
+        utility_policy=policy,
+    )
+    context["canonical_expected_keys"] = list(policy["metrics"]) if context["canonical_hpo"] else []
     context.update(
         {
             "release_transform_digest": release_transform_digest,
@@ -1805,7 +2577,13 @@ def _hpo_row_error(row: pd.Series) -> str | None:
         return f"error_count={errors}"
     for column in ("error_types", "error_messages"):
         value = row.get(column)
-        if value is not None and not pd.isna(value) and str(value):
+        if value is None:
+            continue
+        try:
+            missing = bool(pd.isna(value))
+        except (TypeError, ValueError):
+            missing = False
+        if not missing and str(value):
             return f"{column}={value}"
     return None
 
@@ -1824,15 +2602,28 @@ def hpo_score(
     every statically declared emitted identity before any score is calculated.
     The result is suitable as an Optuna objective under ``direction="minimize"``.
     """
+    if not isinstance(report_df, pd.DataFrame):
+        raise HPOMetricNotEligibleError("HPO evaluation report has an invalid shape")
     provenance = report_df.attrs.get("hpo_provenance")
     if provenance is None:
+        if report_df.attrs.get("canonical_hpo") is True or expected_keys is not None:
+            raise HPOMetricNotEligibleError(
+                "HPO evaluation report is missing required hpo_provenance"
+            )
         raise ValueError("HPO evaluation report is missing required hpo_provenance")
-    _require_hpo_provenance(provenance, label="HPO evaluation provenance")
+    try:
+        _require_hpo_provenance(provenance, label="HPO evaluation provenance")
+    except (TypeError, ValueError) as exc:
+        if report_df.attrs.get("canonical_hpo") is True or expected_keys is not None:
+            raise HPOMetricNotEligibleError(
+                "HPO evaluation provenance is not decision-eligible"
+            ) from exc
+        raise
     policy = _resolve_utility_policy(utility_policy)
-    if report_df.empty:
-        raise ValueError("HPO evaluation emitted no metric rows")
+    if report_df.empty or report_df.columns.duplicated().any():
+        raise HPOMetricNotEligibleError("HPO evaluation emitted no metric rows")
     if "mean" not in report_df.columns or "direction" not in report_df.columns:
-        raise ValueError("HPO evaluation must emit mean and direction columns")
+        raise HPOMetricNotEligibleError("HPO evaluation must emit mean and direction columns")
 
     canonical_keys = set(report_df.attrs.get("canonical_hpo_keys", ()))
     if not canonical_keys and expected_keys is not None:
@@ -1843,7 +2634,7 @@ def hpo_score(
     if report_df.attrs.get("canonical_hpo") is True and (
         not canonical_keys or observed_canonical != canonical_keys
     ):
-        raise ValueError(
+        raise HPOMetricNotEligibleError(
             "HPO evaluation is not decision-eligible: incomplete metric set; "
             "canonical utility objective requires the complete metric set: "
             f"missing={sorted(canonical_keys - observed_canonical)}"
@@ -1852,7 +2643,7 @@ def hpo_score(
     if expected_keys is not None:
         required_keys = tuple(expected_keys)
         if len(required_keys) != len(set(required_keys)):
-            raise ValueError("HPO expected emitted metric keys must be unique")
+            raise HPOMetricNotEligibleError("HPO expected emitted metric keys must be unique")
         observed_keys = [str(key) for key in report_df.index]
         missing_keys = [key for key in required_keys if key not in observed_keys]
         duplicate_keys = sorted({key for key in observed_keys if observed_keys.count(key) > 1})
@@ -1865,7 +2656,7 @@ def hpo_score(
                 details.append(f"duplicate={duplicate_keys}")
             if unexpected_keys:
                 details.append(f"unexpected={unexpected_keys}")
-            raise ValueError(
+            raise HPOMetricNotEligibleError(
                 "HPO evaluation emitted an incomplete metric set: " + ", ".join(details)
             )
 
@@ -1923,7 +2714,9 @@ def hpo_score(
                     candidate_dependent_keys.add(emitted_key)
 
     if invalid:
-        raise ValueError("HPO evaluation is not decision-eligible: " + "; ".join(invalid))
+        raise HPOMetricNotEligibleError(
+            "HPO evaluation is not decision-eligible: " + "; ".join(invalid)
+        )
     for emitted_key, oriented_value in legacy_aggregate_scores:
         base_key = emitted_key.rsplit(".", 1)[0]
         if any(
@@ -1932,15 +2725,15 @@ def hpo_score(
             continue
         scores.append(oriented_value)
     if not scores:
-        raise ValueError("HPO evaluation emitted no eligible objective rows")
+        raise HPOMetricNotEligibleError("HPO evaluation emitted no eligible objective rows")
     required_utility_keys = tuple(policy["metrics"])
     observed_keys = [str(key) for key in report_df.index]
     if len(observed_keys) != len(set(observed_keys)):
-        raise ValueError("HPO evaluation emitted duplicate utility evidence")
+        raise HPOMetricNotEligibleError("HPO evaluation emitted duplicate utility evidence")
     missing_utility_keys = set(required_utility_keys) - set(observed_keys)
     unexpected_utility_keys = set(observed_keys) - set(required_utility_keys)
     if missing_utility_keys or unexpected_utility_keys:
-        raise ValueError(
+        raise HPOMetricNotEligibleError(
             "HPO evaluation must emit exactly fixed release utility metrics: "
             f"missing={sorted(missing_utility_keys)}, "
             f"unexpected={sorted(unexpected_utility_keys)}"
@@ -1953,7 +2746,7 @@ def hpo_score(
             value = 1.0 - value
         utility.append(value)
     if not all(math.isfinite(value) for value in utility):
-        raise ValueError("HPO evaluation emitted non-finite utility evidence")
+        raise HPOMetricNotEligibleError("HPO evaluation emitted non-finite utility evidence")
     return -sum(weight * value for weight, value in zip(policy["weights"], utility, strict=True))
 
 
@@ -1978,8 +2771,10 @@ def _validate_aligned_group_ids(
                 f"Patient-group HPO group IDs for {role} do not align with DataFrame rows"
             )
         values = values.reindex(frame.index)
-    elif isinstance(group_ids, (pd.Series, pd.Index)):
+    elif isinstance(group_ids, pd.Series):
         values = pd.Series(group_ids.to_numpy(copy=False), index=group_ids.index, dtype=object)
+    elif isinstance(group_ids, pd.Index):
+        values = pd.Series(group_ids.to_numpy(copy=False), dtype=object)
     else:
         try:
             values = pd.Series(group_ids, dtype=object)
@@ -2070,7 +2865,7 @@ def build_synthetic_eval_fn(
     configured_keys = {
         str(metric_name) for metric_names in metric_config.values() for metric_name in metric_names
     }
-    if configured_keys.issubset(canonical_keys):
+    if configured_keys == canonical_keys:
 
         def canonical_eval_fn(syn_df: pd.DataFrame) -> float:
             report = evaluate_canonical_hpo_metrics(
@@ -2084,6 +2879,9 @@ def build_synthetic_eval_fn(
                 seed=seed,
                 release_generalization=release_generalization,
                 utility_policy=policy,
+                group_context=group_context,
+                train_group_ids=train_group_ids,
+                tuning_group_ids=holdout_group_ids,
             )
             return hpo_score(report, expected_keys=expected_keys, utility_policy=policy)
 
@@ -2162,6 +2960,15 @@ def build_synthetic_eval_fn(
             X_ref_syn_group_ids=reference_synthetic_group_ids,
             X_augmented_group_ids=augmented_group_ids,
         )
+        if group_mode == "patient_group":
+            group_safety = getattr(report, "attrs", {}).get("group_safety")
+            if (
+                not isinstance(group_safety, Mapping)
+                or group_safety.get("schema_version") != "group-safety-v1"
+                or group_safety.get("status") != "group_safe"
+                or group_safety.get("group_mode") != "patient_group"
+            ):
+                raise HPOGroupUnsafeError()
         return hpo_score(report, expected_keys=expected_keys, utility_policy=policy)
 
     return eval_fn
@@ -2514,7 +3321,10 @@ def _json_document(payload: Any) -> Any:
 def _validate_hpo_trial_checkpoint(
     payload: Any,
     *,
+    checkpoint_root: str | Path | None = None,
+    stage_a_root: str | Path | None = None,
     expected_study_name: str | None = None,
+    expected_trial_number: int | None = None,
     expected_context_digest: str | None = None,
     expected_implementation_fingerprint: str | None = None,
 ) -> dict[str, Any]:
@@ -2525,11 +3335,17 @@ def _validate_hpo_trial_checkpoint(
     study_name = payload.get("study_name")
     if not isinstance(study_name, str) or not study_name:
         raise RuntimeError("HPO trial checkpoint study_name must be non-empty")
+    try:
+        _validate_study_name(study_name)
+    except ValueError as exc:
+        raise RuntimeError("HPO trial checkpoint study_name is unsafe") from exc
     if expected_study_name is not None and study_name != expected_study_name:
         raise RuntimeError("HPO trial checkpoint study_name does not match the study")
     trial_number = payload.get("trial_number")
     if isinstance(trial_number, bool) or not isinstance(trial_number, int) or trial_number < 0:
         raise RuntimeError("HPO trial checkpoint trial_number must be non-negative")
+    if expected_trial_number is not None and trial_number != expected_trial_number:
+        raise RuntimeError("HPO trial checkpoint trial_number does not match the path")
     state = payload.get("state")
     if state not in set(_HPO_CHECKPOINT_STATE_NAMES.values()):
         raise RuntimeError(f"HPO trial checkpoint has an invalid state {state!r}")
@@ -2575,27 +3391,99 @@ def _validate_hpo_trial_checkpoint(
     stage_a = metadata.get("stage_a")
     if not isinstance(stage_a, Mapping):
         raise RuntimeError("HPO trial checkpoint stage_a metadata must be an object")
-    result_path = stage_a.get("result_path")
-    if result_path is not None and (
-        not isinstance(result_path, str) or _looks_like_unsafe_path(result_path)
-    ):
-        raise RuntimeError("HPO trial checkpoint stage_a result_path must be relative and safe")
+    _validate_stage_a_result_artifact(
+        stage_a,
+        root=stage_a_root if stage_a_root is not None else checkpoint_root,
+        context=validated_context,
+        expected_study_name=study_name,
+        expected_trial_number=trial_number,
+    )
     metric_metadata = metadata.get("metric_metadata")
-    if metric_metadata is not None and not isinstance(metric_metadata, Mapping):
-        raise RuntimeError("HPO trial checkpoint metric_metadata must be an object or null")
-    result_metadata = metadata.get("result_metadata")
-    if result_metadata is not None and not isinstance(result_metadata, Mapping):
-        raise RuntimeError("HPO trial checkpoint result_metadata must be an object or null")
+    expected_metric_keys = validated_context.get("expected_emitted_keys")
+    historical_identity_fields = "expected_emitted_keys" not in validated_context
+    if not historical_identity_fields and (
+        not isinstance(expected_metric_keys, list) or not expected_metric_keys
+    ):
+        raise RuntimeError("HPO trial checkpoint context has no expected metric identities")
+    canonical_checkpoint = bool(expected_metric_keys) and is_canonical_hpo_context(
+        validated_context.get("metric_config"),
+        expected_keys=expected_metric_keys,
+        utility_policy=validated_context.get("utility_policy"),
+    )
+    # ``hpo-context-v2`` predates explicit canonical identity fields.  Keep
+    # those historical contexts readable; enforce new fields when present.
     if (
-        metric_metadata is not None
-        and result_metadata is not None
-        and dict(metric_metadata) != dict(result_metadata)
+        "canonical_hpo" in validated_context
+        and validated_context.get("canonical_hpo") != canonical_checkpoint
+    ):
+        raise RuntimeError("HPO trial checkpoint canonical context flag is inconsistent")
+    if "canonical_expected_keys" in validated_context and validated_context.get(
+        "canonical_expected_keys"
+    ) != (list(expected_metric_keys) if canonical_checkpoint else []):
+        raise RuntimeError("HPO trial checkpoint canonical metric identities are inconsistent")
+    validated_metric_metadata = (
+        _validate_bounded_hpo_metric_metadata(metric_metadata, expected_keys=expected_metric_keys)
+        if canonical_checkpoint and expected_metric_keys
+        else metric_metadata
+    )
+    result_metadata = metadata.get("result_metadata")
+    validated_result_metadata = (
+        _validate_bounded_hpo_metric_metadata(result_metadata, expected_keys=expected_metric_keys)
+        if canonical_checkpoint and expected_metric_keys
+        else result_metadata
+    )
+    if not canonical_checkpoint and result_metadata is None and metric_metadata is not None:
+        validated_result_metadata = metric_metadata
+    if (
+        not canonical_checkpoint
+        and (metric_metadata is not None or result_metadata is not None)
+        and metric_metadata != validated_result_metadata
     ):
         raise RuntimeError("HPO trial checkpoint result_metadata does not match metric_metadata")
+    if (
+        canonical_checkpoint
+        and state == "complete"
+        and (validated_metric_metadata is None or validated_result_metadata is None)
+    ):
+        raise RuntimeError("Completed HPO trial checkpoint requires canonical metric metadata")
+    if (
+        canonical_checkpoint
+        and (validated_metric_metadata is not None or validated_result_metadata is not None)
+        and validated_metric_metadata != validated_result_metadata
+    ):
+        raise RuntimeError("HPO trial checkpoint result_metadata does not match metric_metadata")
+    canonical_metric_items = (
+        validated_metric_metadata if isinstance(validated_metric_metadata, Mapping) else {}
+    )
+    if canonical_checkpoint and state == "complete":
+        if any(
+            item["status"] != "complete"
+            or not item["finite"]
+            or not item["eligible"]
+            or item["error_reason_code"] is not None
+            for item in canonical_metric_items.values()
+        ):
+            raise RuntimeError("Completed HPO trial checkpoint lacks complete eligible metrics")
+    elif (
+        canonical_checkpoint
+        and canonical_metric_items
+        and any(item["status"] != "failed" for item in canonical_metric_items.values())
+    ):
+        raise RuntimeError("Non-completed HPO trial checkpoint has completed metric evidence")
     outcome = metadata.get("outcome")
     if outcome is not None and not isinstance(outcome, Mapping):
         raise RuntimeError("HPO trial checkpoint outcome must be an object or null")
     error_provenance = metadata.get("hpo_error_provenance")
+    missing_evidence = metadata.get("hpo_error_provenance_state") == "missing_evidence"
+    if canonical_checkpoint and state != "complete" and not isinstance(error_provenance, Mapping):
+        raise RuntimeError("Non-completed HPO trial checkpoint requires error provenance")
+    if (
+        state != "complete"
+        and not isinstance(error_provenance, Mapping)
+        and not missing_evidence
+        and not (not canonical_checkpoint and "hpo_error_provenance_state" not in metadata)
+    ):
+        raise RuntimeError("Non-completed HPO trial checkpoint requires explicit evidence state")
     if error_provenance is not None:
         try:
             normalized_provenance = normalize_hpo_metadata(error_provenance)
@@ -2626,6 +3514,7 @@ def persist_hpo_trial_checkpoint(
     *,
     hpo_context: Mapping[str, Any] | None = None,
     expected_implementation_fingerprint: str | None = None,
+    stage_a_root: str | Path | None = None,
 ) -> Path:
     """Persist one immutable, schema-versioned HPO trial outcome."""
     study_name = _validate_study_name(study_name)
@@ -2643,8 +3532,47 @@ def persist_hpo_trial_checkpoint(
         _require_validated_hpo_context(hpo_context, label="HPO checkpoint context")
     )
     attrs = getattr(trial, "user_attrs", {}) or {}
+    stage_a_state = attrs.get("stage_a_state")
+    stage_a_contract_digest = attrs.get("stage_a_contract_digest")
+    raw_stage_a_path = attrs.get("stage_a_result_path")
+    stage_a_result_path = _checkpoint_stage_a_result_identifier(raw_stage_a_path)
+    stage_a_fields_present = any(
+        value is not None for value in (stage_a_state, stage_a_contract_digest, raw_stage_a_path)
+    )
+    if stage_a_state is not None and stage_a_state not in {"passed", "pruned"}:
+        raise RuntimeError("HPO checkpoint Stage A state is invalid")
+    if stage_a_fields_present and (
+        stage_a_result_path is None
+        or not isinstance(stage_a_state, str)
+        or not isinstance(stage_a_contract_digest, str)
+        or not stage_a_contract_digest
+    ):
+        raise RuntimeError("HPO checkpoint Stage A evidence is incomplete")
+    _validate_stage_a_result_artifact(
+        {
+            "state": stage_a_state,
+            "contract_digest": stage_a_contract_digest,
+            "result_path": stage_a_result_path,
+        },
+        root=stage_a_root if stage_a_root is not None else root,
+        context=context,
+        expected_study_name=study_name,
+        expected_trial_number=trial_number,
+    )
     metric_metadata = attrs.get("metric_metadata")
-    result_metadata = attrs.get("result_metadata", metric_metadata)
+    result_metadata = attrs.get("result_metadata")
+    if (
+        not is_canonical_hpo_context(
+            context.get("metric_config"),
+            expected_keys=context.get("expected_emitted_keys"),
+            utility_policy=context.get("utility_policy"),
+        )
+        and result_metadata is None
+        and metric_metadata is not None
+    ):
+        result_metadata = metric_metadata
+    error_provenance = attrs.get("hpo_error_provenance")
+    missing_evidence = state != "complete" and not isinstance(error_provenance, Mapping)
     payload = _json_document(
         {
             "schema_version": HPO_TRIAL_CHECKPOINT_SCHEMA_VERSION,
@@ -2659,17 +3587,16 @@ def persist_hpo_trial_checkpoint(
             "hpo_context": context,
             "metadata": {
                 "stage_a": {
-                    "state": attrs.get("stage_a_state"),
-                    "contract_digest": attrs.get("stage_a_contract_digest"),
-                    "result_path": _checkpoint_stage_a_result_identifier(
-                        attrs.get("stage_a_result_path")
-                    ),
+                    "state": stage_a_state,
+                    "contract_digest": stage_a_contract_digest,
+                    "result_path": stage_a_result_path,
                     "prune_reasons": attrs.get("stage_a_prune_reasons", []),
                 },
                 "metric_metadata": metric_metadata,
                 "result_metadata": result_metadata,
                 "outcome": attrs.get("hpo_outcome"),
-                "hpo_error_provenance": attrs.get("hpo_error_provenance"),
+                "hpo_error_provenance": error_provenance,
+                "hpo_error_provenance_state": "missing_evidence" if missing_evidence else None,
                 "generator": {
                     "state": attrs.get("generator_metadata_state", "not_recorded"),
                     "plugin_name": attrs.get("generator_plugin_name"),
@@ -2682,26 +3609,21 @@ def persist_hpo_trial_checkpoint(
     )
     _validate_hpo_trial_checkpoint(
         payload,
+        checkpoint_root=Path(root).resolve(),
+        stage_a_root=Path(stage_a_root).resolve() if stage_a_root is not None else None,
         expected_study_name=study_name,
         expected_context_digest=hpo_context_digest(context),
         expected_implementation_fingerprint=expected_implementation_fingerprint,
     )
     path = Path(root) / study_name / f"trial-{trial_number}" / "checkpoint.json"
-    if path.exists():
-        try:
-            cached = load_json(path)
-        except (OSError, ValueError) as exc:
-            raise RuntimeError(f"HPO trial checkpoint at {path} is unreadable") from exc
-        _validate_hpo_trial_checkpoint(
-            cached,
-            expected_study_name=study_name,
-            expected_context_digest=hpo_context_digest(context),
-            expected_implementation_fingerprint=expected_implementation_fingerprint,
-        )
-        if cached != payload:
-            raise RuntimeError(f"HPO trial checkpoint at {path} does not match the current trial")
-        return path
-    _atomic_stage_a_json(path, payload)
+    _locked_stage_a_json(
+        Path(root),
+        (study_name, f"trial-{trial_number}"),
+        "checkpoint.json",
+        payload,
+        path,
+        artifact_label="trial checkpoint",
+    )
     return path
 
 
@@ -2710,16 +3632,34 @@ def load_hpo_trial_checkpoint(
     *,
     hpo_context: Mapping[str, Any] | None = None,
     expected_implementation_fingerprint: str | None = None,
+    stage_a_root: str | Path | None = None,
 ) -> dict[str, Any]:
     """Load and validate a durable HPO trial checkpoint."""
     checkpoint_path = Path(path)
-    try:
-        payload = load_json(checkpoint_path)
-    except (OSError, ValueError) as exc:
-        raise RuntimeError(f"HPO trial checkpoint at {checkpoint_path} is unreadable") from exc
     context = _require_validated_hpo_context(hpo_context, label="HPO checkpoint context")
+    try:
+        expected_study_name = _validate_study_name(checkpoint_path.parents[1].name)
+        trial_directory = checkpoint_path.parents[0].name
+        expected_trial_number = int(trial_directory.removeprefix("trial-"))
+        if not trial_directory.startswith("trial-") or expected_trial_number < 0:
+            raise ValueError
+        if checkpoint_path.name != "checkpoint.json":
+            raise ValueError
+    except (IndexError, ValueError) as exc:
+        raise RuntimeError("HPO trial checkpoint path has an invalid identity") from exc
+    payload = _locked_read_stage_a_json(
+        checkpoint_path.parents[2],
+        (expected_study_name, trial_directory),
+        checkpoint_path.name,
+        checkpoint_path,
+        artifact_label="trial checkpoint",
+    )
     return _validate_hpo_trial_checkpoint(
         payload,
+        checkpoint_root=checkpoint_path.parents[2] if len(checkpoint_path.parents) >= 3 else None,
+        stage_a_root=stage_a_root,
+        expected_study_name=expected_study_name,
+        expected_trial_number=expected_trial_number,
         expected_context_digest=hpo_context_digest(context),
         expected_implementation_fingerprint=expected_implementation_fingerprint,
     )
@@ -2731,6 +3671,7 @@ def _persist_hpo_trial_checkpoints(
     *,
     hpo_context: Mapping[str, Any] | None,
     expected_implementation_fingerprint: str | None = None,
+    stage_a_root: str | Path | None = None,
 ) -> None:
     for trial in study.trials:
         if getattr(getattr(trial, "state", None), "name", None) in _HPO_CHECKPOINT_STATE_NAMES:
@@ -2740,6 +3681,7 @@ def _persist_hpo_trial_checkpoints(
                 trial,
                 hpo_context=hpo_context,
                 expected_implementation_fingerprint=expected_implementation_fingerprint,
+                stage_a_root=stage_a_root,
             )
 
 
@@ -2818,6 +3760,7 @@ def run_study(
     checkpoint_plugin: str | None = None,
     hpo_context: Mapping[str, Any] | None = None,
     checkpoint_implementation_fingerprint: str | None = None,
+    stage_a_root: str | Path | None = None,
 ) -> dict:
     """Run (or resume, via SQLite storage) an Optuna study; return best params.
 
@@ -2855,6 +3798,7 @@ def run_study(
                 checkpoint_path,
                 hpo_context=context_payload,
                 expected_implementation_fingerprint=checkpoint_implementation_fingerprint,
+                stage_a_root=stage_a_root,
             )
         if existing_checkpoints:
             logger.info(
@@ -2905,6 +3849,7 @@ def run_study(
             trial,
             hpo_context=context_payload,
             expected_implementation_fingerprint=checkpoint_implementation_fingerprint,
+            stage_a_root=stage_a_root,
         )
 
     terminal_states = {
@@ -2937,6 +3882,7 @@ def run_study(
             study,
             hpo_context=context_payload,
             expected_implementation_fingerprint=checkpoint_implementation_fingerprint,
+            stage_a_root=stage_a_root,
         )
 
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]

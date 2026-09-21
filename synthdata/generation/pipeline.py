@@ -1223,6 +1223,7 @@ def run_generation(
                         checkpoint_implementation_fingerprint=sc.generator_implementation_fingerprint(
                             name
                         ),
+                        stage_a_root=stage_a_root,
                     )
                     cache.set("synthcity", name, params)
                 params = dict(cache.get("synthcity", name))
@@ -1394,6 +1395,7 @@ def run_generation(
                         checkpoint_implementation_fingerprint=sc.generator_implementation_fingerprint(
                             "tabpfgen_standard"
                         ),
+                        stage_a_root=stage_a_root,
                     )
                     cache.set("tabpfgen", "tabpfgen_standard", params)
                 params = cache.get("tabpfgen", "tabpfgen_standard")
@@ -1468,6 +1470,7 @@ def run_generation(
                         checkpoint_implementation_fingerprint=sc.generator_implementation_fingerprint(
                             "tabpfgen_custom"
                         ),
+                        stage_a_root=stage_a_root,
                     )
                     cache.set("tabpfgen", "tabpfgen_custom", params)
                 params = cache.get("tabpfgen", "tabpfgen_custom")

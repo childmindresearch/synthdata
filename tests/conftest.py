@@ -4,6 +4,12 @@ Fixtures here are deliberately in-memory / tmp_path-rooted so unit tests never
 touch the real ``data/``/``output/`` directories or require network access.
 """
 
+import os
+import stat
+import time
+from pathlib import Path
+from uuid import uuid4
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -23,9 +29,168 @@ from synthdata.data_roles import allocate_roles, resolve_population_identity
 from synthdata.utils import ensure_dir
 
 
+def _selected_repository_root() -> Path:
+    """Find nearest marked SynthData checkout containing this conftest."""
+    conftest_path = Path(__file__).resolve()
+    for candidate in conftest_path.parents:
+        resolved_candidate = candidate.resolve()
+        if (resolved_candidate / "AGENTS.md").is_file() and (
+            resolved_candidate / "pyproject.toml"
+        ).is_file():
+            return resolved_candidate
+    raise RuntimeError(
+        "Unable to locate SynthData repository root from tests/conftest.py: "
+        "required AGENTS.md and pyproject.toml markers are absent"
+    )
+
+
+def _reject_symlink_components(path: Path) -> None:
+    """Reject scratch path components that could redirect pytest outside checkout."""
+    current = Path(path.anchor) if path.is_absolute() else Path()
+    for component in path.parts[1:] if path.is_absolute() else path.parts:
+        current /= component
+        if current.is_symlink():
+            raise RuntimeError(f"Refusing symlink in pytest scratch path: {current}")
+
+
+def _secure_directory_fd(name: str, parent_fd: int, mode: int, label: str) -> int:
+    """Create/open one directory below ``parent_fd`` without following links."""
+    try:
+        os.mkdir(name, mode=mode, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise RuntimeError(f"Unable to create {label}: {name}") from exc
+
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not no_follow or not directory:
+        raise RuntimeError("Pinned platform lacks no-follow directory support")
+    directory_fd: int | None = None
+    try:
+        directory_fd = os.open(
+            name,
+            os.O_RDONLY | directory | no_follow,
+            dir_fd=parent_fd,
+        )
+        directory_stat = os.fstat(directory_fd)
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise RuntimeError(f"Refusing {label} that is not a directory: {name}")
+        if directory_stat.st_uid != os.geteuid():
+            raise RuntimeError(f"Refusing {label} not owned by current user: {name}")
+        if directory_stat.st_mode & 0o022:
+            raise RuntimeError(f"Refusing group/world-writable {label}: {name}")
+        os.fchmod(directory_fd, mode)
+        return directory_fd
+    except RuntimeError:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        raise
+    except OSError as exc:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        raise RuntimeError(f"Unable to secure {label}: {name}") from exc
+
+
+def _validate_final_basetemp_boundary(
+    basetemp: Path,
+    repository_root: Path,
+    expected_stats: tuple[os.stat_result, os.stat_result, os.stat_result],
+) -> None:
+    """Reopen every basetemp component before pytest consumes its pathname.
+
+    Pytest accepts only a pathname, so descriptors cannot pin this path through
+    its internal setup. This is the final security boundary: no-follow opens,
+    ownership/type/mode checks, containment checks, and identity comparisons
+    reject replacement before handing the pathname to pytest.
+    """
+    if not basetemp.is_absolute() or not basetemp.is_relative_to(repository_root):
+        raise RuntimeError(f"Refusing pytest basetemp outside repository: {basetemp}")
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not no_follow or not directory:
+        raise RuntimeError("Pinned platform lacks no-follow directory support")
+
+    descriptors: list[int] = []
+    labels = ("repository root", "pytest scratch root", "pytest basetemp")
+    try:
+        try:
+            descriptors.append(os.open(str(repository_root), os.O_RDONLY | directory | no_follow))
+            descriptors.append(
+                os.open("tmp", os.O_RDONLY | directory | no_follow, dir_fd=descriptors[0])
+            )
+            descriptors.append(
+                os.open(basetemp.name, os.O_RDONLY | directory | no_follow, dir_fd=descriptors[1])
+            )
+        except OSError as exc:
+            raise RuntimeError(f"Unable to reopen pytest basetemp securely: {basetemp}") from exc
+
+        for index, descriptor in enumerate(descriptors):
+            current = os.fstat(descriptor)
+            expected = expected_stats[index]
+            if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+                raise RuntimeError(f"Refusing replaced {labels[index]}: {basetemp}")
+            if not stat.S_ISDIR(current.st_mode):
+                raise RuntimeError(f"Refusing {labels[index]} that is not a directory: {basetemp}")
+            if current.st_uid != os.geteuid():
+                raise RuntimeError(
+                    f"Refusing {labels[index]} not owned by current user: {basetemp}"
+                )
+            if index > 0 and current.st_mode & 0o022:
+                raise RuntimeError(f"Refusing group/world-writable {labels[index]}: {basetemp}")
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config: pytest.Config) -> None:
+    """Set one unique, repository-local basetemp before pytest creates fixtures."""
+    repository_root = _selected_repository_root()
+    scratch_root = repository_root / "tmp"
+    if not scratch_root.is_absolute() or not scratch_root.is_relative_to(repository_root):
+        raise RuntimeError(f"Refusing pytest scratch root outside repository: {scratch_root}")
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not no_follow or not directory:
+        raise RuntimeError("Pinned platform lacks no-follow directory support")
+    try:
+        repository_fd = os.open(str(repository_root), os.O_RDONLY | directory | no_follow)
+    except OSError as exc:
+        raise RuntimeError(f"Unable to open repository root securely: {repository_root}") from exc
+    try:
+        scratch_fd = _secure_directory_fd("tmp", repository_fd, 0o700, "pytest scratch root")
+        try:
+            repository_stat = os.fstat(repository_fd)
+            scratch_stat = os.fstat(scratch_fd)
+            if scratch_stat.st_uid != os.geteuid() or scratch_stat.st_mode & 0o022:
+                raise RuntimeError(f"Refusing unsafe pytest scratch root: {scratch_root}")
+            run_id = f"{os.getpid()}-{time.time_ns()}-{uuid4().hex}"
+            basetemp = scratch_root / run_id
+            basetemp_fd = _secure_directory_fd(run_id, scratch_fd, 0o700, "pytest basetemp")
+            basetemp_stat = os.fstat(basetemp_fd)
+            os.close(basetemp_fd)
+            # Pytest only accepts a pathname; perform final no-follow validation
+            # immediately before assigning it, then pytest may consume it.
+            _validate_final_basetemp_boundary(
+                basetemp,
+                repository_root,
+                (repository_stat, scratch_stat, basetemp_stat),
+            )
+            config.option.basetemp = str(basetemp)
+        finally:
+            os.close(scratch_fd)
+    finally:
+        os.close(repository_fd)
+
+
 @pytest.fixture(autouse=True)
-def patient_id_hmac_secret(monkeypatch):
+def patient_id_hmac_secret(monkeypatch, tmp_path: Path):
     """Provide only test-local key material for canonical identity resolution."""
+    scratch_root = (_selected_repository_root() / "tmp").resolve()
+    _reject_symlink_components(tmp_path)
+    if not tmp_path.is_absolute() or not tmp_path.resolve().is_relative_to(scratch_root):
+        raise AssertionError(f"pytest tmp_path escaped repository scratch: {tmp_path}")
     monkeypatch.setenv("SYNTHDATA_PATIENT_ID_HMAC_KEY", "unit-test-only-patient-id-secret")
 
 

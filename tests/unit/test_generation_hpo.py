@@ -2,7 +2,9 @@
 
 import enum
 import json
+import math
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +14,7 @@ import pytest
 import torch
 
 from synthdata.config import HPOConfig, load_config
-from synthdata.data import semantic_context_payload
+from synthdata.data import dataframe_fingerprint, semantic_context_payload
 from synthdata.generation import hpo as hpo_module
 from synthdata.generation import synthcity_backend as synthcity_backend_module
 from synthdata.generation.hpo import (
@@ -36,7 +38,10 @@ from synthdata.generation.hpo import (
     screen_stage_a_trial,
     validate_hpo_metric_config,
 )
-from synthdata.generation.synthcity_backend import build_synthcity_objective
+from synthdata.generation.synthcity_backend import (
+    _validate_native_benchmark_report,
+    build_synthcity_objective,
+)
 from tests.unit.synthcity_emitted_key_fixtures import HPO_SYNTHCITY_EMITTED_KEY_FIXTURES
 
 pytestmark = pytest.mark.unit
@@ -83,6 +88,13 @@ def _hpo_context(**overrides):
         objective_version="release-utility-v1",
     )
     context.update(overrides)
+    canonical = hpo_module.is_canonical_hpo_context(
+        context["metric_config"],
+        expected_keys=context["expected_emitted_keys"],
+        utility_policy=context["utility_policy"],
+    )
+    context["canonical_hpo"] = canonical
+    context["canonical_expected_keys"] = list(context["expected_emitted_keys"]) if canonical else []
     return context
 
 
@@ -110,6 +122,39 @@ def _provenance_kwargs():
 def _score(report, **kwargs):
     report.attrs.setdefault("hpo_provenance", _hpo_context())
     return hpo_score(report, **kwargs)
+
+
+def _canonical_metric_metadata(*, failed: bool = False):
+    """Build complete bounded metadata for canonical trial evidence."""
+    metrics = ("mixed_mmd.v1", "elastic_net_jsd.v1", "tstr_macro_f1.v1")
+    return {
+        key: {
+            "metric_name": key,
+            "status": "failed" if failed else "complete",
+            "direction": "maximize" if key == "tstr_macro_f1.v1" else "minimize",
+            "finite": not failed,
+            "eligible": not failed,
+            "error_reason_code": "metric_evaluation_exception" if failed else None,
+            "fit_roles": ["train"],
+            "evaluation_role": "tuning",
+        }
+        for key in metrics
+    }
+
+
+def _canonical_hpo_context(**overrides):
+    """Build context matching exact canonical objective identities."""
+    context = _hpo_context(
+        metric_config={
+            "canonical_objectives": [
+                "tstr_macro_f1.v1",
+                "mixed_mmd.v1",
+                "elastic_net_jsd.v1",
+            ]
+        },
+        **overrides,
+    )
+    return context
 
 
 def test_default_hpo_objective_excludes_privacy_and_diagnostics():
@@ -200,7 +245,13 @@ def test_patient_group_hpo_resolves_reordered_rows_by_stable_identity(mocker):
         tuning,
         "target",
         [],
-        {"task12": ["mixed_mmd.v1"]},
+        {
+            "canonical_objectives": [
+                "tstr_macro_f1.v1",
+                "mixed_mmd.v1",
+                "elastic_net_jsd.v1",
+            ]
+        },
         seed=0,
         group_context={"group_mode": "patient_group"},
         train_group_ids=groups,
@@ -211,7 +262,13 @@ def test_patient_group_hpo_resolves_reordered_rows_by_stable_identity(mocker):
         tuning.iloc[[1, 0]],
         "target",
         [],
-        {"task12": ["mixed_mmd.v1"]},
+        {
+            "canonical_objectives": [
+                "tstr_macro_f1.v1",
+                "mixed_mmd.v1",
+                "elastic_net_jsd.v1",
+            ]
+        },
         seed=0,
         group_context={"group_mode": "patient_group"},
         train_group_ids=groups,
@@ -238,6 +295,197 @@ def test_patient_group_hpo_rejects_misaligned_group_rows():
             train_group_ids=pd.Series(["p1", "p2"], index=["b", "wrong"]),
             holdout_group_ids=pd.Series(["p3", "p4"], index=["c", "d"]),
         )
+
+
+def test_patient_group_ids_accepts_aligned_index_for_range_index_frame():
+    frame = pd.DataFrame({"x": [0.0, 1.0], "target": [0, 1]})
+
+    assert hpo_module._validate_aligned_group_ids(frame, pd.Index(["p1", "p2"]), "train") == [
+        "p1",
+        "p2",
+    ]
+
+
+def test_patient_group_ids_index_rejects_non_range_frame_as_group_unsafe():
+    train = pd.DataFrame({"x": [0.0, 1.0], "target": [0, 1]}, index=pd.Index(["a", "b"]))
+    tuning = pd.DataFrame({"x": [2.0, 3.0], "target": [0, 1]}, index=pd.Index(["c", "d"]))
+
+    with pytest.raises(hpo_module.HPOGroupUnsafeError, match="contract is malformed"):
+        hpo_module.evaluate_canonical_hpo_metrics(
+            train,
+            tuning,
+            train.copy(),
+            metric_config={"canonical_objectives": list(HPO_OBJECTIVE_METRICS)},
+            target_column="target",
+            group_context=_patient_group_contract(train, tuning, ["p1", "p2"], ["p3", "p4"]),
+            train_group_ids=pd.Index(["p1", "p2"]),
+            tuning_group_ids=pd.Index(["p3", "p4"]),
+        )
+
+
+def _patient_group_contract(train, tuning, train_groups, tuning_groups):
+    """Build bounded group evidence matching canonical evaluator inputs."""
+    return {
+        "group_mode": "patient_group",
+        "roles": {
+            role: {
+                "rows": len(values),
+                "groups": len(set(values)),
+                "fingerprint": dataframe_fingerprint(pd.DataFrame({"group_id": values})),
+                "source": "dataset_role_groups",
+            }
+            for role, values in (("train", train_groups), ("tuning", tuning_groups))
+        },
+    }
+
+
+def test_canonical_patient_group_evaluator_emits_affirmative_bounded_contract():
+    train = pd.DataFrame({"x": [0.0, 1.0], "target": [0, 1]})
+    tuning = pd.DataFrame({"x": [2.0, 3.0], "target": [0, 1]})
+    groups = ["p1", "p2"]
+    train_groups = dict(zip(train.index, groups, strict=True))
+    tuning_groups = dict(zip(tuning.index, ["p3", "p4"], strict=True))
+    report = hpo_module.evaluate_canonical_hpo_metrics(
+        train,
+        tuning,
+        train.copy(),
+        metric_config={"canonical_objectives": list(HPO_OBJECTIVE_METRICS)},
+        target_column="target",
+        feature_types={"x": "continuous", "target": "categorical"},
+        group_context=_patient_group_contract(train, tuning, groups, ["p3", "p4"]),
+        train_group_ids=train_groups,
+        tuning_group_ids=tuning_groups,
+    )
+    safety = report.attrs["group_safety"]
+    assert safety["schema_version"] == "group-safety-v1"
+    assert safety["status"] == "group_safe"
+    assert safety["group_mode"] == "patient_group"
+    assert set(safety["roles"]) == {"train", "tuning"}
+    assert all("fingerprint" in evidence for evidence in safety["roles"].values())
+    assert "p1" not in json.dumps(report.attrs)
+    assert "p3" not in json.dumps(report.attrs)
+
+
+@pytest.mark.parametrize(
+    "contract_mutation",
+    [
+        lambda contract: contract.pop("roles"),
+        lambda contract: contract["roles"]["train"].update({"groups": 99}),
+        lambda contract: contract["roles"]["tuning"].update({"source": "raw_ids"}),
+    ],
+)
+def test_canonical_patient_group_missing_or_contradictory_contract_fails_closed(contract_mutation):
+    train = pd.DataFrame({"x": [0.0, 1.0], "target": [0, 1]})
+    tuning = pd.DataFrame({"x": [2.0, 3.0], "target": [0, 1]})
+    contract = _patient_group_contract(train, tuning, ["p1", "p2"], ["p3", "p4"])
+    contract_mutation(contract)
+    with pytest.raises(hpo_module.HPOGroupUnsafeError):
+        hpo_module.evaluate_canonical_hpo_metrics(
+            train,
+            tuning,
+            train.copy(),
+            metric_config={"canonical_objectives": list(HPO_OBJECTIVE_METRICS)},
+            target_column="target",
+            group_context=contract,
+            train_group_ids=dict(zip(train.index, ["p1", "p2"], strict=True)),
+            tuning_group_ids=dict(zip(tuning.index, ["p3", "p4"], strict=True)),
+        )
+
+
+def test_native_report_rejects_provenance_and_metadata_leakage():
+    report = pd.DataFrame(
+        {"mean": [0.2], "direction": ["minimize"]}, index=_strings("mixed_mmd.v1")
+    )
+    report.attrs["hpo_provenance"] = {"role_hashes": {"train": "x"}}
+    report.attrs["metric_metadata"] = {
+        "mixed_mmd.v1": {
+            "metric_name": "mixed_mmd.v1",
+            "status": "complete",
+            "exception": "SECRET /tmp/raw-path",
+        }
+    }
+    with pytest.raises(hpo_module.HPOMetricNotEligibleError):
+        _validate_native_benchmark_report({"trial_0": report}, "trial_0")
+
+
+def test_native_report_accepts_valid_bounded_metadata_contract():
+    report = pd.DataFrame(
+        {"mean": [0.2], "direction": ["minimize"]}, index=_strings("mixed_mmd.v1")
+    )
+    report.attrs["hpo_provenance"] = {
+        "release_transform_digest": "release-a",
+        "role_hashes": {"train": "train-a", "tuning": "tuning-a"},
+        "contracts": {
+            "fit_roles": ["train"],
+            "comparison_role": "tuning",
+            "excluded_roles": ["final_holdout"],
+        },
+        "objective_version": "native-v1",
+    }
+    report.attrs["metric_metadata"] = {
+        "mixed_mmd.v1": {
+            "metric_name": "mixed_mmd.v1",
+            "status": "complete",
+            "finite": True,
+            "eligible": True,
+            "error_reason_code": None,
+        }
+    }
+    report.attrs["result_metadata"] = dict(report.attrs["metric_metadata"])
+    assert _validate_native_benchmark_report({"trial_0": report}, "trial_0") is report
+
+
+def _native_group_safety(status="group_safe"):
+    return {
+        "schema_version": "group-safety-v1",
+        "status": status,
+        "group_mode": "patient_group",
+        "roles": {
+            role: {
+                "rows": 4,
+                "groups": 4,
+                "fingerprint": "a" * 64 if role == "train" else "b" * 64,
+                "source": "dataset_role_groups",
+            }
+            for role in ("train", "tuning")
+        },
+    }
+
+
+def test_native_group_unsafe_requires_complete_bounded_contract():
+    report = pd.DataFrame(
+        {"mean": [0.2], "direction": ["minimize"]}, index=_strings("mixed_mmd.v1")
+    )
+    report.attrs["group_safety"] = _native_group_safety("group_unsafe")
+    provenance = _provenance_kwargs()
+    provenance["contracts"] = {
+        key: provenance["contracts"][key]
+        for key in ("fit_roles", "comparison_role", "excluded_roles")
+    }
+    report.attrs["hpo_provenance"] = {
+        key: provenance[key]
+        for key in ("release_transform_digest", "role_hashes", "contracts", "objective_version")
+    }
+    report.attrs["metric_metadata"] = {
+        "mixed_mmd.v1": {
+            "metric_name": "mixed_mmd.v1",
+            "status": "complete",
+            "finite": True,
+            "eligible": True,
+            "error_reason_code": None,
+        }
+    }
+    report.attrs["result_metadata"] = dict(report.attrs["metric_metadata"])
+    assert _validate_native_benchmark_report({"trial_0": report}, "trial_0") is report
+
+
+def test_native_group_unsafe_malformed_contract_fails_closed():
+    report = pd.DataFrame(
+        {"mean": [0.2], "direction": ["minimize"]}, index=_strings("mixed_mmd.v1")
+    )
+    report.attrs["group_safety"] = {"status": "group_unsafe"}
+    with pytest.raises(hpo_module.HPOGroupUnsafeError):
+        _validate_native_benchmark_report({"trial_0": report}, "trial_0")
 
 
 def test_hpo_context_uses_contextual_emitted_key_manifest():
@@ -596,7 +844,11 @@ def test_checkpoint_persist_and_load_require_context(tmp_path):
 
 
 def test_run_study_and_resume_require_context(tmp_path):
-    config = HPOConfig(n_trials=1, timeout_seconds=None)
+    config = HPOConfig(
+        n_trials=1,
+        timeout_seconds=None,
+        metric_config={"task12": ["mixed_mmd.v1"]},
+    )
     with pytest.raises(ValueError, match="canonical hpo_context"):
         run_study("context_required", lambda _trial: 1.0, config, tmp_path, seed=0, drop_keys=())
 
@@ -873,6 +1125,147 @@ def test_stage_a_trial_persists_screen_exception_as_pruned(tmp_path):
     assert "source frame does not match" not in payload["prune_reasons"][0]
 
 
+def test_stage_a_exception_artifact_roundtrips_with_null_fingerprint(tmp_path):
+    source = _stage_a_source()
+    contract = _stage_a_contract(source)
+    study = optuna.create_study(direction="minimize")
+    trial = study.ask()
+    result = hpo_module._stage_a_exception_result(None, contract, ValueError("hidden"))
+    result_path = hpo_module.persist_stage_a_result(
+        tmp_path, "exception_roundtrip", trial.number, result
+    )
+    payload = json.loads(result_path.read_text())
+
+    hpo_module._validate_stage_a_result_artifact(
+        payload,
+        root=tmp_path,
+        context={"stage_a_contract_digest": contract.digest},
+        expected_study_name="exception_roundtrip",
+        expected_trial_number=trial.number,
+    )
+    assert payload["candidate_frame_fingerprint"] is None
+
+
+def test_stage_a_first_write_validates_persisted_artifact(tmp_path, mocker):
+    source = _stage_a_source()
+    contract = _stage_a_contract(source)
+    result = hpo_module._stage_a_exception_result(None, contract, ValueError("hidden"))
+
+    def write_malformed(directory_fd, name, _payload):
+        malformed_fd = hpo_module.os.open(
+            name, hpo_module.os.O_WRONLY | hpo_module.os.O_CREAT, 0o600, dir_fd=directory_fd
+        )
+        try:
+            hpo_module.os.write(malformed_fd, b"{")
+        finally:
+            hpo_module.os.close(malformed_fd)
+
+    mocker.patch.object(hpo_module, "_atomic_stage_a_json_fd", side_effect=write_malformed)
+
+    with pytest.raises(RuntimeError, match="is unreadable"):
+        hpo_module.persist_stage_a_result(tmp_path, "first_write", 0, result)
+
+
+def test_stage_a_existing_result_read_rejects_symlinked_trial_directory(tmp_path):
+    result = hpo_module._stage_a_exception_result(
+        None, _stage_a_contract(_stage_a_source()), ValueError()
+    )
+    study_root = tmp_path / "existing_read"
+    target = tmp_path / "outside"
+    target.mkdir()
+    (target / "result.json").write_text(json.dumps({"not": "stage-a"}))
+    study_root.mkdir()
+    (study_root / "trial-0").symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="symlink path|is unreadable"):
+        hpo_module.persist_stage_a_result(tmp_path, "existing_read", 0, result)
+
+
+def test_stage_a_result_rejects_divergent_existing_payload(tmp_path):
+    source = _stage_a_source()
+    result = hpo_module._stage_a_exception_result(None, _stage_a_contract(source), ValueError())
+    path = hpo_module.persist_stage_a_result(tmp_path, "divergent", 0, result)
+    payload = json.loads(path.read_text())
+    payload["trial_number"] = 1
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match="does not match the current result"):
+        hpo_module.persist_stage_a_result(tmp_path, "divergent", 0, result)
+
+
+def test_stage_a_contract_rejects_divergent_existing_payload(tmp_path):
+    contract = _stage_a_contract(_stage_a_source())
+    path = persist_stage_a_contract(tmp_path, contract)
+    payload = json.loads(path.read_text())
+    payload["digest"] = "different"
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match="does not match the current contract"):
+        persist_stage_a_contract(tmp_path, contract)
+
+
+@pytest.mark.parametrize("trial_number", [True, False, 1.0, "1", None])
+def test_stage_a_result_rejects_non_integer_trial_number_before_filesystem_access(
+    tmp_path, trial_number
+):
+    result = hpo_module._stage_a_exception_result(
+        None, _stage_a_contract(_stage_a_source()), ValueError()
+    )
+
+    with pytest.raises(ValueError, match="trial_number"):
+        hpo_module.persist_stage_a_result(tmp_path, "invalid_trial", trial_number, result)
+    assert not (tmp_path / "invalid_trial").exists()
+
+
+def test_stage_a_artifact_rejects_cross_trial_and_malformed_bounded_fields(tmp_path):
+    payload = {
+        "schema_version": hpo_module.STAGE_A_SCREEN_SCHEMA_VERSION,
+        "study_name": "identity-study",
+        "trial_number": 2,
+        "contract_digest": "stage-a",
+        "candidate_shape": [1, 1],
+        "candidate_columns": ["feature"],
+        "candidate_frame_fingerprint": "a" * 64,
+        "state": "passed",
+        "passed": True,
+        "pruned": False,
+        "checks": [],
+        "prune_reasons": [],
+    }
+    result_path = tmp_path / "identity-study" / "trial-2" / "result.json"
+    result_path.parent.mkdir(parents=True)
+    result_path.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match="trial_number does not match"):
+        hpo_module._validate_stage_a_result_artifact(
+            {
+                "state": "passed",
+                "contract_digest": "stage-a",
+                "result_path": "identity-study/trial-2/result.json",
+            },
+            root=tmp_path,
+            context={},
+            expected_study_name="identity-study",
+            expected_trial_number=3,
+        )
+
+    payload["candidate_shape"] = [0, 2]
+    payload["candidate_columns"] = ["feature", "feature"]
+    result_path.write_text(json.dumps(payload))
+    with pytest.raises(RuntimeError, match="invalid bounded fields|shape is inconsistent"):
+        hpo_module._validate_stage_a_result_artifact(
+            {
+                "state": "passed",
+                "contract_digest": "stage-a",
+                "result_path": "identity-study/trial-2/result.json",
+            },
+            root=tmp_path,
+            context={},
+            expected_study_name="identity-study",
+            expected_trial_number=2,
+        )
+
+
 def test_stage_a_result_path_in_checkpoint_is_relative_and_safe(tmp_path):
     source = _stage_a_source()
     contract = _stage_a_contract(source)
@@ -890,6 +1283,12 @@ def test_stage_a_result_path_in_checkpoint_is_relative_and_safe(tmp_path):
         n_trials=1,
     )
     trial = study.trials[0]
+    result_path = tmp_path / "checkpoints" / "safe_paths" / "trial-0" / "result.json"
+    result_path.parent.mkdir(parents=True)
+    result_payload = json.loads((tmp_path / "safe_paths" / "trial-0" / "result.json").read_text())
+    result_payload["contract_digest"] = "stage-a"
+    result_path.write_text(json.dumps(result_payload))
+    trial.set_user_attr("stage_a_contract_digest", "stage-a")
     checkpoint = persist_hpo_trial_checkpoint(
         tmp_path / "checkpoints",
         "safe_paths",
@@ -901,6 +1300,129 @@ def test_stage_a_result_path_in_checkpoint_is_relative_and_safe(tmp_path):
     assert result_path == "safe_paths/trial-0/result.json"
     assert not Path(result_path).is_absolute()
     assert ".." not in Path(result_path).parts
+
+
+def test_checkpoint_first_write_uses_sibling_stage_a_root(tmp_path):
+    context = _hpo_context()
+    stage_a_root = tmp_path / "hpo_stage_a"
+    checkpoint_root = tmp_path / "hpo_checkpoints"
+    study_name = "sibling_stage"
+    result_path = stage_a_root / study_name / "trial-0" / "result.json"
+    result_path.parent.mkdir(parents=True)
+    result_path.write_text(
+        json.dumps(
+            {
+                "schema_version": hpo_module.STAGE_A_SCREEN_SCHEMA_VERSION,
+                "study_name": study_name,
+                "trial_number": 0,
+                "contract_digest": "stage-a",
+                "candidate_shape": [4, 3],
+                "candidate_columns": ["age", "group", "target"],
+                "candidate_frame_fingerprint": "a" * 64,
+                "state": "passed",
+                "passed": True,
+                "pruned": False,
+                "checks": [],
+                "prune_reasons": [],
+            }
+        )
+    )
+    study = optuna.create_study(direction="minimize")
+    study.optimize(lambda _trial: 0.1, n_trials=1)
+    trial = study.trials[0]
+    trial.set_user_attr("stage_a_state", "passed")
+    trial.set_user_attr("stage_a_contract_digest", "stage-a")
+    trial.set_user_attr("stage_a_result_path", f"{study_name}/trial-0/result.json")
+
+    checkpoint_path = persist_hpo_trial_checkpoint(
+        checkpoint_root,
+        study_name,
+        trial,
+        hpo_context=context,
+        stage_a_root=stage_a_root,
+    )
+
+    assert checkpoint_path.exists()
+    assert (
+        load_hpo_trial_checkpoint(checkpoint_path, hpo_context=context, stage_a_root=stage_a_root)[
+            "trial_number"
+        ]
+        == 0
+    )
+
+
+@pytest.mark.parametrize(
+    ("tamper", "message"),
+    [
+        ("delete", "artifact is missing"),
+        ("corrupt", "result is unreadable"),
+        ("state", "state does not match"),
+        ("contract", "contract digest does not match result"),
+        ("fingerprint", "candidate fingerprint is invalid"),
+        ("unsafe", "result_path is unsafe"),
+        ("symlink", "uses a symlink path"),
+    ],
+)
+def test_loading_rejects_tampered_stage_a_artifact(tmp_path, tamper, message):
+    context = _hpo_context()
+    study = optuna.create_study(direction="minimize")
+    study.optimize(lambda trial: 0.25, n_trials=1)
+    trial = study.trials[0]
+    result_path = tmp_path / "hpo_checkpoints" / "stage_load" / "trial-0" / "result.json"
+    result_path.parent.mkdir(parents=True)
+    result_path.write_text(
+        json.dumps(
+            {
+                "schema_version": hpo_module.STAGE_A_SCREEN_SCHEMA_VERSION,
+                "study_name": "stage_load",
+                "trial_number": 0,
+                "contract_digest": "stage-a",
+                "candidate_shape": [4, 3],
+                "candidate_columns": ["age", "group", "target"],
+                "candidate_frame_fingerprint": "a" * 64,
+                "state": "passed",
+                "passed": True,
+                "pruned": False,
+                "checks": [],
+                "prune_reasons": [],
+            }
+        )
+    )
+    trial.set_user_attr("stage_a_state", "passed")
+    trial.set_user_attr("stage_a_contract_digest", "stage-a")
+    trial.set_user_attr("stage_a_result_path", "stage_load/trial-0/result.json")
+    checkpoint_path = persist_hpo_trial_checkpoint(
+        tmp_path / "hpo_checkpoints", "stage_load", trial, hpo_context=context
+    )
+
+    if tamper == "delete":
+        result_path.unlink()
+    elif tamper == "corrupt":
+        result_path.write_text("{")
+    elif tamper == "state":
+        result = json.loads(result_path.read_text())
+        result["state"] = "pruned"
+        result_path.write_text(json.dumps(result))
+    elif tamper == "contract":
+        result = json.loads(result_path.read_text())
+        result["contract_digest"] = "b" * 64
+        result_path.write_text(json.dumps(result))
+    elif tamper == "fingerprint":
+        result = json.loads(result_path.read_text())
+        result["candidate_frame_fingerprint"] = "not-a-fingerprint"
+        result_path.write_text(json.dumps(result))
+    elif tamper == "unsafe":
+        checkpoint = json.loads(checkpoint_path.read_text())
+        checkpoint["metadata"]["stage_a"]["result_path"] = "../escape.json"
+        checkpoint_path.write_text(json.dumps(checkpoint))
+    else:
+        linked_path = tmp_path / "outside-result.json"
+        linked_path.write_text(result_path.read_text())
+        result_path.unlink()
+        result_path.symlink_to(linked_path)
+
+    with pytest.raises(RuntimeError, match=message):
+        load_hpo_trial_checkpoint(checkpoint_path, hpo_context=context)
 
 
 def test_stage_a_setup_failure_is_persisted_before_trial_construction(tmp_path, mocker):
@@ -941,6 +1463,95 @@ def test_stage_a_setup_failure_is_persisted_before_trial_construction(tmp_path, 
     assert sentinel not in result_path.read_text()
 
 
+@pytest.mark.parametrize("capability", ["O_DIRECTORY", "O_NOFOLLOW"])
+def test_stage_a_locking_requires_descriptor_capabilities(mocker, capability):
+    mocker.patch.object(hpo_module.os, capability, None)
+
+    with pytest.raises(RuntimeError, match=r"missing: os\." + capability):
+        hpo_module._require_stage_a_locking()
+
+
+def test_stage_a_persistence_requires_locking_before_path_resolution(mocker, tmp_path):
+    contract = _stage_a_contract(_stage_a_source())
+    result = hpo_module._stage_a_exception_result(None, contract, ValueError())
+    mocker.patch.object(hpo_module, "_require_stage_a_locking", side_effect=RuntimeError("locking"))
+    mocker.patch.object(Path, "resolve", side_effect=AssertionError("resolved before preflight"))
+
+    with pytest.raises(RuntimeError, match="locking"):
+        hpo_module.persist_stage_a_contract(tmp_path, contract)
+    with pytest.raises(RuntimeError, match="locking"):
+        hpo_module.persist_stage_a_result(tmp_path, "ordering", 0, result)
+    with pytest.raises(RuntimeError, match="locking"):
+        hpo_module.persist_stage_a_exception(tmp_path, "ordering", contract, ValueError())
+
+
+def test_stage_a_directory_rejects_symlinked_root_and_ancestor(tmp_path):
+    real_root = tmp_path / "real-root"
+    real_root.mkdir()
+    symlink_root = tmp_path / "symlink-root"
+    symlink_root.symlink_to(real_root, target_is_directory=True)
+    with pytest.raises(OSError):
+        hpo_module._open_stage_a_directory(symlink_root, (), create=True)
+
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    (real_parent / "workspace").mkdir()
+    symlink_parent = tmp_path / "symlink-parent"
+    symlink_parent.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(OSError):
+        hpo_module._open_stage_a_directory(symlink_parent / "workspace", (), create=True)
+
+
+def test_stage_a_construction_failure_rejects_divergent_existing_payload(tmp_path):
+    contract = _stage_a_contract(_stage_a_source())
+    hpo_module.persist_stage_a_exception(tmp_path, "construction_divergent", contract, ValueError())
+    path = tmp_path / "construction_divergent" / "construction-failure.json"
+    payload = json.loads(path.read_text())
+    payload["trial_number"] = 0
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match="does not match the current construction failure"):
+        hpo_module.persist_stage_a_exception(
+            tmp_path, "construction_divergent", contract, ValueError()
+        )
+
+
+def test_stage_a_construction_failure_rejects_symlinked_study_directory(tmp_path):
+    contract = _stage_a_contract(_stage_a_source())
+    target = tmp_path / "outside-construction"
+    target.mkdir()
+    (tmp_path / "construction_symlink").symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="uses a symlink path"):
+        hpo_module.persist_stage_a_exception(
+            tmp_path, "construction_symlink", contract, ValueError()
+        )
+
+
+def test_stage_a_atomic_json_handles_short_writes(tmp_path, mocker):
+    directory = tmp_path / "short-write"
+    directory.mkdir()
+    directory_fd = hpo_module.os.open(
+        directory, hpo_module.os.O_RDONLY | hpo_module.os.O_DIRECTORY | hpo_module.os.O_NOFOLLOW
+    )
+    original_write = hpo_module.os.write
+    calls = 0
+
+    def short_write(file_fd, data):
+        nonlocal calls
+        calls += 1
+        return original_write(file_fd, data[:1])
+
+    mocker.patch.object(hpo_module.os, "write", side_effect=short_write)
+    try:
+        hpo_module._atomic_stage_a_json_fd(directory_fd, "result.json", {"value": "evidence"})
+    finally:
+        hpo_module.os.close(directory_fd)
+
+    assert calls > 1
+    assert json.loads((directory / "result.json").read_text()) == {"value": "evidence"}
+
+
 def test_resumed_study_counts_pruned_trials_without_rerunning_them(tmp_path):
     calls = []
 
@@ -948,7 +1559,11 @@ def test_resumed_study_counts_pruned_trials_without_rerunning_them(tmp_path):
         calls.append(True)
         raise optuna.TrialPruned("screen failed")
 
-    config = HPOConfig(n_trials=1, timeout_seconds=None)
+    config = HPOConfig(
+        n_trials=1,
+        timeout_seconds=None,
+        metric_config={"task12": ["mixed_mmd.v1"]},
+    )
     context = _hpo_context()
     with pytest.raises(RuntimeError, match="produced no completed trials"):
         run_study(
@@ -1231,6 +1846,128 @@ def test_durable_checkpoint_rejects_legacy_metadata_with_valid_context():
         )
 
 
+def _canonical_checkpoint_payload(tmp_path, *, state="complete"):
+    context = _hpo_context(
+        metric_config={
+            "canonical_objectives": [
+                "tstr_macro_f1.v1",
+                "mixed_mmd.v1",
+                "elastic_net_jsd.v1",
+            ]
+        }
+    )
+    metadata = _canonical_metric_metadata(failed=state != "complete")
+
+    def objective(trial):
+        trial.set_user_attr("metric_metadata", metadata)
+        trial.set_user_attr("result_metadata", dict(metadata))
+        if state != "complete":
+            error = hpo_module.HPOMetricEvaluationError("SECRET /tmp/raw-path")
+            trial.set_user_attr(
+                "hpo_error_provenance",
+                hpo_module.hpo_exception_provenance(error, location="canonical_metric_evaluation"),
+            )
+            raise optuna.TrialPruned("metric evaluation failed")
+        return 0.25
+
+    with nullcontext() if state == "complete" else pytest.raises(RuntimeError):
+        run_study(
+            "checkpoint_metadata_shape",
+            objective,
+            HPOConfig(n_trials=1),
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+        )
+    path = (
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name("checkpoint_metadata_shape", context)
+        / "trial-0"
+        / "checkpoint.json"
+    )
+    return json.loads(path.read_text()), context
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload["metadata"].pop("metric_metadata"),
+        lambda payload: payload["metadata"]["metric_metadata"].pop("mixed_mmd.v1"),
+        lambda payload: payload["metadata"]["metric_metadata"].update(
+            {"unexpected.v1": payload["metadata"]["metric_metadata"]["tstr_macro_f1.v1"]}
+        ),
+        lambda payload: payload["metadata"].update(
+            {"result_metadata": {**payload["metadata"]["metric_metadata"], "extra.v1": {}}}
+        ),
+        lambda payload: payload["metadata"]["result_metadata"]["mixed_mmd.v1"].update(
+            {"eligible": False}
+        ),
+        lambda payload: payload["metadata"]["metric_metadata"]["mixed_mmd.v1"].update(
+            {"fit_roles": ["tuning"]}
+        ),
+        lambda payload: payload["metadata"]["metric_metadata"]["mixed_mmd.v1"].update(
+            {"status": "pending"}
+        ),
+        lambda payload: payload["metadata"]["metric_metadata"]["mixed_mmd.v1"].update(
+            {"finite": "true"}
+        ),
+        lambda payload: payload["metadata"]["metric_metadata"]["mixed_mmd.v1"].update(
+            {"error_reason_code": "unsafe_reason"}
+        ),
+        lambda payload: payload["metadata"]["metric_metadata"]["mixed_mmd.v1"].update(
+            {
+                "status": "failed",
+                "finite": False,
+                "eligible": False,
+                "error_reason_code": "metric_evaluation_exception",
+            }
+        ),
+    ],
+    ids=[
+        "absent",
+        "partial-identities",
+        "extra-identity",
+        "unequal-identities",
+        "unequal-values",
+        "invalid-roles",
+        "invalid-status",
+        "invalid-flags",
+        "invalid-error-code",
+        "complete-but-failed",
+    ],
+)
+def test_canonical_checkpoint_rejects_incomplete_or_inconsistent_metric_evidence(
+    tmp_path, mutation
+):
+    payload, context = _canonical_checkpoint_payload(tmp_path)
+    mutation(payload)
+
+    with pytest.raises(RuntimeError):
+        hpo_module._validate_hpo_trial_checkpoint(
+            payload,
+            expected_study_name=payload["study_name"],
+            expected_context_digest=hpo_context_digest(context),
+        )
+
+
+def test_canonical_failed_checkpoint_requires_matching_safe_evidence(tmp_path):
+    payload, context = _canonical_checkpoint_payload(tmp_path, state="pruned")
+    assert "SECRET" not in json.dumps(payload)
+    assert "/tmp" not in json.dumps(payload)
+    payload["metadata"]["metric_metadata"]["mixed_mmd.v1"]["error_reason_code"] = (
+        "hpo_metric_not_eligible"
+    )
+
+    with pytest.raises(RuntimeError, match="result_metadata"):
+        hpo_module._validate_hpo_trial_checkpoint(
+            payload,
+            expected_study_name=payload["study_name"],
+            expected_context_digest=hpo_context_digest(context),
+        )
+
+
 def test_failed_hpo_checkpoint_persists_exception_context(tmp_path):
     sentinel = "generator fit failed SECRET_VALUE /tmp/raw-path"
 
@@ -1268,6 +2005,129 @@ def test_failed_hpo_checkpoint_persists_exception_context(tmp_path):
         "state": "failed",
     }
     assert sentinel not in json.dumps(checkpoint)
+
+
+def test_metric_failure_metadata_and_provenance_survive_checkpoint(tmp_path):
+    context = _hpo_context()
+
+    def objective(trial):
+        trial.set_user_attr("metric_metadata", _canonical_metric_metadata(failed=True))
+        trial.set_user_attr("result_metadata", trial.user_attrs["metric_metadata"])
+        error = hpo_module.HPOMetricEvaluationError("SECRET /tmp/patient")
+        trial.set_user_attr(
+            "hpo_error_provenance",
+            hpo_module.hpo_exception_provenance(error, location="canonical_metric_evaluation"),
+        )
+        raise optuna.TrialPruned("metric evaluation failed")
+
+    with pytest.raises(RuntimeError, match="no completed trials"):
+        run_study(
+            "metric_failure_checkpoint",
+            objective,
+            HPOConfig(n_trials=1),
+            tmp_path,
+            0,
+            hpo_context=context,
+        )
+
+    checkpoint = load_hpo_trial_checkpoint(
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name("metric_failure_checkpoint", context)
+        / "trial-0"
+        / "checkpoint.json",
+        hpo_context=context,
+    )
+    metadata = checkpoint["metadata"]
+    assert checkpoint["state"] == "pruned"
+    assert set(metadata["metric_metadata"]) == {
+        "mixed_mmd.v1",
+        "elastic_net_jsd.v1",
+        "tstr_macro_f1.v1",
+    }
+    assert all(
+        item["error_reason_code"] == "metric_evaluation_exception"
+        for item in metadata["metric_metadata"].values()
+    )
+    assert metadata["metric_metadata"] == metadata["result_metadata"]
+    assert metadata["hpo_error_provenance"]["error_reason_code"] == "metric_evaluation_exception"
+    assert metadata["metric_metadata"]["mixed_mmd.v1"]["fit_roles"] == ["train"]
+    assert metadata["metric_metadata"]["mixed_mmd.v1"]["evaluation_role"] == "tuning"
+    assert "SECRET" not in json.dumps(checkpoint)
+    assert "/tmp" not in json.dumps(checkpoint)
+
+
+def test_mixed_metric_failure_reasons_survive_checkpoint_validation(tmp_path):
+    payload, context = _canonical_checkpoint_payload(tmp_path, state="pruned")
+    metric_metadata = payload["metadata"]["metric_metadata"]
+    result_metadata = payload["metadata"]["result_metadata"]
+    for metadata in (metric_metadata, result_metadata):
+        metadata["mixed_mmd.v1"]["error_reason_code"] = "hpo_metric_not_eligible"
+    provenance = hpo_module.HPOMetricNotEligibleError("not eligible")
+    payload["metadata"]["hpo_error_provenance"] = hpo_module.hpo_exception_provenance(
+        provenance, location="canonical_metric_evaluation"
+    )
+
+    validated = hpo_module._validate_hpo_trial_checkpoint(
+        payload,
+        expected_study_name=payload["study_name"],
+        expected_context_digest=hpo_context_digest(context),
+    )
+
+    assert (
+        validated["metadata"]["metric_metadata"]["mixed_mmd.v1"]["error_reason_code"]
+        == "hpo_metric_not_eligible"
+    )
+    assert (
+        validated["metadata"]["metric_metadata"]["elastic_net_jsd.v1"]["error_reason_code"]
+        == "metric_evaluation_exception"
+    )
+
+
+def test_historical_v2_noncanonical_context_without_new_identity_fields_is_readable(tmp_path):
+    payload, context = _canonical_checkpoint_payload(tmp_path)
+    historical_context = dict(context)
+    historical_context["metric_config"] = {"task12": ["mixed_mmd.v1"]}
+    historical_context.pop("canonical_hpo")
+    historical_context.pop("canonical_expected_keys")
+    payload["hpo_context"] = historical_context
+    payload["hpo_context_digest"] = hpo_context_digest(historical_context)
+
+    validated = hpo_module._validate_hpo_trial_checkpoint(
+        payload,
+        expected_study_name=payload["study_name"],
+        expected_context_digest=hpo_context_digest(historical_context),
+    )
+
+    assert validated["hpo_context"]["schema_version"] == "hpo-context-v2"
+    assert "canonical_hpo" not in validated["hpo_context"]
+
+
+def test_group_unsafe_provenance_is_bounded_and_distinct():
+    provenance = hpo_module.hpo_exception_provenance(
+        hpo_module.HPOGroupUnsafeError("unsafe details"),
+        location="grouped_metric_evaluation",
+    )
+
+    assert provenance["error_reason_code"] == "group_unsafe"
+    assert provenance["error_message"] == hpo_module._safe_exception_message("group_unsafe")
+
+
+def test_invalid_metric_report_has_distinct_non_eligible_provenance():
+    report = pd.DataFrame(
+        {"mean": [float("nan")], "direction": _strings("minimize")},
+        index=_strings("mixed_mmd.v1"),
+    )
+    report.attrs["hpo_provenance"] = _hpo_context()
+    report.attrs["canonical_hpo"] = True
+    report.attrs["canonical_hpo_keys"] = ("mixed_mmd.v1",)
+    with pytest.raises(hpo_module.HPOMetricNotEligibleError) as error:
+        _score(report, expected_keys=("mixed_mmd.v1",))
+    provenance = hpo_module.hpo_exception_provenance(error.value, location="synthcity_objective")
+    assert provenance["error_reason_code"] == "hpo_metric_not_eligible"
+    assert provenance["error_message"] == hpo_module._safe_exception_message(
+        "hpo_metric_not_eligible"
+    )
 
 
 def test_hpo_metadata_normalizes_runtime_values_deterministically():
@@ -1491,8 +2351,11 @@ def test_synthcity_objective_persists_sampled_and_effective_parameters(tmp_path,
             },
             index=_strings("mixed_mmd.v1", "elastic_net_jsd.v1", "tstr_macro_f1.v1"),
         )
-        report.attrs["metric_metadata"] = {}
-        report.attrs["hpo_provenance"] = _hpo_context()
+        report.attrs["metric_metadata"] = {
+            key: {**value, "mean": 0.25, "errors": 0}
+            for key, value in _canonical_metric_metadata().items()
+        }
+        report.attrs["hpo_provenance"] = _canonical_hpo_context()
         return report
 
     def fake_fit_generate(*args, **kwargs):
@@ -1519,14 +2382,13 @@ def test_synthcity_objective_persists_sampled_and_effective_parameters(tmp_path,
     monkeypatch.setattr(
         synthcity_backend_module, "evaluate_canonical_hpo_metrics", fake_canonical_metrics
     )
-    monkeypatch.setattr(synthcity_backend_module, "hpo_score", lambda *_args, **_kwargs: 0.25)
 
     config = HPOConfig(
         n_trials=1,
         timeout_seconds=None,
         n_iter_cap=40,
     )
-    context = _hpo_context()
+    context = _canonical_hpo_context()
     objective = build_synthcity_objective(
         "ctgan",
         train_loader=object(),
@@ -1577,6 +2439,239 @@ def test_synthcity_objective_persists_sampled_and_effective_parameters(tmp_path,
         "device": "cuda",
     }
     json.dumps(checkpoint)
+
+
+@pytest.mark.parametrize("report_kind", ["none", "missing_trial", "malformed_metric"])
+def test_native_malformed_benchmark_report_is_persisted_as_not_eligible(
+    tmp_path, monkeypatch, report_kind
+):
+    class FakePlugin:
+        @staticmethod
+        def sample_hyperparameters_optuna(_trial):
+            return {}
+
+    from synthcity.benchmark import Benchmarks
+
+    def fake_evaluate(*_args, **_kwargs):
+        if report_kind == "none":
+            return None
+        if report_kind == "missing_trial":
+            return {}
+        return {"trial_0": object()}
+
+    monkeypatch.setattr(synthcity_backend_module, "get_plugin_class", lambda _name: FakePlugin)
+    monkeypatch.setattr(synthcity_backend_module, "plugin_accepts", lambda *_args: False)
+    monkeypatch.setattr(Benchmarks, "evaluate", staticmethod(fake_evaluate))
+
+    config = HPOConfig(
+        n_trials=1,
+        timeout_seconds=None,
+        metric_config={"task12": ["mixed_mmd.v1"]},
+    )
+    context = _hpo_context()
+    objective = build_synthcity_objective(
+        "ctgan",
+        train_loader=object(),
+        tuning_loader=object(),
+        hpo_cfg=config,
+        seed=0,
+    )
+    study_name = f"native_malformed_{report_kind}"
+    with pytest.raises(RuntimeError, match="produced no completed trials"):
+        run_study(
+            study_name,
+            objective,
+            config,
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+        )
+
+    checkpoint = load_hpo_trial_checkpoint(
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name(study_name, context)
+        / "trial-0"
+        / "checkpoint.json",
+        hpo_context=context,
+    )
+    assert checkpoint["state"] == "pruned"
+    assert checkpoint["objective_value"] is None
+    provenance = checkpoint["metadata"]["hpo_error_provenance"]
+    assert provenance["error_reason_code"] == "hpo_metric_not_eligible"
+    assert provenance["error_location"] == "synthcity_objective"
+    assert checkpoint["metadata"]["outcome"]["state"] == "pruned"
+    assert "SECRET" not in json.dumps(checkpoint)
+    assert "/tmp" not in json.dumps(checkpoint)
+
+
+@pytest.mark.parametrize("report_kind", ["all_failed", "invalid", "successful"])
+def test_synthcity_canonical_report_call_chain_persists_metric_outcome(
+    tmp_path, monkeypatch, report_kind
+):
+    metrics = ["mixed_mmd.v1", "elastic_net_jsd.v1", "tstr_macro_f1.v1"]
+
+    class FakePlugin:
+        @staticmethod
+        def sample_hyperparameters_optuna(_trial):
+            return {}
+
+    def fake_fit_generate(*_args, **_kwargs):
+        return pd.DataFrame({"target": [0]}), {
+            "schema_version": "generator-metadata-v1",
+            "generator_context": {"privacy_claim_type": "none"},
+            "plugin_name": "ctgan",
+            "plugin_fqdn": "synthcity.ctgan",
+            "requested_parameters": {},
+            "n_samples": 1,
+            "random_state": 0,
+            "privacy_accounting": None,
+        }
+
+    def fake_metrics(*_args, **_kwargs):
+        failed = report_kind == "all_failed"
+        invalid = report_kind == "invalid"
+        means = [float("nan")] * 3 if failed else [0.2, 0.3, 0.8]
+        directions = (
+            _strings("maximize", "maximize", "minimize")
+            if invalid
+            else _strings("minimize", "minimize", "maximize")
+        )
+        report = pd.DataFrame(
+            {"mean": means, "direction": directions},
+            index=_strings(*metrics),
+        )
+        report.attrs["hpo_provenance"] = _canonical_hpo_context()
+        report.attrs["metric_metadata"] = {
+            key: {
+                "metric_name": key,
+                "status": "failed" if failed or invalid else "complete",
+                "direction": "maximize" if key == "tstr_macro_f1.v1" else "minimize",
+                "mean": None if failed or invalid else mean,
+                "errors": 1 if failed or invalid else 0,
+                "error_reason_code": (
+                    "metric_evaluation_exception"
+                    if failed
+                    else "hpo_metric_not_eligible"
+                    if invalid
+                    else None
+                ),
+                "fit_roles": ["train"],
+                "evaluation_role": "tuning",
+            }
+            for key, mean in zip(metrics, means, strict=True)
+        }
+        return report
+
+    monkeypatch.setattr(synthcity_backend_module, "get_plugin_class", lambda _name: FakePlugin)
+    monkeypatch.setattr(synthcity_backend_module, "plugin_accepts", lambda *_args: False)
+    monkeypatch.setattr(synthcity_backend_module, "fit_generate", fake_fit_generate)
+    monkeypatch.setattr(synthcity_backend_module, "evaluate_canonical_hpo_metrics", fake_metrics)
+    frame = pd.DataFrame({"target": [0]})
+    config = HPOConfig(n_trials=1, timeout_seconds=None)
+    context = _canonical_hpo_context()
+    objective = build_synthcity_objective(
+        "ctgan",
+        object(),
+        config,
+        0,
+        tuning_loader=object(),
+        train_df=frame,
+        tuning_df=frame,
+        target_column="target",
+        synthetic_size=1,
+    )
+    with (
+        pytest.raises(RuntimeError, match="produced no completed trials")
+        if report_kind != "successful"
+        else nullcontext()
+    ):
+        run_study(
+            f"canonical_{report_kind}",
+            objective,
+            config,
+            tmp_path,
+            0,
+            drop_keys=(),
+            hpo_context=context,
+        )
+    checkpoint = load_hpo_trial_checkpoint(
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name(f"canonical_{report_kind}", context)
+        / "trial-0"
+        / "checkpoint.json",
+        hpo_context=context,
+    )
+    assert checkpoint["metadata"]["metric_metadata"]
+    metric_metadata = checkpoint["metadata"]["metric_metadata"]
+    assert set(metric_metadata) == set(metrics)
+    assert metric_metadata == checkpoint["metadata"]["result_metadata"]
+    assert "SECRET" not in json.dumps(checkpoint) and "/tmp" not in json.dumps(checkpoint)
+    if report_kind == "successful":
+        assert checkpoint["state"] == "complete"
+        assert math.isfinite(checkpoint["objective_value"])
+    else:
+        assert checkpoint["state"] == "pruned"
+        assert checkpoint["objective_value"] is None
+        expected = (
+            "metric_evaluation_exception"
+            if report_kind == "all_failed"
+            else "hpo_metric_not_eligible"
+        )
+        assert all(item["status"] == "failed" for item in metric_metadata.values())
+        assert checkpoint["metadata"]["hpo_error_provenance"]["error_reason_code"] == expected
+
+
+def test_canonical_pre_evaluation_failure_preserves_absent_metric_evidence(tmp_path, monkeypatch):
+    class FakePlugin:
+        @staticmethod
+        def sample_hyperparameters_optuna(_trial):
+            return {}
+
+    monkeypatch.setattr(synthcity_backend_module, "get_plugin_class", lambda _name: FakePlugin)
+    monkeypatch.setattr(synthcity_backend_module, "plugin_accepts", lambda *_args: False)
+    monkeypatch.setattr(
+        synthcity_backend_module,
+        "fit_generate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("fit failed")),
+    )
+    config = HPOConfig(n_trials=1, timeout_seconds=None)
+    context = _canonical_hpo_context()
+    objective = build_synthcity_objective(
+        "ctgan",
+        object(),
+        config,
+        0,
+        tuning_loader=object(),
+        train_df=pd.DataFrame({"target": [0]}),
+        tuning_df=pd.DataFrame({"target": [0]}),
+        target_column="target",
+    )
+    with pytest.raises(RuntimeError, match="produced no completed trials"):
+        run_study(
+            "canonical_pre_eval_failure",
+            objective,
+            config,
+            tmp_path,
+            0,
+            drop_keys=(),
+            hpo_context=context,
+        )
+    checkpoint = load_hpo_trial_checkpoint(
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name("canonical_pre_eval_failure", context)
+        / "trial-0"
+        / "checkpoint.json",
+        hpo_context=context,
+    )
+    assert checkpoint["metadata"]["metric_metadata"] is None
+    assert checkpoint["metadata"]["result_metadata"] is None
+    assert (
+        checkpoint["metadata"]["hpo_error_provenance"]["error_reason_code"] == "hpo_trial_exception"
+    )
 
 
 def test_hpo_checkpoint_boundary_keeps_requested_and_effective_parameters(tmp_path):
@@ -1638,7 +2733,7 @@ def test_synthcity_objective_rejects_malformed_v1_generator_metadata(tmp_path, m
             },
             index=_strings("mixed_mmd.v1", "elastic_net_jsd.v1", "tstr_macro_f1.v1"),
         )
-        report.attrs["metric_metadata"] = {}
+        report.attrs["metric_metadata"] = _canonical_metric_metadata()
         report.attrs["hpo_provenance"] = _hpo_context()
         return report
 
@@ -2107,6 +3202,470 @@ def test_default_canonical_report_scores_with_complete_role_provenance():
     assert provenance["contracts"]["fit_roles"] == ["train"]
     assert provenance["contracts"]["comparison_role"] == "tuning"
     assert np.isfinite(hpo_score(report))
+    assert all(report.attrs["metric_metadata"][key]["errors"] == 0 for key in report.index)
+    assert hpo_module.sanitize_hpo_metric_metadata(
+        report.attrs["metric_metadata"],
+        allowed_keys=list(report.index),
+    )
+
+
+def test_real_canonical_evaluator_runs_through_objective_and_checkpoint(tmp_path, monkeypatch):
+    class FakePlugin:
+        @staticmethod
+        def sample_hyperparameters_optuna(_trial):
+            return {}
+
+    def fake_fit_generate(*_args, **_kwargs):
+        return frame.copy(), {
+            "schema_version": "generator-metadata-v1",
+            "generator_context": {"privacy_claim_type": "none"},
+            "plugin_name": "ctgan",
+            "plugin_fqdn": "synthcity.ctgan",
+            "requested_parameters": {},
+            "n_samples": 20,
+            "random_state": 0,
+            "privacy_accounting": None,
+        }
+
+    monkeypatch.setattr(synthcity_backend_module, "get_plugin_class", lambda _name: FakePlugin)
+    monkeypatch.setattr(synthcity_backend_module, "plugin_accepts", lambda *_args: False)
+    monkeypatch.setattr(synthcity_backend_module, "fit_generate", fake_fit_generate)
+    frame = pd.DataFrame({"x": np.arange(20, dtype=float), "target": [0, 1] * 10})
+    config = HPOConfig(n_trials=1, timeout_seconds=None)
+    context = _hpo_context(
+        metric_config={
+            "canonical_objectives": [
+                "tstr_macro_f1.v1",
+                "mixed_mmd.v1",
+                "elastic_net_jsd.v1",
+            ]
+        }
+    )
+    objective = build_synthcity_objective(
+        "ctgan",
+        train_loader=object(),
+        tuning_loader=object(),
+        hpo_cfg=config,
+        seed=0,
+        train_df=frame,
+        tuning_df=frame.copy(),
+        target_column="target",
+        feature_types={"x": "continuous", "target": "categorical"},
+        synthetic_size=len(frame),
+    )
+
+    run_study(
+        "real_canonical_boundary",
+        objective,
+        config,
+        tmp_path,
+        seed=0,
+        drop_keys=(),
+        hpo_context=context,
+    )
+    checkpoint = load_hpo_trial_checkpoint(
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name("real_canonical_boundary", context)
+        / "trial-0"
+        / "checkpoint.json",
+        hpo_context=context,
+    )
+    assert checkpoint["state"] == "complete"
+    assert math.isfinite(checkpoint["objective_value"])
+    assert all(
+        item["status"] == "complete" and item["eligible"]
+        for item in checkpoint["metadata"]["metric_metadata"].values()
+    )
+
+
+@pytest.mark.parametrize("outcome", ["failed", "invalid"])
+def test_real_canonical_evaluator_failure_and_invalid_evidence_checkpoint(
+    tmp_path, monkeypatch, outcome
+):
+    """Real evaluator preserves bounded failure evidence without report fabrication."""
+
+    class FakePlugin:
+        @staticmethod
+        def sample_hyperparameters_optuna(_trial):
+            return {}
+
+    frame = pd.DataFrame({"x": np.arange(4, dtype=float), "target": [0, 1, 0, 1]})
+
+    def fake_fit_generate(*_args, **_kwargs):
+        return frame.copy(), {
+            "schema_version": "generator-metadata-v1",
+            "generator_context": {"privacy_claim_type": "none"},
+            "plugin_name": "ctgan",
+            "plugin_fqdn": "synthcity.ctgan",
+            "requested_parameters": {},
+            "n_samples": len(frame),
+            "random_state": 0,
+            "privacy_accounting": None,
+        }
+
+    def lower_metric(*_args, **_kwargs):
+        if outcome == "failed":
+            raise RuntimeError("controlled metric failure")
+        if outcome == "invalid":
+            raise hpo_module.HPOMetricNotEligibleError("controlled invalid evidence")
+        return {"b_mmd_clip": float("nan"), "bandwidth": 1.0}
+
+    def lower_jsd(*_args, **_kwargs):
+        if outcome == "failed":
+            raise RuntimeError("controlled metric failure")
+        if outcome == "invalid":
+            raise hpo_module.HPOMetricNotEligibleError("controlled invalid evidence")
+        return float("nan"), {}
+
+    def fake_tstr(*_args, **_kwargs):
+        if outcome == "failed":
+            raise RuntimeError("controlled metric failure")
+        raise hpo_module.HPOMetricNotEligibleError("controlled invalid evidence")
+
+    monkeypatch.setattr(synthcity_backend_module, "get_plugin_class", lambda _name: FakePlugin)
+    monkeypatch.setattr(synthcity_backend_module, "plugin_accepts", lambda *_args: False)
+    monkeypatch.setattr(synthcity_backend_module, "fit_generate", fake_fit_generate)
+    monkeypatch.setattr(hpo_module, "_evaluate_train_frozen_mmd", lower_metric)
+    monkeypatch.setattr(hpo_module, "_evaluate_train_frozen_jsd", lower_jsd)
+    monkeypatch.setattr(
+        "synthdata.evaluation.tstr.run_tstr_evaluation",
+        fake_tstr,
+    )
+
+    config = HPOConfig(n_trials=1, timeout_seconds=None)
+    context = _hpo_context(
+        metric_config={
+            "canonical_objectives": [
+                "tstr_macro_f1.v1",
+                "mixed_mmd.v1",
+                "elastic_net_jsd.v1",
+            ]
+        }
+    )
+    objective = build_synthcity_objective(
+        "ctgan",
+        object(),
+        config,
+        0,
+        tuning_loader=object(),
+        train_df=frame,
+        tuning_df=frame.copy(),
+        target_column="target",
+        feature_types={"x": "continuous", "target": "categorical"},
+        synthetic_size=len(frame),
+    )
+
+    with pytest.raises(RuntimeError, match="produced no completed trials"):
+        run_study(
+            f"real_canonical_{outcome}",
+            objective,
+            config,
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+        )
+
+    checkpoint = load_hpo_trial_checkpoint(
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name(f"real_canonical_{outcome}", context)
+        / "trial-0"
+        / "checkpoint.json",
+        hpo_context=context,
+    )
+    assert checkpoint["state"] == "pruned"
+    assert checkpoint["objective_value"] is None
+    metadata = checkpoint["metadata"]["metric_metadata"]
+    assert set(metadata) == {
+        "tstr_macro_f1.v1",
+        "mixed_mmd.v1",
+        "elastic_net_jsd.v1",
+    }
+    assert all(item["status"] == "failed" for item in metadata.values())
+    expected_reason = (
+        "metric_evaluation_exception" if outcome == "failed" else "hpo_metric_not_eligible"
+    )
+    assert checkpoint["metadata"]["hpo_error_provenance"]["error_reason_code"] == expected_reason
+    assert "hpo_provenance" not in checkpoint["metadata"]
+    assert "SECRET" not in json.dumps(checkpoint) and "/tmp" not in json.dumps(checkpoint)
+
+
+def test_real_canonical_evaluator_mixed_metric_reasons_checkpoint(tmp_path, monkeypatch):
+    """Canonical objective preserves mixed bounded metric failures durably."""
+
+    class FakePlugin:
+        @staticmethod
+        def sample_hyperparameters_optuna(_trial):
+            return {}
+
+    frame = pd.DataFrame({"x": np.arange(4, dtype=float), "target": [0, 1, 0, 1]})
+
+    def fake_fit_generate(*_args, **_kwargs):
+        return frame.copy(), {
+            "schema_version": "generator-metadata-v1",
+            "generator_context": {"privacy_claim_type": "none"},
+            "plugin_name": "ctgan",
+            "plugin_fqdn": "synthcity.ctgan",
+            "requested_parameters": {},
+            "n_samples": len(frame),
+            "random_state": 0,
+            "privacy_accounting": None,
+        }
+
+    def failed_mmd(*_args, **_kwargs):
+        raise RuntimeError("controlled mmd failure SECRET /tmp/raw-path")
+
+    def ineligible_jsd(*_args, **_kwargs):
+        raise hpo_module.HPOMetricNotEligibleError("controlled jsd invalid SECRET")
+
+    def failed_tstr(*_args, **_kwargs):
+        raise RuntimeError("controlled tstr failure SECRET /tmp/raw-path")
+
+    monkeypatch.setattr(synthcity_backend_module, "get_plugin_class", lambda _name: FakePlugin)
+    monkeypatch.setattr(synthcity_backend_module, "plugin_accepts", lambda *_args: False)
+    monkeypatch.setattr(synthcity_backend_module, "fit_generate", fake_fit_generate)
+    monkeypatch.setattr(hpo_module, "_evaluate_train_frozen_mmd", failed_mmd)
+    monkeypatch.setattr(hpo_module, "_evaluate_train_frozen_jsd", ineligible_jsd)
+    monkeypatch.setattr("synthdata.evaluation.tstr.run_tstr_evaluation", failed_tstr)
+
+    config = HPOConfig(n_trials=1, timeout_seconds=None)
+    context = _canonical_hpo_context()
+    objective = build_synthcity_objective(
+        "ctgan",
+        object(),
+        config,
+        0,
+        tuning_loader=object(),
+        train_df=frame,
+        tuning_df=frame.copy(),
+        target_column="target",
+        feature_types={"x": "continuous", "target": "categorical"},
+        synthetic_size=len(frame),
+    )
+
+    with pytest.raises(RuntimeError, match="produced no completed trials"):
+        run_study(
+            "real_canonical_mixed_reasons",
+            objective,
+            config,
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+        )
+
+    checkpoint = load_hpo_trial_checkpoint(
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name("real_canonical_mixed_reasons", context)
+        / "trial-0"
+        / "checkpoint.json",
+        hpo_context=context,
+    )
+    assert checkpoint["state"] == "pruned"
+    assert checkpoint["objective_value"] is None
+    metadata = checkpoint["metadata"]
+    metric_metadata = metadata["metric_metadata"]
+    assert set(metric_metadata) == {
+        "tstr_macro_f1.v1",
+        "mixed_mmd.v1",
+        "elastic_net_jsd.v1",
+    }
+    assert {key: item["error_reason_code"] for key, item in metric_metadata.items()} == {
+        "tstr_macro_f1.v1": "metric_evaluation_exception",
+        "mixed_mmd.v1": "metric_evaluation_exception",
+        "elastic_net_jsd.v1": "hpo_metric_not_eligible",
+    }
+    assert all(
+        item["status"] == "failed"
+        and item["finite"] is False
+        and item["eligible"] is False
+        and item["fit_roles"] == ["train"]
+        and item["evaluation_role"] == "tuning"
+        for item in metric_metadata.values()
+    )
+    assert metric_metadata == metadata["result_metadata"]
+    assert "hpo_provenance" not in metadata
+
+    aggregate = metadata["hpo_error_provenance"]
+    assert aggregate["error_reason_code"] == "hpo_metric_not_eligible"
+    assert aggregate["error_message"] == (
+        "HPO metric report was not eligible; exception details suppressed."
+    )
+    assert aggregate["error_location"] == "canonical_metric_evaluation"
+    assert len(aggregate["error_fingerprint"]) == 64
+    assert all(character in "0123456789abcdef" for character in aggregate["error_fingerprint"])
+    assert "SECRET" not in json.dumps(checkpoint)
+    assert "/tmp" not in json.dumps(checkpoint)
+
+
+@pytest.mark.parametrize("outcome", ["complete", "failed", "pruned"])
+def test_noncanonical_checkpoint_preserves_native_metadata_contract(tmp_path, outcome):
+    context = _hpo_context(metric_config={"task12": ["mixed_mmd.v1"]})
+
+    def objective(trial):
+        if outcome == "complete":
+            trial.set_user_attr("metric_metadata", {"native": {"value": 1}})
+            trial.set_user_attr("result_metadata", {"native": {"value": 1}})
+            return 0.25
+        if outcome == "pruned":
+            raise optuna.TrialPruned("native metric unavailable")
+        raise RuntimeError("native metric failed")
+
+    with pytest.raises(RuntimeError) if outcome != "complete" else nullcontext():
+        run_study(
+            f"noncanonical_{outcome}",
+            objective,
+            HPOConfig(n_trials=1, timeout_seconds=None),
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+        )
+    checkpoint = load_hpo_trial_checkpoint(
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name(f"noncanonical_{outcome}", context)
+        / "trial-0"
+        / "checkpoint.json",
+        hpo_context=context,
+    )
+    assert checkpoint["state"] == outcome
+    if outcome == "complete":
+        assert checkpoint["metadata"]["metric_metadata"] == {"native": {"value": 1}}
+        assert checkpoint["metadata"]["result_metadata"] == {"native": {"value": 1}}
+    else:
+        assert checkpoint["metadata"]["metric_metadata"] is None
+        assert checkpoint["metadata"]["result_metadata"] is None
+
+
+def test_noncanonical_checkpoint_defaults_result_metadata_to_metric_metadata(tmp_path):
+    context = _hpo_context(metric_config={"task12": ["mixed_mmd.v1"]})
+    study = optuna.create_study(direction="minimize")
+
+    def objective(trial):
+        trial.set_user_attr("metric_metadata", {"native": {"value": 1}})
+        return 0.25
+
+    study.optimize(objective, n_trials=1)
+    path = persist_hpo_trial_checkpoint(
+        tmp_path,
+        "noncanonical_fallback",
+        study.trials[0],
+        hpo_context=context,
+    )
+
+    checkpoint = load_hpo_trial_checkpoint(path, hpo_context=context)
+    assert checkpoint["metadata"]["result_metadata"] == {"native": {"value": 1}}
+
+
+def test_noncanonical_checkpoint_rejects_unequal_metadata(tmp_path):
+    context = _hpo_context(metric_config={"task12": ["mixed_mmd.v1"]})
+    study = optuna.create_study(direction="minimize")
+
+    def objective(trial):
+        trial.set_user_attr("metric_metadata", {"native": {"value": 1}})
+        trial.set_user_attr("result_metadata", {"native": {"value": 2}})
+        return 0.25
+
+    study.optimize(objective, n_trials=1)
+    with pytest.raises(RuntimeError, match="result_metadata"):
+        persist_hpo_trial_checkpoint(
+            tmp_path,
+            "noncanonical_mismatch",
+            study.trials[0],
+            hpo_context=context,
+        )
+
+
+def test_group_unsafe_objective_provenance_survives_run_study_checkpoint(tmp_path, monkeypatch):
+    class FakePlugin:
+        @staticmethod
+        def sample_hyperparameters_optuna(_trial):
+            return {}
+
+    def fake_evaluate(*_args, **_kwargs):
+        report = pd.DataFrame(
+            {"mean": [0.2], "direction": _strings("minimize")},
+            index=_strings("mixed_mmd.v1"),
+        )
+        report.attrs["group_safety"] = _native_group_safety("group_unsafe")
+        provenance = _provenance_kwargs()
+        provenance["contracts"] = {
+            key: provenance["contracts"][key]
+            for key in ("fit_roles", "comparison_role", "excluded_roles")
+        }
+        report.attrs["hpo_provenance"] = {
+            key: provenance[key]
+            for key in (
+                "release_transform_digest",
+                "role_hashes",
+                "contracts",
+                "objective_version",
+            )
+        }
+        report.attrs["metric_metadata"] = {
+            "mixed_mmd.v1": {
+                "metric_name": "mixed_mmd.v1",
+                "status": "complete",
+                "finite": True,
+                "eligible": True,
+                "error_reason_code": None,
+            }
+        }
+        report.attrs["result_metadata"] = dict(report.attrs["metric_metadata"])
+        return {"trial_0": report}
+
+    from synthcity.benchmark import Benchmarks
+
+    monkeypatch.setattr(synthcity_backend_module, "get_plugin_class", lambda _name: FakePlugin)
+    monkeypatch.setattr(synthcity_backend_module, "plugin_accepts", lambda *_args: False)
+    monkeypatch.setattr(Benchmarks, "evaluate", staticmethod(fake_evaluate))
+
+    config = HPOConfig(
+        n_trials=1,
+        timeout_seconds=None,
+        metric_config={"task12": ["mixed_mmd.v1"]},
+    )
+    context = _hpo_context()
+    objective = build_synthcity_objective(
+        "ctgan",
+        train_loader=object(),
+        tuning_loader=object(),
+        hpo_cfg=config,
+        seed=0,
+    )
+
+    with pytest.raises(RuntimeError, match="produced no completed trials"):
+        run_study(
+            "group_unsafe_checkpoint",
+            objective,
+            config,
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+        )
+
+    checkpoint = load_hpo_trial_checkpoint(
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name("group_unsafe_checkpoint", context)
+        / "trial-0"
+        / "checkpoint.json",
+        hpo_context=context,
+    )
+    assert checkpoint["state"] == "pruned"
+    assert checkpoint["objective_value"] is None
+    assert checkpoint["metadata"]["metric_metadata"] is None
+    assert checkpoint["metadata"]["result_metadata"] is None
+    assert checkpoint["metadata"]["hpo_error_provenance"]["error_reason_code"] == "group_unsafe"
+    assert checkpoint["metadata"]["outcome"]["group_safety"] == {
+        "status": "group_unsafe",
+        "reason_code": "group_unsafe",
+    }
 
 
 def test_tabpfgen_hpo_objective_screens_candidate_before_eval(mocker, tmp_path):
@@ -2689,7 +4248,13 @@ def test_canonical_tabpfgen_eval_uses_canonical_producer_not_native_metrics(mock
         tuning,
         "target",
         [],
-        {"task12": ["mixed_mmd.v1"]},
+        {
+            "canonical_objectives": [
+                "tstr_macro_f1.v1",
+                "mixed_mmd.v1",
+                "elastic_net_jsd.v1",
+            ]
+        },
         seed=0,
     )
 

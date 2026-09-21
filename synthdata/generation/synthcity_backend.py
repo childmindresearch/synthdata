@@ -5,7 +5,9 @@ import importlib
 import importlib.metadata
 import inspect
 import json
+import math
 from collections.abc import Mapping
+from numbers import Real
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -18,16 +20,21 @@ from synthdata.data import semantic_context_digest
 from synthdata.evaluation.catalog import emitted_keys_for_synthcity_metrics
 from synthdata.generation.hpo import (
     HPO_GENERATOR_METADATA_SCHEMA_VERSION,
+    HPOGroupUnsafeError,
     HPOMetadataSerializationError,
+    HPOMetricEvaluationError,
+    HPOMetricNotEligibleError,
     StageAScreenContract,
     _resolve_utility_policy,
     _safe_exception_message,
     evaluate_canonical_hpo_metrics,
     hpo_exception_provenance,
     hpo_score,
+    is_canonical_hpo_context,
     normalize_hpo_metadata,
     persist_stage_a_trial_exception,
     prepare_stage_a_screen,
+    sanitize_hpo_metric_metadata,
     screen_stage_a_trial,
     validate_hpo_metric_config,
 )
@@ -41,6 +48,176 @@ class _BenchmarksAPI(Protocol):
     def evaluate(
         generators: list[tuple[str, str, dict]], train_loader: object, **kwargs: object
     ) -> dict[str, pd.DataFrame]: ...
+
+
+def _validate_native_group_safety(value: object) -> dict[str, object]:
+    """Validate native grouped-evaluation evidence before it affects HPO."""
+    if not isinstance(value, Mapping):
+        raise HPOGroupUnsafeError("native group safety evidence is malformed")
+    if set(value) != {"schema_version", "status", "group_mode", "roles"}:
+        raise HPOGroupUnsafeError("native group safety has unsafe root fields")
+    if value.get("schema_version") != "group-safety-v1":
+        raise HPOGroupUnsafeError("native group safety schema is unsupported")
+    if value.get("status") not in {"group_safe", "group_unsafe"}:
+        raise HPOGroupUnsafeError("native group safety status is invalid")
+    if value.get("group_mode") != "patient_group":
+        raise HPOGroupUnsafeError("native group safety mode is invalid")
+    roles = value.get("roles")
+    if not isinstance(roles, Mapping) or set(roles) != {"train", "tuning"}:
+        raise HPOGroupUnsafeError("native group safety roles are invalid")
+    for role in ("train", "tuning"):
+        evidence = roles[role]
+        if not isinstance(evidence, Mapping) or set(evidence) != {
+            "rows",
+            "groups",
+            "fingerprint",
+            "source",
+        }:
+            raise HPOGroupUnsafeError("native group safety role is unbounded")
+        for field in ("rows", "groups"):
+            count = evidence[field]
+            if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+                raise HPOGroupUnsafeError("native group safety counts are invalid")
+        if evidence["groups"] > evidence["rows"]:
+            raise HPOGroupUnsafeError("native group safety groups exceed rows")
+        fingerprint = evidence["fingerprint"]
+        if (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in fingerprint)
+        ):
+            raise HPOGroupUnsafeError("native group safety fingerprint is invalid")
+        if evidence["source"] != "dataset_role_groups":
+            raise HPOGroupUnsafeError("native group safety source is invalid")
+    return dict(value)
+
+
+def _validate_native_benchmark_report(
+    report: object, trial_id: str, *, expected_keys: list[str] | None = None
+) -> pd.DataFrame:
+    """Validate SynthCity's bounded benchmark report contract before inspection."""
+    if not isinstance(report, Mapping) or set(report) != {trial_id}:
+        raise HPOMetricNotEligibleError("SynthCity benchmark report is not decision-eligible")
+    try:
+        metric_report = report[trial_id]
+    except (KeyError, TypeError) as exc:
+        raise HPOMetricNotEligibleError(
+            "SynthCity benchmark report is not decision-eligible"
+        ) from exc
+    if not isinstance(metric_report, pd.DataFrame):
+        raise HPOMetricNotEligibleError("SynthCity metric report has an invalid shape")
+    try:
+        attrs = metric_report.attrs
+    except AttributeError as exc:
+        raise HPOMetricNotEligibleError("SynthCity metric report has invalid metadata") from exc
+    if not isinstance(attrs, Mapping):
+        raise HPOMetricNotEligibleError("SynthCity metric report has invalid metadata")
+    if metric_report.columns.duplicated().any() or metric_report.empty:
+        raise HPOMetricNotEligibleError("SynthCity metric report has an invalid schema")
+    if set(metric_report.columns) != {"mean", "direction"}:
+        raise HPOMetricNotEligibleError("SynthCity metric report has an incomplete schema")
+    if not metric_report.index.is_unique or any(
+        not isinstance(key, str) for key in metric_report.index
+    ):
+        raise HPOMetricNotEligibleError("SynthCity metric report has invalid metric identities")
+    if expected_keys is not None and set(metric_report.index) != set(expected_keys):
+        raise HPOMetricNotEligibleError("SynthCity metric report has unexpected metric identities")
+    if (
+        metric_report["mean"]
+        .map(
+            lambda value: (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(float(value))
+            )
+        )
+        .any()
+    ):
+        raise HPOMetricNotEligibleError("SynthCity metric report has non-finite means")
+    if expected_keys is not None:
+        expected_directions = {
+            key: "maximize" if key == "tstr_macro_f1.v1" else "minimize" for key in expected_keys
+        }
+        if any(
+            metric_report.loc[key, "direction"] != expected_directions.get(key)
+            for key in metric_report.index
+        ):
+            raise HPOMetricNotEligibleError("SynthCity metric report has invalid directions")
+    provenance = attrs.get("hpo_provenance")
+    group_safety = attrs.get("group_safety")
+    if group_safety is not None:
+        _validate_native_group_safety(group_safety)
+    if provenance is None or not isinstance(provenance, Mapping):
+        raise HPOMetricNotEligibleError("SynthCity metric report is missing bounded provenance")
+    required = {"release_transform_digest", "role_hashes", "contracts", "objective_version"}
+    if set(provenance) != required or not isinstance(provenance.get("role_hashes"), Mapping):
+        raise HPOMetricNotEligibleError("SynthCity metric report has incomplete provenance")
+    role_hashes = provenance["role_hashes"]
+    if set(role_hashes) != {"train", "tuning"} or any(
+        not isinstance(role_hashes[role], str) or not role_hashes[role].strip()
+        for role in ("train", "tuning")
+    ):
+        raise HPOMetricNotEligibleError("SynthCity metric report has invalid provenance roles")
+    contracts = provenance["contracts"]
+    if (
+        not isinstance(contracts, Mapping)
+        or set(contracts) != {"fit_roles", "comparison_role", "excluded_roles"}
+        or contracts.get("fit_roles") != ["train"]
+        or contracts.get("comparison_role") != "tuning"
+        or "final_holdout" not in contracts.get("excluded_roles", [])
+    ):
+        raise HPOMetricNotEligibleError("SynthCity metric report has invalid provenance contract")
+    for field in ("release_transform_digest", "objective_version"):
+        if not isinstance(provenance.get(field), str) or not provenance[field].strip():
+            raise HPOMetricNotEligibleError(
+                "SynthCity metric report has invalid provenance identity"
+            )
+    metric_metadata = attrs.get("metric_metadata")
+    result_metadata = attrs.get("result_metadata")
+    if not isinstance(metric_metadata, Mapping) or not isinstance(result_metadata, Mapping):
+        raise HPOMetricNotEligibleError("SynthCity metric report requires both metadata contracts")
+    if metric_metadata != result_metadata or set(metric_metadata) != set(metric_report.index):
+        raise HPOMetricNotEligibleError("SynthCity metric report has unbounded metric metadata")
+    for metric_name, item in metric_metadata.items():
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {"metric_name", "status", "finite", "eligible", "error_reason_code"}
+            or item.get("metric_name") != metric_name
+        ):
+            raise HPOMetricNotEligibleError("SynthCity metric report has invalid metric metadata")
+        if item.get("status") not in {"complete", "failed"}:
+            raise HPOMetricNotEligibleError("SynthCity metric report has invalid metric status")
+        if not isinstance(item.get("finite"), bool) or not isinstance(item.get("eligible"), bool):
+            raise HPOMetricNotEligibleError("SynthCity metric report has invalid metric flags")
+        if item.get("error_reason_code") not in {
+            None,
+            "metric_evaluation_exception",
+            "hpo_metric_not_eligible",
+        }:
+            raise HPOMetricNotEligibleError("SynthCity metric report has invalid metric error code")
+        status = item["status"]
+        finite = item["finite"]
+        eligible = item["eligible"]
+        error_reason = item["error_reason_code"]
+        if status == "complete" and (not finite or not eligible or error_reason is not None):
+            raise HPOMetricNotEligibleError(
+                "SynthCity complete metric metadata has inconsistent bounded flags"
+            )
+        if status == "failed" and (finite or eligible or error_reason is None):
+            raise HPOMetricNotEligibleError(
+                "SynthCity failed metric metadata has inconsistent bounded flags"
+            )
+        forbidden_metadata_keys = {
+            "exception",
+            "error",
+            "error_message",
+            "error_messages",
+            "path",
+            "category",
+        }
+        if forbidden_metadata_keys.intersection(item):
+            raise HPOMetricNotEligibleError("SynthCity metric metadata contains unsafe fields")
+    return metric_report
 
 
 GENERATOR_METADATA_SCHEMA_VERSION = "generator-metadata-v1"
@@ -544,22 +721,38 @@ def build_synthcity_objective(
     call.
     """
     validate_hpo_metric_config(hpo_cfg.metric_config, group_context=group_context)
-    configured_keys = {
+    utility_policy = _resolve_utility_policy(hpo_cfg.utility_policy)
+    configured_keys = [
         str(metric_name)
         for metric_names in hpo_cfg.metric_config.values()
         for metric_name in metric_names
-    }
-    canonical = configured_keys.issubset({"elastic_net_jsd.v1", "mixed_mmd.v1", "tstr_macro_f1.v1"})
+    ]
+    canonical_configured = len(configured_keys) == len(set(configured_keys)) and set(
+        configured_keys
+    ) == set(utility_policy["metrics"])
+    configured_canonical = is_canonical_hpo_context(
+        hpo_cfg.metric_config,
+        expected_keys=list(utility_policy["metrics"]),
+        utility_policy=utility_policy,
+    )
+    if expected_emitted_keys is not None:
+        expected_keys = [str(key) for key in expected_emitted_keys]
+        if canonical_configured and expected_keys != list(utility_policy["metrics"]):
+            raise ValueError(
+                "Canonical HPO expected emitted metric keys must match configured utility identities"
+            )
+    elif configured_canonical:
+        expected_keys = list(utility_policy["metrics"])
+    else:
+        expected_keys = emitted_keys_for_synthcity_metrics(hpo_cfg.metric_config)
+    canonical = is_canonical_hpo_context(
+        hpo_cfg.metric_config,
+        expected_keys=expected_keys,
+        utility_policy=utility_policy,
+    )
     if canonical and (train_df is None or tuning_df is None or target_column is None):
         raise ValueError("Canonical SynthCity HPO requires train_df, tuning_df, and target_column")
-    utility_policy = _resolve_utility_policy(hpo_cfg.utility_policy) if canonical else None
-    expected_keys = (
-        list(expected_emitted_keys)
-        if expected_emitted_keys is not None
-        else list(utility_policy["metrics"] if utility_policy is not None else ())
-        if canonical
-        else emitted_keys_for_synthcity_metrics(hpo_cfg.metric_config)
-    )
+    utility_policy = utility_policy if canonical else None
     if len(expected_keys) != len(set(expected_keys)):
         raise ValueError("HPO expected emitted metric keys must be unique")
     group_mode = group_context.get("group_mode", "row") if group_context else "row"
@@ -722,13 +915,10 @@ def build_synthcity_objective(
                     seed=seed,
                     release_generalization=release_generalization,
                     utility_policy=utility_policy,
+                    group_context=group_context,
+                    train_group_ids=getattr(train_loader, "group_ids", None),
+                    tuning_group_ids=getattr(tuning_loader, "group_ids", None),
                 )
-                metric_report.attrs["metric_metadata"] = {
-                    "producer": "synthdata.generation.hpo.evaluate_canonical_hpo_metrics",
-                    "fit_roles": ["train"],
-                    "evaluation_role": "tuning",
-                    "candidate_train_only": True,
-                }
             else:
                 from synthcity.benchmark import Benchmarks
 
@@ -750,14 +940,30 @@ def build_synthcity_objective(
                 report = cast(_BenchmarksAPI, Benchmarks).evaluate(
                     [(trial_id, name, params)], train_loader, **evaluate_kwargs
                 )
-                if not isinstance(report, dict) or trial_id not in report:
-                    raise RuntimeError(
-                        f"SynthCity benchmark did not return report for {trial_id!r}"
-                    )
-                metric_report = report[trial_id]
+                metric_report = _validate_native_benchmark_report(
+                    report, trial_id, expected_keys=expected_keys
+                )
+            if canonical and not isinstance(metric_report, pd.DataFrame):
+                raise HPOMetricNotEligibleError("canonical metric report has an invalid shape")
             group_safety = getattr(metric_report, "attrs", {}).get("group_safety")
-            if isinstance(group_safety, Mapping) and group_safety.get("status") == "group_unsafe":
+            if (
+                isinstance(group_safety, Mapping) and group_safety.get("status") == "group_unsafe"
+            ) or (
+                group_mode == "patient_group"
+                and (
+                    not isinstance(group_safety, Mapping)
+                    or group_safety.get("schema_version") != "group-safety-v1"
+                    or group_safety.get("status") != "group_safe"
+                    or group_safety.get("group_mode") != "patient_group"
+                )
+            ):
                 reason_code = "group_unsafe"
+                group_error = HPOGroupUnsafeError()
+                set_trial_attr(
+                    trial,
+                    "hpo_error_provenance",
+                    hpo_exception_provenance(group_error, location="grouped_metric_evaluation"),
+                )
                 set_trial_attr(
                     trial,
                     "hpo_outcome",
@@ -776,9 +982,38 @@ def build_synthcity_objective(
                     "group_unsafe: Grouped evaluation unsafe; details suppressed."
                 )
             metric_metadata = metric_report.attrs.get("metric_metadata", {})
+            if canonical:
+                try:
+                    metric_metadata = sanitize_hpo_metric_metadata(
+                        metric_metadata, allowed_keys=expected_keys
+                    )
+                except HPOMetricNotEligibleError as exc:
+                    raise HPOMetricNotEligibleError(
+                        "canonical metric metadata is not decision-eligible"
+                    ) from exc
             if metric_metadata:
                 set_trial_attr(trial, "metric_metadata", metric_metadata)
                 set_trial_attr(trial, "result_metadata", metric_metadata)
+                if canonical and any(
+                    item.get("status") == "failed" for item in metric_metadata.values()
+                ):
+                    not_eligible = any(
+                        item.get("error_reason_code") == "hpo_metric_not_eligible"
+                        for item in metric_metadata.values()
+                    )
+                    metric_error = (
+                        HPOMetricNotEligibleError("canonical metric report is not eligible")
+                        if not_eligible
+                        else HPOMetricEvaluationError("canonical metric evaluation failed")
+                    )
+                    set_trial_attr(
+                        trial,
+                        "hpo_error_provenance",
+                        hpo_exception_provenance(
+                            metric_error, location="canonical_metric_evaluation"
+                        ),
+                    )
+                    raise metric_error
             if not canonical:
                 generator_metadata = build_hpo_generator_metadata(
                     base_name,
@@ -831,14 +1066,16 @@ def build_synthcity_objective(
             if reason_code not in {
                 "stage_a_screen_exception",
                 "metric_evaluation_exception",
+                "hpo_metric_not_eligible",
                 "hpo_trial_exception",
             }:
                 reason_code = "hpo_trial_exception"
-            set_trial_attr(
-                trial,
-                "hpo_error_provenance",
-                hpo_exception_provenance(exc, location="synthcity_objective"),
-            )
+            if not getattr(trial, "user_attrs", {}).get("hpo_error_provenance"):
+                set_trial_attr(
+                    trial,
+                    "hpo_error_provenance",
+                    hpo_exception_provenance(exc, location="synthcity_objective"),
+                )
             logger.warning(
                 "[%s] trial %d failed: %s (%s)",
                 name,

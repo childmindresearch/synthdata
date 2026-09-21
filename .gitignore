@@ -12,6 +12,7 @@ docs/internal/
 catboost_info/
 graphify-out/
 MNIST/
+AGENTS.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
