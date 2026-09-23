@@ -38,6 +38,22 @@ def _features(
     # Reindexing test to train's columns prevents evaluation-only categories from
     # changing the representation learned by the release model.
     test_encoded = test_encoded.reindex(columns=train_encoded.columns, fill_value=0)
+    feature_names = [str(column) for column in train_encoded.columns]
+    valid_names = {name for name in feature_names if not any(char in name for char in "[]<")}
+    used_names: set[str] = set()
+    safe_names = []
+    for name in feature_names:
+        safe_name = name.replace("[", "_lbracket_").replace("]", "_rbracket_").replace("<", "_lt_")
+        if safe_name in used_names or (safe_name != name and safe_name in valid_names):
+            suffix = 1
+            base_name = safe_name
+            while f"{base_name}_{suffix}" in used_names or f"{base_name}_{suffix}" in valid_names:
+                suffix += 1
+            safe_name = f"{base_name}_{suffix}"
+        used_names.add(safe_name)
+        safe_names.append(safe_name)
+    train_encoded.columns = safe_names
+    test_encoded.columns = safe_names
     return train_encoded.reset_index(drop=True), test_encoded.reset_index(drop=True)
 
 

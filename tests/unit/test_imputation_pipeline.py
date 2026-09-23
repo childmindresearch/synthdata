@@ -26,6 +26,7 @@ from synthdata.imputation.pipeline import (
     _cache_key_payload,
     _cache_key_record,
     _load_cached_key,
+    build_validation_report,
     run_imputation,
 )
 from synthdata.imputation.tabimpute_backend import (
@@ -116,6 +117,108 @@ def test_final_phase_noop_metadata_uses_concat_fit_fingerprint(make_config, make
     from synthdata.imputation.hyperimpute_backend import metadata_fingerprint
 
     assert metadata["state_fingerprint"] == metadata_fingerprint(metadata)
+
+
+def test_candidate_validation_report_uses_only_train_and_tuning(
+    make_config, make_canonical_dataset
+):
+    cfg = make_config()
+    dataset = make_canonical_dataset()
+    raw_roles = {role: frame.copy() for role, frame in dataset.roles.items()}
+    imputed_roles = {role: frame.copy() for role, frame in dataset.roles.items()}
+
+    raw_roles["train"].iloc[0, raw_roles["train"].columns.get_loc("feature")] = np.nan
+    imputed_roles["train"].iloc[0, imputed_roles["train"].columns.get_loc("feature")] = 1000.0
+    raw_roles["tuning"].iloc[0, raw_roles["tuning"].columns.get_loc("protected")] = np.nan
+    imputed_roles["tuning"].iloc[0, imputed_roles["tuning"].columns.get_loc("protected")] = "A"
+    raw_roles["final_holdout"].iloc[0, raw_roles["final_holdout"].columns.get_loc("feature")] = (
+        np.nan
+    )
+    imputed_roles["final_holdout"].iloc[
+        0, imputed_roles["final_holdout"].columns.get_loc("feature")
+    ] = 2000.0
+    dataset.roles = raw_roles
+    dataset.set_imputed_roles(imputed_roles)
+
+    report = build_validation_report(cfg, dataset)
+
+    assert len(report) == 2
+    assert report["column"].is_unique
+    assert report["column"].tolist() == ["feature", "protected"]
+    report_by_column = report.set_index("column")
+    assert report_by_column["n_missing"].to_dict() == {"feature": 1, "protected": 1}
+    assert report_by_column["n_imputed"].to_dict() == {"feature": 1, "protected": 1}
+    assert not report.set_index("column").loc["feature", "all_valid"]
+    assert report.set_index("column").loc["protected", "all_valid"]
+    assert "target" not in report["column"].tolist()
+
+
+def test_validation_report_uses_schema_datatypes_and_type_specific_statistics(
+    make_config, make_canonical_dataset
+):
+    cfg = make_config()
+    dataset = make_canonical_dataset()
+    raw_roles = {role: frame.copy() for role, frame in dataset.roles.items()}
+    imputed_roles = {role: frame.copy() for role, frame in dataset.roles.items()}
+    raw_roles["train"].loc[raw_roles["train"].index[0], "feature"] = np.nan
+    imputed_roles["train"].loc[imputed_roles["train"].index[0], "feature"] = 5.0
+    raw_roles["tuning"].loc[raw_roles["tuning"].index[0], "protected"] = np.nan
+    imputed_roles["tuning"].loc[imputed_roles["tuning"].index[0], "protected"] = "A"
+    dataset.roles = raw_roles
+    dataset.set_imputed_roles(imputed_roles)
+
+    report = build_validation_report(cfg, dataset).set_index("column")
+
+    assert report.loc["feature", "datatype"] == "continuous"
+    feature_observed = pd.concat(
+        [raw_roles["train"]["feature"], raw_roles["tuning"]["feature"]]
+    ).dropna()
+    feature_imputed = pd.concat(
+        [
+            imputed_roles["train"].loc[raw_roles["train"]["feature"].isna(), "feature"],
+            imputed_roles["tuning"].loc[raw_roles["tuning"]["feature"].isna(), "feature"],
+        ]
+    ).dropna()
+    assert report.loc["feature", "obs_cardinality"] == feature_observed.nunique()
+    assert report.loc["feature", "imp_cardinality"] == feature_imputed.nunique()
+    assert report.loc["feature", "obs_mean"] == pytest.approx(feature_observed.mean())
+    assert pd.isna(report.loc["feature", "obs_mode"])
+    assert report.loc["protected", "datatype"] == "categorical"
+    assert report.loc["protected", "obs_cardinality"] == 2
+    assert report.loc["protected", "imp_cardinality"] == 1
+    protected_observed = pd.concat(
+        [raw_roles["train"]["protected"], raw_roles["tuning"]["protected"]]
+    ).dropna()
+    assert report.loc["protected", "obs_mode"] == protected_observed.mode().iloc[0]
+    assert report.loc["protected", "imp_mode"] == "A"
+    assert pd.isna(report.loc["protected", "obs_mean"])
+    assert pd.isna(report.loc["protected", "imp_std"])
+
+
+def test_empty_validation_report_has_complete_schema(make_config, make_canonical_dataset):
+    cfg = make_config()
+    dataset = make_canonical_dataset()
+
+    report = build_validation_report(cfg, dataset)
+
+    assert report.empty
+    assert report.columns.tolist() == [
+        "column",
+        "datatype",
+        "categorical",
+        "n_missing",
+        "obs_cardinality",
+        "imp_cardinality",
+        "obs_mean",
+        "obs_std",
+        "imp_mean",
+        "imp_std",
+        "obs_mode",
+        "imp_mode",
+        "n_imputed",
+        "n_valid",
+        "all_valid",
+    ]
 
 
 class TestCacheKeyPayload:

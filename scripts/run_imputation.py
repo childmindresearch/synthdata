@@ -9,8 +9,9 @@ import argparse
 
 from synthdata.config import load_config
 from synthdata.data import load_dataset
-from synthdata.experiment import dataset_plots_dir
+from synthdata.experiment import dataset_plots_dir, imputation_output_dir
 from synthdata.imputation import build_validation_report, run_imputation
+from synthdata.imputation.pipeline import VALIDATION_REPORT_COLUMNS
 from synthdata.utils import get_logger, set_global_seed
 
 logger = get_logger("run_imputation")
@@ -42,8 +43,11 @@ def main() -> None:
     validation_df = None
     if cfg.imputation.enabled:
         validation_df = build_validation_report(cfg, dataset)
-        if len(validation_df):
-            logger.info("Imputation validation report:\n%s", validation_df.to_string(index=False))
+        if validation_df.empty and not len(validation_df.columns):
+            validation_df = validation_df.reindex(columns=VALIDATION_REPORT_COLUMNS)
+        validation_report_path = imputation_output_dir(cfg) / "imputation_validation_report.csv"
+        validation_df.to_csv(validation_report_path, index=False)
+        logger.info("Imputation validation report written to %s", validation_report_path)
 
     if args.plot:
         from synthdata.plotting.data_plots import save_data_plots
@@ -55,8 +59,11 @@ def main() -> None:
             save_imputation_plots(cfg, dataset, validation_df, plots_dir)
 
     logger.info(
-        "Done. Imputed data cached under %s (dataset version=%s)",
+        "Done. Imputed data cache under %s; validation report under %s (dataset version=%s)",
         dataset.data_dir,
+        imputation_output_dir(cfg) / "imputation_validation_report.csv"
+        if cfg.imputation.enabled
+        else "not written",
         dataset.version or "unversioned",
     )
 

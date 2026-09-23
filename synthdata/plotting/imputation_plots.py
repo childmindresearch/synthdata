@@ -94,6 +94,33 @@ def plot_validation_summary(validation_df: pd.DataFrame):
     return fig
 
 
+def _imputation_plot_frames(
+    dataset: Dataset, full_imputed_model_df: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return raw and imputed rows used by observed-vs-imputed plots."""
+    if not dataset.has_canonical_roles:
+        full_imputed_df = dataset.full_imputed_decoded_df
+        if full_imputed_df is None:
+            full_imputed_df = dataset.decode_ordinal_frame(full_imputed_model_df)
+        return dataset.decode_ordinal_frame(dataset.full_df), full_imputed_df
+
+    raw_frames = []
+    imputed_frames = []
+    for role in ("train", "tuning"):
+        raw_frame = dataset.role_frame(role)
+        imputed_frame = dataset.role_frame(role, imputed=True)
+        if raw_frame is None or imputed_frame is None:
+            raise RuntimeError(
+                f"Canonical imputation plots require populated raw and imputed {role!r} role"
+            )
+        raw_frames.append(dataset.decode_ordinal_frame(raw_frame))
+        imputed_frames.append(dataset.decode_ordinal_frame(imputed_frame))
+    return (
+        pd.concat(raw_frames, ignore_index=True),
+        pd.concat(imputed_frames, ignore_index=True),
+    )
+
+
 def save_imputation_plots(
     cfg: Config, dataset: Dataset, validation_df: pd.DataFrame, output_dir: str | Path
 ) -> None:
@@ -101,10 +128,7 @@ def save_imputation_plots(
     full_imputed_model_df = dataset.full_imputed_df
     if full_imputed_model_df is None:
         raise RuntimeError("save_imputation_plots() requires imputed data")
-    full_df = dataset.decode_ordinal_frame(dataset.full_df)
-    full_imputed_df = dataset.full_imputed_decoded_df
-    if full_imputed_df is None:
-        full_imputed_df = dataset.decode_ordinal_frame(full_imputed_model_df)
+    full_df, full_imputed_df = _imputation_plot_frames(dataset, full_imputed_model_df)
     columns_with_missing = [c for c in dataset.feature_columns if full_df[c].isna().any()]
     fig1 = plot_observed_vs_imputed(
         full_df,

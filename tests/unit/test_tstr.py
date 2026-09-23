@@ -240,6 +240,52 @@ def test_run_is_deterministic_and_uses_synthetic_schema(monkeypatch):
     assert seen == [(2, ("x", "category_a", "category_b", "category_nan"), (0, 1))] * 2
 
 
+def test_run_sanitizes_forbidden_release_category_feature_names(monkeypatch):
+    synthetic, roles, _ = transform_release_roles(
+        pd.DataFrame(
+            [
+                {"category": "<18", "group": "a", "y": 0},
+                {"category": "[$40,000", "group": "b", "y": 1},
+                {"category": "age[1]", "group": "a", "y": 0},
+                {"category": "plain", "group": "b", "y": 1},
+            ]
+        ),
+        {
+            "tuning": pd.DataFrame(
+                [
+                    {"category": "<18", "group": "a", "y": 0},
+                    {"category": "[$40,000", "group": "b", "y": 1},
+                    {"category": "age[1]", "group": "a", "y": 0},
+                    {"category": "plain", "group": "b", "y": 1},
+                ]
+            )
+        },
+    )
+    real = roles["tuning"]
+    seen: list[tuple[str, ...]] = []
+
+    class Model:
+        def fit(self, x, y):
+            seen.append(tuple(x.columns))
+            return self
+
+        def predict_proba(self, x):
+            seen.append(tuple(x.columns))
+            return pd.DataFrame([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]]).to_numpy()
+
+        def predict(self, x):
+            return pd.Series([0, 1, 0, 1]).to_numpy()
+
+    monkeypatch.setattr("synthdata.evaluation.tstr._xgb", lambda seed, classes: Model())
+    result = run_tstr_evaluation(synthetic, real, target_column="y", protected_columns=["group"])
+
+    assert result.report["state"] == "complete"
+    assert seen[0] == seen[1]
+    assert all(not any(char in name for char in "[]<") for name in seen[0])
+    assert "category_plain" in seen[0]
+    assert "group_a" not in seen[0]
+
+
 def test_final_holdout_eo_uses_raw_non_numeric_labels():
     synthetic, roles, _ = transform_release_roles(
         pd.DataFrame([{"x": 0, "y": "cat"}, {"x": 1, "y": "dog"}]),

@@ -62,6 +62,8 @@ HPO_GENERATOR_METADATA_SCHEMA_VERSION = "generator-metadata-v2"
 # fixtures, but checkpoint metadata must still have a bounded schema surface.
 _MAX_STAGE_A_RESULT_COLUMNS = 4096
 _MAX_STAGE_A_CHECK_BYTES = 131072
+_MAX_STAGE_A_REASON_LENGTH = 4096
+_STAGE_A_REASON_TRUNCATION_SUFFIX = " ... [truncated]"
 HPO_METADATA_SERIALIZATION_REASON_CODE = "hpo_metadata_serialization_failure"
 STAGE_A_SCREEN_IDS = (
     "shape_schema",
@@ -88,6 +90,14 @@ def _safe_exception_message(reason_code: str) -> str:
     return _SAFE_EXCEPTION_MESSAGES.get(
         reason_code, _SAFE_EXCEPTION_MESSAGES["hpo_trial_exception"]
     )
+
+
+def _bound_stage_a_reason(reason: str) -> str:
+    """Bound human-readable Stage-A evidence without changing structured evidence."""
+    if len(reason) <= _MAX_STAGE_A_REASON_LENGTH:
+        return reason
+    prefix_length = _MAX_STAGE_A_REASON_LENGTH - len(_STAGE_A_REASON_TRUNCATION_SUFFIX)
+    return reason[:prefix_length] + _STAGE_A_REASON_TRUNCATION_SUFFIX
 
 
 class HPOMetricNotEligibleError(ValueError):
@@ -1017,9 +1027,7 @@ def build_stage_a_contract(
         if column not in columns:
             raise ValueError(f"Stage A declared column {column!r} is not present in source_df")
     categorical = tuple(
-        dict.fromkeys(
-            (*categorical, *protected, *([target_column] if target_is_categorical else []))
-        )
+        dict.fromkeys((*categorical, *([target_column] if target_is_categorical else [])))
     )
 
     categorical_values = {
@@ -1080,6 +1088,7 @@ def screen_stage_a(
     prune_reasons: list[str] = []
 
     def add_check(screen: str, passed: bool, expected: Any, observed: Any, reason: str) -> None:
+        reason = _bound_stage_a_reason(reason)
         check = {
             "screen": screen,
             "passed": bool(passed),
@@ -1273,10 +1282,17 @@ def screen_stage_a(
     subgroup_observed: dict[str, Any] = {}
     subgroup_reasons = []
     for column in contract.protected_columns:
-        values = contract.categorical_values.get(column, ())
         if column not in candidate_df.columns:
             subgroup_reasons.append(f"protected column {column!r} is missing")
             continue
+        if column in contract.numeric_bounds:
+            subgroup_observed[column] = {
+                "status": "not_applicable",
+                "discrete": False,
+                "reason": "continuous protected column is non-discrete",
+            }
+            continue
+        values = contract.categorical_values.get(column, ())
         counts = candidate_df[column].value_counts(dropna=False)
         group_counts = {
             str(_json_safe(value)): int(
@@ -1351,7 +1367,7 @@ def _stage_a_exception_result(
         candidate_columns = ()
     reason_code = "stage_a_screen_exception"
     message = _safe_exception_message(reason_code)
-    reason = f"{reason_code}: {message}"
+    reason = _bound_stage_a_reason(f"{reason_code}: {message}")
     return StageAScreenResult(
         contract_digest=contract.digest,
         candidate_shape=candidate_shape,
@@ -1924,6 +1940,22 @@ def _evaluate_train_frozen_jsd(
     return value, metadata
 
 
+def _effective_metric_feature_types(
+    feature_types: Mapping[str, str] | None,
+    release_meta: Mapping[str, Any],
+) -> tuple[dict[str, str], list[str]]:
+    """Return schema types matching values emitted by release generalization."""
+    effective = dict(feature_types or {})
+    generalization = release_meta.get("synthetic", {}).get("generalization", {})
+    generalized_columns: list[str] = []
+    if isinstance(generalization, Mapping):
+        for column, spec in generalization.items():
+            if isinstance(spec, Mapping) and isinstance(spec.get("intervals"), Sequence):
+                generalized_columns.append(str(column))
+                effective[str(column)] = "categorical"
+    return effective, generalized_columns
+
+
 def _resolve_utility_policy(policy: Mapping[str, Any] | None = None) -> dict[str, list]:
     """Resolve fixed release utility policy, rejecting unsafe substitutions."""
     expected = list(TUNING_UTILITY_METRICS)
@@ -2169,15 +2201,21 @@ def evaluate_canonical_hpo_metrics(
                     {"train": train_df, "tuning": tuning_df},
                     release_generalization or {},
                 )
+                effective_feature_types, generalized_columns = _effective_metric_feature_types(
+                    feature_types, release_meta
+                )
                 value, candidate_metadata = _evaluate_train_frozen_jsd(
                     released_roles["train"],
                     released_roles["tuning"],
                     released_synthetic,
-                    feature_types=feature_types,
+                    feature_types=effective_feature_types,
                 )
                 metadata.update(
                     {
                         "support": candidate_metadata,
+                        "metric_feature_types": effective_feature_types,
+                        "original_feature_types": dict(feature_types or {}),
+                        "generalized_categorical_columns": generalized_columns,
                         "release_transform_digest": release_meta["synthetic"].get(
                             "release_transform_digest", release_meta["common_protocol_digest"]
                         ),
@@ -2187,23 +2225,19 @@ def evaluate_canonical_hpo_metrics(
                         "provenance": {
                             "fit_roles": ["train"],
                             "support_fit_roles": ["train"],
+                            "metric_feature_types": effective_feature_types,
+                            "original_feature_types": dict(feature_types or {}),
+                            "generalized_categorical_columns": generalized_columns,
                             "comparison_role": "tuning",
                             **_release_provenance(release_meta),
                         },
                     }
                 )
+                if value is None:
+                    raise HPOMetricNotEligibleError(
+                        "FrozenSupportJSD did not produce an eligible aggregate"
+                    )
             elif key == "mixed_mmd.v1":
-                continuous = [
-                    column for column, kind in (feature_types or {}).items() if kind == "continuous"
-                ]
-                ordinal = [
-                    column for column, kind in (feature_types or {}).items() if kind == "ordinal"
-                ]
-                nominal = [
-                    column
-                    for column, kind in (feature_types or {}).items()
-                    if kind == "categorical"
-                ]
                 from synthdata.evaluation.release import transform_release_roles
 
                 released_synthetic, released_roles, release_meta = transform_release_roles(
@@ -2211,6 +2245,22 @@ def evaluate_canonical_hpo_metrics(
                     {"train": train_df, "tuning": tuning_df},
                     release_generalization or {},
                 )
+                effective_feature_types, generalized_columns = _effective_metric_feature_types(
+                    feature_types, release_meta
+                )
+                continuous = [
+                    column
+                    for column, kind in effective_feature_types.items()
+                    if kind == "continuous"
+                ]
+                ordinal = [
+                    column for column, kind in effective_feature_types.items() if kind == "ordinal"
+                ]
+                nominal = [
+                    column
+                    for column, kind in effective_feature_types.items()
+                    if kind == "categorical"
+                ]
                 result = _evaluate_train_frozen_mmd(
                     released_roles["train"],
                     released_roles["tuning"],
@@ -2223,11 +2273,17 @@ def evaluate_canonical_hpo_metrics(
                 metadata.update(
                     {
                         "bandwidth": result["bandwidth"],
+                        "metric_feature_types": effective_feature_types,
+                        "original_feature_types": dict(feature_types or {}),
+                        "generalized_categorical_columns": generalized_columns,
                         "fit_roles": ["train"],
                         "evaluation_role": "tuning",
                         "provenance": {
                             "fit_roles": ["train"],
                             "bandwidth_fit_roles": ["train"],
+                            "metric_feature_types": effective_feature_types,
+                            "original_feature_types": dict(feature_types or {}),
+                            "generalized_categorical_columns": generalized_columns,
                             "comparison_role": "tuning",
                             **_release_provenance(release_meta),
                         },
@@ -3559,39 +3615,13 @@ def _validate_hpo_trial_checkpoint(
     ):
         raise RuntimeError("Non-completed HPO trial checkpoint has completed metric evidence")
     outcome = metadata.get("outcome")
-    if outcome is not None and not isinstance(outcome, Mapping):
-        raise RuntimeError("HPO trial checkpoint outcome must be an object or null")
     error_provenance = metadata.get("hpo_error_provenance")
-    missing_evidence = metadata.get("hpo_error_provenance_state") == "missing_evidence"
-    if canonical_checkpoint and state != "complete" and not isinstance(error_provenance, Mapping):
-        raise RuntimeError("Non-completed HPO trial checkpoint requires error provenance")
-    if (
-        state != "complete"
-        and not isinstance(error_provenance, Mapping)
-        and not missing_evidence
-        and not (not canonical_checkpoint and "hpo_error_provenance_state" not in metadata)
-    ):
-        raise RuntimeError("Non-completed HPO trial checkpoint requires explicit evidence state")
-    if error_provenance is not None:
-        try:
-            normalized_provenance = normalize_hpo_metadata(error_provenance)
-        except HPOMetadataSerializationError as exc:
-            raise RuntimeError(
-                "HPO trial checkpoint hpo_error_provenance is not normalized JSON metadata"
-            ) from exc
-        if normalized_provenance != error_provenance:
-            raise RuntimeError(
-                "HPO trial checkpoint hpo_error_provenance is not normalized JSON metadata"
-            )
-        validated_provenance = _validate_hpo_error_provenance(error_provenance)
-        if (
-            validated_provenance["error_reason_code"] == HPO_METADATA_SERIALIZATION_REASON_CODE
-            and state == "pruned"
-        ):
-            if not isinstance(outcome, Mapping):
-                raise RuntimeError("Metadata serialization outcome must preserve error provenance")
-            if any(outcome.get(key) != value for key, value in validated_provenance.items()):
-                raise RuntimeError("Metadata serialization outcome does not match error provenance")
+    _validate_hpo_recovery_evidence(
+        error_provenance,
+        outcome,
+        expected_state=state,
+        require_provenance=state != "complete",
+    )
     return dict(payload)
 
 
@@ -3660,7 +3690,6 @@ def persist_hpo_trial_checkpoint(
     ):
         result_metadata = metric_metadata
     error_provenance = attrs.get("hpo_error_provenance")
-    missing_evidence = state != "complete" and not isinstance(error_provenance, Mapping)
     payload = _json_document(
         {
             "schema_version": HPO_TRIAL_CHECKPOINT_SCHEMA_VERSION,
@@ -3684,7 +3713,7 @@ def persist_hpo_trial_checkpoint(
                 "result_metadata": result_metadata,
                 "outcome": attrs.get("hpo_outcome"),
                 "hpo_error_provenance": error_provenance,
-                "hpo_error_provenance_state": "missing_evidence" if missing_evidence else None,
+                "hpo_error_provenance_state": None,
                 "generator": {
                     "state": attrs.get("generator_metadata_state", "not_recorded"),
                     "plugin_name": attrs.get("generator_plugin_name"),
@@ -3776,6 +3805,178 @@ def _persist_hpo_trial_checkpoints(
 _HPO_RUNNING_RECOVERY_SCHEMA_VERSION = "hpo-running-recovery-v1"
 
 
+def _hpo_running_recovery_metadata(
+    study: optuna.Study,
+    trial: Any,
+    *,
+    context_digest: str,
+) -> dict[str, Any]:
+    """Return expected metadata identifying one verified stale-trial recovery."""
+    return {
+        "schema_version": _HPO_RUNNING_RECOVERY_SCHEMA_VERSION,
+        "study_name": study.study_name,
+        "context_digest": context_digest,
+        "trial_number": trial.number,
+        "original_state": "RUNNING",
+        "reason_code": "stale_running_trial_recovery",
+        "terminal_state": "FAIL",
+    }
+
+
+def _repair_recovered_trial_provenance(
+    study: optuna.Study,
+    trial: Any,
+    *,
+    validated_provenance: Mapping[str, str],
+    validated_outcome: Mapping[str, Any],
+) -> None:
+    """Add bounded failure evidence for a verified stale-running recovery."""
+    attrs = getattr(trial, "user_attrs", {}) or {}
+    provenance = attrs.get("hpo_error_provenance")
+    outcome = attrs.get("hpo_outcome")
+    repaired_outcome = dict(validated_outcome)
+    repaired_outcome.update(
+        {key: value for key, value in validated_provenance.items() if key not in repaired_outcome}
+    )
+    repaired_outcome.setdefault("state", "failed")
+    if provenance is None:
+        study._storage.set_trial_user_attr(  # noqa: SLF001 - durable recovery repair
+            trial._trial_id,
+            "hpo_error_provenance",
+            validated_provenance,
+        )
+    if repaired_outcome != outcome:
+        study._storage.set_trial_user_attr(  # noqa: SLF001 - durable recovery repair
+            trial._trial_id,
+            "hpo_outcome",
+            repaired_outcome,
+        )
+
+
+def _validate_hpo_recovery_evidence(
+    provenance: Any,
+    value: Any,
+    *,
+    expected_state: str = "failed",
+    require_provenance: bool = True,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Validate all bounded evidence used to recover a stale HPO trial."""
+    if provenance is None:
+        if require_provenance:
+            raise RuntimeError("Non-completed HPO trial checkpoint requires error provenance")
+        validated_provenance: dict[str, str] = {}
+    else:
+        try:
+            normalized_provenance = normalize_hpo_metadata(provenance)
+        except HPOMetadataSerializationError as exc:
+            raise RuntimeError(
+                "HPO trial checkpoint hpo_error_provenance is not normalized JSON metadata"
+            ) from exc
+        if normalized_provenance != provenance:
+            raise RuntimeError(
+                "HPO trial checkpoint hpo_error_provenance is not normalized JSON metadata"
+            )
+        validated_provenance = _validate_hpo_error_provenance(provenance)
+    if value is None:
+        return validated_provenance, {}
+    if not isinstance(value, Mapping):
+        raise RuntimeError("Recovered HPO trial outcome must be an object")
+    allowed = set(validated_provenance) | {"state", "status", "group_safety"}
+    if set(value) - allowed:
+        raise RuntimeError("Recovered HPO trial outcome has unknown fields")
+    provenance_keys = set(validated_provenance)
+    present_provenance = provenance_keys.intersection(value)
+    if present_provenance and present_provenance != provenance_keys:
+        raise RuntimeError("Recovered HPO trial outcome has incomplete provenance")
+    if present_provenance and any(
+        value[key] != validated_provenance[key] for key in provenance_keys
+    ):
+        raise RuntimeError("Recovered HPO trial outcome does not match error provenance")
+    if "state" in value and value["state"] != expected_state:
+        raise RuntimeError("Recovered HPO trial outcome has an invalid state")
+    if "status" in value and value["status"] != "group_unsafe":
+        raise RuntimeError("Recovered HPO trial outcome has an invalid status")
+    if "group_safety" in value:
+        group_safety = value["group_safety"]
+        if group_safety != {"status": "group_unsafe", "reason_code": "group_unsafe"}:
+            raise RuntimeError("Recovered HPO trial outcome has malformed group safety")
+        if value.get("status") != "group_unsafe":
+            raise RuntimeError("Recovered HPO trial outcome has inconsistent group safety")
+    if value.get("status") == "group_unsafe" and "group_safety" not in value:
+        raise RuntimeError("Recovered HPO trial outcome is missing group safety")
+    if value.get("status") == "group_unsafe" and expected_state == "complete":
+        raise RuntimeError("Recovered HPO trial outcome cannot mark a completed trial group unsafe")
+    return validated_provenance, dict(value)
+
+
+def _validated_trial_recovery_evidence(
+    trial: Any,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Return validated recovery evidence from one persisted trial."""
+    attrs = getattr(trial, "user_attrs", {}) or {}
+    existing_provenance = attrs.get("hpo_error_provenance")
+    provenance = (
+        existing_provenance
+        if existing_provenance is not None
+        else hpo_exception_provenance(Exception(), location="stale_running_trial_recovery")
+    )
+    return _validate_hpo_recovery_evidence(provenance, attrs.get("hpo_outcome"))
+
+
+def _repair_terminal_recovered_trial(
+    study: optuna.Study,
+    trial: Any,
+    *,
+    validated_provenance: Mapping[str, str],
+    validated_outcome: Mapping[str, Any],
+) -> None:
+    """Repair terminal RDB trials while retaining their terminal state."""
+    storage = study._storage  # noqa: SLF001 - Optuna has no terminal-attr repair API
+    backend = getattr(storage, "_backend", None)
+    if backend is None or not hasattr(backend, "scoped_session"):
+        raise RuntimeError("HPO stale-recovery evidence requires an RDB-backed Optuna study")
+    attrs = getattr(trial, "user_attrs", {}) or {}
+    provenance = attrs.get("hpo_error_provenance")
+    outcome = attrs.get("hpo_outcome")
+    repaired_outcome = dict(validated_outcome)
+    repaired_outcome.update(
+        {key: value for key, value in validated_provenance.items() if key not in repaired_outcome}
+    )
+    repaired_outcome.setdefault("state", "failed")
+    needs_provenance = provenance is None
+    needs_outcome = repaired_outcome != outcome
+    if not needs_provenance and not needs_outcome:
+        return
+    from optuna.storages._rdb import models
+    from optuna.storages._rdb.storage import _create_scoped_session
+
+    with _create_scoped_session(backend.scoped_session, True) as session:
+        stored_trial = models.TrialModel.find_or_raise_by_id(trial._trial_id, session)
+        stored_trial.state = optuna.trial.TrialState.RUNNING
+        if needs_provenance:
+            backend._set_trial_attr_without_commit(  # noqa: SLF001
+                session,
+                models.TrialUserAttributeModel,
+                trial._trial_id,
+                "hpo_error_provenance",
+                validated_provenance,
+            )
+        if needs_outcome:
+            backend._set_trial_attr_without_commit(  # noqa: SLF001
+                session,
+                models.TrialUserAttributeModel,
+                trial._trial_id,
+                "hpo_outcome",
+                repaired_outcome,
+            )
+        stored_trial.state = optuna.trial.TrialState.FAIL
+    refreshed = backend.get_trial(trial._trial_id)
+    storage._add_trials_to_cache(  # noqa: SLF001 - refresh CachedStorage after direct repair
+        trial._study_id if hasattr(trial, "_study_id") else study._study_id,  # noqa: SLF001
+        [refreshed],
+    )
+
+
 def _recover_running_trials(
     study: optuna.Study,
     *,
@@ -3787,36 +3988,47 @@ def _recover_running_trials(
     trial by number.  Its storage contract does expose the transition by the
     trial's stable storage id, which preserves all existing trial evidence.
     """
-    running_trials = [
-        trial for trial in study.trials if trial.state == optuna.trial.TrialState.RUNNING
-    ]
-    if not running_trials:
-        return 0
-
     context_digest = hpo_context_digest(context)
     recovered = 0
-    for trial in running_trials:
-        recovery = {
-            "schema_version": _HPO_RUNNING_RECOVERY_SCHEMA_VERSION,
-            "study_name": study.study_name,
-            "context_digest": context_digest,
-            "trial_number": trial.number,
-            "original_state": "RUNNING",
-            "reason_code": "stale_running_trial_recovery",
-            "terminal_state": "FAIL",
-        }
+    for trial in study.trials:
+        if trial.state not in {
+            optuna.trial.TrialState.RUNNING,
+            optuna.trial.TrialState.FAIL,
+        }:
+            continue
+        recovery = _hpo_running_recovery_metadata(study, trial, context_digest=context_digest)
         existing = (trial.user_attrs or {}).get("hpo_running_recovery")
         if existing is not None and existing != recovery:
             raise RuntimeError(
                 f"HPO study {study.study_name!r} trial {trial.number} has conflicting "
                 "running-trial recovery metadata"
             )
+        if trial.state == optuna.trial.TrialState.FAIL:
+            if existing == recovery:
+                validated_provenance, validated_outcome = _validated_trial_recovery_evidence(trial)
+                _repair_terminal_recovered_trial(
+                    study,
+                    trial,
+                    validated_provenance=validated_provenance,
+                    validated_outcome=validated_outcome,
+                )
+            continue
+
+        # Validate every piece of evidence before adding the recovery marker.
+        validated_provenance, validated_outcome = _validated_trial_recovery_evidence(trial)
         if existing is None:
             study._storage.set_trial_user_attr(  # noqa: SLF001 - storage transition needs trial id
                 trial._trial_id,
                 "hpo_running_recovery",
                 recovery,  # noqa: SLF001
             )
+
+        _repair_recovered_trial_provenance(
+            study,
+            trial,
+            validated_provenance=validated_provenance,
+            validated_outcome=validated_outcome,
+        )
 
         transitioned = study._storage.set_trial_state_values(  # noqa: SLF001
             trial._trial_id,  # noqa: SLF001
@@ -3878,6 +4090,8 @@ def run_study(
         seed,
         hpo_context=context_payload,
     )
+    _recover_running_trials(study, context=context_payload)
+
     if checkpoint_implementation_fingerprint is not None:
         checkpoint_dir = Path(output_dir) / "hpo_checkpoints" / study.study_name
         existing_checkpoints = sorted(checkpoint_dir.glob("trial-*/checkpoint.json"))
@@ -3896,22 +4110,34 @@ def run_study(
                 checkpoint_implementation_fingerprint[:16],
             )
 
-    _recover_running_trials(study, context=context_payload)
-
     def _set_outcome(trial: optuna.Trial, state: str, error: BaseException | None = None) -> None:
-        existing_outcome = getattr(trial, "user_attrs", {}).get("hpo_outcome")
-        outcome = dict(existing_outcome) if isinstance(existing_outcome, Mapping) else {}
-        outcome["state"] = state
+        attrs = getattr(trial, "user_attrs", {}) or {}
+        existing_outcome = attrs.get("hpo_outcome")
+        existing_provenance = attrs.get("hpo_error_provenance")
+        provenance = existing_provenance
+        if error is not None and provenance is None:
+            provenance = hpo_exception_provenance(error, location="tracked_objective")
+
+        require_provenance = state != "complete"
+        validated_provenance, validated_outcome = _validate_hpo_recovery_evidence(
+            provenance,
+            existing_outcome,
+            expected_state=state,
+            require_provenance=require_provenance,
+        )
+        outcome = dict(validated_outcome)
         if error is not None:
-            provenance = getattr(trial, "user_attrs", {}).get("hpo_error_provenance")
-            try:
-                if not isinstance(provenance, Mapping):
-                    raise RuntimeError("missing HPO error provenance")
-                _validate_hpo_error_provenance(provenance)
-            except RuntimeError:
-                provenance = hpo_exception_provenance(error, location="tracked_objective")
-                trial.set_user_attr("hpo_error_provenance", provenance)
-            outcome.update(provenance)
+            outcome.update(validated_provenance)
+        outcome["state"] = state
+        _validate_hpo_recovery_evidence(
+            validated_provenance if provenance is not None else None,
+            outcome,
+            expected_state=state,
+            require_provenance=require_provenance,
+        )
+
+        if error is not None and existing_provenance is None:
+            trial.set_user_attr("hpo_error_provenance", validated_provenance)
         trial.set_user_attr("hpo_outcome", outcome)
 
     def _tracked_objective(trial: optuna.Trial) -> float:

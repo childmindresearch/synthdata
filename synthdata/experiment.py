@@ -73,6 +73,11 @@ def dataset_plots_dir(cfg: Config) -> Path:
     return ensure_dir(Path(cfg.plots.output_dir) / dataset_version_scope(cfg) / "dataset")
 
 
+def imputation_output_dir(cfg: Config) -> Path:
+    """Return the version-scoped destination for imputation artifacts."""
+    return ensure_dir(Path("output") / cfg.name / "imputation" / dataset_version_scope(cfg))
+
+
 def _experiments_root(cfg: Config) -> Path:
     return Path(cfg.generation.output_dir).parent / "experiments" / dataset_version_scope(cfg)
 

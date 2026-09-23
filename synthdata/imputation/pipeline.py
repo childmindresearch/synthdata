@@ -8,6 +8,7 @@ import dataclasses
 import hashlib
 import json
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -27,6 +28,25 @@ from synthdata.imputation.hyperimpute_backend import (
 from synthdata.utils import ensure_dir, get_logger, resolve_device
 
 logger = get_logger(__name__)
+
+
+VALIDATION_REPORT_COLUMNS = [
+    "column",
+    "datatype",
+    "categorical",
+    "n_missing",
+    "obs_cardinality",
+    "imp_cardinality",
+    "obs_mean",
+    "obs_std",
+    "imp_mean",
+    "imp_std",
+    "obs_mode",
+    "imp_mode",
+    "n_imputed",
+    "n_valid",
+    "all_valid",
+]
 
 
 class RoleIsolationError(RuntimeError):
@@ -630,36 +650,77 @@ def run_imputation(cfg: Config, dataset: Dataset, phase: str = "candidate") -> D
     return dataset
 
 
-def build_validation_report(cfg: Config, dataset: Dataset) -> pd.DataFrame:
-    """Build a per-column validation table comparing observed vs. imputed values."""
-    rows = []
-    full_df = dataset.full_df
-    full_imputed = dataset.full_imputed_df
-    if full_imputed is None:
+def build_validation_report(
+    cfg: Config, dataset: Dataset, phase: str = "candidate"
+) -> pd.DataFrame:
+    """Build validation rows for values imputed in the selected phase.
+
+    Canonical candidate validation is limited to train and tuning. Legacy
+    two-role datasets retain their historical full-frame report semantics.
+    """
+    _validate_phase(phase)
+    if dataset.full_imputed_df is None:
         raise RuntimeError("run_imputation() must be called before build_validation_report()")
 
+    if dataset.legacy_two_role:
+        raw_frames = [dataset.full_df]
+        imputed_frames = [dataset.full_imputed_df]
+    else:
+        roles = ("train", "tuning") if phase == "candidate" else ("final_holdout",)
+        raw_frames = [dataset.role_frame(role) for role in roles]
+        imputed_frames = [dataset.role_frame(role, imputed=True) for role in roles]
+        if any(frame is None for frame in raw_frames + imputed_frames):
+            raise RuntimeError(
+                f"Imputation report phase {phase!r} lacks one or more required role frames"
+            )
+
+    raw_scope = pd.concat([cast(pd.DataFrame, frame) for frame in raw_frames], ignore_index=True)
+    imputed_scope = pd.concat(
+        [cast(pd.DataFrame, frame) for frame in imputed_frames], ignore_index=True
+    )
+    raw_scope = dataset.decode_ordinal_frame(raw_scope)
+    imputed_scope = dataset.decode_ordinal_frame(imputed_scope)
+    rows = []
     for col in dataset.feature_columns:
-        missing_mask = full_df[col].isna()
+        missing_mask = raw_scope[col].isna()
         n_missing = int(missing_mask.sum())
         if n_missing == 0:
             continue
-        observed = full_df.loc[~missing_mask, col]
-        imputed = full_imputed.loc[missing_mask, col]
-        is_categorical = col in dataset.categorical_columns
-        is_numeric = pd.api.types.is_numeric_dtype(observed)
+        observed = raw_scope.loc[~missing_mask, col]
+        imputed = imputed_scope.loc[missing_mask, col]
+        datatype = dataset.variable_schema[col]["kind"]
+        is_categorical = datatype == "categorical"
         result = validate_imputed_column(
             observed, imputed, is_categorical, cfg.imputation.validation_margin
         )
-        rows.append(
-            {
-                "column": col,
-                "categorical": is_categorical,
-                "n_missing": n_missing,
-                "obs_mean": float(observed.mean()) if is_numeric and len(observed) else np.nan,
-                "obs_std": float(observed.std()) if is_numeric and len(observed) else np.nan,
-                "imp_mean": float(imputed.mean()) if is_numeric and len(imputed) else np.nan,
-                "imp_std": float(imputed.std()) if is_numeric and len(imputed) else np.nan,
-                **result,
-            }
-        )
-    return pd.DataFrame(rows)
+        row = {
+            "column": col,
+            "datatype": datatype,
+            "categorical": is_categorical,
+            "n_missing": n_missing,
+            "obs_cardinality": int(observed.dropna().nunique()),
+            "imp_cardinality": int(imputed.dropna().nunique()),
+            "obs_mean": np.nan,
+            "obs_std": np.nan,
+            "imp_mean": np.nan,
+            "imp_std": np.nan,
+            "obs_mode": np.nan,
+            "imp_mode": np.nan,
+            **result,
+        }
+        if is_categorical:
+            observed_mode = observed.dropna().mode()
+            imputed_mode = imputed.dropna().mode()
+            row["obs_mode"] = observed_mode.iloc[0] if len(observed_mode) else np.nan
+            row["imp_mode"] = imputed_mode.iloc[0] if len(imputed_mode) else np.nan
+        else:
+            row.update(
+                {
+                    "obs_mean": float(observed.mean()) if len(observed) else np.nan,
+                    "obs_std": float(observed.std()) if len(observed) else np.nan,
+                    "imp_mean": float(imputed.mean()) if len(imputed) else np.nan,
+                    "imp_std": float(imputed.std()) if len(imputed) else np.nan,
+                }
+            )
+        rows.append(row)
+    return pd.DataFrame.from_records(rows).reindex(columns=VALIDATION_REPORT_COLUMNS)

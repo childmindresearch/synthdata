@@ -128,6 +128,32 @@ The four commands form an ordered pipeline:
 
 Artifacts are namespaced by dataset name, dataset version, and experiment ID. Their folder names make both levels explicit: for example, `data_v_1.2/exp_v_0.4/`. Generation creates a new experiment by default; evaluation and plotting use the latest one or accept `--experiment-id` to revisit a prior run. This preserves cached inputs, model outputs, HPO state, metrics, and figures across dataset revisions.
 
+### Imputation artifacts and logs
+
+`synthdata-impute` writes its validation table to:
+
+```text
+output/<config.name>/imputation/data_v_<version>/imputation_validation_report.csv
+```
+
+For a config without `data.version`, `<version>` is `unversioned`, so the
+report is written under `output/<config.name>/imputation/data_v_unversioned/`.
+The imputed-data cache is separate from this report: raw, imputed, and split
+CSV artifacts are stored under `<data.data_dir>/data_v_<version>/` (or
+`<data.data_dir>/data_v_unversioned/`), alongside its cache-lineage metadata.
+The CLI logs both locations rather than printing validation-table contents to
+the terminal.
+
+The canonical candidate validation report covers only roles transformed for
+candidate use: `train` and `tuning`. It does not represent imputation of the
+final holdout. Each row includes `datatype` from the variable schema's
+`kind`, observed and imputed cardinality (`obs_cardinality` and
+`imp_cardinality`), and type-specific summaries. Continuous columns include
+observed and imputed mean/std (`obs_mean`, `obs_std`, `imp_mean`, and
+`imp_std`); these statistics are not meaningful for categorical values and
+remain empty for them. Categorical columns include observed and imputed modes
+(`obs_mode` and `imp_mode`).
+
 Evaluation always retains raw metric values for audit. The ranked columns are
 derived separately and include only complete, decision-eligible policy metrics;
 failed, diagnostic, calibration-only, and blocked results remain visible in

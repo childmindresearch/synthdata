@@ -33,6 +33,7 @@ from synthdata.generation.hpo import (
     normalize_hpo_metadata,
     persist_hpo_trial_checkpoint,
     persist_stage_a_contract,
+    persist_stage_a_result,
     run_study,
     screen_stage_a,
     screen_stage_a_trial,
@@ -959,6 +960,83 @@ def test_stage_a_screen_passes_without_running_attack_metrics():
     }
 
 
+def test_stage_a_continuous_protected_column_uses_numeric_bounds():
+    source = pd.DataFrame(
+        {
+            "Age": [20.0, 20.0, 30.0, 30.0],
+            "Sex": ["F", "F", "M", "M"],
+            "target": [0, 1, 0, 1],
+        }
+    )
+    contract = build_stage_a_contract(
+        source,
+        expected_n_samples=4,
+        target_column="target",
+        categorical_columns=["Sex"],
+        protected_columns=["Age", "Sex"],
+    )
+    candidate = pd.DataFrame(
+        {
+            "Age": [21.0, 21.5, 28.5, 29.0],
+            "Sex": ["F", "F", "M", "M"],
+            "target": [0, 1, 0, 1],
+        }
+    )
+
+    assert "Age" not in contract.categorical_values
+    assert contract.numeric_bounds["Age"] == (20.0, 30.0)
+    assert set(contract.categorical_values) == {"Sex", "target"}
+
+    result = screen_stage_a(candidate, contract, source)
+
+    assert result.passed
+    subgroup_check = next(
+        check for check in result.checks if check["screen"] == "subgroup_collapse"
+    )
+    assert subgroup_check["observed"]["Age"] == {
+        "status": "not_applicable",
+        "discrete": False,
+        "reason": "continuous protected column is non-discrete",
+    }
+    assert subgroup_check["observed"]["Sex"]["groups"] == {"F": 2, "M": 2}
+    assert "target_cells" in subgroup_check["observed"]["Sex"]
+
+
+def test_stage_a_categorical_protected_column_retains_subgroup_support_screen():
+    source = pd.DataFrame(
+        {
+            "Age": [20.0, 20.0, 30.0, 30.0],
+            "Sex": ["F", "F", "M", "M"],
+            "target": [0, 1, 0, 1],
+        }
+    )
+    contract = build_stage_a_contract(
+        source,
+        expected_n_samples=4,
+        target_column="target",
+        categorical_columns=["Sex"],
+        protected_columns=["Age", "Sex"],
+    )
+    candidate = pd.DataFrame(
+        {
+            "Age": [21.0, 21.5, 28.5, 29.0],
+            "Sex": ["F", "F", "F", "F"],
+            "target": [0, 1, 0, 1],
+        }
+    )
+
+    result = screen_stage_a(candidate, contract, source)
+
+    assert result.pruned
+    subgroup_check = next(
+        check for check in result.checks if check["screen"] == "subgroup_collapse"
+    )
+    assert not subgroup_check["passed"]
+    assert subgroup_check["observed"]["Sex"]["groups"] == {"F": 4, "M": 0}
+    assert any("protected-group support" in reason for reason in result.prune_reasons)
+    assert any("target/protected cell 'Sex'='M'|0" in reason for reason in result.prune_reasons)
+
+
 @pytest.mark.parametrize(
     ("mutate", "screen"),
     [
@@ -986,6 +1064,56 @@ def test_stage_a_screen_prunes_invalid_candidates(mutate, screen):
 
     assert result.pruned
     assert any(check["screen"] == screen and not check["passed"] for check in result.checks)
+
+
+def test_stage_a_screen_bounds_wide_diagnostic_reasons_without_dropping_observed_evidence(
+    tmp_path: Path,
+):
+    row_count = 1000
+    source = pd.DataFrame(
+        {
+            "group": [f"source-group-{index}" for index in range(row_count)],
+            "target": [0] * row_count,
+        }
+    )
+    candidate = pd.DataFrame(
+        {
+            "group": [f"candidate-group-{index}" for index in range(row_count)],
+            "target": [0] * row_count,
+        }
+    )
+
+    contract = build_stage_a_contract(
+        source,
+        expected_n_samples=row_count,
+        target_column="target",
+        categorical_columns=["group"],
+        protected_columns=["group"],
+    )
+    result = screen_stage_a(candidate, contract, source)
+
+    assert result.pruned
+    assert all(len(reason) <= 4096 for reason in result.prune_reasons)
+    assert all(len(check["reason"]) <= 4096 for check in result.checks if "reason" in check)
+    assert all(
+        check["reason"].endswith(" ... [truncated]")
+        for check in result.checks
+        if check["screen"] in {"bounds_categories", "subgroup_collapse"}
+    )
+    bounds_check = next(check for check in result.checks if check["screen"] == "bounds_categories")
+    subgroup_check = next(
+        check for check in result.checks if check["screen"] == "subgroup_collapse"
+    )
+    assert len(bounds_check["observed"]["group"]["unseen"]) == row_count
+    assert len(subgroup_check["observed"]["group"]["groups"]) == row_count
+    result_path = persist_stage_a_result(tmp_path, "wide-reasons", 0, result)
+    assert validate_existing_stage_a_trial_result(tmp_path, "wide-reasons", 0, contract)
+    payload = json.loads(result_path.read_text())
+    persisted_check_reasons = [check["reason"] for check in payload["checks"] if "reason" in check]
+    assert all(len(reason) <= 4096 for reason in persisted_check_reasons)
+    assert all(len(reason) <= 4096 for reason in payload["prune_reasons"])
+    assert persisted_check_reasons == payload["prune_reasons"]
+    assert payload["state"] == "pruned"
 
 
 def test_stage_a_screen_enforces_zero_exact_reuse_and_target_support():
@@ -1439,6 +1567,10 @@ def test_stage_a_result_path_in_checkpoint_is_relative_and_safe(tmp_path):
     result_payload["contract_digest"] = "stage-a"
     result_path.write_text(json.dumps(result_payload))
     trial.set_user_attr("stage_a_contract_digest", "stage-a")
+    trial.set_user_attr(
+        "hpo_error_provenance",
+        hpo_module.hpo_exception_provenance(Exception(), location="stage_a_screen_exception"),
+    )
     checkpoint = persist_hpo_trial_checkpoint(
         tmp_path / "checkpoints",
         "safe_paths",
@@ -1816,6 +1948,12 @@ def test_resuming_recovers_stale_running_trial_without_extra_allocation(tmp_path
         "reason_code": "stale_running_trial_recovery",
         "terminal_state": "FAIL",
     }
+    provenance = recovered.user_attrs["hpo_error_provenance"]
+    assert hpo_module._validate_hpo_error_provenance(provenance) == provenance
+    assert provenance["error_reason_code"] == "hpo_trial_exception"
+    assert provenance["error_location"] == "stale_running_trial_recovery"
+    assert recovered.user_attrs["hpo_outcome"] == {**provenance, "state": "failed"}
+    assert "/" not in provenance["error_message"]
 
 
 def test_stale_running_recovery_is_idempotent(tmp_path):
@@ -1859,6 +1997,141 @@ def test_stale_running_recovery_is_idempotent(tmp_path):
     assert second.state == optuna.trial.TrialState.FAIL
     assert second.params == first.params
     assert second.user_attrs == first.user_attrs
+
+
+def test_stale_running_recovery_rejects_raw_provenance_without_copying_it(tmp_path):
+    config = HPOConfig(n_trials=1, timeout_seconds=None)
+    context = _hpo_context()
+    study = hpo_module.create_study(
+        "hpo_stale_unsafe", config, tmp_path, seed=0, hpo_context=context
+    )
+    stale = study.ask()
+    stale.set_user_attr("hpo_error_provenance", {"secret": "SECRET /tmp/raw-path"})
+
+    with pytest.raises(RuntimeError, match="HPO error provenance"):
+        run_study(
+            "hpo_stale_unsafe",
+            lambda _trial: 0.5,
+            config,
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+        )
+
+    recovered = optuna.load_study(
+        study_name=contextual_study_name("hpo_stale_unsafe", context),
+        storage=default_storage_url(tmp_path),
+    ).trials[0]
+    assert "hpo_outcome" not in recovered.user_attrs
+
+
+def test_already_failed_stale_recovery_gets_missing_provenance(tmp_path):
+    config = HPOConfig(n_trials=1, timeout_seconds=None)
+    context = _hpo_context()
+    study = hpo_module.create_study(
+        "hpo_stale_migration", config, tmp_path, seed=0, hpo_context=context
+    )
+    stale = study.ask()
+    stale.suggest_int("depth", 1, 2)
+    recovery = {
+        "schema_version": "hpo-running-recovery-v1",
+        "study_name": study.study_name,
+        "context_digest": hpo_context_digest(context),
+        "trial_number": stale.number,
+        "original_state": "RUNNING",
+        "reason_code": "stale_running_trial_recovery",
+        "terminal_state": "FAIL",
+    }
+    study._storage.set_trial_user_attr(stale._trial_id, "hpo_running_recovery", recovery)
+    study._storage.set_trial_state_values(stale._trial_id, optuna.trial.TrialState.FAIL)
+
+    with pytest.raises(RuntimeError, match="produced no completed trials"):
+        run_study(
+            "hpo_stale_migration",
+            lambda _trial: 0.5,
+            config,
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+        )
+
+    migrated = optuna.load_study(
+        study_name=contextual_study_name("hpo_stale_migration", context),
+        storage=default_storage_url(tmp_path),
+    ).trials[0]
+    assert migrated.state == optuna.trial.TrialState.FAIL
+    assert migrated.params == stale.params
+    assert migrated.user_attrs["hpo_running_recovery"] == recovery
+    provenance = migrated.user_attrs["hpo_error_provenance"]
+    assert hpo_module._validate_hpo_error_provenance(provenance) == provenance
+    assert migrated.user_attrs["hpo_outcome"] == {**provenance, "state": "failed"}
+
+
+def test_noncanonical_noncompleted_checkpoint_rejects_missing_provenance(tmp_path):
+    study = optuna.create_study(
+        study_name="missing_provenance", storage=default_storage_url(tmp_path)
+    )
+    study.optimize(lambda _trial: (_ for _ in ()).throw(optuna.TrialPruned()), n_trials=1)
+
+    with pytest.raises(RuntimeError, match="requires error provenance"):
+        persist_hpo_trial_checkpoint(
+            tmp_path / "hpo_checkpoints",
+            "missing_provenance",
+            study.trials[0],
+            hpo_context=_hpo_context(),
+        )
+
+
+def test_canonical_stale_recovery_persists_valid_checkpoint(tmp_path):
+    metric_config = {
+        "canonical_objectives": [
+            "tstr_macro_f1.v1",
+            "mixed_mmd.v1",
+            "elastic_net_jsd.v1",
+        ]
+    }
+    config = HPOConfig(n_trials=2, timeout_seconds=None, metric_config=metric_config)
+    context = _hpo_context(metric_config=metric_config)
+    study = hpo_module.create_study(
+        "hpo_canonical_stale", config, tmp_path, seed=0, hpo_context=context
+    )
+
+    def complete(trial):
+        metadata = _canonical_metric_metadata(failed=False)
+        trial.set_user_attr("metric_metadata", metadata)
+        trial.set_user_attr("result_metadata", dict(metadata))
+        return 0.25
+
+    study.optimize(complete, n_trials=1)
+    stale = study.ask()
+    stale.suggest_int("depth", 1, 2)
+
+    run_study(
+        "hpo_canonical_stale",
+        lambda _trial: pytest.fail("recovery must not allocate a trial"),
+        config,
+        tmp_path,
+        seed=0,
+        drop_keys=(),
+        hpo_context=context,
+    )
+
+    checkpoint = load_hpo_trial_checkpoint(
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name("hpo_canonical_stale", context)
+        / f"trial-{stale.number}"
+        / "checkpoint.json",
+        hpo_context=context,
+    )
+    assert checkpoint["state"] == "failed"
+    provenance = checkpoint["metadata"]["hpo_error_provenance"]
+    assert hpo_module._validate_hpo_error_provenance(provenance) == provenance
+    assert checkpoint["metadata"]["outcome"] == {**provenance, "state": "failed"}
+    assert "SECRET" not in json.dumps(checkpoint)
+    assert "/tmp" not in json.dumps(checkpoint)
 
 
 def test_hpo_checkpoint_resume_rejects_changed_implementation_fingerprint(tmp_path):
@@ -2118,6 +2391,57 @@ def test_canonical_failed_checkpoint_requires_matching_safe_evidence(tmp_path):
         )
 
 
+@pytest.mark.parametrize("canonical", [True, False], ids=["canonical", "noncanonical"])
+def test_checkpoint_rejects_outcome_provenance_mismatch(tmp_path, canonical):
+    payload, context = _canonical_checkpoint_payload(tmp_path, state="pruned")
+    if not canonical:
+        context = dict(context)
+        context["metric_config"] = {"task12": ["mixed_mmd.v1"]}
+        context.pop("canonical_hpo")
+        context.pop("canonical_expected_keys")
+        payload["hpo_context"] = context
+        payload["hpo_context_digest"] = hpo_context_digest(context)
+    outcome = payload["metadata"]["outcome"]
+    outcome["error_location"] = "different_location"
+
+    with pytest.raises(RuntimeError, match="does not match error provenance"):
+        hpo_module._validate_hpo_trial_checkpoint(
+            payload,
+            expected_study_name=payload["study_name"],
+            expected_context_digest=hpo_context_digest(context),
+        )
+
+
+def test_recovery_outcome_rejects_complete_group_unsafe_but_accepts_failure():
+    provenance = hpo_module.hpo_exception_provenance(
+        hpo_module.HPOGroupUnsafeError("unsafe details"),
+        location="grouped_metric_evaluation",
+    )
+    outcome = {
+        **provenance,
+        "state": "complete",
+        "status": "group_unsafe",
+        "group_safety": {"status": "group_unsafe", "reason_code": "group_unsafe"},
+    }
+
+    with pytest.raises(RuntimeError, match="completed trial group unsafe"):
+        hpo_module._validate_hpo_recovery_evidence(
+            provenance,
+            outcome,
+            expected_state="complete",
+        )
+
+    outcome["state"] = "failed"
+    assert (
+        hpo_module._validate_hpo_recovery_evidence(
+            provenance,
+            outcome,
+            expected_state="failed",
+        )[1]
+        == outcome
+    )
+
+
 def test_failed_hpo_checkpoint_persists_exception_context(tmp_path):
     sentinel = "generator fit failed SECRET_VALUE /tmp/raw-path"
 
@@ -2349,6 +2673,10 @@ def test_mixed_metric_failure_reasons_survive_checkpoint_validation(tmp_path):
     payload["metadata"]["hpo_error_provenance"] = hpo_module.hpo_exception_provenance(
         provenance, location="canonical_metric_evaluation"
     )
+    payload["metadata"]["outcome"] = {
+        **payload["metadata"]["hpo_error_provenance"],
+        "state": "pruned",
+    }
 
     validated = hpo_module._validate_hpo_trial_checkpoint(
         payload,
@@ -3310,6 +3638,95 @@ def test_canonical_jsd_uses_tuning_for_candidate_evidence_not_train():
     assert second.loc["elastic_net_jsd.v1", "mean"] != pytest.approx(
         first.loc["elastic_net_jsd.v1", "mean"]
     )
+
+
+def test_canonical_release_intervals_use_effective_categorical_metric_schema(mocker):
+    frames = [
+        pd.DataFrame({"Age": [17.0, 46.0], "target": [0, 1]}),
+        pd.DataFrame({"Age": [18.0, 60.0], "target": [0, 1]}),
+        pd.DataFrame({"Age": [17.0, 60.0], "target": [0, 1]}),
+    ]
+    generalization = {
+        "columns": {
+            "Age": {
+                "intervals": [
+                    {"lower": None, "upper": 18, "label": "<18"},
+                    {"lower": 18, "upper": 61, "label": "18-60"},
+                    {"lower": 61, "upper": None, "label": ">60"},
+                ]
+            }
+        }
+    }
+    mmd = mocker.patch.object(
+        hpo_module,
+        "_evaluate_train_frozen_mmd",
+        return_value={"b_mmd_clip": 0.1, "bandwidth": 1.0},
+    )
+    jsd = mocker.patch.object(
+        hpo_module,
+        "_evaluate_train_frozen_jsd",
+        return_value=(0.2, {"candidate_state": "valid"}),
+    )
+    mocker.patch(
+        "synthdata.evaluation.tstr.run_tstr_evaluation",
+        return_value=mocker.Mock(report={"macro_f1": 0.5}),
+    )
+
+    report = hpo_module.evaluate_canonical_hpo_metrics(
+        *frames,
+        metric_config={"task12": ["mixed_mmd.v1"]},
+        target_column="target",
+        feature_types={"Age": "continuous", "target": "categorical"},
+        release_generalization=generalization,
+    )
+
+    expected = {"Age": "categorical", "target": "categorical"}
+    assert mmd.call_args.kwargs["continuous_columns"] == []
+    assert mmd.call_args.kwargs["nominal_columns"] == ["Age", "target"]
+    assert jsd.call_args.kwargs["feature_types"] == expected
+    for key in ("mixed_mmd.v1", "elastic_net_jsd.v1"):
+        assert report.loc[key, "metric_feature_types"] == expected
+        assert report.loc[key, "original_feature_types"] == {
+            "Age": "continuous",
+            "target": "categorical",
+        }
+        assert report.loc[key, "generalized_categorical_columns"] == ["Age"]
+
+
+def test_canonical_none_jsd_is_explicitly_not_eligible_with_evidence(mocker):
+    frame = pd.DataFrame({"feature": ["a", "b"], "target": [0, 1]})
+    mocker.patch.object(
+        hpo_module,
+        "_evaluate_train_frozen_mmd",
+        return_value={"b_mmd_clip": 0.1, "bandwidth": 1.0},
+    )
+    mocker.patch.object(
+        hpo_module,
+        "_evaluate_train_frozen_jsd",
+        return_value=(None, {"candidate_state": "indeterminate"}),
+    )
+    mocker.patch(
+        "synthdata.evaluation.tstr.run_tstr_evaluation",
+        return_value=mocker.Mock(report={"macro_f1": 0.5}),
+    )
+
+    report = hpo_module.evaluate_canonical_hpo_metrics(
+        frame,
+        frame.copy(),
+        frame.copy(),
+        metric_config={"task12": ["elastic_net_jsd.v1"]},
+        target_column="target",
+        feature_types={"feature": "categorical", "target": "categorical"},
+    )
+
+    row = report.loc["elastic_net_jsd.v1"]
+    assert row["errors"] == 1
+    assert row["error_reason_code"] == "hpo_metric_not_eligible"
+    assert row["error_type"] == "HPOMetricNotEligibleError"
+    assert pd.isna(row["mean"])
+    assert row["support"] == {"candidate_state": "indeterminate"}
+    assert row["provenance"]["release_transform_digest"]
+    assert row["provenance"]["role_hashes"]
 
 
 def test_hpo_context_is_invariant_to_candidate_order_and_excludes_holdout():
