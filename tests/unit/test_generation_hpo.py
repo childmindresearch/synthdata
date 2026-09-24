@@ -63,6 +63,10 @@ def _screen_trial_callback(
     return wrapped
 
 
+def _unexpected_hpo_trial(_trial: optuna.Trial) -> float:
+    raise AssertionError("recovery must not allocate a trial")
+
+
 def _hpo_context(**overrides):
     context = build_hpo_context(
         task_type="classification",
@@ -1066,6 +1070,25 @@ def test_stage_a_screen_prunes_invalid_candidates(mutate, screen):
     assert any(check["screen"] == screen and not check["passed"] for check in result.checks)
 
 
+def test_stage_a_empty_candidate_persists_shape_schema_prune(tmp_path):
+    source = _stage_a_source()
+    contract = _stage_a_contract(source)
+    result = screen_stage_a(source.iloc[0:0].copy(), contract, source)
+
+    assert result.pruned
+    shape_check = next(check for check in result.checks if check["screen"] == "shape_schema")
+    assert shape_check["passed"] is False
+    assert shape_check["observed"]["rows"] == 0
+    result_path = persist_stage_a_result(tmp_path, "empty_candidate", 0, result)
+
+    assert validate_existing_stage_a_trial_result(tmp_path, "empty_candidate", 0, contract)
+    payload = json.loads(result_path.read_text())
+    assert payload["state"] == "pruned"
+    assert payload["candidate_shape"][0] == 0
+    assert payload["checks"][0]["screen"] == "shape_schema"
+    assert payload["checks"][0]["passed"] is False
+
+
 def test_stage_a_screen_bounds_wide_diagnostic_reasons_without_dropping_observed_evidence(
     tmp_path: Path,
 ):
@@ -1983,7 +2006,7 @@ def test_stale_running_recovery_is_idempotent(tmp_path):
     with pytest.raises(RuntimeError, match="produced no completed trials"):
         run_study(
             "hpo_stale_idempotent",
-            lambda _trial: pytest.fail("recovery must not allocate a trial"),
+            _unexpected_hpo_trial,
             config,
             tmp_path,
             seed=0,
@@ -2110,7 +2133,7 @@ def test_canonical_stale_recovery_persists_valid_checkpoint(tmp_path):
 
     run_study(
         "hpo_canonical_stale",
-        lambda _trial: pytest.fail("recovery must not allocate a trial"),
+        _unexpected_hpo_trial,
         config,
         tmp_path,
         seed=0,
@@ -2592,7 +2615,7 @@ def test_stage_a_prune_through_tracked_objective_preserves_evidence(tmp_path):
         )
         return 0.0
 
-    with pytest.raises(RuntimeError, match="no completed trials"):
+    with pytest.raises(hpo_module.StageAExhaustionError) as exhaustion:
         run_study(
             "stage_a_tracked_prune",
             objective,
@@ -2603,6 +2626,14 @@ def test_stage_a_prune_through_tracked_objective_preserves_evidence(tmp_path):
             hpo_context=context,
             stage_a_root=tmp_path,
         )
+    assert exhaustion.value.study_name == persisted_study_name
+    assert exhaustion.value.evidence_references == [
+        {
+            "trial_number": 0,
+            "result_path": f"{persisted_study_name}/trial-0/result.json",
+            "contract_digest": contract.digest,
+        }
+    ]
 
     checkpoint = load_hpo_trial_checkpoint(
         tmp_path / "hpo_checkpoints" / persisted_study_name / "trial-0" / "checkpoint.json",
@@ -2616,6 +2647,35 @@ def test_stage_a_prune_through_tracked_objective_preserves_evidence(tmp_path):
     assert metadata["stage_a"]["prune_reasons"]
     assert metadata["hpo_error_provenance"]["error_reason_code"] == "hpo_trial_exception"
     assert metadata["outcome"]["state"] == "pruned"
+
+
+def test_stage_a_screen_exception_is_not_candidate_exhaustion(tmp_path):
+    source = _stage_a_source()
+    contract = _stage_a_contract(source)
+    context = _hpo_context(stage_a_contract_digest=contract.digest)
+    study_name = contextual_study_name("stage_a_exception_prune", context)
+
+    def objective(trial):
+        hpo_module.persist_stage_a_trial_exception(
+            trial,
+            tmp_path,
+            study_name,
+            contract,
+            ValueError("screen construction failed"),
+        )
+        raise optuna.TrialPruned("Stage A screen failed")
+
+    with pytest.raises(RuntimeError, match="produced no completed trials"):
+        run_study(
+            "stage_a_exception_prune",
+            objective,
+            HPOConfig(n_trials=1),
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+            stage_a_root=tmp_path,
+        )
 
 
 def test_uncaught_objective_exception_produces_valid_fail_checkpoint(tmp_path):
@@ -2834,8 +2894,11 @@ def test_hpo_metadata_allows_safe_slash_bearing_identifier():
 
 
 def test_hpo_exception_provenance_maps_unknown_reason_code():
-    error = RuntimeError("SECRET /tmp/raw-data")
-    error.reason_code = "untrusted_reason"  # type: ignore[attr-defined]
+    class ErrorWithReasonCode(RuntimeError):
+        reason_code: str
+
+    error = ErrorWithReasonCode("SECRET /tmp/raw-data")
+    error.reason_code = "untrusted_reason"
 
     provenance = hpo_module.hpo_exception_provenance(error, location="test")
 

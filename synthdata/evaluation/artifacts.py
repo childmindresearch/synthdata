@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import uuid
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from numbers import Real
 from pathlib import Path
@@ -163,6 +164,15 @@ _FINAL_REFIT_IDENTITY_KEYS = frozenset(
     }
 )
 _LEGACY_FINAL_EVIDENCE_SCHEMA = "final-holdout-evidence-legacy-v1"
+
+
+@dataclass(frozen=True)
+class GenerationInventory:
+    """Validated generation outputs declared by an experiment manifest."""
+
+    expected_outputs: tuple[str, ...]
+    produced_outputs: tuple[str, ...]
+    failed_outputs: tuple[str, ...]
 
 
 def _final_evidence_state_defaults(evidence: Mapping[str, Any]) -> dict[str, str]:
@@ -339,6 +349,275 @@ def _file_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _stage_a_base_study_name(model_name: str) -> str:
+    """Return generation's base study name for one supported failed HPO output."""
+    if model_name.startswith("tabpfgen_"):
+        supported_models = {"tabpfgen_standard_hpo", "tabpfgen_custom_hpo"}
+        if model_name not in supported_models:
+            raise ValueError(f"Unsupported Stage A failed output model {model_name!r}")
+    elif not model_name.endswith("_hpo") or not model_name[: -len("_hpo")]:
+        raise ValueError(f"Unsupported Stage A failed output model {model_name!r}")
+    return f"hpo_{model_name[: -len('_hpo')]}"
+
+
+def _load_stage_a_bound_hpo_context(
+    generation_root: Path,
+    failure: Mapping[str, Any],
+    *,
+    model_name: str,
+) -> tuple[dict[str, Any], str]:
+    """Load current digest-versioned context and require its failed-output bindings."""
+    from synthdata.generation import hpo
+
+    label = f"Stage A failure {model_name!r} HPO context"
+    expected_digest = _sha256_digest(failure.get("hpo_context_digest"), f"{label} digest")
+    expected_filename = f"hpo_context-{expected_digest}.json"
+    context_path_value = _non_empty_string(failure.get("hpo_context_path"), f"{label} path")
+    if context_path_value != expected_filename:
+        raise ValueError(f"{label} path must reference its digest-versioned artifact")
+    context_path = _relative_artifact_path(generation_root, context_path_value, label)
+    if context_path.is_symlink() or not context_path.is_file():
+        raise ValueError(f"{label} artifact must be a regular file")
+    try:
+        payload = json.loads(context_path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} artifact is unreadable") from exc
+    if not isinstance(payload, Mapping) or set(payload) != {
+        "schema_version",
+        "context_digest",
+        "context",
+        "context_file",
+    }:
+        raise ValueError(f"{label} artifact has an invalid shape")
+    if payload.get("schema_version") != hpo.HPO_CONTEXT_SCHEMA_VERSION:
+        raise ValueError(f"{label} artifact has an unsupported schema")
+    if payload.get("context_file") != expected_filename:
+        raise ValueError(f"{label} artifact filename binding is invalid")
+    if _sha256_digest(payload.get("context_digest"), f"{label} artifact digest") != expected_digest:
+        raise ValueError(f"{label} artifact digest does not match generation binding")
+    context = payload.get("context")
+    try:
+        validated_context = hpo._require_validated_hpo_context(context, label=label)
+        recomputed_digest = hpo.hpo_context_digest(validated_context)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} context is invalid") from exc
+    if recomputed_digest != expected_digest:
+        raise ValueError(f"{label} context digest does not match generation binding")
+
+    # The mutable pointer is the context persisted as current by this generation
+    # run. A valid but stale versioned artifact alone cannot authorize omission.
+    pointer_path = _relative_artifact_path(generation_root, "hpo_context.json", label)
+    if pointer_path.is_symlink() or not pointer_path.is_file():
+        raise ValueError(f"{label} current context pointer is missing or unsafe")
+    try:
+        current_payload = json.loads(pointer_path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} current context pointer is unreadable") from exc
+    if current_payload != payload:
+        raise ValueError(f"{label} artifact is stale or differs from current generation context")
+
+    expected_contract_digest = _sha256_digest(
+        validated_context.get("stage_a_contract_digest"),
+        f"{label}.stage_a_contract_digest",
+    )
+    if (
+        _sha256_digest(
+            failure.get("stage_a_contract_digest"),
+            f"Stage A failure {model_name!r} contract digest",
+        )
+        != expected_contract_digest
+    ):
+        raise ValueError(f"Stage A failure {model_name!r} contract binding differs from context")
+    expected_study = hpo.contextual_study_name(
+        _stage_a_base_study_name(model_name), validated_context
+    )
+    study_name = _non_empty_string(
+        failure.get("hpo_study"), f"Stage A failure {model_name!r}.hpo_study"
+    )
+    if study_name != expected_study:
+        raise ValueError(
+            f"Stage A failure {model_name!r} study does not match its bound HPO context"
+        )
+    return validated_context, expected_contract_digest
+
+
+def load_generation_inventory(
+    manifest_path: str | Path,
+    generation_dir: str | Path,
+) -> GenerationInventory:
+    """Resolve and validate latest generation completeness from experiment evidence."""
+    manifest_file = Path(manifest_path)
+    if manifest_file.is_symlink() or not manifest_file.is_file():
+        raise ValueError("Experiment manifest must be a regular file")
+    try:
+        manifest = json.loads(manifest_file.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Experiment manifest is unreadable") from exc
+    if not isinstance(manifest, Mapping):
+        raise ValueError("Experiment manifest must be an object")
+    runs = manifest.get("runs")
+    if not isinstance(runs, list):
+        raise ValueError("Experiment manifest runs must be a list")
+    if any(not isinstance(run, Mapping) for run in runs):
+        raise ValueError("Experiment manifest runs must contain objects")
+    generation_runs = [run for run in runs if run.get("stage") == "generation"]
+    if not generation_runs:
+        raise ValueError("Experiment manifest has no generation record")
+    generation = generation_runs[-1]
+    artifacts_payload = generation.get("artifacts")
+    if not isinstance(artifacts_payload, Mapping):
+        raise ValueError("Generation manifest artifacts must be an object")
+
+    inventory_fields = {"expected_outputs", "produced_outputs", "failed_outputs", "failed_models"}
+    status = generation.get("status")
+    if "status" not in generation:
+        if inventory_fields & set(generation):
+            raise ValueError("Legacy generation manifest cannot contain partial inventory fields")
+        legacy_models = _string_list(artifacts_payload.get("models"), "Legacy generation models")
+        if len(legacy_models) != len(set(legacy_models)):
+            raise ValueError("Legacy generation models must not contain duplicates")
+        return GenerationInventory(
+            expected_outputs=tuple(legacy_models),
+            produced_outputs=tuple(legacy_models),
+            failed_outputs=(),
+        )
+
+    if not isinstance(status, str) or status not in {"complete", "partial"}:
+        raise ValueError(f"Generation manifest has invalid status {status!r}")
+    expected_outputs = _string_list(
+        generation.get("expected_outputs"), "Generation expected_outputs"
+    )
+    produced_outputs = _string_list(
+        generation.get("produced_outputs"), "Generation produced_outputs"
+    )
+    failed_outputs = _string_list(generation.get("failed_outputs"), "Generation failed_outputs")
+    for label, values in (
+        ("expected_outputs", expected_outputs),
+        ("produced_outputs", produced_outputs),
+        ("failed_outputs", failed_outputs),
+    ):
+        if len(values) != len(set(values)):
+            raise ValueError(f"Generation {label} must not contain duplicates")
+    if set(expected_outputs) != set(produced_outputs) | set(failed_outputs):
+        raise ValueError("Generation expected_outputs must equal produced plus failed outputs")
+    if set(produced_outputs) & set(failed_outputs):
+        raise ValueError("Generation produced_outputs and failed_outputs must be disjoint")
+
+    failed_models = generation.get("failed_models")
+    if not isinstance(failed_models, list):
+        raise ValueError("Generation failed_models must be a list")
+    failed_by_model: dict[str, Mapping[str, Any]] = {}
+    for index, item in enumerate(failed_models):
+        label = f"Generation failed_models[{index}]"
+        if not isinstance(item, Mapping) or set(item) != {
+            "model",
+            "hpo_study",
+            "hpo_context_path",
+            "hpo_context_digest",
+            "stage_a_contract_digest",
+            "evidence_references",
+        }:
+            raise ValueError(f"{label} has an invalid shape")
+        model_name = _non_empty_string(item.get("model"), f"{label}.model")
+        if model_name in failed_by_model:
+            raise ValueError("Generation failed_models must not contain duplicate models")
+        failed_by_model[model_name] = item
+    if set(failed_by_model) != set(failed_outputs):
+        raise ValueError("Generation failed_models do not match failed_outputs")
+
+    models = _string_list(artifacts_payload.get("models"), "Generation artifact models")
+    if len(models) != len(set(models)) or set(models) != set(produced_outputs):
+        raise ValueError("Generation artifact models do not match produced_outputs")
+    n_models = generation.get("n_models")
+    if (
+        isinstance(n_models, bool)
+        or not isinstance(n_models, int)
+        or n_models != len(produced_outputs)
+    ):
+        raise ValueError("Generation n_models does not match produced_outputs")
+
+    if status == "complete":
+        if failed_outputs or failed_models or set(expected_outputs) != set(produced_outputs):
+            raise ValueError("Complete generation manifest contains failed or missing outputs")
+    elif not failed_outputs:
+        raise ValueError("Partial generation manifest must declare failed outputs")
+
+    generation_root = Path(generation_dir)
+    if generation_root.is_symlink() or not generation_root.is_dir():
+        raise ValueError("Generated-data root must be a regular directory")
+    generation_root = generation_root.resolve()
+    stage_a_root = generation_root / "hpo_stage_a"
+    for model_name, failure in failed_by_model.items():
+        context, expected_contract_digest = _load_stage_a_bound_hpo_context(
+            generation_root, failure, model_name=model_name
+        )
+        study_name = cast(str, failure["hpo_study"])
+        references = failure.get("evidence_references")
+        if not isinstance(references, list) or not references:
+            raise ValueError(f"Stage A failure {model_name!r} requires evidence references")
+        trial_numbers: list[int] = []
+        result_paths: set[str] = set()
+        contract_digest: str | None = None
+        for index, reference in enumerate(references):
+            label = f"Stage A failure {model_name!r}.evidence_references[{index}]"
+            if not isinstance(reference, Mapping) or set(reference) != {
+                "trial_number",
+                "result_path",
+                "contract_digest",
+            }:
+                raise ValueError(f"{label} has an invalid shape")
+            trial_number = reference.get("trial_number")
+            if (
+                isinstance(trial_number, bool)
+                or not isinstance(trial_number, int)
+                or trial_number < 0
+            ):
+                raise ValueError(f"{label}.trial_number must be a non-negative integer")
+            result_path = _non_empty_string(reference.get("result_path"), f"{label}.result_path")
+            digest = _sha256_digest(reference.get("contract_digest"), f"{label}.contract_digest")
+            if (
+                digest != expected_contract_digest
+                or result_path in result_paths
+                or (contract_digest is not None and digest != contract_digest)
+            ):
+                raise ValueError(f"{label} duplicates or conflicts with prior evidence")
+            trial_numbers.append(trial_number)
+            result_paths.add(result_path)
+            contract_digest = digest
+
+            from synthdata.generation import hpo
+
+            evidence_reference = {
+                "state": "pruned",
+                "contract_digest": digest,
+                "result_path": result_path,
+            }
+            try:
+                hpo._validate_stage_a_result_artifact(
+                    evidence_reference,
+                    root=stage_a_root,
+                    context=context,
+                    expected_study_name=study_name,
+                    expected_trial_number=trial_number,
+                )
+                result = hpo._read_stage_a_json_pinned(stage_a_root, stage_a_root / result_path)
+            except (RuntimeError, ValueError) as exc:
+                raise ValueError(f"{label} failed Stage A evidence validation") from exc
+            if not any(
+                check.get("screen") in hpo.STAGE_A_SCREEN_IDS and check.get("passed") is False
+                for check in result["checks"]
+            ):
+                raise ValueError(f"{label} does not prove Stage A rejection")
+        if sorted(trial_numbers) != list(range(len(trial_numbers))):
+            raise ValueError(f"Stage A failure {model_name!r} evidence trials are incomplete")
+
+    return GenerationInventory(
+        expected_outputs=tuple(expected_outputs),
+        produced_outputs=tuple(produced_outputs),
+        failed_outputs=tuple(failed_outputs),
+    )
+
+
 def load_validated_generated_datasets(
     generation_dir: str | Path,
     dataset,
@@ -346,6 +625,7 @@ def load_validated_generated_datasets(
     model_names: list[str] | None = None,
     classification_score: str | None = None,
     generation_hpo_enabled: bool | None = None,
+    generation_inventory: GenerationInventory | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Load generated CSVs only when their current cache envelopes verify.
 
@@ -364,14 +644,59 @@ def load_validated_generated_datasets(
     ):
         raise ValueError("Generated CSVs must be contained regular files, not symlinks")
     discovered = {path.stem for path in csv_paths}
-    expected = set(model_names) if model_names else discovered
-    if discovered != expected:
-        missing = sorted(expected - discovered)
-        unexpected = sorted(discovered - expected)
+    sidecar_paths = sorted(root.glob("*.cache.json"))
+    if any(
+        path.is_symlink() or not path.is_file() or not path.resolve().is_file()
+        for path in sidecar_paths
+    ):
+        raise ValueError("Generated cache sidecars must be contained regular files, not symlinks")
+    sidecar_models = {path.name[: -len(".cache.json")] for path in sidecar_paths}
+    if sidecar_models != discovered:
+        missing_sidecars = sorted(discovered - sidecar_models)
+        orphaned_sidecars = sorted(sidecar_models - discovered)
         raise ValueError(
-            f"Generated model inventory mismatch; missing={missing}, unexpected={unexpected}"
+            "Generated CSV/cache inventory mismatch; "
+            f"missing_sidecars={missing_sidecars}, orphaned_sidecars={orphaned_sidecars}"
         )
-    if not expected:
+
+    requested = set(model_names) if model_names else None
+    if generation_inventory is not None:
+        declared_produced = set(generation_inventory.produced_outputs)
+        if discovered != declared_produced:
+            missing = sorted(declared_produced - discovered)
+            unexpected = sorted(discovered - declared_produced)
+            raise ValueError(
+                "Generated model inventory does not match experiment manifest; "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        expected = set(generation_inventory.expected_outputs)
+        allowed_missing = set(generation_inventory.failed_outputs)
+        selected = expected if requested is None else requested
+        unexplained_requested = selected - expected
+        if unexplained_requested:
+            raise ValueError(
+                "Requested evaluation models are not declared by the generation manifest: "
+                f"{sorted(unexplained_requested)}"
+            )
+        missing_requested = (selected - declared_produced) - allowed_missing
+        if missing_requested:
+            raise ValueError(
+                "Generated model inventory mismatch; "
+                f"missing={sorted(missing_requested)}, unexpected=[]"
+            )
+        validation_models = declared_produced
+    else:
+        expected = requested if requested is not None else discovered
+        allowed_missing = set()
+        unexplained_missing = expected - discovered
+        unexpected = discovered - expected
+        if unexplained_missing or unexpected:
+            raise ValueError(
+                "Generated model inventory mismatch; "
+                f"missing={sorted(unexplained_missing)}, unexpected={sorted(unexpected)}"
+            )
+        validation_models = expected - allowed_missing
+    if not validation_models:
         return {}
 
     from synthdata.data import role_context_payload, semantic_context_payload
@@ -381,7 +706,7 @@ def load_validated_generated_datasets(
     # expected role context so one stale config flag cannot reinterpret caches.
     cache_payloads: dict[str, Mapping[str, Any]] = {}
     persisted_scopes: dict[str, tuple[str, ...]] = {}
-    for model_name in sorted(expected):
+    for model_name in sorted(validation_models):
         metadata_path = _relative_artifact_path(root, f"{model_name}.cache.json", "Generated cache")
         if (
             metadata_path.is_symlink()
@@ -428,7 +753,7 @@ def load_validated_generated_datasets(
     expected_schema = dataset.variable_schema_fingerprint
     expected_registry = DEFAULT_METRIC_CONTRACT_REGISTRY.digest()
     loaded: dict[str, pd.DataFrame] = {}
-    for model_name in sorted(expected):
+    for model_name in sorted(validation_models):
         csv_path = _relative_artifact_path(root, f"{model_name}.csv", "Generated data")
         metadata_path = _relative_artifact_path(root, f"{model_name}.cache.json", "Generated cache")
         if (
@@ -465,6 +790,8 @@ def load_validated_generated_datasets(
         if len(frame) != payload["row_count"]:
             raise ValueError(f"Generated data row count does not match cache for {model_name!r}")
         loaded[model_name] = frame
+    if generation_inventory is not None and requested is not None:
+        return {model_name: loaded[model_name] for model_name in sorted(requested & set(loaded))}
     return loaded
 
 

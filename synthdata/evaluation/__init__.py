@@ -224,18 +224,63 @@ def _generation_metadata(cfg: Config, model_names: list[str]) -> dict[str, dict]
 
 
 def select_models(
-    cfg: Config, synthetic_datasets: dict[str, pd.DataFrame]
+    cfg: Config,
+    synthetic_datasets: dict[str, pd.DataFrame],
+    generation_inventory: artifacts.GenerationInventory | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """Restrict to cfg.evaluation.models if set, else evaluate everything generated."""
-    if not cfg.evaluation.models:
+    """Restrict evaluation to requested, manifest-declared generated models."""
+    requested = list(cfg.evaluation.models or [])
+    if not requested and generation_inventory is not None:
+        requested = list(generation_inventory.expected_outputs)
+    if not requested:
         return synthetic_datasets
-    missing = [m for m in cfg.evaluation.models if m not in synthetic_datasets]
-    if missing:
+    missing = [model for model in requested if model not in synthetic_datasets]
+    allowed_missing = (
+        set(generation_inventory.failed_outputs) & set(requested)
+        if generation_inventory is not None
+        else set()
+    )
+    unexplained_missing = [model for model in missing if model not in allowed_missing]
+    if unexplained_missing:
         raise ValueError(
             "Requested evaluation models are missing from generated datasets: "
-            f"{missing}. Regenerate or remove missing models before evaluation."
+            f"{unexplained_missing}. Regenerate or remove missing models before evaluation."
         )
-    return {k: v for k, v in synthetic_datasets.items() if k in cfg.evaluation.models}
+    return {name: synthetic_datasets[name] for name in requested if name in synthetic_datasets}
+
+
+def _evaluation_coverage(
+    requested_models: list[str],
+    selected_datasets: dict[str, pd.DataFrame],
+    generation_inventory: artifacts.GenerationInventory | None,
+) -> dict | None:
+    """Describe validated model coverage without creating rows for failed outputs."""
+    if generation_inventory is None:
+        return None
+    failed_names = set(generation_inventory.failed_outputs)
+    failed_outputs = [name for name in requested_models if name in failed_names]
+    if not failed_outputs:
+        return None
+    return {
+        "status": "partial",
+        "requested_models": list(requested_models),
+        "evaluated_models": sorted(selected_datasets),
+        "failed_outputs": failed_outputs,
+    }
+
+
+def _load_generation_inventory(experiment) -> artifacts.GenerationInventory | None:
+    """Reload the experiment's validated generation inventory for evaluation."""
+    if experiment is None:
+        return None
+    manifest_path = getattr(experiment, "manifest_path", None)
+    generation_dir = getattr(experiment, "generation_dir", None)
+    if manifest_path is None or generation_dir is None:
+        raise ValueError(
+            "Evaluation experiment must provide manifest_path and generation_dir "
+            "to validate generation completeness"
+        )
+    return artifacts.load_generation_inventory(manifest_path, generation_dir)
 
 
 def _synthcity_attack_target_types(dataset: Dataset, selection_cfg) -> dict[str, str]:
@@ -1225,8 +1270,30 @@ def run_evaluation(
         cfg.plots.output_dir = str(experiment.plots_dir)
     synthcity_semantics = _synthcity_semantic_context(dataset, eval_cfg.synthcity)
 
-    selected_datasets = select_models(cfg, synthetic_datasets)
+    generation_inventory = _load_generation_inventory(experiment)
+    selected_datasets = select_models(cfg, synthetic_datasets, generation_inventory)
     model_names = sorted(selected_datasets)
+    requested_models = (
+        list(eval_cfg.models)
+        if eval_cfg.models
+        else list(generation_inventory.expected_outputs)
+        if generation_inventory is not None
+        else list(model_names)
+    )
+    evaluation_coverage = _evaluation_coverage(
+        requested_models, selected_datasets, generation_inventory
+    )
+    if evaluation_coverage is not None:
+        attempt_metadata["evaluation_coverage"] = evaluation_coverage
+        logger.warning(
+            "[evaluation] partial model coverage experiment=%s dataset=%s@%s "
+            "evaluated=%s failed_outputs=%s",
+            getattr(experiment, "id", None),
+            dataset.name,
+            dataset.version,
+            model_names,
+            evaluation_coverage["failed_outputs"],
+        )
     logger.info("Evaluating %d models: %s", len(model_names), model_names)
     train_frame, tuning_frame, final_holdout_frame = _candidate_role_frames(dataset)
     group_context = syntheval_eval.build_group_context(
@@ -1645,6 +1712,8 @@ def run_evaluation(
         "final_holdout_evidence": final_holdout_evidence,
         "artifact_manifest": str(artifact_manifest),
     }
+    if evaluation_coverage is not None:
+        extras["evaluation_coverage"] = evaluation_coverage
 
     if eval_cfg.generate_report:
         report_path = report.save_evaluation_report(cfg, dataset, combined, extras, experiment)

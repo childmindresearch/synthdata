@@ -117,6 +117,7 @@ def main() -> None:
         from synthdata.evaluation.artifacts import (
             artifact_bundle_dir,
             expected_evaluation_context,
+            load_generation_inventory,
             load_log_disparity_reports,
             validate_evaluation_bundle,
             verify_native_syntheval_artifacts,
@@ -134,7 +135,7 @@ def main() -> None:
                 "Run `synthdata-evaluate --config <path>` first."
             )
         expected_context = expected_evaluation_context(dataset)
-        validate_evaluation_bundle(
+        evaluation_manifest = validate_evaluation_bundle(
             cfg.evaluation.output_dir,
             expected_config_path=cfg.config_path,
             expected_role_context_fingerprints=expected_context["role_context_fingerprints"],
@@ -148,7 +149,18 @@ def main() -> None:
         )
         combined = load_combined_table(str(combined_path))
         log_disparity_reports = load_log_disparity_reports(cfg.evaluation.output_dir)
-        save_rank_tradeoff_plots(cfg, combined, cfg.plots.output_dir)
+        if experiment is None:
+            raise RuntimeError("Evaluation plotting requires a loaded experiment")
+        generation_inventory = load_generation_inventory(
+            experiment.manifest_path, experiment.generation_dir
+        )
+        save_rank_tradeoff_plots(
+            cfg,
+            combined,
+            cfg.plots.output_dir,
+            produced_outputs=generation_inventory.produced_outputs,
+            missing_stage_a_outputs=generation_inventory.failed_outputs,
+        )
         save_log_disparity_plots(log_disparity_reports, cfg.plots.output_dir)
         verify_native_syntheval_artifacts(cfg.evaluation.output_dir)
 
@@ -164,6 +176,9 @@ def main() -> None:
                     "log_disparity_reports": log_disparity_reports,
                     "artifact_manifest": str(
                         artifact_bundle_dir(cfg.evaluation.output_dir) / "manifest.json"
+                    ),
+                    "evaluation_coverage": evaluation_manifest.get("evaluation_attempt", {}).get(
+                        "evaluation_coverage"
                     ),
                 },
                 experiment,

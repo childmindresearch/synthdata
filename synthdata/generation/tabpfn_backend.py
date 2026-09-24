@@ -7,6 +7,7 @@ see ``generation.tabpfn.data_variants`` in the pipeline config, which drives
 :func:`synthdata.generation.pipeline.run_generation`.
 """
 
+from collections import Counter
 from typing import Protocol, cast
 
 import numpy as np
@@ -319,6 +320,31 @@ def generate_tabpfn_standard(
 
     synthetic_data = decode_label_encoded_columns(synthetic_encoded, category_maps)
     synthetic_data[target_column] = target_values
+
+    input_columns = list(train_df.columns)
+    generated_columns = list(synthetic_data.columns)
+    if Counter(generated_columns) != Counter(input_columns):
+        raise RuntimeError(
+            "TabPFN standard generator returned columns "
+            f"{generated_columns!r}; expected input columns {input_columns!r}"
+        )
+    if generated_columns != input_columns:
+        positions_by_column: dict[str, list[int]] = {}
+        for position, column in enumerate(generated_columns):
+            positions_by_column.setdefault(column, []).append(position)
+        occurrences: dict[str, int] = {}
+        ordered_positions = []
+        for column in input_columns:
+            occurrence = occurrences.get(column, 0)
+            ordered_positions.append(positions_by_column[column][occurrence])
+            occurrences[column] = occurrence + 1
+        synthetic_data = synthetic_data.iloc[:, ordered_positions]
+        logger.info(
+            "[tabpfn] standard output columns reordered to match input schema order "
+            "generated=%s expected=%s",
+            generated_columns,
+            input_columns,
+        )
 
     return synthetic_data, experiment
 

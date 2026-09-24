@@ -30,7 +30,7 @@ from synthdata.utils import get_logger, set_global_seed
 logger = get_logger("run_evaluation")
 
 
-def _load_synthetic_datasets(cfg, dataset=None) -> dict:
+def _load_synthetic_datasets(cfg, dataset=None, *, generation_inventory=None) -> dict:
     """Load generated inputs after strict canonical cache preflight."""
     if dataset is None:
         raise ValueError("Canonical evaluation requires candidate dataset context for preflight")
@@ -40,6 +40,7 @@ def _load_synthetic_datasets(cfg, dataset=None) -> dict:
         dataset,
         model_names=configured_models,
         classification_score=cfg.evaluation.synthcity.classification_score,
+        generation_inventory=generation_inventory,
     )
 
 
@@ -120,7 +121,15 @@ def main() -> None:
     cfg.evaluation.output_dir = str(experiment.evaluation_dir)
     cfg.plots.output_dir = str(experiment.plots_dir)
 
-    synthetic_datasets = _load_synthetic_datasets(cfg, dataset)
+    generation_inventory = artifacts.load_generation_inventory(
+        experiment.manifest_path,
+        experiment.generation_dir,
+    )
+    synthetic_datasets = _load_synthetic_datasets(
+        cfg,
+        dataset,
+        generation_inventory=generation_inventory,
+    )
     if not synthetic_datasets:
         raise SystemExit(
             f"No synthetic datasets found in {cfg.generation.output_dir}. "

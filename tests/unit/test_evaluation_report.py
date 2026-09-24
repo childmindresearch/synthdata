@@ -176,6 +176,48 @@ class TestBuildEvaluationReport:
         ):
             assert header in text
 
+    def test_complete_coverage_keeps_existing_rank_and_recommendation_wording(
+        self, make_config, make_dataset
+    ):
+        text = build_evaluation_report(
+            make_config(),
+            make_dataset(),
+            _combined_table(),
+            {"selected_datasets": {"model_a": None, "model_b": None}},
+        )
+
+        assert "## Ranked summary (higher = better)" in text
+        assert "## Generation coverage" not in text
+        assert "Selected using highest complete fixed-transform tuning utility only" in text
+        assert "partial coverage" not in text.lower()
+
+    def test_partial_coverage_labels_available_only_ranking_and_failed_outputs(
+        self, make_config, make_dataset
+    ):
+        combined = _combined_table().loc[["model_a"]]
+        text = build_evaluation_report(
+            make_config(),
+            make_dataset(),
+            combined,
+            {
+                "selected_datasets": {"model_a": None},
+                "evaluation_coverage": {
+                    "status": "partial",
+                    "requested_models": ["model_a", "stage_a_failed"],
+                    "evaluated_models": ["model_a"],
+                    "failed_outputs": ["stage_a_failed"],
+                },
+            },
+        )
+
+        assert "## Generation coverage" in text
+        assert "Failed outputs: `stage_a_failed`" in text
+        assert "not a complete-run ranking" in text
+        assert "## Ranked summary (partial coverage; higher = better)" in text
+        recommendation = text.split("## Recommended model")[1].split("##")[0]
+        assert "available models only" in recommendation
+        assert "coverage is partial" in recommendation
+
     def test_recommends_highest_complete_tuning_utility_without_gate(
         self, make_config, make_dataset
     ):

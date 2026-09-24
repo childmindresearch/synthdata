@@ -395,6 +395,22 @@ def test_failed_binary_unknown_category_execution_round_trips_strictly(tmp_path)
             "encoding": {"positive": 1, "negative": 0},
         },
     }
+    evaluation_role_context = {
+        "schema_version": "evaluation-role-context-v1",
+        "fit_role": "train",
+        "fit_roles": ["train"],
+        "evidence_role": "tuning",
+        "fit_frame": "train-frame-fingerprint",
+        "evidence_frame": "tuning-frame-fingerprint",
+        "assignment_fingerprint": None,
+        "assignment_policy_fingerprint": None,
+        "semantic_fingerprint": "semantic-fingerprint",
+        "variable_schema_fingerprint": "schema-fingerprint",
+        "compatibility_mode": None,
+        "target_view_context": semantic_context["binary_target_context"],
+        "semantic_context": semantic_context,
+        "semantic_context_digest": semantic_context_digest(semantic_context),
+    }
     payload = _failed_execution_payload(
         model_name="model_a",
         pass_name="binary_target",
@@ -402,7 +418,7 @@ def test_failed_binary_unknown_category_execution_round_trips_strictly(tmp_path)
         expected_manifest_digest="manifest-hash",
         expected_output_manifest={"auroc_diff": ("auroc_diff",)},
         context_fingerprint="context-hash",
-        role_context=None,
+        role_context=evaluation_role_context,
         group_context=None,
         semantic_context=semantic_context,
         failure_status={
@@ -776,6 +792,424 @@ def test_generated_input_preflight_fails_before_evaluator(
             classification_score="balanced_accuracy",
         )
     assert backend_calls == []
+
+
+def _stage_a_failure_setup(
+    generation_dir: Path,
+    model_name: str = "ctgan_hpo",
+    *,
+    source_values: tuple[float, float] = (0.0, 1.0),
+) -> tuple[dict, dict]:
+    from synthdata.generation import hpo
+
+    source = pd.DataFrame({"feature": list(source_values), "target": [0, 1]})
+    contract = hpo.build_stage_a_contract(
+        source,
+        expected_n_samples=1,
+        target_column="target",
+    )
+    result = hpo.screen_stage_a(
+        pd.DataFrame({"feature": [5.0], "target": [0]}),
+        contract,
+        source,
+    )
+    assert result.pruned
+    context = hpo.build_hpo_context(
+        task_type="classification",
+        metric_config={"task12": ["mixed_mmd.v1"]},
+        registry_digest="registry-a",
+        stage_a_contract_digest=contract.digest,
+        group_context={"group_mode": "row"},
+        role_context_fingerprint="roles-a",
+        role_context={"roles": {"train": {"rows": 4}, "tuning": {"rows": 2}}},
+        release_transform_digest="release-a",
+        role_hashes={"train": "train-a", "tuning": "tuning-a"},
+        contracts={
+            "fit_roles": ["train"],
+            "comparison_role": "tuning",
+            "excluded_roles": ["final_holdout"],
+            "privacy": False,
+            "fairness": False,
+        },
+        support_provenance={"fit_roles": ["train"], "support_contract": "train_frozen_v1"},
+        bandwidth_provenance={
+            "fit_roles": ["train"],
+            "comparison_role": "tuning",
+            "contract": "train_frozen_v1",
+        },
+        objective_version="release-utility-v1",
+    )
+    context_digest = hpo.hpo_context_digest(context)
+    context_filename = f"hpo_context-{context_digest}.json"
+    context_payload = {
+        "schema_version": hpo.HPO_CONTEXT_SCHEMA_VERSION,
+        "context_digest": context_digest,
+        "context": context,
+        "context_file": context_filename,
+    }
+    (generation_dir / context_filename).write_text(json.dumps(context_payload))
+    (generation_dir / "hpo_context.json").write_text(json.dumps(context_payload))
+    study_name = hpo.contextual_study_name(f"hpo_{model_name.removesuffix('_hpo')}", context)
+    stage_a_root = generation_dir / "hpo_stage_a"
+    result_path = hpo.persist_stage_a_result(stage_a_root, study_name, 0, result)
+    return (
+        {
+            "trial_number": 0,
+            "result_path": result_path.relative_to(stage_a_root).as_posix(),
+            "contract_digest": contract.digest,
+        },
+        {
+            "hpo_study": study_name,
+            "hpo_context_path": context_filename,
+            "hpo_context_digest": context_digest,
+            "stage_a_contract_digest": contract.digest,
+        },
+    )
+
+
+def _write_generation_manifest(tmp_path: Path, record: dict) -> Path:
+    experiment_dir = tmp_path / "experiment"
+    experiment_dir.mkdir()
+    manifest_path = experiment_dir / "manifest.json"
+    manifest_path.write_text(json.dumps({"runs": [record]}))
+    return manifest_path
+
+
+def _generation_record(
+    *,
+    status: str = "complete",
+    expected: list[str] | None = None,
+    produced: list[str] | None = None,
+    failed: list[str] | None = None,
+    failed_models: list[dict] | None = None,
+) -> dict:
+    expected_outputs = expected if expected is not None else ["ctgan"]
+    produced_outputs = produced if produced is not None else ["ctgan"]
+    failed_outputs = failed if failed is not None else []
+    return {
+        "stage": "generation",
+        "artifacts": {"models": produced_outputs},
+        "n_models": len(produced_outputs),
+        "status": status,
+        "expected_outputs": expected_outputs,
+        "produced_outputs": produced_outputs,
+        "failed_outputs": failed_outputs,
+        "failed_models": failed_models if failed_models is not None else [],
+    }
+
+
+def test_stage_a_manifest_failure_allows_only_evidenced_missing_output(
+    tmp_path, make_canonical_dataset
+):
+    dataset = make_canonical_dataset()
+    generation_dir, _cache = _write_valid_generated_artifact(tmp_path, dataset)
+    evidence, binding = _stage_a_failure_setup(generation_dir)
+    record = _generation_record(
+        status="partial",
+        expected=["ctgan", "ctgan_hpo"],
+        produced=["ctgan"],
+        failed=["ctgan_hpo"],
+        failed_models=[
+            {
+                "model": "ctgan_hpo",
+                **binding,
+                "evidence_references": [evidence],
+            }
+        ],
+    )
+    manifest_path = _write_generation_manifest(tmp_path, record)
+    inventory = artifacts.load_generation_inventory(manifest_path, generation_dir)
+
+    loaded = artifacts.load_validated_generated_datasets(
+        generation_dir,
+        dataset,
+        classification_score="balanced_accuracy",
+        generation_inventory=inventory,
+    )
+
+    assert list(loaded) == ["ctgan"]
+    (generation_dir / "ctgan.csv").write_text("feature,target\n999,0\n")
+    with pytest.raises(ValueError, match="digest"):
+        artifacts.load_validated_generated_datasets(
+            generation_dir,
+            dataset,
+            classification_score="balanced_accuracy",
+            generation_inventory=inventory,
+        )
+
+
+def test_stage_a_manifest_rejects_self_consistent_foreign_context_evidence(
+    tmp_path, make_canonical_dataset
+):
+    dataset = make_canonical_dataset()
+    generation_dir, _cache = _write_valid_generated_artifact(tmp_path, dataset)
+    _current_evidence, current_binding = _stage_a_failure_setup(generation_dir)
+    foreign_evidence, foreign_binding = _stage_a_failure_setup(
+        generation_dir, source_values=(0.0, 2.0)
+    )
+    current_payload = json.loads((generation_dir / current_binding["hpo_context_path"]).read_text())
+    (generation_dir / "hpo_context.json").write_text(json.dumps(current_payload))
+    record = _generation_record(
+        status="partial",
+        expected=["ctgan", "ctgan_hpo"],
+        produced=["ctgan"],
+        failed=["ctgan_hpo"],
+        failed_models=[
+            {
+                "model": "ctgan_hpo",
+                **current_binding,
+                "hpo_study": foreign_binding["hpo_study"],
+                "evidence_references": [foreign_evidence],
+            }
+        ],
+    )
+    manifest_path = _write_generation_manifest(tmp_path, record)
+
+    with pytest.raises(ValueError, match="study does not match|contract binding"):
+        artifacts.load_generation_inventory(manifest_path, generation_dir)
+
+
+def test_stage_a_manifest_rejects_stale_foreign_context_binding(tmp_path, make_canonical_dataset):
+    dataset = make_canonical_dataset()
+    generation_dir, _cache = _write_valid_generated_artifact(tmp_path, dataset)
+    _current_evidence, current_binding = _stage_a_failure_setup(generation_dir)
+    foreign_evidence, foreign_binding = _stage_a_failure_setup(
+        generation_dir, source_values=(0.0, 2.0)
+    )
+    current_payload = json.loads((generation_dir / current_binding["hpo_context_path"]).read_text())
+    (generation_dir / "hpo_context.json").write_text(json.dumps(current_payload))
+    record = _generation_record(
+        status="partial",
+        expected=["ctgan", "ctgan_hpo"],
+        produced=["ctgan"],
+        failed=["ctgan_hpo"],
+        failed_models=[
+            {
+                "model": "ctgan_hpo",
+                **foreign_binding,
+                "evidence_references": [foreign_evidence],
+            }
+        ],
+    )
+    manifest_path = _write_generation_manifest(tmp_path, record)
+
+    with pytest.raises(ValueError, match="stale or differs from current generation context"):
+        artifacts.load_generation_inventory(manifest_path, generation_dir)
+
+
+@pytest.mark.parametrize("invalid_binding", ["missing", "unsafe_path", "wrong_digest"])
+def test_stage_a_manifest_rejects_missing_or_invalid_context_binding(
+    tmp_path, make_canonical_dataset, invalid_binding
+):
+    dataset = make_canonical_dataset()
+    generation_dir, _cache = _write_valid_generated_artifact(tmp_path, dataset)
+    evidence, binding = _stage_a_failure_setup(generation_dir)
+    if invalid_binding == "missing":
+        del binding["hpo_context_path"]
+    elif invalid_binding == "unsafe_path":
+        binding["hpo_context_path"] = "../hpo_context.json"
+    else:
+        binding["hpo_context_digest"] = "0" * 64
+    record = _generation_record(
+        status="partial",
+        expected=["ctgan", "ctgan_hpo"],
+        produced=["ctgan"],
+        failed=["ctgan_hpo"],
+        failed_models=[
+            {
+                "model": "ctgan_hpo",
+                **binding,
+                "evidence_references": [evidence],
+            }
+        ],
+    )
+    manifest_path = _write_generation_manifest(tmp_path, record)
+
+    with pytest.raises(ValueError):
+        artifacts.load_generation_inventory(manifest_path, generation_dir)
+
+
+@pytest.mark.parametrize(
+    ("model_name", "study_name"),
+    [
+        ("ctgan_hpo", "hpo_tvae"),
+        ("ctgan", "hpo_ctgan"),
+        ("tabpfgen_other_hpo", "hpo_tabpfgen_other"),
+    ],
+)
+def test_generation_manifest_rejects_invalid_stage_a_model_study_binding(
+    tmp_path, make_canonical_dataset, model_name, study_name
+):
+    dataset = make_canonical_dataset()
+    generation_dir, _cache = _write_valid_generated_artifact(tmp_path, dataset)
+    evidence, binding = _stage_a_failure_setup(generation_dir, model_name)
+    binding["hpo_study"] = study_name
+    record = _generation_record(
+        status="partial",
+        expected=["present", model_name],
+        produced=["present"],
+        failed=[model_name],
+        failed_models=[
+            {
+                "model": model_name,
+                **binding,
+                "evidence_references": [evidence],
+            }
+        ],
+    )
+    manifest_path = _write_generation_manifest(tmp_path, record)
+
+    with pytest.raises(ValueError, match="Stage A|Unsupported"):
+        artifacts.load_generation_inventory(manifest_path, generation_dir)
+
+
+def test_requested_subset_validates_full_inventory_then_selects_requested_models(
+    tmp_path, make_canonical_dataset
+):
+    dataset = make_canonical_dataset()
+    generation_dir, _cache = _write_valid_generated_artifact(tmp_path, dataset, model_name="ctgan")
+    (tmp_path / "unrequested").mkdir()
+    unrequested_dir, _unrequested_cache = _write_valid_generated_artifact(
+        tmp_path / "unrequested", dataset, model_name="tvae"
+    )
+    for suffix in (".csv", ".cache.json"):
+        (generation_dir / f"tvae{suffix}").write_bytes(
+            (unrequested_dir / f"tvae{suffix}").read_bytes()
+        )
+    evidence, binding = _stage_a_failure_setup(generation_dir, "failed_hpo")
+    record = _generation_record(
+        status="partial",
+        expected=["ctgan", "tvae", "failed_hpo"],
+        produced=["ctgan", "tvae"],
+        failed=["failed_hpo"],
+        failed_models=[
+            {
+                "model": "failed_hpo",
+                **binding,
+                "evidence_references": [evidence],
+            }
+        ],
+    )
+    manifest_path = _write_generation_manifest(tmp_path, record)
+    inventory = artifacts.load_generation_inventory(manifest_path, generation_dir)
+
+    loaded = artifacts.load_validated_generated_datasets(
+        generation_dir,
+        dataset,
+        model_names=["failed_hpo", "ctgan"],
+        classification_score="balanced_accuracy",
+        generation_inventory=inventory,
+    )
+
+    assert list(loaded) == ["ctgan"]
+    assert "tvae" not in loaded
+    (generation_dir / "tvae.cache.json").write_text("{}")
+    with pytest.raises(ValueError, match="Generated cache"):
+        artifacts.load_validated_generated_datasets(
+            generation_dir,
+            dataset,
+            model_names=["failed_hpo", "ctgan"],
+            classification_score="balanced_accuracy",
+            generation_inventory=inventory,
+        )
+
+
+def test_complete_manifest_does_not_allow_undeclared_missing_output(
+    tmp_path, make_canonical_dataset
+):
+    dataset = make_canonical_dataset()
+    generation_dir, _cache = _write_valid_generated_artifact(tmp_path, dataset)
+    record = _generation_record(expected=["ctgan", "ctgan_hpo"], produced=["ctgan", "ctgan_hpo"])
+    manifest_path = _write_generation_manifest(tmp_path, record)
+    inventory = artifacts.load_generation_inventory(manifest_path, generation_dir)
+
+    with pytest.raises(ValueError, match="inventory"):
+        artifacts.load_validated_generated_datasets(
+            generation_dir,
+            dataset,
+            generation_inventory=inventory,
+        )
+
+
+@pytest.mark.parametrize("failure", ["invalid_status", "invalid_evidence"])
+def test_generation_manifest_rejects_invalid_status_or_stage_a_evidence(
+    tmp_path, make_canonical_dataset, failure
+):
+    dataset = make_canonical_dataset()
+    generation_dir, _cache = _write_valid_generated_artifact(tmp_path, dataset)
+    evidence, binding = _stage_a_failure_setup(generation_dir)
+    record = _generation_record(
+        status="partial",
+        expected=["ctgan", "ctgan_hpo"],
+        produced=["ctgan"],
+        failed=["ctgan_hpo"],
+        failed_models=[
+            {
+                "model": "ctgan_hpo",
+                **binding,
+                "evidence_references": [evidence],
+            }
+        ],
+    )
+    if failure == "invalid_status":
+        record["status"] = "incomplete"
+    else:
+        record["failed_models"][0]["evidence_references"][0]["contract_digest"] = "0" * 64
+    manifest_path = _write_generation_manifest(tmp_path, record)
+
+    with pytest.raises(ValueError):
+        artifacts.load_generation_inventory(manifest_path, generation_dir)
+
+
+def test_unexpected_generated_output_fails_manifest_preflight(tmp_path, make_canonical_dataset):
+    dataset = make_canonical_dataset()
+    generation_dir, _cache = _write_valid_generated_artifact(tmp_path, dataset)
+    (generation_dir / "manual.csv").write_text("feature,target\n1,0\n")
+    (generation_dir / "manual.cache.json").write_text("{}")
+    manifest_path = _write_generation_manifest(tmp_path, _generation_record())
+    inventory = artifacts.load_generation_inventory(manifest_path, generation_dir)
+
+    with pytest.raises(ValueError, match="inventory"):
+        artifacts.load_validated_generated_datasets(
+            generation_dir,
+            dataset,
+            generation_inventory=inventory,
+        )
+
+
+def test_complete_generation_inventory_loads_generated_csv(tmp_path, make_canonical_dataset):
+    dataset = make_canonical_dataset()
+    generation_dir, _cache = _write_valid_generated_artifact(tmp_path, dataset)
+    manifest_path = _write_generation_manifest(tmp_path, _generation_record())
+    inventory = artifacts.load_generation_inventory(manifest_path, generation_dir)
+
+    loaded = artifacts.load_validated_generated_datasets(
+        generation_dir,
+        dataset,
+        classification_score="balanced_accuracy",
+        generation_inventory=inventory,
+    )
+
+    assert list(loaded) == ["ctgan"]
+
+
+def test_legacy_complete_generation_manifest_remains_loadable(tmp_path, make_canonical_dataset):
+    dataset = make_canonical_dataset()
+    generation_dir, _cache = _write_valid_generated_artifact(tmp_path, dataset)
+    manifest_path = _write_generation_manifest(
+        tmp_path,
+        {"stage": "generation", "artifacts": {"models": ["ctgan"]}, "n_models": 1},
+    )
+    inventory = artifacts.load_generation_inventory(manifest_path, generation_dir)
+
+    loaded = artifacts.load_validated_generated_datasets(
+        generation_dir,
+        dataset,
+        classification_score="balanced_accuracy",
+        generation_inventory=inventory,
+    )
+
+    assert list(loaded) == ["ctgan"]
 
 
 def test_non_hpo_train_only_cache_rejects_tampering_before_evaluator(

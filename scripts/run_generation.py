@@ -124,15 +124,6 @@ def main() -> None:
 
         save_hpo_plots(cfg, cfg.plots.output_dir)
 
-    experiment.record(
-        "generation",
-        artifacts={
-            "synthetic_data_dir": str(experiment.generation_dir),
-            "models": sorted(synthetic_datasets),
-        },
-        n_models=len(synthetic_datasets),
-    )
-
     logger.info(
         "Generated/loaded %d synthetic datasets under %s",
         len(synthetic_datasets),

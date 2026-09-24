@@ -1,5 +1,6 @@
 """Evaluation figures: interactive rank trade-offs and log-disparity reports."""
 
+import json
 from colorsys import hls_to_rgb
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import pandas as pd
 
 from synthdata.config import Config
 from synthdata.evaluation.artifacts import _model_artifact_id
-from synthdata.plotting import save_matplotlib_figure, save_plotly_figure
+from synthdata.plotting import save_plotly_figure
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -63,10 +64,14 @@ def _plot_status(combined: pd.DataFrame, rank_keys: tuple[tuple, ...]) -> tuple[
     return "succeeded", ""
 
 
-def _mark_matplotlib_status(figure, status: str, reason: str) -> None:
+def _mark_matplotlib_status(
+    figure, status: str, reason: str, metadata: dict[str, object] | None = None
+) -> None:
     """Attach machine-readable status and visible explanation to a figure."""
-    figure._synthdata_status = {"status": status, "reason": reason}
-    if status != "succeeded":
+    figure._synthdata_status = (
+        metadata if metadata is not None else {"status": status, "reason": reason}
+    )
+    if status not in {"succeeded", "partial"}:
         figure.axes[0].text(
             0.5,
             0.5,
@@ -78,6 +83,67 @@ def _mark_matplotlib_status(figure, status: str, reason: str) -> None:
         )
 
 
+def _filter_produced_outputs(
+    combined: pd.DataFrame, produced_outputs: tuple[str, ...] | None
+) -> pd.DataFrame:
+    """Keep saved evaluation rows belonging to manifest-declared outputs."""
+    if produced_outputs is None:
+        return combined
+    return combined.loc[combined.index.isin(produced_outputs)]
+
+
+def _rank_plot_status(
+    combined: pd.DataFrame,
+    rank_keys: tuple[tuple, ...],
+    missing_stage_a_outputs: tuple[str, ...],
+) -> tuple[str, str, dict[str, object]]:
+    """Combine rank evidence status with validated generation coverage."""
+    status, reason = _plot_status(combined, rank_keys)
+    if not missing_stage_a_outputs:
+        return status, reason, {"status": status, "reason": reason}
+
+    missing_text = ", ".join(missing_stage_a_outputs)
+    coverage_reason = f"Partial cohort; missing Stage A outputs: {missing_text}"
+    plot_status = "partial" if status == "succeeded" else status
+    plot_reason = coverage_reason if status == "succeeded" else f"{reason}; {coverage_reason}"
+    return (
+        plot_status,
+        plot_reason,
+        {
+            "status": plot_status,
+            "reason": plot_reason,
+            "generation_status": "partial",
+            "missing_stage_a_outputs": list(missing_stage_a_outputs),
+        },
+    )
+
+
+def _partial_plot_title(title: str, missing_stage_a_outputs: tuple[str, ...]) -> str:
+    if not missing_stage_a_outputs:
+        return title
+    missing_text = ", ".join(missing_stage_a_outputs)
+    return f"{title}\nPARTIAL COHORT — missing Stage A outputs: {missing_text}"
+
+
+def _static_plot_metadata(metadata: dict[str, object], fmt: str) -> dict[str, str]:
+    """Map status JSON to metadata field supported by Matplotlib's static backends."""
+    metadata_fields = {
+        "png": "Description",
+        "pdf": "Subject",
+        "svg": "Description",
+        "ps": "Creator",
+        "eps": "Creator",
+    }
+    metadata_field = metadata_fields.get(fmt.lower())
+    if metadata_field is None:
+        supported = ", ".join(sorted(metadata_fields))
+        raise ValueError(
+            f"Static rank plot format {fmt!r} cannot persist status metadata; "
+            f"supported formats: {supported}"
+        )
+    return {metadata_field: json.dumps(metadata, sort_keys=True)}
+
+
 def plot_rank_tradeoff(
     combined: pd.DataFrame,
     x_key: tuple,
@@ -85,6 +151,9 @@ def plot_rank_tradeoff(
     x_label: str,
     y_label: str,
     title: str,
+    *,
+    produced_outputs: tuple[str, ...] | None = None,
+    missing_stage_a_outputs: tuple[str, ...] = (),
 ):
     """Build a two-dimensional rank trade-off scatter plot.
 
@@ -93,9 +162,9 @@ def plot_rank_tradeoff(
     """
     from matplotlib.lines import Line2D
 
-    filtered = _finite_decision_eligible_rows(
-        combined, (x_key, y_key, ("__all__", "overall", "rank"))
-    )
+    cohort = _filter_produced_outputs(combined, produced_outputs)
+    rank_keys = (x_key, y_key, ("__all__", "overall", "rank"))
+    filtered = _finite_decision_eligible_rows(cohort, rank_keys)
     models = list(filtered.index)
     base_models = sorted({_base_model(model) for model in models})
     palette = {
@@ -130,7 +199,9 @@ def plot_rank_tradeoff(
 
     ax.set_xlabel(x_label, fontsize=12)
     ax.set_ylabel(y_label, fontsize=12)
-    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.set_title(
+        _partial_plot_title(title, missing_stage_a_outputs), fontsize=14, fontweight="bold"
+    )
     ax.grid(True, alpha=0.3)
     color_handles = [
         Line2D(
@@ -169,12 +240,17 @@ def plot_rank_tradeoff(
     ]
     ax.legend(handles=color_handles + variant_handles, loc="best", fontsize=8, ncol=2)
     fig.tight_layout()
-    status, reason = _plot_status(combined, (x_key, y_key, ("__all__", "overall", "rank")))
-    _mark_matplotlib_status(fig, status, reason)
+    status, reason, metadata = _rank_plot_status(cohort, rank_keys, missing_stage_a_outputs)
+    _mark_matplotlib_status(fig, status, reason, metadata)
     return fig
 
 
-def plot_rank_tradeoff_3d(combined: pd.DataFrame):
+def plot_rank_tradeoff_3d(
+    combined: pd.DataFrame,
+    *,
+    produced_outputs: tuple[str, ...] | None = None,
+    missing_stage_a_outputs: tuple[str, ...] = (),
+):
     """Build an interactive utility/privacy/fairness rank scatter plot.
 
     HPO-tuned variants are diamonds; regular variants are circles. All
@@ -188,11 +264,11 @@ def plot_rank_tradeoff_3d(combined: pd.DataFrame):
         "Privacy": ("__all__", "privacy", "rank"),
         "Fairness": ("__all__", "fairness", "rank"),
     }
-    filtered = _finite_decision_eligible_rows(
-        combined, (*tuple(rank_keys.values()), ("__all__", "overall", "rank"))
-    )
-    status, reason = _plot_status(
-        combined, (*tuple(rank_keys.values()), ("__all__", "overall", "rank"))
+    cohort = _filter_produced_outputs(combined, produced_outputs)
+    required_rank_keys = (*tuple(rank_keys.values()), ("__all__", "overall", "rank"))
+    filtered = _finite_decision_eligible_rows(cohort, required_rank_keys)
+    status, reason, metadata = _rank_plot_status(
+        cohort, required_rank_keys, missing_stage_a_outputs
     )
     models = list(filtered.index)
     base_models = sorted({_base_model(model) for model in models})
@@ -264,7 +340,9 @@ def plot_rank_tradeoff_3d(combined: pd.DataFrame):
             )
         )
     fig.update_layout(
-        title="Utility, Privacy, and Fairness Rank Trade-off",
+        title=_partial_plot_title(
+            "Utility, Privacy, and Fairness Rank Trade-off", missing_stage_a_outputs
+        ),
         scene={
             "xaxis_title": "Utility rank",
             "yaxis_title": "Privacy rank",
@@ -272,15 +350,32 @@ def plot_rank_tradeoff_3d(combined: pd.DataFrame):
         },
         legend_title_text="Base model / variant",
         margin={"l": 0, "r": 0, "b": 0, "t": 50},
-        meta={"status": status, "reason": reason},
+        meta=metadata,
     )
     return fig
 
 
-def save_rank_tradeoff_plots(cfg: Config, combined: pd.DataFrame, output_dir: str | Path) -> None:
+def save_rank_tradeoff_plots(
+    cfg: Config,
+    combined: pd.DataFrame,
+    output_dir: str | Path,
+    *,
+    produced_outputs: tuple[str, ...] | None = None,
+    missing_stage_a_outputs: tuple[str, ...] = (),
+) -> None:
     """Save interactive 3D and static pairwise rank trade-off plots."""
     output_dir = Path(output_dir) / "evaluation"
-    fig = plot_rank_tradeoff_3d(combined)
+    static_formats = tuple(cfg.plots.formats)
+    # Validate all metadata carriers before writing any files, so unsupported
+    # configured formats cannot leave a partial set of rank plot artifacts.
+    for fmt in static_formats:
+        _static_plot_metadata({}, fmt)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fig = plot_rank_tradeoff_3d(
+        combined,
+        produced_outputs=produced_outputs,
+        missing_stage_a_outputs=missing_stage_a_outputs,
+    )
     save_plotly_figure(fig, output_dir / "rank_tradeoff_3d", ("html",))
 
     pairs = [
@@ -314,9 +409,27 @@ def save_rank_tradeoff_plots(cfg: Config, combined: pd.DataFrame, output_dir: st
         if missing_keys:
             logger.warning("Skipping %s; missing rank columns: %s", filename, missing_keys)
             continue
-        figure = plot_rank_tradeoff(combined, x_key, y_key, x_label, y_label, title)
+        figure = plot_rank_tradeoff(
+            combined,
+            x_key,
+            y_key,
+            x_label,
+            y_label,
+            title,
+            produced_outputs=produced_outputs,
+            missing_stage_a_outputs=missing_stage_a_outputs,
+        )
         try:
-            save_matplotlib_figure(figure, output_dir / filename, cfg.plots.dpi, cfg.plots.formats)
+            metadata = figure._synthdata_status
+            for fmt in static_formats:
+                path = (output_dir / filename).with_suffix(f".{fmt}")
+                figure.savefig(
+                    path,
+                    dpi=cfg.plots.dpi,
+                    bbox_inches="tight",
+                    metadata=_static_plot_metadata(metadata, fmt),
+                )
+                logger.info("Saved figure: %s", path)
         finally:
             plt.close(figure)
 

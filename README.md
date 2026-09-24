@@ -266,6 +266,18 @@ are persisted as per-trial prune results under the generation experiment and
 cannot become partial objective evidence. No privacy or fairness attack is
 invoked by Stage A.
 
+If every trial for an HPO variant is rejected by these Stage A screens, only
+that variant's output is skipped. No fallback parameters or synthetic output
+are fabricated; other generation outputs can still be produced. The existing
+experiment manifest records generation as `partial`, lists expected,
+produced, and failed outputs, and references the persisted Stage A evidence.
+This manifest is the authoritative source for status; evaluation accepts a
+missing variant only when the manifest explains it. Evaluation processes
+available requested outputs and records partial coverage rather than
+inventing metrics for the missing output. Partial reports and ranking plots are
+labeled as such: their rankings compare only evaluated models and are not a
+complete comparison of all requested outputs.
+
 > [!TIP]
 > See [`synthdata/config.py`](synthdata/config.py) for cache, device, model, HPO, parallel evaluation, artifact, experiment, metric, ranking, privacy-gate, and plot options.
 

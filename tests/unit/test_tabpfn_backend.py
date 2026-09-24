@@ -138,6 +138,93 @@ def test_tabpfn_custom_consumes_semantic_context(make_canonical_dataset, mocker)
     assert returned_experiment.semantic_context_digest == semantic_context_digest(semantic_context)
 
 
+def test_tabpfn_standard_preserves_nonfinal_target_column_order(mocker):
+    train = pd.DataFrame(
+        {
+            "first": [1.0, 2.0],
+            "target": [0, 1],
+            "second": [3.0, 4.0],
+        }
+    )
+
+    class FakeExperiment:
+        def __init__(self):
+            self.data = train.copy()
+            self.synthetic_X = torch.tensor([[10.0, 30.0], [20.0, 40.0]])
+
+        def run(self, **kwargs):
+            assert kwargs["attribute_names"] == ["first", "second"]
+
+    class FakeClassifier:
+        def fit(self, features, labels):
+            del features, labels
+            return self
+
+        def predict(self, features):
+            return np.asarray([0, 1][: len(features)])
+
+    experiment = FakeExperiment()
+    mocker.patch.object(tabpfn_backend, "_make_experiment", return_value=(experiment, object()))
+    mocker.patch("tabpfn.TabPFNClassifier", FakeClassifier)
+
+    generated, _ = tabpfn_backend.generate_tabpfn_standard(
+        train,
+        ["first", "second"],
+        [],
+        "target",
+        2,
+    )
+
+    assert generated.columns.tolist() == train.columns.tolist()
+    assert generated["target"].tolist() == [0, 1]
+
+
+@pytest.mark.parametrize("mismatch", ["missing", "extra", "duplicate"])
+def test_tabpfn_standard_rejects_column_membership_mismatch(mocker, mismatch):
+    train = pd.DataFrame(
+        {
+            "first": [1.0, 2.0],
+            "target": [0, 1],
+            "second": [3.0, 4.0],
+        }
+    )
+    features = ["first", "second"]
+    if mismatch == "missing":
+        features = ["first"]
+    elif mismatch == "extra":
+        train["unexpected"] = [5.0, 6.0]
+    else:
+        features = ["first", "second", "second"]
+        mocker.patch.object(
+            tabpfn_backend,
+            "label_encode_non_numeric_columns",
+            return_value=(pd.DataFrame([[1.0, 3.0, 4.0]] * 2, columns=pd.Index(features)), {}),
+        )
+
+    class FakeExperiment:
+        def __init__(self):
+            self.data = train.copy()
+            self.synthetic_X = torch.zeros((2, len(features)))
+
+        def run(self, **kwargs):
+            del kwargs
+
+    class FakeClassifier:
+        def fit(self, features, labels):
+            del features, labels
+            return self
+
+        def predict(self, features):
+            return np.zeros(len(features), dtype=int)
+
+    experiment = FakeExperiment()
+    mocker.patch.object(tabpfn_backend, "_make_experiment", return_value=(experiment, object()))
+    mocker.patch("tabpfn.TabPFNClassifier", FakeClassifier)
+
+    with pytest.raises(RuntimeError, match="TabPFN standard generator returned columns"):
+        tabpfn_backend.generate_tabpfn_standard(train, features, [], "target", 2)
+
+
 def test_tabpfgen_objective_uses_supplied_shared_evaluator(mocker):
     """TabPFGen objective must score release output through shared callback."""
     train = pd.DataFrame({"feature": [0.0, 1.0, 0.0, 1.0], "target": [0, 1, 0, 1]})

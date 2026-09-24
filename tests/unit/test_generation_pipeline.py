@@ -10,6 +10,7 @@ from typing import cast
 import optuna
 import pandas as pd
 import pytest
+import torch
 import yaml
 
 from synthdata.data import role_context_payload, semantic_context_payload
@@ -161,6 +162,52 @@ def test_generation_reaches_model_with_valid_candidate_cache(
     run_generation(cfg, dataset)
 
     builder.assert_called_once()
+
+
+def test_tabpfn_standard_output_passes_strict_pipeline_schema_check(
+    make_config, make_canonical_dataset, mocker
+):
+    cfg = make_config()
+    _configure_tabpfn_only(cfg)
+    cfg.generation.tabpfn.variants = ["standard"]
+    cfg.generation.tabpfn.data_variants = ["raw"]
+    cfg.generation.n_samples = 2
+    cfg.generation.force_retrain = True
+    dataset = make_canonical_dataset()
+    canonical_columns = ["feature", "target", "protected"]
+    dataset.full_df = dataset.full_df.loc[:, canonical_columns]
+    dataset.roles = {role: frame.loc[:, canonical_columns] for role, frame in dataset.roles.items()}
+    dataset.imputed_roles = {
+        role: frame.loc[:, canonical_columns] for role, frame in dataset.imputed_roles.items()
+    }
+    train = dataset.role_frame("train", imputed=False)
+
+    class FakeExperiment:
+        def __init__(self):
+            self.data = train.copy()
+            self.synthetic_X = torch.tensor([[10.0, 0.0], [11.0, 1.0]])
+
+        def run(self, **kwargs):
+            del kwargs
+
+    class FakeClassifier:
+        def fit(self, features, labels):
+            del features, labels
+            return self
+
+        def predict(self, features):
+            return [0, 1][: len(features)]
+
+    experiment = FakeExperiment()
+    mocker.patch(
+        "synthdata.generation.tabpfn_backend._make_experiment",
+        return_value=(experiment, object()),
+    )
+    mocker.patch("tabpfn.TabPFNClassifier", FakeClassifier)
+
+    generated = run_generation(cfg, dataset, prepare_candidate_cache=False)
+
+    assert generated["tabpfn_standard"].columns.tolist() == canonical_columns
 
 
 def test_non_hpo_generation_fits_train_but_persists_candidate_scope(
@@ -350,13 +397,28 @@ def test_plot_callback_failure_persists_safe_failure_metadata(make_config, make_
                 "message": "Generation plot callback failed.",
                 "error_type": "ValueError",
             },
-        )
+        ),
+        (
+            "generation",
+            {
+                "artifacts": {
+                    "synthetic_data_dir": cfg.generation.output_dir,
+                    "models": ["tabpfn_custom"],
+                },
+                "n_models": 1,
+                "status": "complete",
+                "expected_outputs": ["tabpfn_custom"],
+                "produced_outputs": ["tabpfn_custom"],
+                "failed_outputs": [],
+                "failed_models": [],
+            },
+        ),
     ]
     assert "sentinel" not in json.dumps(experiment.records)
     assert "/private/secret/path" not in json.dumps(experiment.records)
 
 
-def test_generation_plot_path_uses_bounded_model_id(mocker, tmp_path):
+def test_generation_plot_path_uses_bounded_model_id(mocker, tmp_path, make_config):
     model_name = "../team/model: candidate"
     dataset = mocker.Mock()
     dataset.role_frame.return_value = pd.DataFrame({"feature": [1]})
@@ -369,9 +431,9 @@ def test_generation_plot_path_uses_bounded_model_id(mocker, tmp_path):
         "synthdata.plotting.generation_plots.plot_real_vs_synthetic", return_value=object()
     )
     save_figure = mocker.patch("synthdata.plotting.generation_plots.save_matplotlib_figure")
-    cfg = SimpleNamespace(
-        plots=SimpleNamespace(dpi=100, formats=("png",)),
-    )
+    cfg = make_config()
+    cfg.plots.dpi = 100
+    cfg.plots.formats = ("png",)
 
     save_generation_plots(cfg, dataset, {model_name: pd.DataFrame({"feature": [1]})}, tmp_path)
 
@@ -1145,7 +1207,9 @@ def test_hpo_generated_cache_rejects_changed_objective_context(
     assert run_study.call_args.kwargs["hpo_context"]["objective_context"]["n_iter_cap"] == 301
 
 
-def test_synthcity_stage_a_screen_runs_before_canonical_metric_evaluation(mocker, make_config):
+def test_synthcity_stage_a_screen_runs_before_canonical_metric_evaluation(
+    mocker, make_config, tmp_path
+):
     cfg = make_config()
     hpo_cfg = cfg.generation.hpo
     hpo_cfg.metric_config = {"utility": ["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"]}
@@ -1182,6 +1246,19 @@ def test_synthcity_stage_a_screen_runs_before_canonical_metric_evaluation(mocker
     )
     report.attrs["canonical_hpo"] = True
     report.attrs["canonical_hpo_keys"] = tuple(report.index)
+    report.attrs["metric_metadata"] = {
+        metric_name: {
+            "metric_name": metric_name,
+            "status": "complete",
+            "direction": "maximize" if metric_name == "tstr_macro_f1.v1" else "minimize",
+            "mean": float(value),
+            "errors": 0,
+            "error_reason_code": None,
+            "fit_roles": ["train"],
+            "evaluation_role": "tuning",
+        }
+        for metric_name, value in zip(report.index, report["mean"], strict=True)
+    }
 
     mocker.patch.object(sc, "get_plugin_class", return_value=Plugin)
     mocker.patch.object(sc, "generator_implementation_fingerprint", return_value="impl")
@@ -1192,7 +1269,14 @@ def test_synthcity_stage_a_screen_runs_before_canonical_metric_evaluation(mocker
         "screen_stage_a_trial",
         side_effect=lambda *args: events.append("stage_a"),
     )
-    mocker.patch.object(sc, "fit_generate", return_value=(candidate, {"metadata": "ok"}))
+    candidate_metadata = sc.build_generator_metadata(
+        "ctgan",
+        {"random_state": 42},
+        1,
+        42,
+        plugin_fqdn="generic.ctgan",
+    )
+    mocker.patch.object(sc, "fit_generate", return_value=(candidate, candidate_metadata))
     mocker.patch.object(
         sc,
         "evaluate_canonical_hpo_metrics",
@@ -1207,9 +1291,9 @@ def test_synthcity_stage_a_screen_runs_before_canonical_metric_evaluation(mocker
         seed=42,
         tuning_loader=object(),
         synthetic_size=1,
-        stage_a_contract=cast(sc.StageAScreenContract, SimpleNamespace()),
+        stage_a_contract=cast(sc.StageAScreenContract, SimpleNamespace(digest="stage-a")),
         stage_a_source_df=pd.DataFrame({"feature": [0.0], "target": [0]}),
-        stage_a_root="stage-a",
+        stage_a_root=str(tmp_path / "stage-a"),
         study_name="study",
         expected_emitted_keys=list(report.index),
         train_df=pd.DataFrame({"feature": [0.0], "target": [0]}),
@@ -1229,7 +1313,7 @@ def test_synthcity_stage_a_screen_runs_before_canonical_metric_evaluation(mocker
     assert not metric_frames["train"].equals(metric_frames["tuning"])
 
 
-def test_synthcity_stage_a_prune_skips_canonical_metric_evaluation(mocker, make_config):
+def test_synthcity_stage_a_prune_skips_canonical_metric_evaluation(mocker, make_config, tmp_path):
     cfg = make_config()
     hpo_cfg = cfg.generation.hpo
     hpo_cfg.metric_config = {"utility": ["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"]}
@@ -1254,7 +1338,18 @@ def test_synthcity_stage_a_prune_skips_canonical_metric_evaluation(mocker, make_
     mocker.patch.object(sc, "generator_implementation_fingerprint", return_value="impl")
     mocker.patch.object(sc, "plugin_accepts", return_value=False)
     mocker.patch.object(sc, "prepare_stage_a_screen")
-    mocker.patch.object(sc, "fit_generate", return_value=(pd.DataFrame(), {"metadata": "ok"}))
+    candidate_metadata = sc.build_generator_metadata(
+        "ctgan",
+        {"random_state": 42},
+        1,
+        42,
+        plugin_fqdn="generic.ctgan",
+    )
+    mocker.patch.object(
+        sc,
+        "fit_generate",
+        return_value=(pd.DataFrame(), candidate_metadata),
+    )
     mocker.patch.object(sc, "screen_stage_a_trial", side_effect=optuna.TrialPruned("screen failed"))
     evaluate = mocker.patch.object(sc, "evaluate_canonical_hpo_metrics")
 
@@ -1265,9 +1360,9 @@ def test_synthcity_stage_a_prune_skips_canonical_metric_evaluation(mocker, make_
         seed=42,
         tuning_loader=object(),
         synthetic_size=1,
-        stage_a_contract=cast(sc.StageAScreenContract, SimpleNamespace()),
+        stage_a_contract=cast(sc.StageAScreenContract, SimpleNamespace(digest="stage-a")),
         stage_a_source_df=pd.DataFrame({"feature": [0.0], "target": [0]}),
-        stage_a_root="stage-a",
+        stage_a_root=str(tmp_path / "stage-a"),
         study_name="study",
         train_df=pd.DataFrame({"feature": [0.0], "target": [0]}),
         tuning_df=pd.DataFrame({"feature": [1.0], "target": [1]}),
@@ -1344,6 +1439,107 @@ def test_hpo_context_carries_canonical_exclusions_and_provenance(
     assert not hpo_mod.BestParamsCache(cache_path, hpo_context=changed_context).has(
         "synthcity", "ctgan"
     )
+
+
+def test_stage_a_exhausted_hpo_output_does_not_stop_sibling_generation(
+    make_config, make_canonical_dataset, mocker
+):
+    cfg = make_config()
+    cfg.generation.synthcity.names = ["ctgan", "tvae"]
+    cfg.generation.tabpfn.enabled = False
+    cfg.generation.tabpfgen.enabled = False
+    cfg.generation.hpo.n_trials = 1
+    cfg.generation.n_samples = 4
+    cfg.generation.hpo.utility_policy = {
+        "metrics": ["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"],
+        "weights": [1 / 3, 1 / 3, 1 / 3],
+    }
+    dataset = make_canonical_dataset()
+    synthetic = dataset.role_frame("train", imputed=True).head(4).copy()
+    mocker.patch("synthdata.generation.pipeline.sc.make_loader", return_value=object())
+    mocker.patch("synthdata.generation.pipeline.sc.plugin_accepts", return_value=False)
+    mocker.patch(
+        "synthdata.generation.pipeline.sc.build_synthcity_objective",
+        return_value=lambda _trial: 0.5,
+    )
+    mocker.patch(
+        "synthdata.generation.pipeline.sc.fit_generate",
+        return_value=synthetic,
+    )
+    evidence = [
+        {
+            "trial_number": 0,
+            "result_path": "hpo_stage_a/study-ctgan/trial-0/result.json",
+            "contract_digest": "a" * 64,
+        }
+    ]
+
+    def fake_run_study(study_name, *_args, **kwargs):
+        if study_name == "hpo_ctgan":
+            current_study = hpo_mod.contextual_study_name(study_name, kwargs["hpo_context"])
+            raise hpo_mod.StageAExhaustionError(current_study, evidence)
+        return {"n_iter": 3}
+
+    run_study = mocker.patch(
+        "synthdata.generation.pipeline.hpo_mod.run_study", side_effect=fake_run_study
+    )
+
+    class Experiment:
+        def __init__(self):
+            self.records = []
+
+        def record(self, stage, **fields):
+            self.records.append((stage, fields))
+
+    experiment = Experiment()
+    result = run_generation(cfg, dataset, experiment=experiment)
+    persisted_context = json.loads(
+        (Path(cfg.generation.output_dir) / "hpo_context.json").read_text()
+    )
+    context_artifact = Path(cfg.generation.output_dir) / persisted_context["context_file"]
+    failed_entry = experiment.records[0][1]["failed_models"][0]
+
+    assert sorted(result) == ["ctgan", "tvae", "tvae_hpo"]
+    assert context_artifact.is_file()
+    assert failed_entry["hpo_context_path"] == context_artifact.name
+    assert failed_entry["hpo_context_digest"] == persisted_context["context_digest"]
+    assert (
+        failed_entry["stage_a_contract_digest"]
+        == persisted_context["context"]["stage_a_contract_digest"]
+    )
+    assert failed_entry["hpo_study"] == hpo_mod.contextual_study_name(
+        "hpo_ctgan", persisted_context["context"]
+    )
+    assert run_study.call_count == 2
+    assert [call.args[0] for call in run_study.call_args_list] == ["hpo_ctgan", "hpo_tvae"]
+    assert experiment.records == [
+        (
+            "generation",
+            {
+                "artifacts": {
+                    "synthetic_data_dir": cfg.generation.output_dir,
+                    "models": ["ctgan", "tvae", "tvae_hpo"],
+                },
+                "n_models": 3,
+                "status": "partial",
+                "expected_outputs": ["ctgan", "ctgan_hpo", "tvae", "tvae_hpo"],
+                "produced_outputs": ["ctgan", "tvae", "tvae_hpo"],
+                "failed_outputs": ["ctgan_hpo"],
+                "failed_models": [
+                    {
+                        "model": "ctgan_hpo",
+                        "hpo_study": failed_entry["hpo_study"],
+                        "hpo_context_path": context_artifact.name,
+                        "hpo_context_digest": persisted_context["context_digest"],
+                        "stage_a_contract_digest": persisted_context["context"][
+                            "stage_a_contract_digest"
+                        ],
+                        "evidence_references": evidence,
+                    }
+                ],
+            },
+        )
+    ]
 
 
 def _complete_hpo_cache_context():

@@ -28,7 +28,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from numbers import Real
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, cast
 
 try:
     import fcntl
@@ -116,6 +116,29 @@ class HPOGroupUnsafeError(ValueError):
     """Raised when grouped evaluation cannot safely produce HPO evidence."""
 
     reason_code = "group_unsafe"
+
+
+class _MutableOptunaTrialModel(Protocol):
+    """Typed state surface of Optuna's private SQLAlchemy trial model."""
+
+    state: optuna.trial.TrialState
+
+
+class _OptunaCachedStorage(Protocol):
+    """Cache-refresh API provided by Optuna's cached RDB storage wrapper."""
+
+    def _add_trials_to_cache(
+        self, study_id: int, trials: list[optuna.trial.FrozenTrial]
+    ) -> None: ...
+
+
+class StageAExhaustionError(RuntimeError):
+    """Raised when every HPO trial was rejected by persisted Stage A screens."""
+
+    def __init__(self, study_name: str, evidence_references: Sequence[Mapping[str, Any]]):
+        self.study_name = study_name
+        self.evidence_references = [dict(reference) for reference in evidence_references]
+        super().__init__(f"HPO study {study_name!r} exhausted all trials through Stage A screening")
 
 
 _CANONICAL_HPO_METRIC_KEYS = frozenset({"tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"})
@@ -651,7 +674,7 @@ def _validate_stage_a_result_artifact(
         or len(columns) != len(set(columns))
     ):
         raise RuntimeError("HPO checkpoint Stage A result has invalid bounded fields")
-    if shape[1] != len(columns) or (not exception_result and (shape[0] < 1 or shape[1] < 1)):
+    if shape[1] != len(columns):
         raise RuntimeError("HPO checkpoint Stage A candidate shape is inconsistent")
     checks = result["checks"]
     reasons = result["prune_reasons"]
@@ -687,6 +710,36 @@ def _validate_stage_a_result_artifact(
     screens = [check.get("screen") for check in checks]
     if len(screens) != len(set(screens)):
         raise RuntimeError("HPO checkpoint Stage A checks contain duplicate screens")
+    if shape[0] == 0:
+        shape_check = next(
+            (check for check in checks if check.get("screen") == "shape_schema"), None
+        )
+        expected_rows = (
+            shape_check.get("expected", {}).get("rows")
+            if shape_check is not None and isinstance(shape_check.get("expected"), Mapping)
+            else None
+        )
+        observed_rows = (
+            shape_check.get("observed", {}).get("rows")
+            if shape_check is not None and isinstance(shape_check.get("observed"), Mapping)
+            else None
+        )
+        if not exception_result and (
+            checkpoint_state != "pruned"
+            or shape_check is None
+            or shape_check.get("passed") is not False
+            or isinstance(expected_rows, bool)
+            or not isinstance(expected_rows, int)
+            or expected_rows < 1
+            or isinstance(observed_rows, bool)
+            or not isinstance(observed_rows, int)
+            or observed_rows != 0
+        ):
+            raise RuntimeError(
+                "HPO checkpoint Stage A empty candidate lacks shape-schema prune evidence"
+            )
+    elif not exception_result and shape[1] < 1:
+        raise RuntimeError("HPO checkpoint Stage A candidate shape is inconsistent")
     if "stage_a_exception" in screens and (len(screens) != 1 or result["state"] != "pruned"):
         raise RuntimeError("HPO checkpoint Stage A exception screen is not exclusive")
     if not all(isinstance(reason, str) and 0 < len(reason) <= 4096 for reason in reasons):
@@ -3951,7 +4004,10 @@ def _repair_terminal_recovered_trial(
     from optuna.storages._rdb.storage import _create_scoped_session
 
     with _create_scoped_session(backend.scoped_session, True) as session:
-        stored_trial = models.TrialModel.find_or_raise_by_id(trial._trial_id, session)
+        stored_trial = cast(
+            _MutableOptunaTrialModel,
+            models.TrialModel.find_or_raise_by_id(trial._trial_id, session),
+        )
         stored_trial.state = optuna.trial.TrialState.RUNNING
         if needs_provenance:
             backend._set_trial_attr_without_commit(  # noqa: SLF001
@@ -3971,7 +4027,8 @@ def _repair_terminal_recovered_trial(
             )
         stored_trial.state = optuna.trial.TrialState.FAIL
     refreshed = backend.get_trial(trial._trial_id)
-    storage._add_trials_to_cache(  # noqa: SLF001 - refresh CachedStorage after direct repair
+    cached_storage = cast(_OptunaCachedStorage, storage)
+    cached_storage._add_trials_to_cache(  # noqa: SLF001 - refresh CachedStorage after direct repair
         trial._study_id if hasattr(trial, "_study_id") else study._study_id,  # noqa: SLF001
         [refreshed],
     )
@@ -4218,6 +4275,20 @@ def run_study(
             study.study_name,
             terminal_states,
         )
+        evidence_references = _stage_a_exhaustion_evidence(
+            study,
+            stage_a_root=stage_a_root,
+            hpo_context=context_payload,
+        )
+        if evidence_references is not None:
+            logger.warning(
+                "[%s] all %d trial(s) were rejected by persisted Stage A evidence; "
+                "trial_evidence=%s",
+                study.study_name,
+                len(evidence_references),
+                evidence_references,
+            )
+            raise StageAExhaustionError(study.study_name, evidence_references)
         raise RuntimeError(
             f"HPO study {study.study_name!r} produced no completed trials; "
             f"terminal states={terminal_states}"
@@ -4238,6 +4309,69 @@ def run_study(
             checkpoint_plugin,
         )
     return best
+
+
+def _stage_a_exhaustion_evidence(
+    study: optuna.Study,
+    *,
+    stage_a_root: str | Path | None,
+    hpo_context: Mapping[str, Any],
+) -> list[dict[str, Any]] | None:
+    """Return references iff every trial has valid, ordinary Stage A prune evidence."""
+    trials = study.trials
+    if (
+        not trials
+        or stage_a_root is None
+        or any(trial.state != optuna.trial.TrialState.PRUNED for trial in trials)
+    ):
+        return None
+    expected_contract_digest = hpo_context.get("stage_a_contract_digest")
+    if not isinstance(expected_contract_digest, str) or not expected_contract_digest:
+        return None
+
+    evidence_references = []
+    for trial in trials:
+        attributes = trial.user_attrs
+        outcome = attributes.get("hpo_outcome")
+        if (
+            attributes.get("stage_a_state") != "pruned"
+            or attributes.get("stage_a_contract_digest") != expected_contract_digest
+            or not isinstance(outcome, Mapping)
+            or outcome.get("state") != "pruned"
+        ):
+            return None
+        result_path = _checkpoint_stage_a_result_identifier(attributes.get("stage_a_result_path"))
+        if result_path is None:
+            return None
+        artifact_reference = {
+            "state": "pruned",
+            "contract_digest": expected_contract_digest,
+            "result_path": result_path,
+        }
+        _validate_stage_a_result_artifact(
+            artifact_reference,
+            root=stage_a_root,
+            context=hpo_context,
+            expected_study_name=study.study_name,
+            expected_trial_number=trial.number,
+        )
+        result = _read_stage_a_json_pinned(stage_a_root, Path(stage_a_root) / result_path)
+        rejected_screens = [
+            check
+            for check in result["checks"]
+            if check.get("screen") in STAGE_A_SCREEN_IDS and check.get("passed") is False
+        ]
+        if not rejected_screens:
+            # Screen exceptions and unexplained Optuna prunes are not candidate rejections.
+            return None
+        evidence_references.append(
+            {
+                "trial_number": trial.number,
+                "result_path": result_path,
+                "contract_digest": expected_contract_digest,
+            }
+        )
+    return evidence_references
 
 
 class BestParamsCache:

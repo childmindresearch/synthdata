@@ -5,7 +5,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import NoReturn, cast
 
 import pandas as pd
 import pytest
@@ -35,6 +35,10 @@ from synthdata.generation import pipeline as generation_pipeline
 pytestmark = pytest.mark.unit
 
 
+def _fail_test(message: str) -> NoReturn:
+    raise AssertionError(message)
+
+
 def test_select_models_fails_closed_before_evaluation_for_missing_requested_model(
     make_config,
 ):
@@ -43,6 +47,81 @@ def test_select_models_fails_closed_before_evaluation_for_missing_requested_mode
 
     with pytest.raises(ValueError, match="missing_model"):
         select_models(cfg, {"present_model": pd.DataFrame()})
+
+
+def test_select_models_omits_only_validated_generation_failures(make_config):
+    cfg = make_config()
+    cfg.evaluation.models = ["present_model", "stage_a_failed"]
+    inventory = artifacts.GenerationInventory(
+        expected_outputs=("present_model", "stage_a_failed"),
+        produced_outputs=("present_model",),
+        failed_outputs=("stage_a_failed",),
+    )
+    present = pd.DataFrame({"value": [1]})
+
+    selected = select_models(cfg, {"present_model": present}, inventory)
+
+    assert selected == {"present_model": present}
+    cfg.evaluation.models.append("unvalidated_missing")
+    with pytest.raises(ValueError, match="unvalidated_missing"):
+        select_models(cfg, {"present_model": present}, inventory)
+
+
+def test_run_evaluation_persists_partial_model_coverage(
+    make_config, make_canonical_dataset, monkeypatch
+):
+    cfg = make_config()
+    cfg.evaluation.models = ["model_a", "stage_a_failed"]
+    cfg.evaluation.synthcity.metrics = ["identifiability_score"]
+    cfg.evaluation.syntheval.enabled = False
+    cfg.evaluation.custom.enabled = False
+    cfg.evaluation.binary_target.enabled = False
+    cfg.evaluation.save_per_model_syntheval_plots = False
+    cfg.evaluation.generate_report = True
+    cfg.evaluation.privacy_gate.enabled = False
+
+    dataset = make_canonical_dataset()
+    synthetic = dataset.role_frame("train", imputed=True).copy()
+    synthcity_report = _dataframe(
+        {"mean": [0.25], "direction": ["minimize"]},
+        index=["privacy.identifiability_score.score_OC"],
+    )
+    inventory = artifacts.GenerationInventory(
+        expected_outputs=("model_a", "stage_a_failed"),
+        produced_outputs=("model_a",),
+        failed_outputs=("stage_a_failed",),
+    )
+    experiment = SimpleNamespace(
+        id="partial-generation",
+        manifest_path=Path(cfg.generation.output_dir) / "manifest.json",
+        generation_dir=Path(cfg.generation.output_dir),
+        evaluation_dir=Path(cfg.evaluation.output_dir),
+        plots_dir=Path(cfg.plots.output_dir),
+    )
+    monkeypatch.setattr(artifacts, "load_generation_inventory", lambda *_args: inventory)
+    monkeypatch.setattr(
+        synthcity_eval,
+        "run_synthcity_evaluation",
+        lambda selected, *args, **kwargs: {name: synthcity_report for name in selected},
+    )
+    monkeypatch.setattr(custom_eval, "run_log_disparity_evaluation", lambda *args, **kwargs: {})
+
+    combined, extras = run_evaluation(cfg, dataset, {"model_a": synthetic}, experiment=experiment)
+
+    assert list(combined.index) == ["model_a"]
+    assert "stage_a_failed" not in combined.index
+    assert extras["evaluation_coverage"] == {
+        "status": "partial",
+        "requested_models": ["model_a", "stage_a_failed"],
+        "evaluated_models": ["model_a"],
+        "failed_outputs": ["stage_a_failed"],
+    }
+    manifest = json.loads(Path(extras["artifact_manifest"]).read_text())
+    assert manifest["combined_evaluation"]["models"] == ["model_a"]
+    assert manifest["evaluation_attempt"]["evaluation_coverage"] == extras["evaluation_coverage"]
+    report_text = Path(extras["report_path"]).read_text()
+    assert "Failed outputs: `stage_a_failed`" in report_text
+    assert "partial coverage" in report_text.lower()
 
 
 def test_run_evaluation_missing_requested_model_stops_before_downstream_stages(
@@ -57,21 +136,21 @@ def test_run_evaluation_missing_requested_model_stops_before_downstream_stages(
     monkeypatch.setattr(
         synthcity_eval,
         "run_synthcity_evaluation",
-        lambda *args, **kwargs: calls.append("synthcity") or pytest.fail("must not run"),
+        lambda *args, **kwargs: calls.append("synthcity") or _fail_test("must not run"),
     )
     monkeypatch.setattr(
         syntheval_eval,
         "run_syntheval_evaluation",
-        lambda *args, **kwargs: calls.append("syntheval") or pytest.fail("must not run"),
+        lambda *args, **kwargs: calls.append("syntheval") or _fail_test("must not run"),
     )
     monkeypatch.setattr(
         generation_pipeline,
         "refit_selected_model",
-        lambda *args, **kwargs: calls.append("refit") or pytest.fail("must not run"),
+        lambda *args, **kwargs: calls.append("refit") or _fail_test("must not run"),
     )
     monkeypatch.setattr(
         "synthdata.evaluation._select_policy_model",
-        lambda *args, **kwargs: calls.append("selection") or pytest.fail("must not run"),
+        lambda *args, **kwargs: calls.append("selection") or _fail_test("must not run"),
     )
 
     with pytest.raises(ValueError, match="missing_model"):
@@ -193,13 +272,24 @@ def test_evaluation_cli_hands_candidate_and_final_phase_roles_to_evaluator(
         generation_dir=cfg.generation.output_dir,
         evaluation_dir=cfg.evaluation.output_dir,
         plots_dir=cfg.plots.output_dir,
+        manifest_path=Path("manifest.json"),
         record=lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(evaluation_cli, "load_experiment", lambda *_args, **_kwargs: experiment)
+    inventory = artifacts.GenerationInventory(
+        expected_outputs=("model",),
+        produced_outputs=("model",),
+        failed_outputs=(),
+    )
+    monkeypatch.setattr(
+        evaluation_cli.artifacts, "load_generation_inventory", lambda *_args: inventory
+    )
     monkeypatch.setattr(
         evaluation_cli,
         "_load_synthetic_datasets",
-        lambda _cfg, _dataset: preflight_calls.append(True) or {"model": candidate.full_df},
+        lambda _cfg, _dataset, *, generation_inventory: (
+            preflight_calls.append(generation_inventory) or {"model": candidate.full_df}
+        ),
     )
 
     def fake_run_evaluation(_cfg, dataset, _synthetic, experiment=None):
@@ -217,7 +307,7 @@ def test_evaluation_cli_hands_candidate_and_final_phase_roles_to_evaluator(
     assert handed_off.role_frame("train", imputed=True)["feature"].eq(-1).all()
     assert handed_off.role_frame("tuning", imputed=True)["feature"].eq(-2).all()
     assert handed_off.role_frame("final_holdout", imputed=True)["feature"].eq(-3).all()
-    assert preflight_calls == [True]
+    assert preflight_calls == [inventory]
     assert len(lineage_calls) == 1
     assert lineage_calls[0][1] == {"cache_key": "candidate"}
     assert lineage_calls[0][2] is True
@@ -241,7 +331,7 @@ def test_evaluation_cli_rejects_invalid_candidate_fit_state_before_evaluator(
     monkeypatch.setattr(
         evaluation_cli,
         "load_experiment",
-        lambda *_args, **_kwargs: pytest.fail("evaluator must not be reached"),
+        lambda *_args, **_kwargs: _fail_test("evaluator must not be reached"),
     )
     monkeypatch.setattr("sys.argv", ["run_evaluation", "--config", "config.yaml"])
 
@@ -259,7 +349,7 @@ def test_evaluation_cli_explicit_experiment_id_overrides_latest_resolution(
     monkeypatch.setattr(
         evaluation_cli,
         "load_dataset",
-        lambda _cfg: pytest.fail("explicit experiment override should be applied first"),
+        lambda _cfg: _fail_test("explicit experiment override should be applied first"),
     )
     monkeypatch.setattr(
         "sys.argv",
@@ -272,7 +362,7 @@ def test_evaluation_cli_explicit_experiment_id_overrides_latest_resolution(
         ],
     )
 
-    with pytest.raises(pytest.fail.Exception):
+    with pytest.raises(AssertionError):
         evaluation_cli.main()
 
     assert cfg.experiment.id == "fresh-protected-experiment"
@@ -314,7 +404,7 @@ def test_evaluation_cli_rejects_unvalidated_final_holdout(
     monkeypatch.setattr(
         evaluation_cli,
         "load_experiment",
-        lambda *_args, **_kwargs: pytest.fail("load_experiment must not run"),
+        lambda *_args, **_kwargs: _fail_test("load_experiment must not run"),
     )
     monkeypatch.setattr("sys.argv", ["run_evaluation", "--config", "config.yaml"])
 

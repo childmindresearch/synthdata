@@ -99,12 +99,37 @@ def _run_metadata_section(cfg: Config, dataset: Dataset, model_names: list, expe
     return "\n".join(lines)
 
 
-def _ranked_summary_section(combined: pd.DataFrame) -> str:
+def _ranked_summary_section(combined: pd.DataFrame, *, partial_coverage: bool = False) -> str:
     summary = simple_rank_summary(combined)
     if summary.empty:
         return "## Ranked summary\n\nNo ranking columns were produced."
     table = _dataframe_to_markdown(summary.reset_index())
-    return "## Ranked summary (higher = better)\n\n" + table
+    qualifier = " (partial coverage; higher = better)" if partial_coverage else " (higher = better)"
+    return f"## Ranked summary{qualifier}\n\n" + table
+
+
+def _coverage_section(coverage: dict) -> str:
+    """Render missing generation outputs separately from evaluated model metrics."""
+    failed_outputs = coverage.get("failed_outputs")
+    evaluated_models = coverage.get("evaluated_models")
+    if not isinstance(failed_outputs, list) or not all(
+        isinstance(name, str) for name in failed_outputs
+    ):
+        raise ValueError("Partial evaluation coverage must list failed output names")
+    if not isinstance(evaluated_models, list) or not all(
+        isinstance(name, str) for name in evaluated_models
+    ):
+        raise ValueError("Partial evaluation coverage must list evaluated model names")
+    lines = [
+        "## Generation coverage",
+        "",
+        "**Partial:** failed generation outputs were omitted from metric tables and rankings.",
+        "",
+        "- Evaluated models: " + (", ".join(f"`{name}`" for name in evaluated_models) or "none"),
+        "- Failed outputs: " + (", ".join(f"`{name}`" for name in failed_outputs) or "none"),
+        "- Ranked summary compares evaluated models only; it is not a complete-run ranking.",
+    ]
+    return "\n".join(lines)
 
 
 def _privacy_gate_section(combined: pd.DataFrame) -> str:
@@ -132,7 +157,7 @@ def _privacy_gate_section(combined: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
-def _recommended_model_section(combined: pd.DataFrame) -> str:
+def _recommended_model_section(combined: pd.DataFrame, *, partial_coverage: bool = False) -> str:
     if _TUNING_UTILITY_COL not in combined.columns:
         return (
             "## Recommended model\n\n"
@@ -152,8 +177,13 @@ def _recommended_model_section(combined: pd.DataFrame) -> str:
         "",
         f"**`{best}`** (`U_tuning`: {tuning_utility:.3f})",
         "",
-        "Selected using highest complete fixed-transform tuning utility only; all candidate "
-        "audit rows are retained.",
+        (
+            "Selected from available models only using highest complete fixed-transform "
+            "tuning utility; coverage is partial."
+            if partial_coverage
+            else "Selected using highest complete fixed-transform tuning utility only; all candidate "
+            "audit rows are retained."
+        ),
     ]
     if _GATE_PASS_COL in combined.columns:
         lines.append("")
@@ -480,25 +510,33 @@ def build_evaluation_report(
             "manifest; refusing to render uncontextualized results"
         )
     model_names = sorted(extras.get("selected_datasets", {}) or combined.index.tolist())
+    coverage = extras.get("evaluation_coverage")
+    partial_coverage = isinstance(coverage, dict) and coverage.get("status") == "partial"
     report_dir = Path(report_dir) if report_dir else Path(cfg.evaluation.output_dir)
     sections = [
         f"# Evaluation report: {dataset.name}",
         "",
         _run_metadata_section(cfg, dataset, model_names, experiment),
         "",
-        _ranked_summary_section(combined),
-        "",
-        _privacy_gate_section(combined),
-        "",
-        _recommended_model_section(combined),
-        "",
-        _release_score_section(extras),
-        "",
-        _fairness_highlights_section(combined, extras),
-        "",
-        _plot_links_section(report_dir, cfg, extras.get("log_disparity_reports") or {}),
-        "",
     ]
+    if partial_coverage:
+        sections.extend([_coverage_section(coverage), ""])
+    sections.extend(
+        [
+            _ranked_summary_section(combined, partial_coverage=partial_coverage),
+            "",
+            _privacy_gate_section(combined),
+            "",
+            _recommended_model_section(combined, partial_coverage=partial_coverage),
+            "",
+            _release_score_section(extras),
+            "",
+            _fairness_highlights_section(combined, extras),
+            "",
+            _plot_links_section(report_dir, cfg, extras.get("log_disparity_reports") or {}),
+            "",
+        ]
+    )
     return "\n".join(sections)
 
 

@@ -786,6 +786,27 @@ def refit_selected_model(
     }
 
 
+def _expected_generation_outputs(gen_cfg) -> list[str]:
+    """List configured output names before attempting any model generation."""
+    expected = []
+    if gen_cfg.synthcity.enabled:
+        for name in gen_cfg.synthcity.names:
+            expected.append(name)
+            if gen_cfg.hpo.enabled:
+                expected.append(f"{name}_hpo")
+    if gen_cfg.tabpfn.enabled:
+        for variant in gen_cfg.tabpfn.data_variants:
+            suffix = "_imputed" if variant == "imputed" else ""
+            for model in gen_cfg.tabpfn.variants:
+                expected.append(f"tabpfn_{model}{suffix}")
+    if gen_cfg.tabpfgen.enabled:
+        for variant in gen_cfg.tabpfgen.variants:
+            expected.append(f"tabpfgen_{variant}")
+            if gen_cfg.hpo.enabled:
+                expected.append(f"tabpfgen_{variant}_hpo")
+    return list(dict.fromkeys(expected))
+
+
 def run_generation(
     cfg: Config,
     dataset: Dataset,
@@ -885,6 +906,8 @@ def run_generation(
         device=device,
         semantic_context=generation_semantic_context,
     )
+    hpo_context_artifact_path = None
+    hpo_context_digest = None
     if hpo_context is not None:
         hpo_context_path = output_dir / "hpo_context.json"
         hpo_context_digest = hpo_mod.hpo_context_digest(hpo_context)
@@ -908,7 +931,22 @@ def run_generation(
                 )
         else:
             _atomic_json(versioned_hpo_context_path, hpo_context_payload)
+        try:
+            persisted_hpo_context = load_json(versioned_hpo_context_path)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"Persisted HPO context at {versioned_hpo_context_path} is unreadable"
+            ) from exc
+        if (
+            persisted_hpo_context != hpo_context_payload
+            or hpo_mod.hpo_context_digest(persisted_hpo_context.get("context", {}))
+            != hpo_context_digest
+        ):
+            raise RuntimeError(
+                f"Persisted HPO context at {versioned_hpo_context_path} failed digest validation"
+            )
         _atomic_json(hpo_context_path, hpo_context_payload)
+        hpo_context_artifact_path = versioned_hpo_context_path.name
     hpo_group_context = hpo_context.get("group_context") if hpo_context else None
     best_params_path = gen_cfg.hpo.best_params_path or hpo_mod.default_best_params_path(output_dir)
     best_params = (
@@ -924,6 +962,31 @@ def run_generation(
         return best_params
 
     synthetic_datasets: dict[str, pd.DataFrame] = {}
+    expected_outputs = _expected_generation_outputs(gen_cfg)
+    failed_model_outcomes: list[dict] = []
+
+    def _stage_a_failure_outcome(model_name: str, error: hpo_mod.StageAExhaustionError) -> dict:
+        if hpo_context is None or hpo_context_digest is None or hpo_context_artifact_path is None:
+            raise RuntimeError("Stage A exhaustion requires a persisted HPO context artifact")
+        expected_study_name = hpo_mod.contextual_study_name(
+            f"hpo_{model_name.removesuffix('_hpo')}", hpo_context
+        )
+        if error.study_name != expected_study_name:
+            raise RuntimeError(
+                f"Stage A exhaustion study {error.study_name!r} does not match current "
+                f"HPO context study {expected_study_name!r}"
+            )
+        stage_a_contract_digest = hpo_context.get("stage_a_contract_digest")
+        if not isinstance(stage_a_contract_digest, str) or not stage_a_contract_digest:
+            raise RuntimeError("Stage A exhaustion HPO context has no contract digest")
+        return {
+            "model": model_name,
+            "hpo_study": error.study_name,
+            "hpo_context_path": hpo_context_artifact_path,
+            "hpo_context_digest": hpo_context_digest,
+            "stage_a_contract_digest": stage_a_contract_digest,
+            "evidence_references": error.evidence_references,
+        }
 
     def _cached_or_build(name, build_fn, *, hpo_context=None, resolved_parameters=None):
         path = output_dir / f"{name}.csv"
@@ -1211,20 +1274,31 @@ def run_generation(
                         },
                         release_generalization=dataset.release_generalization,
                     )
-                    params = hpo_mod.run_study(
-                        f"hpo_{name}",
-                        objective,
-                        gen_cfg.hpo,
-                        output_dir,
-                        seed,
-                        hpo_context=hpo_context,
-                        checkpoint_workspace=output_dir / "synthcity_workspace",
-                        checkpoint_plugin=name,
-                        checkpoint_implementation_fingerprint=sc.generator_implementation_fingerprint(
-                            name
-                        ),
-                        stage_a_root=stage_a_root,
-                    )
+                    try:
+                        params = hpo_mod.run_study(
+                            f"hpo_{name}",
+                            objective,
+                            gen_cfg.hpo,
+                            output_dir,
+                            seed,
+                            hpo_context=hpo_context,
+                            checkpoint_workspace=output_dir / "synthcity_workspace",
+                            checkpoint_plugin=name,
+                            checkpoint_implementation_fingerprint=sc.generator_implementation_fingerprint(
+                                name
+                            ),
+                            stage_a_root=stage_a_root,
+                        )
+                    except hpo_mod.StageAExhaustionError as exc:
+                        failed_model_outcomes.append(_stage_a_failure_outcome(f"{name}_hpo", exc))
+                        logger.warning(
+                            "[generation] skipping HPO output=%s after Stage A exhaustion; "
+                            "study=%s evidence=%s",
+                            f"{name}_hpo",
+                            exc.study_name,
+                            exc.evidence_references,
+                        )
+                        continue
                     cache.set("synthcity", name, params)
                 params = dict(cache.get("synthcity", name))
 
@@ -1384,39 +1458,53 @@ def run_generation(
                         variable_schema_fingerprint=dataset.variable_schema_fingerprint,
                         semantic_context=generation_semantic_context,
                     )
-                    params = hpo_mod.run_study(
-                        "hpo_tabpfgen_standard",
-                        objective,
-                        gen_cfg.hpo,
-                        output_dir,
-                        seed,
-                        drop_keys=(),
-                        hpo_context=hpo_context,
-                        checkpoint_implementation_fingerprint=sc.generator_implementation_fingerprint(
-                            "tabpfgen_standard"
-                        ),
-                        stage_a_root=stage_a_root,
-                    )
-                    cache.set("tabpfgen", "tabpfgen_standard", params)
-                params = cache.get("tabpfgen", "tabpfgen_standard")
+                    try:
+                        params = hpo_mod.run_study(
+                            "hpo_tabpfgen_standard",
+                            objective,
+                            gen_cfg.hpo,
+                            output_dir,
+                            seed,
+                            drop_keys=(),
+                            hpo_context=hpo_context,
+                            checkpoint_implementation_fingerprint=sc.generator_implementation_fingerprint(
+                                "tabpfgen_standard"
+                            ),
+                            stage_a_root=stage_a_root,
+                        )
+                    except hpo_mod.StageAExhaustionError as exc:
+                        failed_model_outcomes.append(
+                            _stage_a_failure_outcome("tabpfgen_standard_hpo", exc)
+                        )
+                        logger.warning(
+                            "[generation] skipping HPO output=tabpfgen_standard_hpo after "
+                            "Stage A exhaustion; study=%s evidence=%s",
+                            exc.study_name,
+                            exc.evidence_references,
+                        )
+                        params = None
+                    if params is not None:
+                        cache.set("tabpfgen", "tabpfgen_standard", params)
+                if cache.has("tabpfgen", "tabpfgen_standard"):
+                    params = cache.get("tabpfgen", "tabpfgen_standard")
 
-                _cached_or_build(
-                    "tabpfgen_standard_hpo",
-                    lambda params=params: tpfgen.generate_tabpfgen_standard(
-                        fit_imputed_df,
-                        dataset.feature_columns,
-                        dataset.categorical_columns,
-                        dataset.target_column,
-                        n_samples,
-                        tabpfgen_params=params,
-                        relabel_with_classifier=True,
-                        target_is_categorical=dataset.target_is_categorical,
-                        variable_schema_fingerprint=dataset.variable_schema_fingerprint,
-                        semantic_context=generation_semantic_context,
-                    ),
-                    hpo_context=hpo_context,
-                    resolved_parameters=params,
-                )
+                    _cached_or_build(
+                        "tabpfgen_standard_hpo",
+                        lambda params=params: tpfgen.generate_tabpfgen_standard(
+                            fit_imputed_df,
+                            dataset.feature_columns,
+                            dataset.categorical_columns,
+                            dataset.target_column,
+                            n_samples,
+                            tabpfgen_params=params,
+                            relabel_with_classifier=True,
+                            target_is_categorical=dataset.target_is_categorical,
+                            variable_schema_fingerprint=dataset.variable_schema_fingerprint,
+                            semantic_context=generation_semantic_context,
+                        ),
+                        hpo_context=hpo_context,
+                        resolved_parameters=params,
+                    )
 
         if "custom" in gen_cfg.tabpfgen.variants:
             custom_params = dict(gen_cfg.tabpfgen.custom_params)
@@ -1459,43 +1547,73 @@ def run_generation(
                         variable_schema_fingerprint=dataset.variable_schema_fingerprint,
                         semantic_context=generation_semantic_context,
                     )
-                    params = hpo_mod.run_study(
-                        "hpo_tabpfgen_custom",
-                        objective,
-                        gen_cfg.hpo,
-                        output_dir,
-                        seed,
-                        drop_keys=(),
-                        hpo_context=hpo_context,
-                        checkpoint_implementation_fingerprint=sc.generator_implementation_fingerprint(
-                            "tabpfgen_custom"
-                        ),
-                        stage_a_root=stage_a_root,
-                    )
-                    cache.set("tabpfgen", "tabpfgen_custom", params)
-                params = cache.get("tabpfgen", "tabpfgen_custom")
+                    try:
+                        params = hpo_mod.run_study(
+                            "hpo_tabpfgen_custom",
+                            objective,
+                            gen_cfg.hpo,
+                            output_dir,
+                            seed,
+                            drop_keys=(),
+                            hpo_context=hpo_context,
+                            checkpoint_implementation_fingerprint=sc.generator_implementation_fingerprint(
+                                "tabpfgen_custom"
+                            ),
+                            stage_a_root=stage_a_root,
+                        )
+                    except hpo_mod.StageAExhaustionError as exc:
+                        failed_model_outcomes.append(
+                            _stage_a_failure_outcome("tabpfgen_custom_hpo", exc)
+                        )
+                        logger.warning(
+                            "[generation] skipping HPO output=tabpfgen_custom_hpo after "
+                            "Stage A exhaustion; study=%s evidence=%s",
+                            exc.study_name,
+                            exc.evidence_references,
+                        )
+                        params = None
+                    if params is not None:
+                        cache.set("tabpfgen", "tabpfgen_custom", params)
+                if cache.has("tabpfgen", "tabpfgen_custom"):
+                    params = cache.get("tabpfgen", "tabpfgen_custom")
 
-                _cached_or_build(
-                    "tabpfgen_custom_hpo",
-                    lambda params=params: tpfgen.generate_tabpfgen_custom(
-                        fit_imputed_df,
-                        dataset.feature_columns,
-                        dataset.categorical_columns,
-                        dataset.target_column,
-                        n_samples,
-                        seed=seed,
-                        sgld_params=params,
-                        target_is_categorical=dataset.target_is_categorical,
-                        variable_schema_fingerprint=dataset.variable_schema_fingerprint,
-                        semantic_context=generation_semantic_context,
-                    ),
-                    hpo_context=hpo_context,
-                    resolved_parameters=params,
-                )
+                    _cached_or_build(
+                        "tabpfgen_custom_hpo",
+                        lambda params=params: tpfgen.generate_tabpfgen_custom(
+                            fit_imputed_df,
+                            dataset.feature_columns,
+                            dataset.categorical_columns,
+                            dataset.target_column,
+                            n_samples,
+                            seed=seed,
+                            sgld_params=params,
+                            target_is_categorical=dataset.target_is_categorical,
+                            variable_schema_fingerprint=dataset.variable_schema_fingerprint,
+                            semantic_context=generation_semantic_context,
+                        ),
+                        hpo_context=hpo_context,
+                        resolved_parameters=params,
+                    )
 
     logger.info(
         "Generated/loaded %d synthetic datasets: %s",
         len(synthetic_datasets),
         sorted(synthetic_datasets),
     )
+    if experiment is not None:
+        produced_outputs = sorted(synthetic_datasets)
+        failed_outputs = [outcome["model"] for outcome in failed_model_outcomes]
+        experiment.record(
+            "generation",
+            artifacts={
+                "synthetic_data_dir": str(output_dir),
+                "models": produced_outputs,
+            },
+            n_models=len(synthetic_datasets),
+            status="partial" if failed_model_outcomes else "complete",
+            expected_outputs=expected_outputs,
+            produced_outputs=produced_outputs,
+            failed_outputs=failed_outputs,
+            failed_models=failed_model_outcomes,
+        )
     return synthetic_datasets
