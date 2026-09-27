@@ -1,6 +1,7 @@
 """Behavioral tests for imputation validation-report CLI artifacts."""
 
 import sys
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -122,7 +123,8 @@ def test_validation_report_csv_preserves_columns_and_rows(make_config, monkeypat
 
     report_path = imputation_output_dir(cfg) / "imputation_validation_report.csv"
     persisted = pd.read_csv(report_path)
-    pd.testing.assert_frame_equal(persisted, validation_df, check_dtype=False)
+    csv_normalized = pd.read_csv(StringIO(validation_df.to_csv(index=False)))
+    pd.testing.assert_frame_equal(persisted, csv_normalized, check_dtype=False)
 
 
 def test_empty_validation_report_writes_expected_header(make_config, monkeypatch, tmp_path):

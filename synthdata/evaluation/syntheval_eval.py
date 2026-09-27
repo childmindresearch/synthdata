@@ -3118,9 +3118,10 @@ def _validated_cached_syntheval_tables(
     try:
         # Parquet normalizes all-NaN failed-model columns to float; rebuilding
         # from structured evidence can retain object dtype for those columns.
-        # Values and labels remain strict while dtype normalization is benign.
-        pd.testing.assert_frame_equal(cached_results, rebuilt_results, check_dtype=False)
-        pd.testing.assert_frame_equal(cached_ranks, rebuilt_ranks, check_dtype=False)
+        # Treat only paired None/IEEE-NaN data cells as equal; axes and all
+        # remaining values stay strict while dtype normalization is benign.
+        _assert_cached_frame_equal(cached_results, rebuilt_results)
+        _assert_cached_frame_equal(cached_ranks, rebuilt_ranks)
     except AssertionError as exc:
         logger.warning(
             "[syntheval] %s aggregate cache differs from structured execution tables (%s); "
@@ -3130,6 +3131,47 @@ def _validated_cached_syntheval_tables(
         )
         return None
     return rebuilt_results, rebuilt_ranks
+
+
+def _assert_cached_frame_equal(cached: pd.DataFrame, rebuilt: pd.DataFrame) -> None:
+    """Compare aggregate frames, allowing only paired None and IEEE NaN cells."""
+    pd.testing.assert_index_equal(cached.index, rebuilt.index)
+    pd.testing.assert_index_equal(cached.columns, rebuilt.columns)
+
+    cached_values = cached.to_numpy(dtype=object, copy=True)
+    rebuilt_values = rebuilt.to_numpy(dtype=object, copy=True)
+    for row in range(cached_values.shape[0]):
+        for column in range(cached_values.shape[1]):
+            cached_value = cached_values[row, column]
+            rebuilt_value = rebuilt_values[row, column]
+            if (cached_value is None and _is_ieee_nan(rebuilt_value)) or (
+                rebuilt_value is None and _is_ieee_nan(cached_value)
+            ):
+                cached_values[row, column] = np.nan
+                rebuilt_values[row, column] = np.nan
+            elif _is_missing_scalar(cached_value) or _is_missing_scalar(rebuilt_value):
+                if _is_missing_scalar(cached_value) != _is_missing_scalar(rebuilt_value) or (
+                    type(cached_value) is not type(rebuilt_value)
+                    and not (_is_ieee_nan(cached_value) and _is_ieee_nan(rebuilt_value))
+                ):
+                    raise AssertionError(
+                        f"aggregate cache missing-value mismatch at row {row}, column {column}"
+                    )
+
+    cached_normalized = pd.DataFrame(cached_values, index=cached.index, columns=cached.columns)
+    rebuilt_normalized = pd.DataFrame(rebuilt_values, index=rebuilt.index, columns=rebuilt.columns)
+    pd.testing.assert_frame_equal(cached_normalized, rebuilt_normalized, check_dtype=False)
+
+
+def _is_ieee_nan(value: object) -> bool:
+    """Return whether value is a Python or NumPy IEEE floating-point NaN."""
+    return isinstance(value, (float, np.floating)) and bool(np.isnan(value))
+
+
+def _is_missing_scalar(value: object) -> bool:
+    """Return whether pandas identifies scalar value as missing."""
+    missing = pd.isna(value)
+    return isinstance(missing, (bool, np.bool_)) and bool(missing)
 
 
 def _structured_observations(

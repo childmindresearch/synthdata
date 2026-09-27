@@ -35,6 +35,7 @@ dependencies = [
 [project.scripts]
 synthdata-impute = "scripts.run_imputation:main"
  synthdata-imputation-benchmark = "scripts.run_imputation_benchmark:main"
+synthdata-test = "scripts.run_test:main"
 synthdata-generate = "scripts.run_generation:main"
 synthdata-evaluate = "scripts.run_evaluation:main"
 synthdata-plot = "scripts.run_plots:main"

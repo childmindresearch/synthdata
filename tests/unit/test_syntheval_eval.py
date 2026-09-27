@@ -2264,6 +2264,7 @@ class TestComputeCacheKey:
 
 
 class TestSaveLoadSynthevalCache:
+    @pytest.mark.filterwarnings("error::FutureWarning")
     def test_binary_failed_model_survives_aggregate_cache_reload(self, tmp_path):
         manifest = {"metric_a": ["metric_a"]}
         failed = _failed_execution_payload(
@@ -2358,6 +2359,62 @@ class TestSaveLoadSynthevalCache:
         assert list(validated[0].index) == ["valid_model", "invalid_model"]
         assert pd.isna(validated[0].loc["invalid_model", ("metric_a", "value")])
         assert pd.isna(validated[1].loc["invalid_model", "metric_a"])
+
+        def validate_cached_tables(results_to_check):
+            return _validated_cached_syntheval_tables(
+                results_to_check,
+                loaded[1],
+                executions,
+                ["valid_model", "invalid_model"],
+                "linear",
+                "binary-target",
+            )
+
+        paired_none_nan = next(
+            (
+                (row, column)
+                for row in range(results.shape[0])
+                for column in range(results.shape[1])
+                if (
+                    results.iat[row, column] is None
+                    and isinstance(loaded[0].iat[row, column], (float, np.floating))
+                    and np.isnan(loaded[0].iat[row, column])
+                )
+                or (
+                    loaded[0].iat[row, column] is None
+                    and isinstance(results.iat[row, column], (float, np.floating))
+                    and np.isnan(results.iat[row, column])
+                )
+            ),
+            None,
+        )
+        assert paired_none_nan is not None
+
+        one_sided_missing = loaded[0].copy()
+        one_sided_missing.iat[paired_none_nan[0], paired_none_nan[1]] = 0.25
+        assert validate_cached_tables(one_sided_missing) is None
+
+        other_missing_type = loaded[0].astype(object)
+        other_missing_type.iat[paired_none_nan[0], paired_none_nan[1]] = pd.NA
+        assert validate_cached_tables(other_missing_type) is None
+
+        non_null_mismatch = loaded[0].copy()
+        non_null_mismatch.loc["valid_model", ("metric_a", "value")] = 0.25
+        assert validate_cached_tables(non_null_mismatch) is None
+
+        changed_row_label = loaded[0].copy()
+        changed_row_label.index = ["renamed_model", "invalid_model"]
+        assert validate_cached_tables(changed_row_label) is None
+        assert validate_cached_tables(loaded[0].iloc[::-1]) is None
+
+        changed_column_labels = list(loaded[0].columns)
+        changed_column_labels[0] = ("renamed_metric", changed_column_labels[0][1])
+        changed_columns = loaded[0].copy()
+        changed_columns.columns = pd.MultiIndex.from_tuples(
+            changed_column_labels, names=loaded[0].columns.names
+        )
+        assert validate_cached_tables(changed_columns) is None
+        assert validate_cached_tables(loaded[0].iloc[:, ::-1]) is None
 
         tampered_key = _compute_cache_key(
             {"auroc_diff": {}}, ["valid_model"], "linear", "failure-bound"

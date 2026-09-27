@@ -2,6 +2,7 @@
 min-max scaling, and the combined ranked table.
 """
 
+import warnings
 from collections.abc import Mapping, Sequence
 
 import numpy as np
@@ -10,6 +11,7 @@ import pytest
 
 from synthdata.evaluation.combine import (
     _log_disparity_frames,
+    _materialize_validation_records,
     _minmax_scale,
     _synthcity_frames,
     _syntheval_frames,
@@ -140,6 +142,53 @@ class TestSynthcityFrames:
             == "indeterminate"
         )
         assert oriented.empty
+
+    def test_many_missing_expected_identities_do_not_fragment_raw_frame(self):
+        model_index = pd.Index(["model_b", "model_a"], name="model")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", pd.errors.PerformanceWarning)
+            raw = pd.concat(
+                [
+                    pd.DataFrame({f"metric_{index}": [index, index + 1]}, index=model_index)
+                    for index in range(105)
+                ],
+                axis=1,
+            )
+        expected_keys = [f"expected_{index}" for index in range(1, 106)]
+        records = [
+            MetricStatusRecord(
+                model_name="model_a",
+                expected_key=key,
+                framework="synthcity",
+                status="succeeded",
+                raw_value=value,
+            )
+            for key, value in (
+                ("metric_0", 999),
+                *((key, index) for index, key in enumerate(expected_keys, start=1)),
+            )
+        ]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", pd.errors.PerformanceWarning)
+            materialized = _materialize_validation_records(
+                raw,
+                ["model_a", "model_b"],
+                {"model_a": records, "model_b": ()},
+            )
+
+        assert materialized.columns.tolist() == [
+            *raw.columns.tolist(),
+            *expected_keys,
+        ]
+        pd.testing.assert_index_equal(
+            materialized.index, pd.Index(["model_a", "model_b"], name="model")
+        )
+        assert materialized.loc["model_a", "metric_0"] == 1
+        assert materialized.loc["model_a", "expected_1"] == 1
+        assert materialized.loc["model_a", "expected_4"] == 4
+        assert materialized.loc["model_a", "expected_105"] == 105
+        assert pd.isna(materialized.loc["model_b", "expected_1"])
 
     def test_failed_model_keeps_expected_raw_columns_and_failure_state(self):
         sentinel = "framework crashed at /private/traceback.py:7"

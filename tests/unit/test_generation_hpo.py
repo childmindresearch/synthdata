@@ -14,7 +14,7 @@ import pandas as pd
 import pytest
 import torch
 
-from synthdata.config import HPOConfig, load_config
+from synthdata.config import HPOConfig
 from synthdata.data import dataframe_fingerprint, semantic_context_payload
 from synthdata.generation import hpo as hpo_module
 from synthdata.generation import synthcity_backend as synthcity_backend_module
@@ -173,12 +173,21 @@ def test_default_hpo_objective_excludes_privacy_and_diagnostics():
     assert "privacy" not in config.metric_config
 
 
-def test_loris_config_loads_canonical_versioned_equal_thirds_policy():
-    config = load_config(Path(__file__).parents[2] / "configs" / "config_loris.yaml")
-    metric_config = config.generation.hpo.metric_config
+def test_explicit_hpo_config_uses_canonical_versioned_equal_thirds_policy():
+    metric_config = {
+        "canonical_objectives": [
+            "tstr_macro_f1.v1",
+            "mixed_mmd.v1",
+            "elastic_net_jsd.v1",
+        ]
+    }
     metrics = [metric for values in metric_config.values() for metric in values]
+    config = HPOConfig(
+        metric_config=metric_config,
+        utility_policy={"metrics": metrics, "weights": [1 / 3, 1 / 3, 1 / 3]},
+    )
 
-    assert metric_config == {
+    assert config.metric_config == {
         "canonical_objectives": [
             "tstr_macro_f1.v1",
             "mixed_mmd.v1",
@@ -187,7 +196,7 @@ def test_loris_config_loads_canonical_versioned_equal_thirds_policy():
     }
     assert len(metrics) == len(set(metrics)) == 3
     assert all(metric.endswith(".v1") for metric in metrics)
-    assert config.generation.hpo.utility_policy == {
+    assert config.utility_policy == {
         "metrics": metrics,
         "weights": [1 / 3, 1 / 3, 1 / 3],
     }

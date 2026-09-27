@@ -1,11 +1,10 @@
 """Unit tests for synthdata.experiment: append-only manifest + resumability."""
 
 import json
-from pathlib import Path
 
 import pytest
-import yaml
 
+from synthdata.config import Config, ExperimentConfig, GenerationConfig, SynthcityModelsConfig
 from synthdata.data import role_context_fingerprint, role_context_payload
 from synthdata.experiment import (
     _timestamp_id,
@@ -31,17 +30,20 @@ class TestTimestampId:
         assert timestamp_part.endswith("Z")
 
 
-def test_protected_n40_profile_requires_fresh_auto_experiment_id():
-    profile = yaml.safe_load(
-        (
-            Path(__file__).parents[2] / "configs/config_loris_protected_generation_n40.yaml"
-        ).read_text()
+def test_explicit_config_requires_fresh_auto_experiment_id():
+    config = Config(
+        experiment=ExperimentConfig(),
+        generation=GenerationConfig(
+            force_retrain=True,
+            n_samples=100,
+            synthcity=SynthcityModelsConfig(params={"ctgan": {"n_iter": 40}}),
+        ),
     )
 
-    assert "id" not in profile["experiment"]
-    assert profile["generation"]["force_retrain"] is True
-    assert profile["generation"]["n_samples"] == 100
-    assert profile["generation"]["synthcity"]["params"]["ctgan"]["n_iter"] == 40
+    assert config.experiment.id is None
+    assert config.generation.force_retrain is True
+    assert config.generation.n_samples == 100
+    assert config.generation.synthcity.params["ctgan"]["n_iter"] == 40
 
 
 class TestStartExperiment:

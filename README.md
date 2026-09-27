@@ -25,6 +25,27 @@ uv run synthdata-evaluate --config path/to/your-config.yaml --plot
 uv run synthdata-plot     --config path/to/your-config.yaml
 ```
 
+### Audit a configuration
+
+Run `synthdata-test` to check a configuration before running pipeline stages:
+
+```bash
+uv run synthdata-test --config path/to/your-config.yaml
+uv run synthdata-test --config configs/config_hepatitis.yaml
+```
+
+The audit validates configuration and semantic policies, then loads the
+configured dataset and variable schema by default. It checks the configured
+data, schema, declarations, and split using the normal dataset loader. This
+check can write processed dataset and split artifacts plus related metadata
+under the configured data directory. If the config points to a remote source
+such as UCI and its cache is absent, the audit may fetch and cache that data.
+
+An audit passing means only that the configuration and configured data/schema
+passed these checks. It does not run imputation, generation, evaluation,
+plotting, or hosted inference, and does not establish that those stages will
+succeed.
+
 ## Your dataset configuration
 
 Provide a variable-schema CSV with one row for each feature and target. The schema explicitly declares a column as `categorical` or `continuous`, and records the ordering for ordinal categorical values.

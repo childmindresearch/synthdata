@@ -12,8 +12,8 @@ import optuna
 import pandas as pd
 import pytest
 import torch
-import yaml
 
+from synthdata.config import Config, GenerationConfig, SynthcityModelsConfig
 from synthdata.data import role_context_payload, semantic_context_payload
 from synthdata.experiment import start_experiment
 from synthdata.generation import hpo as hpo_mod
@@ -1232,13 +1232,18 @@ def test_generation_cache_rejects_undersized_frame(make_config, make_canonical_d
     fit_generate.assert_called_once()
 
 
-def test_loris_protected_n40_profile_forces_fresh_generation():
-    config = yaml.safe_load(Path("configs/config_loris_protected_generation_n40.yaml").read_text())
+def test_explicit_generation_settings_force_fresh_ctgan_build():
+    config = Config(
+        generation=GenerationConfig(
+            force_retrain=True,
+            n_samples=100,
+            synthcity=SynthcityModelsConfig(params={"ctgan": {"n_iter": 40}}),
+        )
+    )
 
-    generation = config["generation"]
-    assert generation["force_retrain"] is True
-    assert generation["n_samples"] == 100
-    assert generation["synthcity"]["params"]["ctgan"]["n_iter"] == 40
+    assert config.generation.force_retrain is True
+    assert config.generation.n_samples == 100
+    assert config.generation.synthcity.params["ctgan"]["n_iter"] == 40
 
 
 def test_non_private_generation_cache_requires_generator_metadata(

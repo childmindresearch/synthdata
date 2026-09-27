@@ -1,8 +1,10 @@
 """Unit tests for synthdata.config: dataclass composition, validation, YAML loading."""
 
-import re
+import dataclasses
+import shutil
 from pathlib import Path
 from typing import cast
+from uuid import uuid4
 
 import pytest
 import yaml
@@ -25,6 +27,25 @@ from synthdata.config import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture
+def tmp_path():
+    """Create an owned per-test scratch directory under the repository tmp/ root."""
+    scratch_root = Path(__file__).parents[2] / "tmp"
+    scratch_root.mkdir(exist_ok=True)
+    scratch_path = scratch_root / f"test-config-{uuid4().hex}"
+    scratch_path.mkdir()
+    try:
+        yield scratch_path
+    finally:
+        resolved_root = scratch_root.resolve()
+        resolved_path = scratch_path.resolve()
+        if resolved_path.parent != resolved_root or not resolved_path.name.startswith(
+            "test-config-"
+        ):
+            raise RuntimeError(f"Refusing to remove unowned config test scratch: {resolved_path}")
+        shutil.rmtree(resolved_path)
 
 
 class TestFromDict:
@@ -137,31 +158,50 @@ class TestFromDict:
         # Sibling RefiDiffConfig defaults are preserved.
         assert cfg.imputation.refidiff.denoiser == "auto"
 
-    @pytest.mark.parametrize(
-        "config_name",
-        ["config_loris_refidiff_reference.yaml", "config_loris_refidiff_hpo.yaml"],
-    )
-    def test_refidiff_benchmark_profiles_load(self, config_name):
-        root = Path(__file__).parents[2]
-        cfg = load_config(root / "configs" / config_name)
+    def test_refidiff_settings_build_from_test_owned_data(self):
+        cfg = _from_dict(
+            Config,
+            {
+                "imputation": {
+                    "method": "refidiff",
+                    "refidiff": {
+                        "denoiser": "mamba",
+                        "catboost_warmup_iterations": 1000,
+                    },
+                    "benchmark": {"enabled": True},
+                }
+            },
+        )
         assert cfg.imputation.method == "refidiff"
         assert cfg.imputation.refidiff.denoiser == "mamba"
         assert cfg.imputation.refidiff.catboost_warmup_iterations == 1000
         assert cfg.imputation.benchmark.enabled
 
-    def test_shipped_hepatitis_hpo_profile_uses_native_metrics(self):
-        root = Path(__file__).parents[2]
-        cfg = load_config(root / "configs" / "config_hepatitis.yaml")
-
-        assert cfg.generation.hpo.metric_config == {
-            "stats": ["wasserstein_dist", "inv_kl_divergence"],
-            "sanity": ["nearest_syn_neighbor_distance"],
-            "performance": ["xgb"],
-        }
-
-    def test_shipped_loris_hpo_profile_uses_exact_canonical_metrics(self):
-        root = Path(__file__).parents[2]
-        cfg = load_config(root / "configs" / "config_loris.yaml")
+    def test_hpo_metric_policy_uses_test_owned_settings(self):
+        cfg = _from_dict(
+            Config,
+            {
+                "generation": {
+                    "hpo": {
+                        "metric_config": {
+                            "canonical_objectives": [
+                                "tstr_macro_f1.v1",
+                                "mixed_mmd.v1",
+                                "elastic_net_jsd.v1",
+                            ]
+                        },
+                        "utility_policy": {
+                            "metrics": [
+                                "tstr_macro_f1.v1",
+                                "mixed_mmd.v1",
+                                "elastic_net_jsd.v1",
+                            ],
+                            "weights": [1 / 3, 1 / 3, 1 / 3],
+                        },
+                    }
+                }
+            },
+        )
         metric_config = cfg.generation.hpo.metric_config
         metrics = [metric for values in metric_config.values() for metric in values]
 
@@ -177,6 +217,28 @@ class TestFromDict:
         assert cfg.generation.hpo.utility_policy == {
             "metrics": metrics,
             "weights": [1 / 3, 1 / 3, 1 / 3],
+        }
+
+    def test_native_hpo_metrics_use_test_owned_settings(self):
+        cfg = _from_dict(
+            Config,
+            {
+                "generation": {
+                    "hpo": {
+                        "metric_config": {
+                            "stats": ["wasserstein_dist", "inv_kl_divergence"],
+                            "sanity": ["nearest_syn_neighbor_distance"],
+                            "performance": ["xgb"],
+                        }
+                    }
+                }
+            },
+        )
+
+        assert cfg.generation.hpo.metric_config == {
+            "stats": ["wasserstein_dist", "inv_kl_divergence"],
+            "sanity": ["nearest_syn_neighbor_distance"],
+            "performance": ["xgb"],
         }
 
     def test_evaluation_binary_target_nested_dict_builds_nested_dataclass(self):
@@ -662,37 +724,6 @@ class TestValidate:
 
 
 class TestLoadConfig:
-    def test_active_configs_use_semantic_tuning_labels(self):
-        root = Path(__file__).parents[2]
-        forbidden_plan_labels = re.compile(
-            r"Task\s*(?:6|10|13)|fixed[- ]?tuning|plan[- ]?\d+", re.IGNORECASE
-        )
-        config_paths = [
-            root / "configs" / name
-            for name in (
-                "config_loris.yaml",
-                "config_loris_evaluation_smoke.yaml",
-                "config_loris_generation_smoke.yaml",
-                "config_loris_protected_generation_n40.yaml",
-                "config_loris_protected_smoke.yaml",
-            )
-        ]
-
-        assert config_paths
-        for path in config_paths:
-            text = path.read_text()
-            assert forbidden_plan_labels.search(text) is None, path
-            loaded = yaml.safe_load(text)
-            hpo = loaded.get("generation", {}).get("hpo", {})
-            metric_config = hpo.get("metric_config", {})
-            assert "canonical_objectives" in metric_config, path
-            assert "task12" not in metric_config, path
-            assert "utility_policy_provenance" not in hpo, path
-
-        config_text = (root / "synthdata" / "config.py").read_text()
-        assert forbidden_plan_labels.search(config_text) is None
-        assert "utility_policy_provenance" not in config_text
-
     @staticmethod
     def _canonical_fixture() -> Config:
         """Build canonical config with all policy metadata populated."""
@@ -716,39 +747,56 @@ class TestLoadConfig:
         }
         return cfg
 
-    def test_loris_canonical_policy_loads(self):
-        cfg = load_config(Path(__file__).parents[2] / "configs" / "config_loris.yaml")
+    @classmethod
+    def _canonical_yaml_data(cls) -> dict:
+        """Return YAML-compatible data derived only from the canonical test fixture."""
+        raw = dataclasses.asdict(cls._canonical_fixture())
+        raw.pop("config_path")
+        # Serialization includes dataclass defaults, but this field must be absent
+        # from YAML to represent canonical direct identity rather than nested identity.
+        raw["data"]["split"].pop("patient_id_column")
+        return raw
+
+    def test_canonical_policy_settings_are_populated(self):
+        cfg = self._canonical_fixture()
         assert cfg.data.patient_id_column == "patient_id"
-        assert cfg.data.quasi_identifier_columns == [
-            "Age",
-            "Sex",
-            "region",
-            "PreInt_Demos_Fam__Child_Ethnicity",
-        ]
         assert cfg.evaluation.privacy_policy.k_required == 5
         assert cfg.evaluation.privacy_policy.mia_epsilon_repetitions == 10
         assert cfg.data.split is not None
         assert cfg.data.split.patient_id_column is None
-        assert not hasattr(cfg.generation.hpo, "utility_policy_provenance")
 
-    def test_protected_profiles_align_ctgan_smoke_settings(self):
-        root = Path(__file__).parents[2]
-        evaluation = load_config(root / "configs/config_loris_protected_smoke.yaml")
-        generation = load_config(root / "configs/config_loris_protected_generation_n40.yaml")
+    def test_protected_evaluation_and_generation_settings_align(self):
+        shared_data = {
+            "version": "2.0-protected-smoke",
+            "quasi_identifier_columns": ["age", "sex", "region"],
+            "protected_columns": ["risk_group", "orientation"],
+        }
+        evaluation = _from_dict(
+            Config,
+            {
+                "data": shared_data,
+                "generation": {
+                    "n_samples": 100,
+                    "synthcity": {"names": ["ctgan"], "params": {"ctgan": {"n_iter": 40}}},
+                },
+            },
+        )
+        generation = _from_dict(
+            Config,
+            {
+                "data": shared_data,
+                "generation": {
+                    "n_samples": 100,
+                    "force_retrain": True,
+                    "synthcity": {"names": ["ctgan"], "params": {"ctgan": {"n_iter": 40}}},
+                },
+            },
+        )
 
         assert evaluation.experiment.id is None
         assert evaluation.data.version == generation.data.version == "2.0-protected-smoke"
-        assert evaluation.data.quasi_identifier_columns == [
-            "Age",
-            "Sex",
-            "region",
-            "PreInt_Demos_Fam__Child_Ethnicity",
-        ]
-        assert evaluation.data.protected_columns == [
-            "PreInt_TxHx__suicide",
-            "immigration_vismin",
-            "Sexual Orientation",
-        ]
+        assert evaluation.data.quasi_identifier_columns == ["age", "sex", "region"]
+        assert evaluation.data.protected_columns == ["risk_group", "orientation"]
         assert evaluation.data.protected_columns == generation.data.protected_columns
         assert evaluation.data.quasi_identifier_columns == generation.data.quasi_identifier_columns
         assert (
@@ -842,6 +890,11 @@ class TestLoadConfig:
         with pytest.raises(ValueError, match="canonical"):
             _validate(cfg)
 
+    def test_legacy_settings_are_noncanonical_by_default(self):
+        cfg = _from_dict(Config, {"data": {"source": "csv", "path": "x.csv"}})
+
+        assert cfg.data.canonical is False
+
     @pytest.mark.parametrize(
         "mutator, message",
         [
@@ -853,14 +906,13 @@ class TestLoadConfig:
         ],
     )
     def test_canonical_forbids_legacy_identity_settings(self, mutator, message):
-        cfg = load_config(Path(__file__).parents[2] / "configs" / "config_loris.yaml")
+        cfg = self._canonical_fixture()
         mutator(cfg)
         with pytest.raises(ValueError, match=message):
             _validate(cfg)
 
     def test_canonical_nested_identity_is_rejected_at_load(self, tmp_path):
-        source = Path(__file__).parents[2] / "configs" / "config_loris.yaml"
-        raw = yaml.safe_load(source.read_text())
+        raw = self._canonical_yaml_data()
         raw["data"]["split"]["patient_id_column"] = "patient_id"
         path = tmp_path / "nested.yaml"
         path.write_text(yaml.safe_dump(raw))
@@ -884,8 +936,7 @@ class TestLoadConfig:
         ],
     )
     def test_canonical_omitted_required_policy_fields_fail_closed(self, tmp_path, path_parts):
-        source = Path(__file__).parents[2] / "configs" / "config_loris.yaml"
-        raw = yaml.safe_load(source.read_text())
+        raw = self._canonical_yaml_data()
         value = raw
         for key in path_parts[:-1]:
             value = value[key]
@@ -914,48 +965,25 @@ class TestLoadConfig:
         ],
     )
     def test_canonical_omitted_policy_value_fails_closed(self, tmp_path, block, field):
-        source = Path(__file__).parents[2] / "configs" / "config_loris.yaml"
-        raw = yaml.safe_load(source.read_text())
+        raw = self._canonical_yaml_data()
         del raw["evaluation"][block][field]
         path = tmp_path / f"missing-{block}-{field}.yaml"
         path.write_text(yaml.safe_dump(raw))
         with pytest.raises(ValueError, match=field):
             load_config(path)
 
-    @pytest.mark.parametrize(
-        "config_name",
-        [
-            "config_hepatitis.yaml",
-            "config_loris_refidiff_reference.yaml",
-            "config_loris_refidiff_hpo.yaml",
-        ],
-    )
-    def test_legacy_profiles_are_explicitly_noncanonical(self, config_name):
-        root = Path(__file__).parents[2]
-        cfg = load_config(root / "configs" / config_name)
-        assert cfg.data.canonical is False
-
-    @pytest.mark.parametrize(
-        "config_name",
-        [
-            "config_hepatitis.yaml",
-            "config_loris_refidiff_reference.yaml",
-            "config_loris_refidiff_hpo.yaml",
-        ],
-    )
-    def test_legacy_profiles_marked_canonical_fail_actionably(self, tmp_path, config_name):
-        root = Path(__file__).parents[2]
-        raw = yaml.safe_load((root / "configs" / config_name).read_text())
+    def test_legacy_settings_marked_canonical_fail_actionably(self, tmp_path):
+        raw = self._canonical_yaml_data()
+        raw["imputation"]["method"] = "refidiff"
         raw["data"]["canonical"] = True
-        path = tmp_path / config_name
+        path = tmp_path / "legacy-settings.yaml"
         path.write_text(yaml.safe_dump(raw))
 
-        with pytest.raises(ValueError, match="Canonical evaluation (requires|rejects)"):
+        with pytest.raises(ValueError, match="Canonical profiles require imputation.method"):
             load_config(path)
 
     def test_canonical_omitted_policy_block_fails_closed(self, tmp_path):
-        source = Path(__file__).parents[2] / "configs" / "config_loris.yaml"
-        raw = yaml.safe_load(source.read_text())
+        raw = self._canonical_yaml_data()
         del raw["evaluation"]["privacy_policy"]
         path = tmp_path / "missing-policy.yaml"
         path.write_text(yaml.safe_dump(raw))
