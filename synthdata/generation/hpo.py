@@ -26,6 +26,7 @@ import unicodedata
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
+from datetime import UTC, datetime
 from numbers import Real
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -3179,6 +3180,196 @@ def contextual_study_name(study_name: str, hpo_context: Mapping[str, Any] | None
     return f"{study_name}-{hpo_context_digest(context)[:16]}"
 
 
+def resolve_study_name(
+    study_name: str,
+    implementation_fingerprint: str,
+    hpo_cfg: HPOConfig,
+    output_dir: str | Path,
+    seed: int,
+    *,
+    hpo_context: Mapping[str, Any] | None = None,
+    stage_a_root: str | Path | None = None,
+) -> str:
+    """Choose legacy or fingerprint-scoped identity after validating legacy evidence.
+
+    Existing unsuffixed studies are reusable only when their complete persisted
+    trial set has valid checkpoints carrying the current implementation
+    fingerprint. A proven fingerprint mismatch selects a deterministic scoped
+    identity; malformed or incomplete evidence remains a hard error.
+    """
+    legacy_base = _validate_study_name(study_name)
+    if (
+        not isinstance(implementation_fingerprint, str)
+        or re.fullmatch(r"[0-9a-f]{64}", implementation_fingerprint) is None
+    ):
+        raise ValueError("implementation_fingerprint must be 64 lowercase hexadecimal characters")
+    context = _require_validated_hpo_context(hpo_context, label="HPO study context")
+    scoped_base = _validate_study_name(f"{legacy_base}-{implementation_fingerprint}")
+    legacy_name = contextual_study_name(legacy_base, context)
+    scoped_name = contextual_study_name(scoped_base, context)
+    storage = hpo_cfg.storage or default_storage_url(output_dir)
+    study_names = optuna.study.get_all_study_names(storage=storage)
+    if legacy_name not in study_names:
+        return scoped_base
+
+    study = optuna.load_study(study_name=legacy_name, storage=storage)
+    stored_digest = study.user_attrs.get("hpo_context_digest")
+    stored_context = study.user_attrs.get("hpo_context")
+    expected_digest = hpo_context_digest(context)
+    if not study.trials:
+        if stored_digest is not None and (
+            stored_digest != expected_digest or stored_context != context
+        ):
+            raise RuntimeError(
+                f"HPO study {legacy_name!r} context metadata does not match the current "
+                f"{HPO_CONTEXT_SCHEMA_VERSION} payload"
+            )
+        return legacy_base
+    if stored_digest is None or stored_context is None:
+        raise RuntimeError(
+            f"HPO study {legacy_name!r} has trials but no {HPO_CONTEXT_SCHEMA_VERSION} "
+            "context metadata; refusing to reuse unverified evidence"
+        )
+    if study.user_attrs.get("hpo_context_schema_version") != HPO_CONTEXT_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"HPO study {legacy_name!r} has unsupported HPO context metadata; "
+            "refusing to reuse unverified evidence"
+        )
+    if stored_digest != expected_digest or stored_context != context:
+        raise RuntimeError(
+            f"HPO study {legacy_name!r} context metadata does not match the current "
+            f"{HPO_CONTEXT_SCHEMA_VERSION} payload"
+        )
+
+    checkpoint_dir = Path(output_dir) / "hpo_checkpoints" / legacy_name
+    checkpoint_paths = sorted(checkpoint_dir.glob("trial-*/checkpoint.json"))
+    checkpoint_numbers: set[int] = set()
+    trial_by_number = {trial.number: trial for trial in study.trials}
+    for checkpoint_path in checkpoint_paths:
+        try:
+            number = int(checkpoint_path.parent.name.removeprefix("trial-"))
+        except ValueError as exc:
+            raise RuntimeError("HPO trial checkpoint path has an invalid identity") from exc
+        if not checkpoint_path.parent.name.startswith("trial-") or number in checkpoint_numbers:
+            raise RuntimeError("HPO trial checkpoint path has an invalid identity")
+        if number not in trial_by_number:
+            raise RuntimeError(
+                f"HPO study {legacy_name!r} has a checkpoint for unknown trial {number}"
+            )
+        checkpoint_numbers.add(number)
+
+    fingerprint_mismatch = False
+    expected_numbers = set(trial_by_number)
+    if checkpoint_numbers != expected_numbers:
+        missing = sorted(expected_numbers - checkpoint_numbers)
+        unrecovered_missing = [
+            number
+            for number in missing
+            if not (
+                trial_by_number[number].state == optuna.trial.TrialState.RUNNING
+                and _matching_running_recovery_intent(
+                    study,
+                    trial_by_number[number],
+                    context_digest=expected_digest,
+                )
+            )
+            and not (
+                trial_by_number[number].state == optuna.trial.TrialState.FAIL
+                and _matching_recovered_trial(
+                    study,
+                    trial_by_number[number],
+                    context_digest=expected_digest,
+                )
+            )
+        ]
+        if unrecovered_missing:
+            raise RuntimeError(
+                f"HPO study {legacy_name!r} has incomplete checkpoint evidence; "
+                f"missing trials {unrecovered_missing}"
+            )
+
+    for number, trial in trial_by_number.items():
+        checkpoint_path = checkpoint_dir / f"trial-{number}" / "checkpoint.json"
+        recovered_failure = (
+            trial.state == optuna.trial.TrialState.FAIL
+            and _matching_recovered_trial(
+                study,
+                trial,
+                context_digest=expected_digest,
+            )
+        )
+        running_recovery = (
+            trial.state == optuna.trial.TrialState.RUNNING
+            and trial.user_attrs.get("hpo_running_recovery") is not None
+            and _matching_running_recovery_intent(
+                study,
+                trial,
+                context_digest=expected_digest,
+            )
+        )
+        if not checkpoint_path.exists():
+            if running_recovery:
+                fingerprint_mismatch |= (
+                    trial.user_attrs.get("generator_implementation_fingerprint")
+                    != implementation_fingerprint
+                )
+                continue
+            if recovered_failure:
+                fingerprint_mismatch |= (
+                    trial.user_attrs.get("generator_implementation_fingerprint")
+                    != implementation_fingerprint
+                )
+                continue
+            raise RuntimeError(
+                f"HPO study {legacy_name!r} has incomplete checkpoint evidence; "
+                f"missing trials [{number}]"
+            )
+        checkpoint = load_hpo_trial_checkpoint(
+            checkpoint_path,
+            hpo_context=context,
+            stage_a_root=stage_a_root,
+        )
+        state_name = _HPO_CHECKPOINT_STATE_NAMES.get(trial.state.name)
+        if checkpoint["state"] != state_name and not (
+            recovered_failure and checkpoint["state"] == "running"
+        ):
+            raise RuntimeError(
+                f"HPO study {legacy_name!r} trial {number} checkpoint state does not match study"
+            )
+        generator_evidence = checkpoint["metadata"].get("generator")
+        checkpoint_fingerprint = (
+            generator_evidence.get("implementation_fingerprint")
+            if isinstance(generator_evidence, Mapping)
+            else None
+        )
+        trial_fingerprint = trial.user_attrs.get("generator_implementation_fingerprint")
+        if (
+            not isinstance(checkpoint_fingerprint, str)
+            or not checkpoint_fingerprint.strip()
+            or trial_fingerprint != checkpoint_fingerprint
+        ):
+            raise RuntimeError(
+                f"HPO study {legacy_name!r} trial {number} has incomplete or inconsistent "
+                "implementation fingerprint evidence"
+            )
+        fingerprint_mismatch |= checkpoint_fingerprint != implementation_fingerprint
+
+    if fingerprint_mismatch:
+        logger.warning(
+            "[%s] legacy study implementation fingerprint differs; preserving legacy evidence "
+            "and selecting scoped study %s",
+            legacy_name,
+            scoped_name,
+        )
+        return scoped_base
+    logger.info(
+        "[%s] reusing legacy study after validating %d implementation-matched checkpoints",
+        legacy_name,
+        len(trial_by_number),
+    )
+    return legacy_base
+
+
 def default_best_params_path(output_dir: str | Path) -> Path:
     return Path(output_dir) / "hpo_best_params.json"
 
@@ -3855,6 +4046,64 @@ def _persist_hpo_trial_checkpoints(
             )
 
 
+def _archive_recovered_running_checkpoint(
+    checkpoint_root: Path,
+    study_name: str,
+    trial_number: int,
+    payload: dict[str, Any],
+) -> None:
+    """Preserve validated in-progress checkpoint before publishing its recovery result."""
+    trial_directory = f"trial-{trial_number}"
+    original_path = checkpoint_root / study_name / trial_directory / "checkpoint.json"
+    archive_path = (
+        checkpoint_root / study_name / trial_directory / "recovery-original-checkpoint.json"
+    )
+    parts = (study_name, trial_directory)
+    _locked_stage_a_json(
+        checkpoint_root,
+        parts,
+        "recovery-original-checkpoint.json",
+        payload,
+        archive_path,
+        artifact_label="original recovered trial checkpoint",
+    )
+
+    lock = _require_stage_a_locking()
+    try:
+        directory_fd = _open_stage_a_directory(checkpoint_root, parts, create=False)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Original recovered trial checkpoint at {original_path} is unreadable"
+        ) from exc
+    lock_fd = -1
+    try:
+        lock_fd = os.open(
+            ".stage-a.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd
+        )
+        lock.flock(lock_fd, lock.LOCK_EX)
+        try:
+            _, current = _read_stage_a_json_bytes_fd(
+                directory_fd,
+                "checkpoint.json",
+                original_path,
+                artifact_label="original recovered trial checkpoint",
+            )
+        except RuntimeError as exc:
+            if " is missing" in str(exc):
+                return
+            raise
+        if current != payload:
+            raise RuntimeError(
+                f"Original recovered trial checkpoint at {original_path} changed during recovery"
+            )
+        os.unlink("checkpoint.json", dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        if lock_fd != -1:
+            os.close(lock_fd)
+        os.close(directory_fd)
+
+
 _HPO_RUNNING_RECOVERY_SCHEMA_VERSION = "hpo-running-recovery-v1"
 
 
@@ -3863,9 +4112,11 @@ def _hpo_running_recovery_metadata(
     trial: Any,
     *,
     context_digest: str,
+    implementation_fingerprint: str | None = None,
+    provenance: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Return expected metadata identifying one verified stale-trial recovery."""
-    return {
+    recovery = {
         "schema_version": _HPO_RUNNING_RECOVERY_SCHEMA_VERSION,
         "study_name": study.study_name,
         "context_digest": context_digest,
@@ -3874,6 +4125,60 @@ def _hpo_running_recovery_metadata(
         "reason_code": "stale_running_trial_recovery",
         "terminal_state": "FAIL",
     }
+    if implementation_fingerprint is not None:
+        if provenance is None:
+            raise RuntimeError("Fingerprint-scoped HPO recovery requires failure provenance")
+        recovery.update(
+            {
+                "implementation_fingerprint": implementation_fingerprint,
+                "recovered_at": datetime.now(UTC).isoformat(),
+                "provenance": dict(provenance),
+            }
+        )
+    return recovery
+
+
+def _validate_running_recovery_metadata(
+    existing: Any,
+    expected: Mapping[str, Any],
+    *,
+    implementation_fingerprint: str | None,
+    provenance: Mapping[str, str],
+) -> dict[str, Any]:
+    """Validate persisted recovery identity and retain its original timestamp."""
+    if not isinstance(existing, Mapping):
+        raise RuntimeError("HPO running-trial recovery metadata must be an object")
+    stable_fields = (
+        "schema_version",
+        "study_name",
+        "context_digest",
+        "trial_number",
+        "original_state",
+        "reason_code",
+        "terminal_state",
+    )
+    if any(existing.get(field) != expected.get(field) for field in stable_fields):
+        raise RuntimeError("HPO running-trial recovery metadata has foreign identity")
+    if implementation_fingerprint is None:
+        if dict(existing) != dict(expected):
+            raise RuntimeError("HPO running-trial recovery metadata has unexpected fields")
+        return dict(existing)
+
+    timestamp = existing.get("recovered_at")
+    if (
+        existing.get("implementation_fingerprint") != implementation_fingerprint
+        or existing.get("provenance") != dict(provenance)
+        or set(existing) != set(expected)
+        or not isinstance(timestamp, str)
+    ):
+        raise RuntimeError("HPO running-trial recovery metadata does not match current evidence")
+    try:
+        parsed_timestamp = datetime.fromisoformat(timestamp)
+    except ValueError as exc:
+        raise RuntimeError("HPO running-trial recovery metadata has an invalid timestamp") from exc
+    if parsed_timestamp.tzinfo is None or parsed_timestamp.utcoffset() is None:
+        raise RuntimeError("HPO running-trial recovery metadata has an invalid timestamp")
+    return dict(existing)
 
 
 def _repair_recovered_trial_provenance(
@@ -3964,6 +4269,8 @@ def _validate_hpo_recovery_evidence(
 
 def _validated_trial_recovery_evidence(
     trial: Any,
+    *,
+    allow_running_outcome: bool = False,
 ) -> tuple[dict[str, str], dict[str, Any]]:
     """Return validated recovery evidence from one persisted trial."""
     attrs = getattr(trial, "user_attrs", {}) or {}
@@ -3973,7 +4280,16 @@ def _validated_trial_recovery_evidence(
         if existing_provenance is not None
         else hpo_exception_provenance(Exception(), location="stale_running_trial_recovery")
     )
-    return _validate_hpo_recovery_evidence(provenance, attrs.get("hpo_outcome"))
+    outcome = attrs.get("hpo_outcome")
+    if allow_running_outcome and isinstance(outcome, Mapping) and outcome.get("state") == "running":
+        validated_provenance, validated_outcome = _validate_hpo_recovery_evidence(
+            provenance,
+            outcome,
+            expected_state="running",
+        )
+        validated_outcome["state"] = "failed"
+        return validated_provenance, validated_outcome
+    return _validate_hpo_recovery_evidence(provenance, outcome)
 
 
 def _repair_terminal_recovered_trial(
@@ -4038,6 +4354,7 @@ def _recover_running_trials(
     study: optuna.Study,
     *,
     context: Mapping[str, Any],
+    implementation_fingerprint: str | None = None,
 ) -> int:
     """Terminalize persisted interrupted trials before allocating more work.
 
@@ -4053,16 +4370,29 @@ def _recover_running_trials(
             optuna.trial.TrialState.FAIL,
         }:
             continue
-        recovery = _hpo_running_recovery_metadata(study, trial, context_digest=context_digest)
         existing = (trial.user_attrs or {}).get("hpo_running_recovery")
-        if existing is not None and existing != recovery:
-            raise RuntimeError(
-                f"HPO study {study.study_name!r} trial {trial.number} has conflicting "
-                "running-trial recovery metadata"
+        if trial.state == optuna.trial.TrialState.FAIL and existing is None:
+            continue
+        validated_provenance, validated_outcome = _validated_trial_recovery_evidence(
+            trial,
+            allow_running_outcome=True,
+        )
+        recovery = _hpo_running_recovery_metadata(
+            study,
+            trial,
+            context_digest=context_digest,
+            implementation_fingerprint=implementation_fingerprint,
+            provenance=validated_provenance,
+        )
+        if existing is not None:
+            recovery = _validate_running_recovery_metadata(
+                existing,
+                recovery,
+                implementation_fingerprint=implementation_fingerprint,
+                provenance=validated_provenance,
             )
         if trial.state == optuna.trial.TrialState.FAIL:
-            if existing == recovery:
-                validated_provenance, validated_outcome = _validated_trial_recovery_evidence(trial)
+            if existing is not None:
                 _repair_terminal_recovered_trial(
                     study,
                     trial,
@@ -4071,8 +4401,6 @@ def _recover_running_trials(
                 )
             continue
 
-        # Validate every piece of evidence before adding the recovery marker.
-        validated_provenance, validated_outcome = _validated_trial_recovery_evidence(trial)
         if existing is None:
             study._storage.set_trial_user_attr(  # noqa: SLF001 - storage transition needs trial id
                 trial._trial_id,
@@ -4104,6 +4432,76 @@ def _recover_running_trials(
             recovery["reason_code"],
         )
     return recovered
+
+
+def _matching_recovered_trial(
+    study: optuna.Study,
+    trial: Any,
+    *,
+    context_digest: str,
+) -> bool:
+    """Return whether terminal failure metadata proves this persisted recovery."""
+    existing = (trial.user_attrs or {}).get("hpo_running_recovery")
+    if existing is None:
+        return False
+    if trial.state != optuna.trial.TrialState.FAIL:
+        raise RuntimeError("HPO running-trial recovery marker is attached to a non-FAIL trial")
+    trial_fingerprint = trial.user_attrs.get("generator_implementation_fingerprint")
+    if (
+        not isinstance(trial_fingerprint, str)
+        or re.fullmatch(r"[0-9a-f]{64}", trial_fingerprint) is None
+    ):
+        raise RuntimeError("HPO running-trial recovery marker has no valid trial fingerprint")
+    provenance, _ = _validated_trial_recovery_evidence(trial)
+    expected = _hpo_running_recovery_metadata(
+        study,
+        trial,
+        context_digest=context_digest,
+        implementation_fingerprint=trial_fingerprint,
+        provenance=provenance,
+    )
+    _validate_running_recovery_metadata(
+        existing,
+        expected,
+        implementation_fingerprint=trial_fingerprint,
+        provenance=provenance,
+    )
+    return True
+
+
+def _matching_running_recovery_intent(
+    study: optuna.Study,
+    trial: Any,
+    *,
+    context_digest: str,
+) -> bool:
+    """Return whether a RUNNING trial has a valid durable recovery intent."""
+    existing = (trial.user_attrs or {}).get("hpo_running_recovery")
+    if existing is None:
+        return False
+    if trial.state != optuna.trial.TrialState.RUNNING:
+        raise RuntimeError("HPO running-trial recovery marker is attached to a non-RUNNING trial")
+    trial_fingerprint = trial.user_attrs.get("generator_implementation_fingerprint")
+    if (
+        not isinstance(trial_fingerprint, str)
+        or re.fullmatch(r"[0-9a-f]{64}", trial_fingerprint) is None
+    ):
+        raise RuntimeError("HPO running-trial recovery marker has no valid trial fingerprint")
+    provenance, _ = _validated_trial_recovery_evidence(trial, allow_running_outcome=True)
+    expected = _hpo_running_recovery_metadata(
+        study,
+        trial,
+        context_digest=context_digest,
+        implementation_fingerprint=trial_fingerprint,
+        provenance=provenance,
+    )
+    _validate_running_recovery_metadata(
+        existing,
+        expected,
+        implementation_fingerprint=trial_fingerprint,
+        provenance=provenance,
+    )
+    return True
 
 
 def run_study(
@@ -4147,18 +4545,165 @@ def run_study(
         seed,
         hpo_context=context_payload,
     )
-    _recover_running_trials(study, context=context_payload)
 
+    pre_recovery_checkpoints: dict[int, dict[str, Any]] = {}
     if checkpoint_implementation_fingerprint is not None:
         checkpoint_dir = Path(output_dir) / "hpo_checkpoints" / study.study_name
         existing_checkpoints = sorted(checkpoint_dir.glob("trial-*/checkpoint.json"))
+        checkpoint_numbers: set[int] = set()
         for checkpoint_path in existing_checkpoints:
-            load_hpo_trial_checkpoint(
+            try:
+                number = int(checkpoint_path.parent.name.removeprefix("trial-"))
+            except ValueError as exc:
+                raise RuntimeError("HPO trial checkpoint path has an invalid identity") from exc
+            if not checkpoint_path.parent.name.startswith("trial-") or number in checkpoint_numbers:
+                raise RuntimeError("HPO trial checkpoint path has an invalid identity")
+            checkpoint_numbers.add(number)
+
+        trials_by_number = {trial.number: trial for trial in study.trials}
+        unknown = sorted(checkpoint_numbers - set(trials_by_number))
+        if unknown:
+            raise RuntimeError(
+                f"HPO study {study.study_name!r} has incomplete checkpoint evidence; "
+                f"unknown trials {unknown}"
+            )
+        for number, trial in trials_by_number.items():
+            checkpoint_path = checkpoint_dir / f"trial-{number}" / "checkpoint.json"
+            if number not in checkpoint_numbers:
+                stale_running = (
+                    trial.state == optuna.trial.TrialState.RUNNING
+                    and _matching_running_recovery_intent(
+                        study,
+                        trial,
+                        context_digest=hpo_context_digest(context_payload),
+                    )
+                    and trial.user_attrs.get("generator_implementation_fingerprint")
+                    == checkpoint_implementation_fingerprint
+                )
+                recovered_failure = (
+                    trial.state == optuna.trial.TrialState.FAIL
+                    and _matching_recovered_trial(
+                        study,
+                        trial,
+                        context_digest=hpo_context_digest(context_payload),
+                    )
+                )
+                if stale_running or recovered_failure:
+                    continue
+                raise RuntimeError(
+                    f"HPO study {study.study_name!r} has incomplete checkpoint evidence; "
+                    f"missing trials [{number}], unknown trials []"
+                )
+
+            checkpoint = load_hpo_trial_checkpoint(
                 checkpoint_path,
                 hpo_context=context_payload,
                 expected_implementation_fingerprint=checkpoint_implementation_fingerprint,
                 stage_a_root=stage_a_root,
             )
+            recovered_failure = (
+                trial.state == optuna.trial.TrialState.FAIL
+                and _matching_recovered_trial(
+                    study,
+                    trial,
+                    context_digest=hpo_context_digest(context_payload),
+                )
+            )
+            expected_state = _HPO_CHECKPOINT_STATE_NAMES.get(trial.state.name)
+            if checkpoint["state"] != expected_state and not (
+                recovered_failure and checkpoint["state"] == "running"
+            ):
+                raise RuntimeError(
+                    f"HPO study {study.study_name!r} trial {number} checkpoint state "
+                    "does not match study"
+                )
+            if (
+                trial.user_attrs.get("generator_implementation_fingerprint")
+                != checkpoint_implementation_fingerprint
+            ):
+                raise RuntimeError(
+                    f"HPO study {study.study_name!r} trial {number} implementation fingerprint "
+                    "does not match the current implementation"
+                )
+            pre_recovery_checkpoints[number] = checkpoint
+
+    _recover_running_trials(
+        study,
+        context=context_payload,
+        implementation_fingerprint=checkpoint_implementation_fingerprint,
+    )
+
+    if checkpoint_implementation_fingerprint is not None:
+        checkpoint_root = Path(output_dir) / "hpo_checkpoints"
+        for trial in study.trials:
+            if trial.state != optuna.trial.TrialState.FAIL or not _matching_recovered_trial(
+                study,
+                trial,
+                context_digest=hpo_context_digest(context_payload),
+            ):
+                continue
+            checkpoint = pre_recovery_checkpoints.get(trial.number)
+            if checkpoint is not None and checkpoint["state"] == "running":
+                _archive_recovered_running_checkpoint(
+                    checkpoint_root,
+                    study.study_name,
+                    trial.number,
+                    checkpoint,
+                )
+            if checkpoint is None or checkpoint["state"] == "running":
+                persist_hpo_trial_checkpoint(
+                    checkpoint_root,
+                    study.study_name,
+                    trial,
+                    hpo_context=context_payload,
+                    expected_implementation_fingerprint=checkpoint_implementation_fingerprint,
+                    stage_a_root=stage_a_root,
+                )
+
+    if checkpoint_implementation_fingerprint is not None:
+        checkpoint_dir = Path(output_dir) / "hpo_checkpoints" / study.study_name
+        existing_checkpoints = sorted(checkpoint_dir.glob("trial-*/checkpoint.json"))
+        checkpoint_numbers: set[int] = set()
+        for checkpoint_path in existing_checkpoints:
+            try:
+                number = int(checkpoint_path.parent.name.removeprefix("trial-"))
+            except ValueError as exc:
+                raise RuntimeError("HPO trial checkpoint path has an invalid identity") from exc
+            if not checkpoint_path.parent.name.startswith("trial-") or number in checkpoint_numbers:
+                raise RuntimeError("HPO trial checkpoint path has an invalid identity")
+            checkpoint_numbers.add(number)
+        trial_numbers = {trial.number for trial in study.trials}
+        if checkpoint_numbers != trial_numbers:
+            missing = sorted(trial_numbers - checkpoint_numbers)
+            foreign = sorted(checkpoint_numbers - trial_numbers)
+            raise RuntimeError(
+                f"HPO study {study.study_name!r} has incomplete checkpoint evidence; "
+                f"missing trials {missing}, unknown trials {foreign}"
+            )
+        trials_by_number = {trial.number: trial for trial in study.trials}
+        for checkpoint_path in existing_checkpoints:
+            checkpoint = load_hpo_trial_checkpoint(
+                checkpoint_path,
+                hpo_context=context_payload,
+                expected_implementation_fingerprint=checkpoint_implementation_fingerprint,
+                stage_a_root=stage_a_root,
+            )
+            number = int(checkpoint_path.parent.name.removeprefix("trial-"))
+            trial = trials_by_number[number]
+            expected_state = _HPO_CHECKPOINT_STATE_NAMES.get(trial.state.name)
+            if checkpoint["state"] != expected_state:
+                raise RuntimeError(
+                    f"HPO study {study.study_name!r} trial {number} checkpoint state "
+                    "does not match study"
+                )
+            if (
+                trial.user_attrs.get("generator_implementation_fingerprint")
+                != checkpoint_implementation_fingerprint
+            ):
+                raise RuntimeError(
+                    f"HPO study {study.study_name!r} trial {number} implementation fingerprint "
+                    "does not match the current implementation"
+                )
         if existing_checkpoints:
             logger.info(
                 "[%s] validated %d resumable HPO checkpoint(s) for implementation=%s",

@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+import numpy as np
 import optuna
 import pandas as pd
 import pytest
@@ -208,6 +209,25 @@ def test_tabpfn_standard_output_passes_strict_pipeline_schema_check(
     generated = run_generation(cfg, dataset, prepare_candidate_cache=False)
 
     assert generated["tabpfn_standard"].columns.tolist() == canonical_columns
+
+
+def test_tabpfn_remains_outside_hpo_path(make_config, make_canonical_dataset, mocker):
+    cfg = make_config()
+    _configure_tabpfn_only(cfg)
+    cfg.generation.hpo.enabled = True
+    cfg.generation.n_samples = 4
+    dataset = make_canonical_dataset()
+    generated = dataset.role_frame("train", imputed=True).head(4).copy()
+    mocker.patch(
+        "synthdata.generation.tabpfn_backend.generate_tabpfn_custom", return_value=generated
+    )
+    run_study = mocker.patch("synthdata.generation.pipeline.hpo_mod.run_study")
+
+    outputs = run_generation(cfg, dataset)
+
+    assert "tabpfn_custom" in outputs
+    assert not any(name.endswith("_hpo") for name in outputs)
+    run_study.assert_not_called()
 
 
 def test_non_hpo_generation_fits_train_but_persists_candidate_scope(
@@ -471,6 +491,98 @@ def test_tabpfgen_generation_forwards_complete_semantic_context(
     )
 
 
+def test_tabpfgen_standard_preserves_nonfinal_target_schema_order(
+    make_config, make_canonical_dataset, mocker
+):
+    cfg = make_config()
+    cfg.generation.synthcity.enabled = False
+    cfg.generation.tabpfn.enabled = False
+    cfg.generation.tabpfgen.enabled = True
+    cfg.generation.tabpfgen.variants = ["standard"]
+    cfg.generation.hpo.enabled = False
+    cfg.generation.n_samples = 2
+    cfg.generation.force_retrain = True
+    dataset = make_canonical_dataset()
+    schema_columns = ["feature", "target", "protected"]
+    dataset.full_df = dataset.full_df.loc[:, schema_columns]
+    dataset.roles = {role: frame.loc[:, schema_columns] for role, frame in dataset.roles.items()}
+    dataset.imputed_roles = {
+        role: frame.loc[:, schema_columns] for role, frame in dataset.imputed_roles.items()
+    }
+
+    def generate_classification(_generator, X_train, y_train, n_samples, balance_classes):
+        del X_train, y_train, balance_classes
+        return np.array([[10.0, 0.0], [20.0, 1.0]])[:n_samples], np.array([1, 0])[:n_samples]
+
+    mocker.patch("synthdata.generation.tabpfgen_backend.TabPFGen.__init__", return_value=None)
+    mocker.patch(
+        "synthdata.generation.tabpfgen_backend.TabPFGen.generate_classification",
+        autospec=True,
+        side_effect=generate_classification,
+    )
+
+    generated = run_generation(cfg, dataset)
+
+    expected = pd.DataFrame({"feature": [10.0, 20.0], "target": [1, 0], "protected": ["A", "B"]})
+    assert generated["tabpfgen_standard"].columns.tolist() == schema_columns
+    pd.testing.assert_frame_equal(generated["tabpfgen_standard"], expected)
+
+
+def test_tabpfgen_custom_preserves_nonfinal_target_schema_order(
+    make_config, make_canonical_dataset, mocker
+):
+    from synthdata.data import decode_label_encoded_columns, label_encode_non_numeric_columns
+
+    cfg = make_config()
+    cfg.generation.synthcity.enabled = False
+    cfg.generation.tabpfn.enabled = False
+    cfg.generation.tabpfgen.enabled = True
+    cfg.generation.tabpfgen.variants = ["custom"]
+    cfg.generation.hpo.enabled = False
+    cfg.generation.n_samples = 2
+    cfg.generation.force_retrain = True
+    dataset = make_canonical_dataset()
+    schema_columns = ["feature", "target", "protected"]
+    dataset.full_df = dataset.full_df.loc[:, schema_columns]
+    dataset.roles = {role: frame.loc[:, schema_columns] for role, frame in dataset.roles.items()}
+    dataset.imputed_roles = {
+        role: frame.loc[:, schema_columns] for role, frame in dataset.imputed_roles.items()
+    }
+
+    def generate_classification(_generator, _features, _labels, n_samples, balance_classes):
+        del balance_classes
+        assert n_samples == 2
+        return np.array([[10.0, 0.0], [20.0, 1.0]]), np.array([0, 1])
+
+    mocker.patch(
+        "synthdata.generation.tabpfgen_backend.TabPFGenSGLDLabels.__init__",
+        return_value=None,
+    )
+    mocker.patch(
+        "synthdata.generation.tabpfgen_backend.TabPFGenSGLDLabels.generate_classification",
+        autospec=True,
+        side_effect=generate_classification,
+    )
+
+    generated = run_generation(cfg, dataset)
+
+    train = dataset.role_frame("train", imputed=True)
+    encoded, category_maps = label_encode_non_numeric_columns(
+        train, dataset.feature_columns, categorical_columns=dataset.categorical_columns
+    )
+    del encoded
+    expected = decode_label_encoded_columns(
+        pd.DataFrame([[10.0, 0.0], [20.0, 1.0]], columns=dataset.feature_columns),
+        category_maps,
+    )
+    expected["target"] = [0, 1]
+    expected = expected.sample(frac=1, random_state=42).reset_index(drop=True)
+    expected = expected.loc[:, schema_columns]
+
+    assert generated["tabpfgen_custom"].columns.tolist() == schema_columns
+    pd.testing.assert_frame_equal(generated["tabpfgen_custom"], expected)
+
+
 def test_tabpfgen_hpo_forwards_canonical_evaluation_contract(
     make_config, make_canonical_dataset, mocker
 ):
@@ -502,7 +614,7 @@ def test_tabpfgen_hpo_forwards_canonical_evaluation_contract(
     )
     mocker.patch(
         "synthdata.generation.pipeline.sc.generator_implementation_fingerprint",
-        return_value="tabpfgen-impl",
+        return_value="b" * 64,
     )
 
     run_generation(cfg, dataset)
@@ -517,6 +629,433 @@ def test_tabpfgen_hpo_forwards_canonical_evaluation_contract(
         "mixed_mmd.v1",
         "elastic_net_jsd.v1",
     ]
+
+
+@pytest.mark.parametrize("variant", ["standard", "custom"])
+def test_tabpfgen_hpo_study_identity_tracks_implementation_fingerprint(
+    make_config, make_canonical_dataset, mocker, variant
+):
+    dataset = make_canonical_dataset()
+    generated = dataset.role_frame("train", imputed=True).head(4).copy()
+    cfg_by_fingerprint = {}
+    for fingerprint in ("a" * 64, "b" * 64):
+        cfg = make_config()
+        cfg.generation.synthcity.enabled = False
+        cfg.generation.tabpfn.enabled = False
+        cfg.generation.tabpfgen.enabled = True
+        cfg.generation.tabpfgen.variants = [variant]
+        cfg.generation.hpo.enabled = True
+        cfg.generation.hpo.n_trials = 1
+        cfg.generation.n_samples = 4
+        cfg.generation.output_dir = str(
+            Path(cfg.generation.output_dir).parent
+            / f"implementation-{fingerprint}"
+            / "synthetic_data"
+        )
+        cfg_by_fingerprint[fingerprint] = cfg
+
+    mocker.patch(
+        "synthdata.generation.pipeline.hpo_mod.build_synthetic_eval_fn",
+        return_value=lambda _frame: 0.5,
+    )
+    mocker.patch(
+        f"synthdata.generation.tabpfgen_backend.generate_tabpfgen_{variant}",
+        return_value=generated,
+    )
+    objective_builder = mocker.patch(
+        f"synthdata.generation.tabpfgen_backend.build_tabpfgen_{variant}_objective",
+        return_value=lambda _trial: 0.5,
+    )
+    run_study = mocker.patch(
+        "synthdata.generation.pipeline.hpo_mod.run_study",
+        return_value={"n_sgld_steps": 3},
+    )
+    fingerprint_lookup = mocker.patch(
+        "synthdata.generation.pipeline.sc.generator_implementation_fingerprint"
+    )
+
+    for fingerprint, cfg in cfg_by_fingerprint.items():
+        fingerprint_lookup.return_value = fingerprint
+        run_generation(cfg, dataset)
+
+    base_study_names = [call.args[0] for call in run_study.call_args_list]
+    expected_prefix = f"hpo_tabpfgen_{variant}-"
+    assert base_study_names == [
+        f"{expected_prefix}{'a' * 64}",
+        f"{expected_prefix}{'b' * 64}",
+    ]
+    objective_study_names = [call.kwargs["study_name"] for call in objective_builder.call_args_list]
+    assert objective_study_names == [
+        hpo_mod.contextual_study_name(base_name, study_call.kwargs["hpo_context"])
+        for base_name, study_call in zip(base_study_names, run_study.call_args_list, strict=True)
+    ]
+    assert objective_study_names[0] != objective_study_names[1]
+    assert [
+        call.kwargs["checkpoint_implementation_fingerprint"] for call in run_study.call_args_list
+    ] == ["a" * 64, "b" * 64]
+
+
+@pytest.mark.parametrize("variant", ["standard", "custom"])
+def test_tabpfgen_hpo_cache_is_scoped_to_implementation_fingerprint(
+    make_config, make_canonical_dataset, mocker, variant
+):
+    cfg = make_config()
+    cfg.generation.synthcity.enabled = False
+    cfg.generation.tabpfn.enabled = False
+    cfg.generation.tabpfgen.enabled = True
+    cfg.generation.tabpfgen.variants = [variant]
+    cfg.generation.hpo.enabled = True
+    cfg.generation.hpo.n_trials = 1
+    cfg.generation.n_samples = 4
+    dataset = make_canonical_dataset()
+    generated = dataset.role_frame("train", imputed=True).head(4).copy()
+    fingerprint = mocker.patch(
+        "synthdata.generation.pipeline.sc.generator_implementation_fingerprint",
+        return_value="a" * 64,
+    )
+    mocker.patch(
+        "synthdata.generation.pipeline.hpo_mod.build_synthetic_eval_fn", return_value=object()
+    )
+    generator = mocker.patch(
+        f"synthdata.generation.tabpfgen_backend.generate_tabpfgen_{variant}",
+        return_value=generated,
+    )
+    mocker.patch(
+        f"synthdata.generation.tabpfgen_backend.build_tabpfgen_{variant}_objective",
+        return_value=lambda _trial: 0.5,
+    )
+    run_study = mocker.patch(
+        "synthdata.generation.pipeline.hpo_mod.run_study",
+        side_effect=[{"n_sgld_steps": 3}, {"n_sgld_steps": 7}],
+    )
+
+    run_generation(cfg, dataset)
+    cache_path = hpo_mod.default_best_params_path(cfg.generation.output_dir)
+    context_payload = json.loads((Path(cfg.generation.output_dir) / "hpo_context.json").read_text())
+    cache = hpo_mod.BestParamsCache(cache_path, hpo_context=context_payload["context"])
+    assert cache.has("tabpfgen", f"tabpfgen_{variant}-{'a' * 64}")
+    cache.set("tabpfgen", f"tabpfgen_{variant}", {"n_sgld_steps": 99})
+
+    fingerprint.return_value = "b" * 64
+    run_generation(cfg, dataset)
+    run_generation(cfg, dataset)
+
+    assert run_study.call_count == 2
+    assert [call.args[0] for call in run_study.call_args_list] == [
+        f"hpo_tabpfgen_{variant}-{'a' * 64}",
+        f"hpo_tabpfgen_{variant}-{'b' * 64}",
+    ]
+
+    selected_model = f"tabpfgen_{variant}_hpo"
+    refit_selected_model(
+        cfg,
+        dataset,
+        selected_model,
+        output_dir=Path(cfg.evaluation.output_dir) / "final_refit",
+    )
+    expected_parameter = "tabpfgen_params" if variant == "standard" else "sgld_params"
+    assert generator.call_args.kwargs[expected_parameter] == {"n_sgld_steps": 7}
+
+
+@pytest.mark.parametrize("current_fingerprint", ["a" * 64, "b" * 64])
+def test_pipeline_recovers_only_valid_running_intent_before_checkpoint_validation(
+    make_config, make_canonical_dataset, mocker, current_fingerprint
+):
+    original_fingerprint = "a" * 64
+    cfg, dataset, context, study, stale_number, checkpoint_bytes, real_run_study = (
+        _prepare_pipeline_running_recovery(
+            make_config,
+            make_canonical_dataset,
+            mocker,
+            marker_state="valid",
+            implementation_fingerprint=original_fingerprint,
+        )
+    )
+    original_trial_snapshot = [
+        (trial.number, trial.state, trial.params.copy(), trial.user_attrs.copy())
+        for trial in study.trials
+    ]
+    mocker.patch(
+        "synthdata.generation.pipeline.sc.generator_implementation_fingerprint",
+        return_value=current_fingerprint,
+    )
+    run_study = mocker.patch(
+        "synthdata.generation.pipeline.hpo_mod.run_study",
+        side_effect=real_run_study if current_fingerprint == original_fingerprint else None,
+        return_value={"n_sgld_steps": 3},
+    )
+    objective_calls = []
+    mocker.patch(
+        "synthdata.generation.tabpfgen_backend.build_tabpfgen_standard_objective",
+        return_value=lambda trial: objective_calls.append(trial.number) or 0.5,
+    )
+
+    run_generation(cfg, dataset)
+
+    if current_fingerprint == original_fingerprint:
+        assert run_study.call_args.args[0] == "hpo_tabpfgen_standard"
+        assert objective_calls == []
+        recovered_study = optuna.load_study(
+            study_name=study.study_name,
+            storage=hpo_mod.default_storage_url(cfg.generation.output_dir),
+        )
+        assert len(recovered_study.trials) == 2
+        assert recovered_study.trials[0].state == optuna.trial.TrialState.COMPLETE
+        assert recovered_study.trials[stale_number].state == optuna.trial.TrialState.FAIL
+        assert (
+            recovered_study.trials[stale_number].user_attrs["hpo_running_recovery"][
+                "implementation_fingerprint"
+            ]
+            == original_fingerprint
+        )
+        recovered_checkpoint = (
+            Path(cfg.generation.output_dir)
+            / "hpo_checkpoints"
+            / study.study_name
+            / f"trial-{stale_number}"
+            / "checkpoint.json"
+        )
+        assert (
+            hpo_mod.load_hpo_trial_checkpoint(
+                recovered_checkpoint,
+                hpo_context=context,
+                expected_implementation_fingerprint=original_fingerprint,
+            )["state"]
+            == "failed"
+        )
+        assert (
+            Path(cfg.generation.output_dir)
+            / "hpo_checkpoints"
+            / study.study_name
+            / "trial-0"
+            / "checkpoint.json"
+        ).read_bytes() == checkpoint_bytes
+    else:
+        expected_scoped = f"hpo_tabpfgen_standard-{current_fingerprint}"
+        assert run_study.call_args.args[0] == expected_scoped
+        assert run_study.call_args.kwargs["checkpoint_implementation_fingerprint"] == (
+            current_fingerprint
+        )
+        unchanged = optuna.load_study(
+            study_name=study.study_name,
+            storage=hpo_mod.default_storage_url(cfg.generation.output_dir),
+        )
+        assert [
+            (trial.number, trial.state, trial.params.copy(), trial.user_attrs.copy())
+            for trial in unchanged.trials
+        ] == original_trial_snapshot
+        assert (
+            Path(cfg.generation.output_dir)
+            / "hpo_checkpoints"
+            / study.study_name
+            / "trial-0"
+            / "checkpoint.json"
+        ).read_bytes() == checkpoint_bytes
+
+
+@pytest.mark.parametrize("marker_state", ["absent", "invalid", "foreign"])
+def test_pipeline_rejects_running_trial_without_valid_recovery_intent(
+    make_config, make_canonical_dataset, mocker, marker_state
+):
+    fingerprint = "a" * 64
+    cfg, dataset, _context, _study, _stale_number, _checkpoint_bytes, _real_run_study = (
+        _prepare_pipeline_running_recovery(
+            make_config,
+            make_canonical_dataset,
+            mocker,
+            marker_state=marker_state,
+            implementation_fingerprint=fingerprint,
+        )
+    )
+    mocker.patch(
+        "synthdata.generation.pipeline.sc.generator_implementation_fingerprint",
+        return_value=fingerprint,
+    )
+    run_study = mocker.patch("synthdata.generation.pipeline.hpo_mod.run_study")
+
+    with pytest.raises(
+        RuntimeError,
+        match="incomplete checkpoint evidence|recovery metadata|foreign identity",
+    ):
+        run_generation(cfg, dataset)
+
+    run_study.assert_not_called()
+
+
+def _prepare_pipeline_running_recovery(
+    make_config,
+    make_canonical_dataset,
+    mocker,
+    *,
+    marker_state,
+    implementation_fingerprint,
+):
+    real_run_study = hpo_mod.run_study
+    cfg = make_config()
+    cfg.generation.synthcity.enabled = False
+    cfg.generation.tabpfn.enabled = False
+    cfg.generation.tabpfgen.enabled = True
+    cfg.generation.tabpfgen.variants = ["standard"]
+    cfg.generation.hpo.enabled = True
+    cfg.generation.hpo.n_trials = 2
+    cfg.generation.n_samples = 4
+    dataset = make_canonical_dataset()
+    generated = dataset.role_frame("train", imputed=True).head(4).copy()
+    mocker.patch(
+        "synthdata.generation.pipeline.hpo_mod.build_synthetic_eval_fn",
+        return_value=lambda _frame: 0.5,
+    )
+    mocker.patch(
+        "synthdata.generation.pipeline.sc.generator_implementation_fingerprint",
+        return_value=implementation_fingerprint,
+    )
+    mocker.patch(
+        "synthdata.generation.tabpfgen_backend.generate_tabpfgen_standard",
+        return_value=generated,
+    )
+    mocker.patch(
+        "synthdata.generation.tabpfgen_backend.build_tabpfgen_standard_objective",
+        return_value=lambda _trial: 0.5,
+    )
+    prime_run_study = mocker.patch(
+        "synthdata.generation.pipeline.hpo_mod.run_study",
+        return_value={"n_sgld_steps": 3},
+    )
+    run_generation(cfg, dataset)
+    context = prime_run_study.call_args.kwargs["hpo_context"]
+    hpo_mod.default_best_params_path(cfg.generation.output_dir).unlink()
+
+    study = hpo_mod.create_study(
+        "hpo_tabpfgen_standard",
+        cfg.generation.hpo,
+        cfg.generation.output_dir,
+        seed=42,
+        hpo_context=context,
+    )
+
+    def completed_objective(trial):
+        trial.suggest_int("n_sgld_steps", 1, 4)
+        trial.set_user_attr("generator_plugin_name", "test_generator")
+        trial.set_user_attr("generator_privacy_claim_type", "none")
+        trial.set_user_attr("generator_metadata_state", "not_attempted")
+        trial.set_user_attr("generator_implementation_fingerprint", implementation_fingerprint)
+        metric_metadata = {
+            key: {
+                "metric_name": key,
+                "status": "complete",
+                "direction": "maximize" if key == "tstr_macro_f1.v1" else "minimize",
+                "finite": True,
+                "eligible": True,
+                "error_reason_code": None,
+                "fit_roles": ["train"],
+                "evaluation_role": "tuning",
+            }
+            for key in context["expected_emitted_keys"]
+        }
+        trial.set_user_attr("metric_metadata", metric_metadata)
+        trial.set_user_attr("result_metadata", metric_metadata)
+        return 0.5
+
+    study.optimize(completed_objective, n_trials=1)
+    completed_checkpoint = hpo_mod.persist_hpo_trial_checkpoint(
+        Path(cfg.generation.output_dir) / "hpo_checkpoints",
+        study.study_name,
+        study.trials[0],
+        hpo_context=context,
+        expected_implementation_fingerprint=implementation_fingerprint,
+    )
+    checkpoint_bytes = completed_checkpoint.read_bytes()
+
+    stale = study.ask()
+    stale.set_user_attr("generator_implementation_fingerprint", implementation_fingerprint)
+    stale_number = stale.number
+    provenance = hpo_mod.hpo_exception_provenance(
+        RuntimeError("interrupted objective"), location="tracked_objective"
+    )
+    stale.set_user_attr("hpo_error_provenance", provenance)
+    stale.set_user_attr("hpo_outcome", {**provenance, "state": "running"})
+    if marker_state != "absent":
+        frozen_trial = next(item for item in study.trials if item.number == stale_number)
+        marker = hpo_mod._hpo_running_recovery_metadata(
+            study,
+            frozen_trial,
+            context_digest=hpo_mod.hpo_context_digest(context),
+            implementation_fingerprint=implementation_fingerprint,
+            provenance=provenance,
+        )
+        if marker_state == "invalid":
+            marker["context_digest"] = "0" * 64
+        elif marker_state == "foreign":
+            marker["study_name"] = "foreign-study"
+        stale.set_user_attr("hpo_running_recovery", marker)
+
+    return cfg, dataset, context, study, stale_number, checkpoint_bytes, real_run_study
+
+
+def test_pategan_hpo_study_identity_and_cache_track_implementation_fingerprint(
+    make_config, make_canonical_dataset, mocker
+):
+    dataset = make_canonical_dataset()
+    generated = dataset.role_frame("train", imputed=True).head(4).copy()
+    cfg_by_fingerprint = {}
+    for fingerprint in ("a" * 64, "b" * 64):
+        cfg = make_config()
+        cfg.generation.synthcity.enabled = True
+        cfg.generation.synthcity.names = ["pategan"]
+        cfg.generation.tabpfn.enabled = False
+        cfg.generation.tabpfgen.enabled = False
+        cfg.generation.hpo.enabled = True
+        cfg.generation.hpo.n_trials = 1
+        cfg.generation.n_samples = 4
+        cfg.generation.output_dir = str(
+            Path(cfg.generation.output_dir).parent
+            / f"pategan-implementation-{fingerprint}"
+            / "synthetic_data"
+        )
+        cfg_by_fingerprint[fingerprint] = cfg
+
+    mocker.patch("synthdata.generation.pipeline.sc.make_loader", return_value=object())
+    mocker.patch("synthdata.generation.pipeline.sc.plugin_accepts", return_value=False)
+    objective_builder = mocker.patch(
+        "synthdata.generation.pipeline.sc.build_synthcity_objective",
+        return_value=lambda _trial: 0.5,
+    )
+    mocker.patch(
+        "synthdata.generation.pipeline.sc.fit_generate",
+        side_effect=lambda _name, params, *_args, **_kwargs: (
+            generated,
+            _pategan_generator_metadata(4, params),
+        ),
+    )
+    run_study = mocker.patch(
+        "synthdata.generation.pipeline.hpo_mod.run_study",
+        return_value={"epsilon": 1.0},
+    )
+    fingerprint_lookup = mocker.patch(
+        "synthdata.generation.pipeline.sc.generator_implementation_fingerprint"
+    )
+
+    for fingerprint, cfg in cfg_by_fingerprint.items():
+        fingerprint_lookup.return_value = fingerprint
+        run_generation(cfg, dataset)
+
+    study_names = [call.args[0] for call in run_study.call_args_list]
+    assert study_names == [
+        f"hpo_pategan-{'a' * 64}",
+        f"hpo_pategan-{'b' * 64}",
+    ]
+    objective_study_names = [call.kwargs["study_name"] for call in objective_builder.call_args_list]
+    assert objective_study_names == [
+        hpo_mod.contextual_study_name(study_name, call.kwargs["hpo_context"])
+        for study_name, call in zip(study_names, run_study.call_args_list, strict=True)
+    ]
+    assert objective_study_names[0] != objective_study_names[1]
+    assert [
+        call.kwargs["checkpoint_implementation_fingerprint"] for call in run_study.call_args_list
+    ] == ["a" * 64, "b" * 64]
+    for fingerprint, cfg in cfg_by_fingerprint.items():
+        cache = json.loads((Path(cfg.generation.output_dir) / "hpo_best_params.json").read_text())
+        assert cache["synthcity"][f"pategan-{fingerprint}"] == {"epsilon": 1.0}
 
 
 def test_tabpfgen_hpo_uses_protected_fields_for_fairness(
@@ -551,7 +1090,7 @@ def test_tabpfgen_hpo_uses_protected_fields_for_fairness(
     )
     mocker.patch(
         "synthdata.generation.pipeline.sc.generator_implementation_fingerprint",
-        return_value="tabpfgen-impl",
+        return_value="b" * 64,
     )
 
     run_generation(cfg, dataset)
@@ -1475,7 +2014,7 @@ def test_stage_a_exhausted_hpo_output_does_not_stop_sibling_generation(
     ]
 
     def fake_run_study(study_name, *_args, **kwargs):
-        if study_name == "hpo_ctgan":
+        if study_name.startswith("hpo_ctgan-"):
             current_study = hpo_mod.contextual_study_name(study_name, kwargs["hpo_context"])
             raise hpo_mod.StageAExhaustionError(current_study, evidence)
         return {"n_iter": 3}
@@ -1508,10 +2047,13 @@ def test_stage_a_exhausted_hpo_output_does_not_stop_sibling_generation(
         == persisted_context["context"]["stage_a_contract_digest"]
     )
     assert failed_entry["hpo_study"] == hpo_mod.contextual_study_name(
-        "hpo_ctgan", persisted_context["context"]
+        run_study.call_args_list[0].args[0], persisted_context["context"]
     )
     assert run_study.call_count == 2
-    assert [call.args[0] for call in run_study.call_args_list] == ["hpo_ctgan", "hpo_tvae"]
+    assert [call.args[0] for call in run_study.call_args_list] == [
+        f"hpo_ctgan-{run_study.call_args_list[0].kwargs['checkpoint_implementation_fingerprint']}",
+        f"hpo_tvae-{run_study.call_args_list[1].kwargs['checkpoint_implementation_fingerprint']}",
+    ]
     assert experiment.records == [
         (
             "generation",
@@ -1683,7 +2225,13 @@ def test_best_params_cache_context_identity_preserves_complete_provenance(
     synthetic = dataset.role_frame("train", imputed=True).head(4).copy()
     mocker.patch("synthdata.generation.pipeline.sc.make_loader", return_value=object())
     mocker.patch("synthdata.generation.pipeline.sc.plugin_accepts", return_value=False)
-    mocker.patch("synthdata.generation.pipeline.sc.fit_generate", return_value=synthetic)
+    fit_generate = mocker.patch(
+        "synthdata.generation.pipeline.sc.fit_generate", return_value=synthetic
+    )
+    implementation_fingerprint = mocker.patch(
+        "synthdata.generation.pipeline.sc.generator_implementation_fingerprint",
+        return_value="a" * 64,
+    )
     captured = {}
 
     def fake_run_study(*args, **kwargs):
@@ -1697,7 +2245,17 @@ def test_best_params_cache_context_identity_preserves_complete_provenance(
     context = captured["context"]
     path = Path(cfg.generation.output_dir) / "hpo_best_params.json"
     cache = hpo_mod.BestParamsCache(path, hpo_context=context)
-    assert cache.has("synthcity", "ctgan")
+    cache_name = f"ctgan-{implementation_fingerprint.return_value}"
+    assert cache.has("synthcity", cache_name)
+    assert not cache.has("synthcity", "ctgan")
+
+    refit_selected_model(
+        cfg,
+        dataset,
+        "ctgan_hpo",
+        output_dir=Path(cfg.generation.output_dir) / "final_refit",
+    )
+    assert fit_generate.call_args.args[1] == {"n_iter": 3}
 
     assert context["release_transform_digest"]
     assert set(context["role_hashes"]) == {"train", "tuning"}

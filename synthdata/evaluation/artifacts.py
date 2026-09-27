@@ -125,6 +125,7 @@ _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _GIT_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _GENERATION_CACHE_SCHEMA_VERSION = "generation-cache-v3"
 _FINAL_REFIT_CACHE_SCHEMA_VERSION = "final-refit-v2"
+_HPO_CONTEXT_SCHEMA_VERSIONS = frozenset({"hpo-context-v1", "hpo-context-v2"})
 _LEGACY_CACHE_SCHEMA_VERSIONS = frozenset({"generation-cache-v2", "final-refit-v1"})
 _CACHE_ENVELOPE_DYNAMIC_FIELDS = frozenset(
     {"cache_key", "row_count", "synthetic_data_sha256", "generator_metadata"}
@@ -428,13 +429,23 @@ def _load_stage_a_bound_hpo_context(
         != expected_contract_digest
     ):
         raise ValueError(f"Stage A failure {model_name!r} contract binding differs from context")
-    expected_study = hpo.contextual_study_name(
-        _stage_a_base_study_name(model_name), validated_context
-    )
     study_name = _non_empty_string(
         failure.get("hpo_study"), f"Stage A failure {model_name!r}.hpo_study"
     )
-    if study_name != expected_study:
+    legacy_study = hpo.contextual_study_name(
+        _stage_a_base_study_name(model_name), validated_context
+    )
+    study_matches = study_name == legacy_study
+    if not study_matches:
+        scoped_base_prefix = f"{_stage_a_base_study_name(model_name)}-"
+        scoped_match = re.fullmatch(
+            rf"{re.escape(scoped_base_prefix)}([0-9a-f]{{64}})-([0-9a-f]{{16}})",
+            study_name,
+        )
+        if scoped_match is not None:
+            scoped_base = f"{scoped_base_prefix}{scoped_match.group(1)}"
+            study_matches = study_name == hpo.contextual_study_name(scoped_base, validated_context)
+    if not study_matches:
         raise ValueError(
             f"Stage A failure {model_name!r} study does not match its bound HPO context"
         )
@@ -1049,21 +1060,77 @@ def _persisted_generation_scope(payload: Mapping[str, Any], label: str) -> tuple
         return ("train",)
     if not isinstance(context, Mapping):
         raise ValueError(f"{label} has incomplete HPO metadata")
-    if schema != "hpo-context-v1":
+    if not isinstance(schema, str) or schema not in _HPO_CONTEXT_SCHEMA_VERSIONS:
         raise ValueError(f"{label}.hpo_context_schema_version is unsupported")
-    supplied_digest = _sha256_digest(digest, f"{label}.hpo_context_digest")
-    from synthdata.generation.hpo import (
-        _require_validated_hpo_context,
-        hpo_context_digest,
-    )
-
-    if supplied_digest != hpo_context_digest(context):
-        raise ValueError(f"{label}.hpo_context_digest does not match hpo_context")
-    try:
-        _require_validated_hpo_context(context, label=f"{label}.hpo_context")
-    except (TypeError, ValueError) as exc:
-        raise ValueError(str(exc)) from exc
+    _validate_persisted_hpo_context(context, schema, digest, label)
     return ("train", "tuning")
+
+
+def _validate_persisted_hpo_context(
+    context: Mapping[str, Any], schema: Any, digest: Any, label: str
+) -> None:
+    """Validate the HPO context according to its persisted schema version."""
+    if schema == "hpo-context-v1":
+        required_fields = {
+            "schema_version",
+            "task_type",
+            "registry_digest",
+            "stage_a_contract_digest",
+            "metric_config",
+            "expected_emitted_keys",
+            "group_context",
+            "role_context_fingerprint",
+            "role_context",
+        }
+        if set(context) != required_fields or context.get("schema_version") != schema:
+            raise ValueError(f"{label}.hpo_context has an invalid historical v1 shape")
+        task_type = context.get("task_type")
+        if not isinstance(task_type, str) or task_type not in {"classification", "regression"}:
+            raise ValueError(f"{label}.hpo_context.task_type is invalid")
+        _non_empty_string(context.get("registry_digest"), f"{label}.hpo_context.registry_digest")
+        contract_digest = context.get("stage_a_contract_digest")
+        if contract_digest is not None:
+            _sha256_digest(contract_digest, f"{label}.hpo_context.stage_a_contract_digest")
+        metric_config = context.get("metric_config")
+        if not isinstance(metric_config, Mapping) or any(
+            not isinstance(category, str)
+            or not category.strip()
+            or not isinstance(metrics, list)
+            or any(not isinstance(metric, str) or not metric.strip() for metric in metrics)
+            for category, metrics in metric_config.items()
+        ):
+            raise ValueError(f"{label}.hpo_context.metric_config is invalid")
+        _string_list(
+            context.get("expected_emitted_keys"),
+            f"{label}.hpo_context.expected_emitted_keys",
+            unique=True,
+        )
+        group_context = context.get("group_context")
+        if group_context is not None and not isinstance(group_context, Mapping):
+            raise ValueError(f"{label}.hpo_context.group_context must be an object or None")
+        _non_empty_string(
+            context.get("role_context_fingerprint"),
+            f"{label}.hpo_context.role_context_fingerprint",
+        )
+        if not isinstance(context.get("role_context"), Mapping):
+            raise ValueError(f"{label}.hpo_context.role_context must be an object")
+        expected_digest = _mapping_digest(context)
+    elif schema == "hpo-context-v2":
+        from synthdata.generation.hpo import _require_validated_hpo_context, hpo_context_digest
+
+        try:
+            validated_context = _require_validated_hpo_context(
+                context, label=f"{label}.hpo_context"
+            )
+            expected_digest = hpo_context_digest(validated_context)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label}.hpo_context is invalid") from exc
+    else:
+        raise ValueError(f"{label}.hpo_context_schema_version is unsupported")
+
+    supplied_digest = _sha256_digest(digest, f"{label}.hpo_context_digest")
+    if supplied_digest != expected_digest:
+        raise ValueError(f"{label}.hpo_context_digest does not match hpo_context")
 
 
 def _validate_cache_envelope(
@@ -1272,12 +1339,9 @@ def _validate_cache_envelope(
         else:
             if not isinstance(hpo_context, Mapping):
                 raise ValueError(f"{label}.hpo_context must be an object or None")
-            if hpo_schema != "hpo-context-v1":
+            if not isinstance(hpo_schema, str) or hpo_schema not in _HPO_CONTEXT_SCHEMA_VERSIONS:
                 raise ValueError(f"{label}.hpo_context_schema_version is unsupported")
-            if _mapping_digest(hpo_context) != _sha256_digest(
-                hpo_digest, f"{label}.hpo_context_digest"
-            ):
-                raise ValueError(f"{label}.hpo_context_digest does not match hpo_context")
+            _validate_persisted_hpo_context(hpo_context, hpo_schema, hpo_digest, label)
     else:
         _non_empty_string(payload["backend"], f"{label}.backend")
         fit_roles = _string_list(payload["fit_roles"], f"{label}.fit_roles", unique=True)

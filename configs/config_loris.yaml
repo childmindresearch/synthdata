@@ -7,7 +7,7 @@ device: auto
 
 experiment:
   tag: refactored_loris_v2
-  id: "1.1"
+  id: "1.5"
 
 data:
   # Source and schema

@@ -80,7 +80,6 @@ def _patch_explicit_categorical_feature_inference():
 
     unsupervised_module.__dict__["infer_categorical_features"] = infer_categorical_features
     unsupervised_module.__dict__["_synthdata_explicit_types_patched"] = True
-    logger.info("[tabpfn] patched unsupervised type inference to honor explicit schema roles")
 
 
 def _patch_use_classifier_nan_bug():
@@ -283,18 +282,6 @@ def generate_tabpfn_standard(
     if resolved_semantic_context is not None:
         experiment.semantic_context = resolved_semantic_context
         experiment.semantic_context_digest = semantic_context_digest(resolved_semantic_context)
-    logger.info(
-        "[tabpfn] standard experiment.run train_shape=%s n_samples=%d "
-        "categorical_columns=%s categorical_indices=%s target=%r target_kind=%s "
-        "schema_fingerprint=%s",
-        x.shape,
-        n_samples,
-        list(categorical_columns),
-        categorical_indices,
-        target_column,
-        "categorical" if target_is_categorical else "continuous",
-        variable_schema_fingerprint or "unavailable",
-    )
     experiment.run(
         tabpfn=model_unsupervised,
         X=x,
@@ -339,12 +326,6 @@ def generate_tabpfn_standard(
             ordered_positions.append(positions_by_column[column][occurrence])
             occurrences[column] = occurrence + 1
         synthetic_data = synthetic_data.iloc[:, ordered_positions]
-        logger.info(
-            "[tabpfn] standard output columns reordered to match input schema order "
-            "generated=%s expected=%s",
-            generated_columns,
-            input_columns,
-        )
 
     return synthetic_data, experiment
 
@@ -393,18 +374,6 @@ def generate_tabpfn_custom(
     if resolved_semantic_context is not None:
         experiment.semantic_context = resolved_semantic_context
         experiment.semantic_context_digest = semantic_context_digest(resolved_semantic_context)
-    logger.info(
-        "[tabpfn] custom experiment.run train_shape=%s n_samples=%d "
-        "categorical_columns=%s categorical_indices=%s target=%r target_kind=%s "
-        "schema_fingerprint=%s",
-        train_array.shape,
-        n_samples,
-        modeled_categorical_columns,
-        categorical_indices,
-        target_column,
-        "categorical" if target_is_categorical else "continuous",
-        variable_schema_fingerprint or "unavailable",
-    )
     experiment.run(
         tabpfn=model_unsupervised,
         X=train_array,

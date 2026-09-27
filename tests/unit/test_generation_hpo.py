@@ -5,6 +5,7 @@ import json
 import math
 from collections.abc import Callable
 from contextlib import nullcontext
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -34,6 +35,7 @@ from synthdata.generation.hpo import (
     persist_hpo_trial_checkpoint,
     persist_stage_a_contract,
     persist_stage_a_result,
+    resolve_study_name,
     run_study,
     screen_stage_a,
     screen_stage_a_trial,
@@ -2217,6 +2219,590 @@ def test_hpo_checkpoint_resume_rejects_changed_implementation_fingerprint(tmp_pa
             hpo_context=context,
         )
     assert calls == [True]
+
+
+@pytest.mark.parametrize("prior_checkpoint", ["missing", "running"])
+def test_fingerprinted_interrupted_trial_recovers_and_resumes_without_replacing_evidence(
+    tmp_path, prior_checkpoint
+):
+    fingerprint = "c" * 64
+    config = HPOConfig(n_trials=2, timeout_seconds=None)
+    context = _hpo_context()
+    study = hpo_module.create_study(
+        "hpo_fingerprinted_interrupted", config, tmp_path, seed=0, hpo_context=context
+    )
+    study.optimize(_fingerprinted_trial_objective(fingerprint), n_trials=1)
+    completed = study.trials[0]
+    completed_checkpoint_path = persist_hpo_trial_checkpoint(
+        tmp_path / "hpo_checkpoints",
+        study.study_name,
+        completed,
+        hpo_context=context,
+        expected_implementation_fingerprint=fingerprint,
+    )
+    completed_checkpoint_bytes = completed_checkpoint_path.read_bytes()
+
+    stale = study.ask()
+    stale.suggest_int("depth", 1, 2)
+    stale.set_user_attr("generator_plugin_name", "test_generator")
+    stale.set_user_attr("generator_privacy_claim_type", "none")
+    stale.set_user_attr("generator_metadata_state", "not_attempted")
+    stale.set_user_attr("generator_implementation_fingerprint", fingerprint)
+    stale_number = stale.number
+
+    _persist_running_recovery_intent(study, stale, context, fingerprint)
+    if prior_checkpoint == "running":
+        original_checkpoint_path = persist_hpo_trial_checkpoint(
+            tmp_path / "hpo_checkpoints",
+            study.study_name,
+            study.trials[-1],
+            hpo_context=context,
+            expected_implementation_fingerprint=fingerprint,
+        )
+        original_checkpoint = json.loads(original_checkpoint_path.read_text())
+        assert original_checkpoint["state"] == "running"
+    else:
+        original_checkpoint_path = None
+
+    result = run_study(
+        "hpo_fingerprinted_interrupted",
+        _unexpected_hpo_trial,
+        config,
+        tmp_path,
+        seed=0,
+        drop_keys=(),
+        hpo_context=context,
+        checkpoint_implementation_fingerprint=fingerprint,
+    )
+
+    resumed = optuna.load_study(
+        study_name=study.study_name,
+        storage=default_storage_url(tmp_path),
+    )
+    recovered = resumed.trials[stale_number]
+    assert result == {}
+    assert len(resumed.trials) == 2
+    assert (
+        sum(
+            trial.state
+            in {
+                optuna.trial.TrialState.COMPLETE,
+                optuna.trial.TrialState.PRUNED,
+                optuna.trial.TrialState.FAIL,
+            }
+            for trial in resumed.trials
+        )
+        == config.n_trials
+    )
+    assert all(trial.state != optuna.trial.TrialState.RUNNING for trial in resumed.trials)
+    assert resumed.trials[0].state == optuna.trial.TrialState.COMPLETE
+    assert completed_checkpoint_path.read_bytes() == completed_checkpoint_bytes
+    assert recovered.state == optuna.trial.TrialState.FAIL
+    assert recovered.params == stale.params
+    recovery = recovered.user_attrs["hpo_running_recovery"]
+    assert recovery["study_name"] == study.study_name
+    assert recovery["trial_number"] == stale_number
+    assert recovery["context_digest"] == hpo_context_digest(context)
+    assert recovery["implementation_fingerprint"] == fingerprint
+    assert recovery["original_state"] == "RUNNING"
+    assert recovery["reason_code"] == "stale_running_trial_recovery"
+    assert recovery["terminal_state"] == "FAIL"
+    assert datetime.fromisoformat(recovery["recovered_at"]).tzinfo is not None
+    assert recovery["provenance"] == recovered.user_attrs["hpo_error_provenance"]
+    failure_checkpoint_path = (
+        tmp_path
+        / "hpo_checkpoints"
+        / study.study_name
+        / f"trial-{stale_number}"
+        / "checkpoint.json"
+    )
+    failure_checkpoint = load_hpo_trial_checkpoint(
+        failure_checkpoint_path,
+        hpo_context=context,
+        expected_implementation_fingerprint=fingerprint,
+    )
+    assert failure_checkpoint["state"] == "failed"
+    if original_checkpoint_path is not None:
+        archived_checkpoint = json.loads(
+            (original_checkpoint_path.parent / "recovery-original-checkpoint.json").read_text()
+        )
+        assert archived_checkpoint == original_checkpoint
+
+
+def _fingerprinted_trial_objective(implementation_fingerprint, *, prune=False):
+    def objective(trial):
+        trial.set_user_attr("generator_plugin_name", "test_generator")
+        trial.set_user_attr("generator_privacy_claim_type", "none")
+        trial.set_user_attr("generator_metadata_state", "not_attempted")
+        trial.set_user_attr("generator_implementation_fingerprint", implementation_fingerprint)
+        if prune:
+            raise optuna.TrialPruned("stage-a rejection")
+        return 0.25
+
+    return objective
+
+
+def _interrupt_fingerprint_recovery_before_checkpoint(tmp_path, monkeypatch):
+    fingerprint = "a" * 64
+    context = _hpo_context()
+    initial_config = HPOConfig(n_trials=1, timeout_seconds=None)
+    resume_config = HPOConfig(n_trials=2, timeout_seconds=None)
+    run_study(
+        "hpo_recovery_crash_window",
+        _fingerprinted_trial_objective(fingerprint),
+        initial_config,
+        tmp_path,
+        seed=0,
+        drop_keys=(),
+        hpo_context=context,
+        checkpoint_implementation_fingerprint=fingerprint,
+    )
+    study_name = contextual_study_name("hpo_recovery_crash_window", context)
+    completed_checkpoint = tmp_path / "hpo_checkpoints" / study_name / "trial-0" / "checkpoint.json"
+    completed_checkpoint_bytes = completed_checkpoint.read_bytes()
+    study = optuna.load_study(study_name=study_name, storage=default_storage_url(tmp_path))
+    stale = study.ask()
+    stale.set_user_attr("generator_implementation_fingerprint", fingerprint)
+    stale_number = stale.number
+    _persist_running_recovery_intent(study, stale, context, fingerprint)
+
+    persist_checkpoint = hpo_module.persist_hpo_trial_checkpoint
+
+    def interrupt_before_checkpoint(root, persisted_study_name, trial, **kwargs):
+        if (
+            persisted_study_name == study_name
+            and trial.number == stale_number
+            and trial.state == optuna.trial.TrialState.FAIL
+        ):
+            raise OSError("simulated interruption before recovery checkpoint")
+        return persist_checkpoint(root, persisted_study_name, trial, **kwargs)
+
+    monkeypatch.setattr(hpo_module, "persist_hpo_trial_checkpoint", interrupt_before_checkpoint)
+    with pytest.raises(OSError, match="simulated interruption"):
+        run_study(
+            "hpo_recovery_crash_window",
+            _unexpected_hpo_trial,
+            resume_config,
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+            checkpoint_implementation_fingerprint=fingerprint,
+        )
+    monkeypatch.setattr(hpo_module, "persist_hpo_trial_checkpoint", persist_checkpoint)
+    return fingerprint, context, resume_config, study_name, stale_number, completed_checkpoint_bytes
+
+
+def _persist_running_recovery_intent(study, trial, context, fingerprint):
+    provenance = hpo_module.hpo_exception_provenance(
+        RuntimeError("interrupted objective"), location="tracked_objective"
+    )
+    trial.set_user_attr("hpo_error_provenance", provenance)
+    trial.set_user_attr("hpo_outcome", {**provenance, "state": "running"})
+    frozen_trial = next(item for item in study.trials if item.number == trial.number)
+    recovery = hpo_module._hpo_running_recovery_metadata(
+        study,
+        frozen_trial,
+        context_digest=hpo_context_digest(context),
+        implementation_fingerprint=fingerprint,
+        provenance=provenance,
+    )
+    trial.set_user_attr("hpo_running_recovery", recovery)
+
+
+def test_resolver_and_resume_finish_recovery_after_checkpoint_write_interruption(
+    tmp_path, monkeypatch
+):
+    (
+        fingerprint,
+        context,
+        config,
+        study_name,
+        stale_number,
+        completed_checkpoint_bytes,
+    ) = _interrupt_fingerprint_recovery_before_checkpoint(tmp_path, monkeypatch)
+
+    study_base = "hpo_recovery_crash_window"
+    assert (
+        resolve_study_name(
+            study_base,
+            fingerprint,
+            config,
+            tmp_path,
+            seed=0,
+            hpo_context=context,
+        )
+        == study_base
+    )
+    checkpoint_path = (
+        tmp_path / "hpo_checkpoints" / study_name / f"trial-{stale_number}" / "checkpoint.json"
+    )
+    assert not checkpoint_path.exists()
+
+    run_study(
+        study_base,
+        _unexpected_hpo_trial,
+        config,
+        tmp_path,
+        seed=0,
+        drop_keys=(),
+        hpo_context=context,
+        checkpoint_implementation_fingerprint=fingerprint,
+    )
+
+    resumed = optuna.load_study(study_name=study_name, storage=default_storage_url(tmp_path))
+    recovered = resumed.trials[stale_number]
+    assert len(resumed.trials) == 2
+    assert recovered.state == optuna.trial.TrialState.FAIL
+    assert recovered.user_attrs["hpo_running_recovery"]["reason_code"] == (
+        "stale_running_trial_recovery"
+    )
+    assert recovered.user_attrs["hpo_running_recovery"]["terminal_state"] == "FAIL"
+    assert (
+        datetime.fromisoformat(recovered.user_attrs["hpo_running_recovery"]["recovered_at"]).tzinfo
+        is not None
+    )
+    assert (
+        load_hpo_trial_checkpoint(
+            checkpoint_path,
+            hpo_context=context,
+            expected_implementation_fingerprint=fingerprint,
+        )["state"]
+        == "failed"
+    )
+    assert (
+        tmp_path / "hpo_checkpoints" / study_name / "trial-0" / "checkpoint.json"
+    ).read_bytes() == completed_checkpoint_bytes
+
+
+@pytest.mark.parametrize("current_fingerprint", ["a" * 64, "b" * 64])
+def test_resolver_validates_recovered_legacy_fingerprint_before_scoping(
+    tmp_path, monkeypatch, current_fingerprint
+):
+    (
+        old_fingerprint,
+        context,
+        config,
+        study_name,
+        stale_number,
+        _,
+    ) = _interrupt_fingerprint_recovery_before_checkpoint(tmp_path, monkeypatch)
+    study_base = "hpo_recovery_crash_window"
+    run_study(
+        study_base,
+        _unexpected_hpo_trial,
+        config,
+        tmp_path,
+        seed=0,
+        drop_keys=(),
+        hpo_context=context,
+        checkpoint_implementation_fingerprint=old_fingerprint,
+    )
+
+    storage = default_storage_url(tmp_path)
+    legacy_name = contextual_study_name(study_base, context)
+    legacy = optuna.load_study(study_name=legacy_name, storage=storage)
+    trial_snapshot = [
+        (trial.number, trial.state, trial.params.copy(), trial.user_attrs.copy())
+        for trial in legacy.trials
+    ]
+    checkpoint_dir = tmp_path / "hpo_checkpoints" / legacy_name
+    checkpoint_snapshot = {
+        path.relative_to(checkpoint_dir): path.read_bytes()
+        for path in sorted(checkpoint_dir.glob("trial-*/checkpoint.json"))
+    }
+    assert stale_number in {trial[0] for trial in trial_snapshot}
+    assert (
+        legacy.trials[stale_number].user_attrs["hpo_running_recovery"]["implementation_fingerprint"]
+        == old_fingerprint
+    )
+
+    expected_name = (
+        study_base
+        if current_fingerprint == old_fingerprint
+        else f"{study_base}-{current_fingerprint}"
+    )
+    assert (
+        resolve_study_name(
+            study_base,
+            current_fingerprint,
+            config,
+            tmp_path,
+            seed=0,
+            hpo_context=context,
+        )
+        == expected_name
+    )
+
+    unchanged = optuna.load_study(study_name=legacy_name, storage=storage)
+    assert [
+        (trial.number, trial.state, trial.params.copy(), trial.user_attrs.copy())
+        for trial in unchanged.trials
+    ] == trial_snapshot
+    assert {
+        path.relative_to(checkpoint_dir): path.read_bytes()
+        for path in sorted(checkpoint_dir.glob("trial-*/checkpoint.json"))
+    } == checkpoint_snapshot
+
+
+def test_resolver_rejects_recovered_checkpoint_fingerprint_inconsistent_with_marker(
+    tmp_path, monkeypatch
+):
+    fingerprint, context, config, study_name, stale_number, _ = (
+        _interrupt_fingerprint_recovery_before_checkpoint(tmp_path, monkeypatch)
+    )
+    run_study(
+        "hpo_recovery_crash_window",
+        _unexpected_hpo_trial,
+        config,
+        tmp_path,
+        seed=0,
+        drop_keys=(),
+        hpo_context=context,
+        checkpoint_implementation_fingerprint=fingerprint,
+    )
+    study = optuna.load_study(study_name=study_name, storage=default_storage_url(tmp_path))
+    recovered = study.trials[stale_number]
+    marker = dict(recovered.user_attrs["hpo_running_recovery"])
+    marker["implementation_fingerprint"] = "c" * 64
+    from optuna.storages._rdb import models
+    from optuna.storages._rdb.storage import _create_scoped_session
+
+    backend = study._storage._backend  # noqa: SLF001 - corrupt persisted evidence for validation
+    with _create_scoped_session(backend.scoped_session, True) as session:
+        stored_trial = models.TrialModel.find_or_raise_by_id(recovered._trial_id, session)
+        for key, value in (
+            ("generator_implementation_fingerprint", "c" * 64),
+            ("hpo_running_recovery", marker),
+        ):
+            attribute = models.TrialUserAttributeModel.find_by_trial_and_key(
+                stored_trial, key, session
+            )
+            assert attribute is not None
+            attribute.value_json = json.dumps(value)
+
+    with pytest.raises(RuntimeError, match="inconsistent implementation fingerprint"):
+        resolve_study_name(
+            "hpo_recovery_crash_window",
+            "b" * 64,
+            config,
+            tmp_path,
+            seed=0,
+            hpo_context=context,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema_version", "unsupported-recovery-schema"),
+        ("context_digest", "0" * 64),
+        ("implementation_fingerprint", "b" * 64),
+    ],
+)
+def test_resolver_rejects_invalid_recovery_marker_after_checkpoint_interruption(
+    tmp_path, monkeypatch, field, value
+):
+    fingerprint, context, config, study_name, stale_number, _ = (
+        _interrupt_fingerprint_recovery_before_checkpoint(tmp_path, monkeypatch)
+    )
+    study = optuna.load_study(study_name=study_name, storage=default_storage_url(tmp_path))
+    recovered = study.trials[stale_number]
+    marker = dict(recovered.user_attrs["hpo_running_recovery"])
+    marker[field] = value
+    from optuna.storages._rdb import models
+    from optuna.storages._rdb.storage import _create_scoped_session
+
+    backend = study._storage._backend  # noqa: SLF001 - corrupt persisted marker for validation
+    with _create_scoped_session(backend.scoped_session, True) as session:
+        stored_trial = models.TrialModel.find_or_raise_by_id(recovered._trial_id, session)
+        attribute = models.TrialUserAttributeModel.find_by_trial_and_key(
+            stored_trial, "hpo_running_recovery", session
+        )
+        assert attribute is not None
+        attribute.value_json = json.dumps(marker)
+
+    with pytest.raises(RuntimeError, match="recovery metadata"):
+        resolve_study_name(
+            "hpo_recovery_crash_window",
+            fingerprint,
+            config,
+            tmp_path,
+            seed=0,
+            hpo_context=context,
+        )
+
+
+def test_legacy_study_reuses_five_matching_pruned_trials_without_allocating_another(
+    tmp_path,
+):
+    fingerprint = "a" * 64
+    config = HPOConfig(n_trials=5, timeout_seconds=None)
+    context = _hpo_context()
+    with pytest.raises(RuntimeError, match="produced no completed trials"):
+        run_study(
+            "hpo_pategan",
+            _fingerprinted_trial_objective(fingerprint, prune=True),
+            config,
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+            checkpoint_implementation_fingerprint=fingerprint,
+        )
+
+    assert (
+        resolve_study_name(
+            "hpo_pategan",
+            fingerprint,
+            config,
+            tmp_path,
+            seed=0,
+            hpo_context=context,
+        )
+        == "hpo_pategan"
+    )
+    with pytest.raises(RuntimeError, match="produced no completed trials"):
+        run_study(
+            "hpo_pategan",
+            _unexpected_hpo_trial,
+            config,
+            tmp_path,
+            seed=0,
+            drop_keys=(),
+            hpo_context=context,
+            checkpoint_implementation_fingerprint=fingerprint,
+        )
+
+    study = optuna.load_study(
+        study_name=contextual_study_name("hpo_pategan", context),
+        storage=default_storage_url(tmp_path),
+    )
+    assert len(study.trials) == 5
+    assert all(trial.state == optuna.trial.TrialState.PRUNED for trial in study.trials)
+
+
+def test_mismatched_legacy_study_is_preserved_and_scoped_identity_resumes(tmp_path):
+    config = HPOConfig(n_trials=1, timeout_seconds=None)
+    context = _hpo_context()
+    old_fingerprint = "a" * 64
+    current_fingerprint = "b" * 64
+    run_study(
+        "hpo_ctgan",
+        _fingerprinted_trial_objective(old_fingerprint),
+        config,
+        tmp_path,
+        seed=0,
+        drop_keys=(),
+        hpo_context=context,
+        checkpoint_implementation_fingerprint=old_fingerprint,
+    )
+
+    scoped = resolve_study_name(
+        "hpo_ctgan",
+        current_fingerprint,
+        config,
+        tmp_path,
+        seed=0,
+        hpo_context=context,
+    )
+    assert scoped == f"hpo_ctgan-{current_fingerprint}"
+    legacy = optuna.load_study(
+        study_name=contextual_study_name("hpo_ctgan", context),
+        storage=default_storage_url(tmp_path),
+    )
+    assert len(legacy.trials) == 1
+    assert legacy.trials[0].user_attrs["generator_implementation_fingerprint"] == (old_fingerprint)
+
+    run_study(
+        scoped,
+        _fingerprinted_trial_objective(current_fingerprint),
+        config,
+        tmp_path,
+        seed=0,
+        drop_keys=(),
+        hpo_context=context,
+        checkpoint_implementation_fingerprint=current_fingerprint,
+    )
+    run_study(
+        scoped,
+        _unexpected_hpo_trial,
+        config,
+        tmp_path,
+        seed=0,
+        drop_keys=(),
+        hpo_context=context,
+        checkpoint_implementation_fingerprint=current_fingerprint,
+    )
+    scoped_study = optuna.load_study(
+        study_name=contextual_study_name(scoped, context),
+        storage=default_storage_url(tmp_path),
+    )
+    assert len(scoped_study.trials) == 1
+    assert (
+        resolve_study_name(
+            "hpo_ctgan",
+            current_fingerprint,
+            config,
+            tmp_path,
+            seed=0,
+            hpo_context=context,
+        )
+        == scoped
+    )
+
+
+def test_legacy_study_with_incomplete_checkpoint_evidence_fails_loudly(tmp_path):
+    config = HPOConfig(n_trials=1, timeout_seconds=None)
+    context = _hpo_context()
+    study = hpo_module.create_study("hpo_incomplete", config, tmp_path, seed=0, hpo_context=context)
+    study.optimize(_fingerprinted_trial_objective("a" * 64), n_trials=1)
+
+    with pytest.raises(RuntimeError, match="incomplete checkpoint evidence"):
+        resolve_study_name(
+            "hpo_incomplete",
+            "b" * 64,
+            config,
+            tmp_path,
+            seed=0,
+            hpo_context=context,
+        )
+
+
+def test_legacy_study_with_foreign_checkpoint_fails_loudly(tmp_path):
+    fingerprint = "a" * 64
+    config = HPOConfig(n_trials=1, timeout_seconds=None)
+    context = _hpo_context()
+    run_study(
+        "hpo_foreign_checkpoint",
+        _fingerprinted_trial_objective(fingerprint),
+        config,
+        tmp_path,
+        seed=0,
+        drop_keys=(),
+        hpo_context=context,
+        checkpoint_implementation_fingerprint=fingerprint,
+    )
+    checkpoint_path = (
+        tmp_path
+        / "hpo_checkpoints"
+        / contextual_study_name("hpo_foreign_checkpoint", context)
+        / "trial-0"
+        / "checkpoint.json"
+    )
+    checkpoint = json.loads(checkpoint_path.read_text())
+    checkpoint["study_name"] = "hpo_foreign_study"
+    checkpoint_path.write_text(json.dumps(checkpoint))
+
+    with pytest.raises(RuntimeError, match="study_name does not match"):
+        resolve_study_name(
+            "hpo_foreign_checkpoint",
+            "b" * 64,
+            config,
+            tmp_path,
+            seed=0,
+            hpo_context=context,
+        )
 
 
 def test_legacy_hpo_generator_metadata_is_rejected_as_current_evidence(tmp_path):
@@ -4642,6 +5228,72 @@ def test_tabpfgen_standard_hpo_cardinality_oversamples_and_trims(mocker):
     assert len(evaluated[0]) == 5
 
 
+def test_tabpfgen_standard_hpo_orders_nonfinal_target_and_preserves_values(mocker):
+    from synthdata.generation import tabpfgen_backend as backend
+
+    source = pd.DataFrame(
+        {
+            "feature_a": np.arange(4, dtype=float),
+            "target": [0, 1, 0, 1],
+            "feature_b": np.arange(10, 14, dtype=float),
+        }
+    )
+    evaluated = []
+
+    class FakeGenerator:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def generate_classification(self, **kwargs):
+            del kwargs
+            return np.array([[10.0, 20.0], [11.0, 21.0], [12.0, 22.0], [13.0, 23.0]]), None
+
+    class FakeClassifier:
+        def fit(self, features, labels):
+            del features, labels
+            return self
+
+        def predict(self, features):
+            assert features.tolist() == [[10.0, 20.0], [11.0, 21.0], [12.0, 22.0]]
+            return np.array([1, 0, 1])
+
+    class FakeTrial:
+        number = 8
+
+        def suggest_int(self, name, low, high, step=1):
+            del name, high, step
+            return low
+
+        def suggest_float(self, name, low, high, log=False):
+            del name, high, log
+            return low
+
+        def set_user_attr(self, key, value):
+            del key, value
+
+    mocker.patch.object(backend, "TabPFGen", FakeGenerator)
+    mocker.patch("tabpfn.TabPFNClassifier", FakeClassifier)
+    mocker.patch.object(backend, "_record_hpo_generator_metadata")
+    objective = backend.build_tabpfgen_standard_objective(
+        source,
+        ["feature_a", "feature_b"],
+        [],
+        "target",
+        3,
+        500,
+        lambda synthetic: evaluated.append(synthetic.copy()) or 0.5,
+        target_is_categorical=True,
+    )
+
+    assert objective(FakeTrial()) == pytest.approx(0.5)
+    assert evaluated[0].columns.tolist() == ["feature_a", "target", "feature_b"]
+    assert evaluated[0].to_numpy().tolist() == [
+        [10.0, 1, 20.0],
+        [11.0, 0, 21.0],
+        [12.0, 1, 22.0],
+    ]
+
+
 def test_tabpfgen_hpo_checkpoint_metadata_is_durable(mocker, tmp_path):
     from synthdata.generation import tabpfgen_backend as backend
 
@@ -4743,8 +5395,10 @@ def test_tabpfgen_custom_hpo_records_generator_metadata(mocker):
         {
             "feature": np.arange(6, dtype=float),
             "target": [0, 1, 2, 0, 1, 2],
+            "other": np.arange(100, 106, dtype=float),
         }
     )
+    evaluated = []
 
     class FakeGenerator:
         def __init__(self, **kwargs):
@@ -4753,7 +5407,12 @@ def test_tabpfgen_custom_hpo_records_generator_metadata(mocker):
         def generate_classification(self, features, labels, n_samples, balance_classes):
             del features, labels, balance_classes
             return (
-                np.arange(n_samples, dtype=float).reshape(-1, 1),
+                np.column_stack(
+                    (
+                        np.arange(n_samples, dtype=float) + 10,
+                        np.arange(n_samples, dtype=float) + 100,
+                    )
+                ),
                 np.tile(np.arange(3), n_samples // 3),
             )
 
@@ -4777,12 +5436,12 @@ def test_tabpfgen_custom_hpo_records_generator_metadata(mocker):
     mocker.patch.object(backend, "TabPFGenSGLDLabels", FakeGenerator)
     objective = backend.build_tabpfgen_custom_objective(
         source,
-        ["feature"],
+        ["feature", "other"],
         [],
         "target",
         6,
         500,
-        lambda _synthetic: 0.5,
+        lambda synthetic: evaluated.append(synthetic) or 0.5,
         seed=13,
         target_is_categorical=True,
     )
@@ -4795,6 +5454,31 @@ def test_tabpfgen_custom_hpo_records_generator_metadata(mocker):
     assert trial.user_attrs["generator_metadata"]["plugin_name"] == "tabpfgen_custom"
     assert trial.user_attrs["generator_metadata"]["n_samples"] == 6
     assert trial.user_attrs["generator_metadata"]["random_state"] == 13
+    assert evaluated[0].columns.tolist() == ["feature", "target", "other"]
+    assert {
+        (row.feature, row.target, row.other) for row in evaluated[0].itertuples(index=False)
+    } == {(10.0 + i, i % 3, 100.0 + i) for i in range(6)}
+
+
+@pytest.mark.parametrize(
+    ("generated_columns", "schema_columns", "error_columns"),
+    [
+        (["feature", "target"], ["feature", "target", "other"], r"missing=.*other"),
+        (
+            ["feature", "target", "unexpected"],
+            ["feature", "target"],
+            r"unexpected=.*unexpected",
+        ),
+    ],
+)
+def test_tabpfgen_output_rejects_schema_membership_mismatch(
+    generated_columns, schema_columns, error_columns
+):
+    from synthdata.generation import tabpfgen_backend as backend
+
+    generated = pd.DataFrame([[1] * len(generated_columns)], columns=generated_columns)
+    with pytest.raises(RuntimeError, match=error_columns):
+        backend._validate_and_order_output(generated, schema_columns, "test generation")
 
 
 @pytest.mark.parametrize(

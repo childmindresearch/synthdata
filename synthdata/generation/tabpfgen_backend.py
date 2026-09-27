@@ -4,6 +4,7 @@ Both variants operate on the *imputed* train split (unlike TabPFN, TabPFGen's
 SGLD sampler needs fully-observed numeric inputs).
 """
 
+from collections import Counter
 from collections.abc import Callable
 from typing import Protocol, cast
 
@@ -110,6 +111,23 @@ def _proportional_class_counts(n_samples: int, proportions: pd.Series) -> dict:
         order = np.argsort(-(expected - counts), kind="stable")
         counts[order[:remainder]] += 1
     return {label: int(count) for label, count in zip(proportions.index, counts, strict=True)}
+
+
+def _validate_and_order_output(
+    synthetic: pd.DataFrame,
+    schema_columns: ColumnNames,
+    output_name: str,
+) -> pd.DataFrame:
+    generated_columns = Counter(synthetic.columns)
+    expected_columns = Counter(schema_columns)
+    if generated_columns != expected_columns:
+        missing_columns = list((expected_columns - generated_columns).elements())
+        unexpected_columns = list((generated_columns - expected_columns).elements())
+        raise RuntimeError(
+            f"TabPFGen {output_name} returned columns that differ from the input schema: "
+            f"missing={missing_columns!r}, unexpected={unexpected_columns!r}"
+        )
+    return synthetic.loc[:, schema_columns]
 
 
 def _record_hpo_generator_metadata(
@@ -280,7 +298,17 @@ def generate_tabpfgen_standard(
 
     synthetic = decode_label_encoded_columns(synthetic_encoded, category_maps)
     synthetic[target_column] = target_values
-    return synthetic
+    schema_columns = list(train_imputed_df.columns)
+    generated_columns = Counter(synthetic.columns)
+    expected_columns = Counter(schema_columns)
+    if generated_columns != expected_columns:
+        missing_columns = list((expected_columns - generated_columns).elements())
+        unexpected_columns = list((generated_columns - expected_columns).elements())
+        raise RuntimeError(
+            "TabPFGen returned columns that differ from the input schema: "
+            f"missing={missing_columns!r}, unexpected={unexpected_columns!r}"
+        )
+    return synthetic.loc[:, schema_columns]
 
 
 def generate_tabpfgen_custom(
@@ -359,7 +387,11 @@ def generate_tabpfgen_custom(
         raise RuntimeError(
             f"TabPFGen custom generation returned {len(synthetic)} rows; expected {n_samples}"
         )
-    return synthetic
+    return _validate_and_order_output(
+        synthetic,
+        list(train_imputed_df.columns),
+        "custom generation",
+    )
 
 
 def build_tabpfgen_standard_objective(
@@ -450,6 +482,11 @@ def build_tabpfgen_standard_objective(
             target_values = clf.predict(syn_encoded.to_numpy(dtype=float))
             syn = decode_label_encoded_columns(syn_encoded, category_maps)
             syn[target_column] = target_values
+            syn = _validate_and_order_output(
+                syn,
+                list(train_imputed_df.columns),
+                "standard HPO generation",
+            )
             _record_hpo_generator_metadata(
                 trial,
                 plugin_name,
@@ -587,6 +624,11 @@ def build_tabpfgen_custom_objective(
                 raise RuntimeError(
                     f"TabPFGen custom HPO generation returned {len(syn)} rows; expected {n_samples}"
                 )
+            syn = _validate_and_order_output(
+                syn,
+                list(train_imputed_df.columns),
+                "custom HPO generation",
+            )
             _record_hpo_generator_metadata(
                 trial,
                 plugin_name,

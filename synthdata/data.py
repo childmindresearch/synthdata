@@ -2295,7 +2295,7 @@ def load_imputed_splits(
         return dataset
 
     try:
-        frames = {name: pd.read_csv(path) for name, path in imputed_paths.items()}
+        frames = {name: pd.read_csv(path, low_memory=False) for name, path in imputed_paths.items()}
     except (OSError, pd.errors.ParserError) as exc:
         logger.warning(
             "Ignoring imputed CSVs under %s because a role cache could not be read: %s; "

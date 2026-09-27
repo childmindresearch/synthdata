@@ -59,14 +59,16 @@ def test_explicit_type_patch_disables_cardinality_inference(monkeypatch):
     assert unsupervised.infer_categorical_features([[1, 2], [1, 3]], categorical_features=[]) == []
 
 
-def test_explicit_type_patch_is_idempotent(monkeypatch):
+def test_explicit_type_patch_is_idempotent_and_quiet(monkeypatch, mocker):
     unsupervised = _install_unsupervised_module(monkeypatch)
 
+    mocker.spy(tabpfn_backend.logger, "info")
     tabpfn_backend._patch_explicit_categorical_feature_inference()
     first = unsupervised.infer_categorical_features
     tabpfn_backend._patch_explicit_categorical_feature_inference()
 
     assert unsupervised.infer_categorical_features is first
+    assert not tabpfn_backend.logger.info.call_args_list
 
 
 @pytest.mark.parametrize(
@@ -91,6 +93,60 @@ def test_explicit_type_patch_is_idempotent(monkeypatch):
 def test_tabpfn_generators_reject_continuous_target(generator, arguments):
     with pytest.raises(ValueError, match="target column 'target'.*continuous"):
         generator(*arguments, target_is_categorical=False)
+
+
+@pytest.mark.parametrize("variant", ["standard", "custom"])
+def test_tabpfn_generation_omits_categorical_list_logs_and_preserves_indices(mocker, variant):
+    train = pd.DataFrame(
+        {
+            "category": [1, 2],
+            "value": [0.5, 1.5],
+            "target": [0, 1],
+        }
+    )
+
+    class FakeExperiment:
+        def __init__(self, feature_count):
+            self.data = train.copy()
+            self.synthetic_X = torch.zeros((2, feature_count))
+            self.run_kwargs = None
+
+        def run(self, **kwargs):
+            self.run_kwargs = kwargs
+
+    class FakeClassifier:
+        def fit(self, features, labels):
+            del features, labels
+            return self
+
+        def predict(self, features):
+            return np.zeros(len(features), dtype=int)
+
+    if variant == "standard":
+        feature_columns = ["category", "value"]
+        experiment = FakeExperiment(len(feature_columns))
+        generator = tabpfn_backend.generate_tabpfn_standard
+        arguments = (train, feature_columns, ["category"], "target", 2)
+        expected_categorical_features = [0]
+        mocker.patch("tabpfn.TabPFNClassifier", FakeClassifier)
+    else:
+        experiment = FakeExperiment(len(train.columns))
+        generator = tabpfn_backend.generate_tabpfn_custom
+        arguments = (train, ["category"], "target", 2)
+        expected_categorical_features = [0, 2]
+
+    mocker.patch.object(tabpfn_backend, "_make_experiment", return_value=(experiment, object()))
+    mocker.spy(tabpfn_backend.logger, "info")
+
+    generator(*arguments)
+
+    assert experiment.run_kwargs["categorical_features"] == expected_categorical_features
+    assert all(
+        "categorical_columns" not in str(call.args)
+        and "categorical_indices" not in str(call.args)
+        and "explicit schema roles" not in str(call.args)
+        for call in tabpfn_backend.logger.info.call_args_list
+    )
 
 
 def test_tabpfn_custom_consumes_semantic_context(make_canonical_dataset, mocker):
@@ -166,6 +222,7 @@ def test_tabpfn_standard_preserves_nonfinal_target_column_order(mocker):
     experiment = FakeExperiment()
     mocker.patch.object(tabpfn_backend, "_make_experiment", return_value=(experiment, object()))
     mocker.patch("tabpfn.TabPFNClassifier", FakeClassifier)
+    mocker.spy(tabpfn_backend.logger, "info")
 
     generated, _ = tabpfn_backend.generate_tabpfn_standard(
         train,
@@ -177,6 +234,10 @@ def test_tabpfn_standard_preserves_nonfinal_target_column_order(mocker):
 
     assert generated.columns.tolist() == train.columns.tolist()
     assert generated["target"].tolist() == [0, 1]
+    assert all(
+        "standard output columns reordered" not in str(call.args)
+        for call in tabpfn_backend.logger.info.call_args_list
+    )
 
 
 @pytest.mark.parametrize("mismatch", ["missing", "extra", "duplicate"])

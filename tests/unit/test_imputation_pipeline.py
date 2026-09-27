@@ -414,6 +414,43 @@ class TestRunImputationCaching:
         load_imputed_splits(fresh, expected_cache_key=record["cache_key"])
         assert fresh.full_imputed_df is not None
 
+    def test_canonical_role_cache_reload_disables_chunk_inference_without_coercion(
+        self, make_config, make_canonical_dataset, monkeypatch
+    ):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+        run_imputation(cfg, dataset)
+
+        train_path = dataset.paths()["train_imputed"]
+        cached_train = dataset.imputed_roles["train"].copy()
+        mixed_values = [17, "A"] * (len(cached_train) // 2)
+        if len(cached_train) % 2:
+            mixed_values.append(23)
+        cached_train["protected"] = pd.Series(mixed_values, dtype=object).to_numpy()
+        cached_train.to_csv(train_path, index=False)
+        expected_train = pd.read_csv(train_path, low_memory=False)
+
+        read_options = []
+        original_read_csv = pd.read_csv
+
+        def recording_read_csv(path, *args, **kwargs):
+            read_options.append(kwargs.copy())
+            return original_read_csv(path, *args, **kwargs)
+
+        monkeypatch.setattr(pd, "read_csv", recording_read_csv)
+        fresh = make_canonical_dataset()
+        fresh.data_dir = dataset.data_dir
+        load_imputed_splits(fresh)
+
+        assert len(read_options) == len(dataset.roles)
+        assert all(options.get("low_memory") is False for options in read_options)
+        pd.testing.assert_frame_equal(fresh.imputed_roles["train"], expected_train)
+        assert fresh.imputed_roles["train"]["protected"].dtype == object
+        assert fresh.imputed_roles["train"]["protected"].tolist() == [
+            "17" if value == 17 else value for value in mixed_values
+        ]
+
     def test_canonical_candidate_cache_records_phase_aware_metadata(
         self, make_config, make_canonical_dataset
     ):

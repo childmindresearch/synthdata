@@ -504,7 +504,11 @@ def refit_selected_model(
         tpfgen.validate_tabpfgen_target(dataset.target_column, dataset.target_is_categorical)
         backend = "tabpfgen"
         if is_hpo:
-            params = load_hpo_params("tabpfgen", f"tabpfgen_{variant}")
+            implementation_fingerprint = sc.generator_implementation_fingerprint(
+                f"tabpfgen_{variant}"
+            )
+            cache_name = f"tabpfgen_{variant}-{implementation_fingerprint}"
+            params = load_hpo_params("tabpfgen", cache_name)
         elif variant == "standard":
             params = dict(gen_cfg.tabpfgen.standard_params)
         else:
@@ -554,7 +558,9 @@ def refit_selected_model(
                 raise RuntimeError(
                     f"Selected HPO model {model_name!r} but generation.hpo.enabled is false"
                 )
-            params = load_hpo_params("synthcity", plugin_name)
+            implementation_fingerprint = sc.generator_implementation_fingerprint(plugin_name)
+            cache_name = f"{plugin_name}-{implementation_fingerprint}"
+            params = load_hpo_params("synthcity", cache_name)
             if gen_cfg.hpo.final_n_iter_override and sc.plugin_accepts(plugin_name, "n_iter"):
                 params["n_iter"] = gen_cfg.hpo.final_n_iter_override
         else:
@@ -965,11 +971,16 @@ def run_generation(
     expected_outputs = _expected_generation_outputs(gen_cfg)
     failed_model_outcomes: list[dict] = []
 
-    def _stage_a_failure_outcome(model_name: str, error: hpo_mod.StageAExhaustionError) -> dict:
+    def _stage_a_failure_outcome(
+        model_name: str,
+        error: hpo_mod.StageAExhaustionError,
+        *,
+        study_name: str | None = None,
+    ) -> dict:
         if hpo_context is None or hpo_context_digest is None or hpo_context_artifact_path is None:
             raise RuntimeError("Stage A exhaustion requires a persisted HPO context artifact")
         expected_study_name = hpo_mod.contextual_study_name(
-            f"hpo_{model_name.removesuffix('_hpo')}", hpo_context
+            study_name or f"hpo_{model_name.removesuffix('_hpo')}", hpo_context
         )
         if error.study_name != expected_study_name:
             raise RuntimeError(
@@ -1242,7 +1253,18 @@ def run_generation(
 
             if gen_cfg.hpo.enabled:
                 cache = _require_best_params_cache()
-                if not cache.has("synthcity", name):
+                implementation_fingerprint = sc.generator_implementation_fingerprint(name)
+                cache_name = f"{name}-{implementation_fingerprint}"
+                if not cache.has("synthcity", cache_name):
+                    study_base_name = hpo_mod.resolve_study_name(
+                        f"hpo_{name}",
+                        implementation_fingerprint,
+                        gen_cfg.hpo,
+                        output_dir,
+                        seed,
+                        hpo_context=hpo_context,
+                        stage_a_root=stage_a_root,
+                    )
                     objective = sc.build_synthcity_objective(
                         name,
                         train_loader,
@@ -1258,7 +1280,7 @@ def run_generation(
                         stage_a_contract=stage_a_contract,
                         stage_a_source_df=fit_imputed_df,
                         stage_a_root=str(stage_a_root) if stage_a_root is not None else None,
-                        study_name=hpo_mod.contextual_study_name(f"hpo_{name}", hpo_context),
+                        study_name=hpo_mod.contextual_study_name(study_base_name, hpo_context),
                         group_context=hpo_group_context,
                         expected_emitted_keys=(
                             hpo_context["expected_emitted_keys"]
@@ -1276,7 +1298,7 @@ def run_generation(
                     )
                     try:
                         params = hpo_mod.run_study(
-                            f"hpo_{name}",
+                            study_base_name,
                             objective,
                             gen_cfg.hpo,
                             output_dir,
@@ -1284,13 +1306,13 @@ def run_generation(
                             hpo_context=hpo_context,
                             checkpoint_workspace=output_dir / "synthcity_workspace",
                             checkpoint_plugin=name,
-                            checkpoint_implementation_fingerprint=sc.generator_implementation_fingerprint(
-                                name
-                            ),
+                            checkpoint_implementation_fingerprint=implementation_fingerprint,
                             stage_a_root=stage_a_root,
                         )
                     except hpo_mod.StageAExhaustionError as exc:
-                        failed_model_outcomes.append(_stage_a_failure_outcome(f"{name}_hpo", exc))
+                        failed_model_outcomes.append(
+                            _stage_a_failure_outcome(f"{name}_hpo", exc, study_name=study_base_name)
+                        )
                         logger.warning(
                             "[generation] skipping HPO output=%s after Stage A exhaustion; "
                             "study=%s evidence=%s",
@@ -1299,8 +1321,8 @@ def run_generation(
                             exc.evidence_references,
                         )
                         continue
-                    cache.set("synthcity", name, params)
-                params = dict(cache.get("synthcity", name))
+                    cache.set("synthcity", cache_name, params)
+                params = dict(cache.get("synthcity", cache_name))
 
                 override = gen_cfg.hpo.final_n_iter_override
                 if override and sc.plugin_accepts(name, "n_iter"):
@@ -1438,7 +1460,20 @@ def run_generation(
 
             if gen_cfg.hpo.enabled:
                 cache = _require_best_params_cache()
-                if not cache.has("tabpfgen", "tabpfgen_standard"):
+                implementation_fingerprint = sc.generator_implementation_fingerprint(
+                    "tabpfgen_standard"
+                )
+                cache_name = f"tabpfgen_standard-{implementation_fingerprint}"
+                if not cache.has("tabpfgen", cache_name):
+                    study_name = hpo_mod.resolve_study_name(
+                        "hpo_tabpfgen_standard",
+                        implementation_fingerprint,
+                        gen_cfg.hpo,
+                        output_dir,
+                        seed,
+                        hpo_context=hpo_context,
+                        stage_a_root=stage_a_root,
+                    )
                     objective = tpfgen.build_tabpfgen_standard_objective(
                         fit_imputed_df,
                         dataset.feature_columns,
@@ -1451,30 +1486,28 @@ def run_generation(
                         stage_a_contract=stage_a_contract,
                         stage_a_source_df=fit_imputed_df,
                         stage_a_root=str(stage_a_root) if stage_a_root is not None else None,
-                        study_name=hpo_mod.contextual_study_name(
-                            "hpo_tabpfgen_standard", hpo_context
-                        ),
+                        study_name=hpo_mod.contextual_study_name(study_name, hpo_context),
                         target_is_categorical=dataset.target_is_categorical,
                         variable_schema_fingerprint=dataset.variable_schema_fingerprint,
                         semantic_context=generation_semantic_context,
                     )
                     try:
                         params = hpo_mod.run_study(
-                            "hpo_tabpfgen_standard",
+                            study_name,
                             objective,
                             gen_cfg.hpo,
                             output_dir,
                             seed,
                             drop_keys=(),
                             hpo_context=hpo_context,
-                            checkpoint_implementation_fingerprint=sc.generator_implementation_fingerprint(
-                                "tabpfgen_standard"
-                            ),
+                            checkpoint_implementation_fingerprint=implementation_fingerprint,
                             stage_a_root=stage_a_root,
                         )
                     except hpo_mod.StageAExhaustionError as exc:
                         failed_model_outcomes.append(
-                            _stage_a_failure_outcome("tabpfgen_standard_hpo", exc)
+                            _stage_a_failure_outcome(
+                                "tabpfgen_standard_hpo", exc, study_name=study_name
+                            )
                         )
                         logger.warning(
                             "[generation] skipping HPO output=tabpfgen_standard_hpo after "
@@ -1484,9 +1517,9 @@ def run_generation(
                         )
                         params = None
                     if params is not None:
-                        cache.set("tabpfgen", "tabpfgen_standard", params)
-                if cache.has("tabpfgen", "tabpfgen_standard"):
-                    params = cache.get("tabpfgen", "tabpfgen_standard")
+                        cache.set("tabpfgen", cache_name, params)
+                if cache.has("tabpfgen", cache_name):
+                    params = cache.get("tabpfgen", cache_name)
 
                     _cached_or_build(
                         "tabpfgen_standard_hpo",
@@ -1527,7 +1560,20 @@ def run_generation(
 
             if gen_cfg.hpo.enabled:
                 cache = _require_best_params_cache()
-                if not cache.has("tabpfgen", "tabpfgen_custom"):
+                implementation_fingerprint = sc.generator_implementation_fingerprint(
+                    "tabpfgen_custom"
+                )
+                cache_name = f"tabpfgen_custom-{implementation_fingerprint}"
+                if not cache.has("tabpfgen", cache_name):
+                    study_name = hpo_mod.resolve_study_name(
+                        "hpo_tabpfgen_custom",
+                        implementation_fingerprint,
+                        gen_cfg.hpo,
+                        output_dir,
+                        seed,
+                        hpo_context=hpo_context,
+                        stage_a_root=stage_a_root,
+                    )
                     objective = tpfgen.build_tabpfgen_custom_objective(
                         fit_imputed_df,
                         dataset.feature_columns,
@@ -1540,30 +1586,28 @@ def run_generation(
                         stage_a_contract=stage_a_contract,
                         stage_a_source_df=fit_imputed_df,
                         stage_a_root=str(stage_a_root) if stage_a_root is not None else None,
-                        study_name=hpo_mod.contextual_study_name(
-                            "hpo_tabpfgen_custom", hpo_context
-                        ),
+                        study_name=hpo_mod.contextual_study_name(study_name, hpo_context),
                         target_is_categorical=dataset.target_is_categorical,
                         variable_schema_fingerprint=dataset.variable_schema_fingerprint,
                         semantic_context=generation_semantic_context,
                     )
                     try:
                         params = hpo_mod.run_study(
-                            "hpo_tabpfgen_custom",
+                            study_name,
                             objective,
                             gen_cfg.hpo,
                             output_dir,
                             seed,
                             drop_keys=(),
                             hpo_context=hpo_context,
-                            checkpoint_implementation_fingerprint=sc.generator_implementation_fingerprint(
-                                "tabpfgen_custom"
-                            ),
+                            checkpoint_implementation_fingerprint=implementation_fingerprint,
                             stage_a_root=stage_a_root,
                         )
                     except hpo_mod.StageAExhaustionError as exc:
                         failed_model_outcomes.append(
-                            _stage_a_failure_outcome("tabpfgen_custom_hpo", exc)
+                            _stage_a_failure_outcome(
+                                "tabpfgen_custom_hpo", exc, study_name=study_name
+                            )
                         )
                         logger.warning(
                             "[generation] skipping HPO output=tabpfgen_custom_hpo after "
@@ -1573,9 +1617,9 @@ def run_generation(
                         )
                         params = None
                     if params is not None:
-                        cache.set("tabpfgen", "tabpfgen_custom", params)
-                if cache.has("tabpfgen", "tabpfgen_custom"):
-                    params = cache.get("tabpfgen", "tabpfgen_custom")
+                        cache.set("tabpfgen", cache_name, params)
+                if cache.has("tabpfgen", cache_name):
+                    params = cache.get("tabpfgen", cache_name)
 
                     _cached_or_build(
                         "tabpfgen_custom_hpo",

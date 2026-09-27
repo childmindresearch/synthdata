@@ -660,6 +660,19 @@ def _write_valid_generated_artifact(
     return generation_dir, cache
 
 
+def _set_generated_cache_hpo_context(generation_dir, cache, schema, context, digest):
+    cache["hpo_context_schema_version"] = schema
+    cache["hpo_context_digest"] = digest
+    cache["hpo_context"] = context
+    identity = {
+        key: value
+        for key, value in cache.items()
+        if key not in artifacts._CACHE_ENVELOPE_DYNAMIC_FIELDS
+    }
+    cache["cache_key"] = artifacts._mapping_digest(identity)
+    (generation_dir / f"{cache['model_name']}.cache.json").write_text(json.dumps(cache))
+
+
 def test_valid_current_generated_cache_is_loadable(tmp_path, make_canonical_dataset):
     dataset = make_canonical_dataset()
     generation_dir, _cache = _write_valid_generated_artifact(
@@ -799,6 +812,7 @@ def _stage_a_failure_setup(
     model_name: str = "ctgan_hpo",
     *,
     source_values: tuple[float, float] = (0.0, 1.0),
+    study_base_name: str | None = None,
 ) -> tuple[dict, dict]:
     from synthdata.generation import hpo
 
@@ -849,7 +863,9 @@ def _stage_a_failure_setup(
     }
     (generation_dir / context_filename).write_text(json.dumps(context_payload))
     (generation_dir / "hpo_context.json").write_text(json.dumps(context_payload))
-    study_name = hpo.contextual_study_name(f"hpo_{model_name.removesuffix('_hpo')}", context)
+    study_name = hpo.contextual_study_name(
+        study_base_name or f"hpo_{model_name.removesuffix('_hpo')}", context
+    )
     stage_a_root = generation_dir / "hpo_stage_a"
     result_path = hpo.persist_stage_a_result(stage_a_root, study_name, 0, result)
     return (
@@ -865,6 +881,94 @@ def _stage_a_failure_setup(
             "stage_a_contract_digest": contract.digest,
         },
     )
+
+
+def _historical_hpo_context_v1() -> dict:
+    return {
+        "schema_version": "hpo-context-v1",
+        "task_type": "classification",
+        "registry_digest": "historical-registry",
+        "stage_a_contract_digest": None,
+        "metric_config": {"task12": ["mixed_mmd.v1"]},
+        "expected_emitted_keys": ["mixed_mmd"],
+        "group_context": {"group_mode": "row"},
+        "role_context_fingerprint": "historical-roles",
+        "role_context": {"roles": {"train": {"rows": 4}, "tuning": {"rows": 2}}},
+    }
+
+
+def test_generated_cache_with_current_hpo_context_v2_is_loadable(tmp_path, make_canonical_dataset):
+    dataset = make_canonical_dataset()
+    generation_dir, cache = _write_valid_generated_artifact(tmp_path, dataset)
+    _evidence, binding = _stage_a_failure_setup(generation_dir)
+    context_payload = json.loads((generation_dir / binding["hpo_context_path"]).read_text())
+    context = context_payload["context"]
+    _set_generated_cache_hpo_context(
+        generation_dir,
+        cache,
+        "hpo-context-v2",
+        context,
+        binding["hpo_context_digest"],
+    )
+
+    loaded = artifacts.load_validated_generated_datasets(
+        generation_dir,
+        dataset,
+        model_names=["ctgan"],
+        classification_score="balanced_accuracy",
+    )
+
+    assert list(loaded) == ["ctgan"]
+
+
+def test_generated_cache_with_valid_historical_hpo_context_v1_is_loadable(
+    tmp_path, make_canonical_dataset
+):
+    dataset = make_canonical_dataset()
+    generation_dir, cache = _write_valid_generated_artifact(tmp_path, dataset)
+    context = _historical_hpo_context_v1()
+    _set_generated_cache_hpo_context(
+        generation_dir,
+        cache,
+        "hpo-context-v1",
+        context,
+        artifacts._mapping_digest(context),
+    )
+
+    loaded = artifacts.load_validated_generated_datasets(
+        generation_dir,
+        dataset,
+        model_names=["ctgan"],
+        classification_score="balanced_accuracy",
+    )
+
+    assert list(loaded) == ["ctgan"]
+
+
+@pytest.mark.parametrize("schema", ["hpo-context-v1", "hpo-context-v2"])
+def test_generated_cache_rejects_hpo_context_digest_mismatch(
+    tmp_path, make_canonical_dataset, schema
+):
+    dataset = make_canonical_dataset()
+    generation_dir, cache = _write_valid_generated_artifact(tmp_path, dataset)
+    if schema == "hpo-context-v1":
+        context = _historical_hpo_context_v1()
+        digest = artifacts._mapping_digest(context)
+    else:
+        _evidence, binding = _stage_a_failure_setup(generation_dir)
+        context_payload = json.loads((generation_dir / binding["hpo_context_path"]).read_text())
+        context = context_payload["context"]
+        digest = binding["hpo_context_digest"]
+    context["role_context_fingerprint"] = "tampered-context"
+    _set_generated_cache_hpo_context(generation_dir, cache, schema, context, digest)
+
+    with pytest.raises(ValueError, match="hpo_context_digest|hpo_context is invalid"):
+        artifacts.load_validated_generated_datasets(
+            generation_dir,
+            dataset,
+            model_names=["ctgan"],
+            classification_score="balanced_accuracy",
+        )
 
 
 def _write_generation_manifest(tmp_path: Path, record: dict) -> Path:
@@ -935,6 +1039,132 @@ def test_stage_a_manifest_failure_allows_only_evidenced_missing_output(
             dataset,
             classification_score="balanced_accuracy",
             generation_inventory=inventory,
+        )
+
+
+@pytest.mark.parametrize("variant", ["standard", "custom"])
+def test_stage_a_manifest_accepts_fingerprint_scoped_tabpfgen_identity(
+    tmp_path, make_canonical_dataset, variant
+):
+    dataset = make_canonical_dataset()
+    generation_dir, _cache = _write_valid_generated_artifact(tmp_path, dataset)
+    model_name = f"tabpfgen_{variant}_hpo"
+    evidence, binding = _stage_a_failure_setup(
+        generation_dir,
+        model_name,
+        study_base_name=f"hpo_tabpfgen_{variant}-{'a' * 64}",
+    )
+    record = _generation_record(
+        status="partial",
+        expected=[model_name],
+        produced=[],
+        failed=[model_name],
+        failed_models=[{"model": model_name, **binding, "evidence_references": [evidence]}],
+    )
+
+    inventory = artifacts.load_generation_inventory(
+        _write_generation_manifest(tmp_path, record), generation_dir
+    )
+
+    assert inventory.failed_outputs == (model_name,)
+
+
+@pytest.mark.parametrize("implementation_fingerprint", [None, "b" * 64])
+def test_stage_a_manifest_accepts_legacy_and_fingerprint_scoped_identity_for_any_hpo_model(
+    tmp_path, make_canonical_dataset, implementation_fingerprint
+):
+    dataset = make_canonical_dataset()
+    generation_dir, _cache = _write_valid_generated_artifact(tmp_path, dataset)
+    model_name = "adsgan_hpo"
+    study_base_name = (
+        f"hpo_adsgan-{implementation_fingerprint}"
+        if implementation_fingerprint is not None
+        else None
+    )
+    evidence, binding = _stage_a_failure_setup(
+        generation_dir,
+        model_name,
+        study_base_name=study_base_name,
+    )
+    record = _generation_record(
+        status="partial",
+        expected=[model_name],
+        produced=[],
+        failed=[model_name],
+        failed_models=[{"model": model_name, **binding, "evidence_references": [evidence]}],
+    )
+
+    inventory = artifacts.load_generation_inventory(
+        _write_generation_manifest(tmp_path, record), generation_dir
+    )
+
+    assert inventory.failed_outputs == (model_name,)
+
+
+def test_stage_a_manifest_keeps_legacy_tabpfgen_study_identity_readable(
+    tmp_path, make_canonical_dataset
+):
+    dataset = make_canonical_dataset()
+    generation_dir, _cache = _write_valid_generated_artifact(tmp_path, dataset)
+    model_name = "tabpfgen_standard_hpo"
+    evidence, binding = _stage_a_failure_setup(generation_dir, model_name)
+    record = _generation_record(
+        status="partial",
+        expected=[model_name],
+        produced=[],
+        failed=[model_name],
+        failed_models=[{"model": model_name, **binding, "evidence_references": [evidence]}],
+    )
+
+    inventory = artifacts.load_generation_inventory(
+        _write_generation_manifest(tmp_path, record), generation_dir
+    )
+
+    assert inventory.failed_outputs == (model_name,)
+
+
+@pytest.mark.parametrize(
+    ("model_name", "study_base_name", "wrong_context_suffix"),
+    [
+        ("tabpfgen_standard_hpo", f"hpo_tabpfgen_standard-{'a' * 63}", False),
+        ("tabpfgen_standard_hpo", f"hpo_tabpfgen_custom-{'a' * 64}", False),
+        ("tabpfgen_standard_hpo", f"hpo_tabpfgen_standard-{'a' * 64}", True),
+        ("adsgan_hpo", f"hpo_adsgan-{'a' * 63}", False),
+        ("adsgan_hpo", f"hpo_adsgan-{'A' * 64}", False),
+        ("adsgan_hpo", f"hpo_adsgan-{'g' * 64}", False),
+        ("ctgan_hpo", f"hpo_tvae-{'a' * 64}", False),
+    ],
+)
+def test_stage_a_manifest_rejects_invalid_fingerprint_scoped_study_identity(
+    tmp_path,
+    make_canonical_dataset,
+    model_name,
+    study_base_name,
+    wrong_context_suffix,
+):
+    dataset = make_canonical_dataset()
+    generation_dir, _cache = _write_valid_generated_artifact(tmp_path, dataset)
+    evidence, binding = _stage_a_failure_setup(
+        generation_dir,
+        model_name,
+        study_base_name=study_base_name,
+    )
+    if wrong_context_suffix:
+        expected_suffix = binding["hpo_study"].rsplit("-", maxsplit=1)[1]
+        binding["hpo_study"] = binding["hpo_study"][: -len(expected_suffix)] + (
+            "0" * 16 if expected_suffix != "0" * 16 else "1" * 16
+        )
+    record = _generation_record(
+        status="partial",
+        expected=[model_name],
+        produced=[],
+        failed=[model_name],
+        failed_models=[{"model": model_name, **binding, "evidence_references": [evidence]}],
+    )
+
+    with pytest.raises(ValueError, match="study does not match"):
+        artifacts.load_generation_inventory(
+            _write_generation_manifest(tmp_path, record), generation_dir
         )
 
 
