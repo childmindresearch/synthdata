@@ -2338,6 +2338,26 @@ def load_imputed_splits(
         )
         return dataset
 
+    recorded_fingerprints = provenance.get("imputed_frame_fingerprints")
+    actual_fingerprints = {name: dataframe_fingerprint(frame) for name, frame in frames.items()}
+    fingerprint_mismatches = {
+        name: (
+            recorded_fingerprints.get(name) if isinstance(recorded_fingerprints, dict) else None,
+            fingerprint,
+        )
+        for name, fingerprint in actual_fingerprints.items()
+        if not isinstance(recorded_fingerprints, dict)
+        or recorded_fingerprints.get(name) != fingerprint
+    }
+    if fingerprint_mismatches:
+        logger.warning(
+            "Ignoring imputed CSVs under %s because cached frame content or dtype fingerprints "
+            "are stale or missing: %s",
+            dataset.data_dir,
+            fingerprint_mismatches,
+        )
+        return dataset
+
     if dataset.has_canonical_roles:
         dataset.set_imputed_roles(frames)
     else:

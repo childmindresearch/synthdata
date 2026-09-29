@@ -413,6 +413,44 @@ class TestRunImputationCaching:
         assert record["cache_key"] == _cache_key_record(cfg, fresh)["cache_key"]
         load_imputed_splits(fresh, expected_cache_key=record["cache_key"])
         assert fresh.full_imputed_df is not None
+        assert record["imputed_frame_fingerprints"] == {
+            role: dataframe_fingerprint(
+                pd.read_csv(dataset.paths()[f"{role}_imputed"], low_memory=False)
+            )
+            for role in dataset.roles
+        }
+
+    @pytest.mark.parametrize("drift", ["content", "dtype"])
+    def test_canonical_role_cache_drift_forces_reimputation(
+        self, make_config, make_canonical_dataset, mocker, drift
+    ):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+        run_imputation(cfg, dataset)
+
+        train_path = dataset.paths()["train_imputed"]
+        cached_train = pd.read_csv(train_path, low_memory=False)
+        if drift == "content":
+            cached_train.loc[0, "feature"] += 1.0
+        else:
+            cached_train["target"] = cached_train["target"].astype(float)
+        cached_train.to_csv(train_path, index=False)
+
+        recompute = mocker.patch(
+            "synthdata.imputation.pipeline._impute_canonical_roles",
+            wraps=imputation_pipeline._impute_canonical_roles,
+        )
+        fresh = make_canonical_dataset()
+        fresh.data_dir = dataset.data_dir
+        fresh.full_imputed_df = None
+        fresh.imputed_roles = {}
+        run_imputation(cfg, fresh)
+
+        recompute.assert_called_once()
+        pd.testing.assert_frame_equal(
+            fresh.imputed_roles["train"], fresh.roles["train"], check_dtype=False
+        )
 
     def test_canonical_role_cache_reload_disables_chunk_inference_without_coercion(
         self, make_config, make_canonical_dataset, monkeypatch
@@ -430,6 +468,10 @@ class TestRunImputationCaching:
         cached_train["protected"] = pd.Series(mixed_values, dtype=object).to_numpy()
         cached_train.to_csv(train_path, index=False)
         expected_train = pd.read_csv(train_path, low_memory=False)
+        provenance_path = dataset.data_dir / _CACHE_KEY_FILENAME
+        provenance = json.loads(provenance_path.read_text())
+        provenance["imputed_frame_fingerprints"]["train"] = dataframe_fingerprint(expected_train)
+        provenance_path.write_text(json.dumps(provenance))
 
         read_options = []
         original_read_csv = pd.read_csv

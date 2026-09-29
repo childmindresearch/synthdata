@@ -12,13 +12,20 @@ evaluation is fast, reproducible from cached artifacts, and framework-agnostic.
 
 import hashlib
 import json
+import logging
 import math
-from collections.abc import Mapping
+import re
+import sys
+import time
+from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from numbers import Real
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from synthdata.data import semantic_context_digest
 from synthdata.evaluation.catalog import (
@@ -40,6 +47,72 @@ from synthdata.evaluation.metric_contracts import (
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def _safe_exception_diagnostic(message: str) -> str:
+    """Return only recognized, value-free context from an exception message."""
+    normalized = " ".join(message.split())
+    if not normalized:
+        return "No exception message provided"
+
+    unknown_pattern = r"\b(?:unknown|unseen|unexpected)\s+{}\b"
+    if re.search(unknown_pattern.format(r"categor(?:y|ies)"), normalized, re.IGNORECASE):
+        return "Unrecognized category reported by metric evaluation; value redacted"
+    if re.search(unknown_pattern.format(r"labels?"), normalized, re.IGNORECASE):
+        return "Unrecognized label reported by metric evaluation; value redacted"
+    return "Metric evaluation failed; raw diagnostic redacted"
+
+
+@contextmanager
+def _synthcity_phase(phase: str, *, model: str, role: str, **safe_counts):
+    """Log a phase without including exception text or data values."""
+    started = time.monotonic()
+    safe_context = " ".join(f"{key}={value}" for key, value in safe_counts.items())
+    logger.debug(
+        "[synthcity] phase start model=%s role=%s phase=%s %s",
+        model,
+        role,
+        phase,
+        safe_context,
+    )
+    try:
+        yield
+    finally:
+        exception_type, _, _ = sys.exc_info()
+        elapsed = time.monotonic() - started
+        if exception_type is None:
+            logger.debug(
+                "[synthcity] phase completed model=%s role=%s phase=%s elapsed_seconds=%.3f %s",
+                model,
+                role,
+                phase,
+                elapsed,
+                safe_context,
+            )
+        else:
+            logger.debug(
+                "[synthcity] phase failed model=%s role=%s phase=%s "
+                "elapsed_seconds=%.3f exception_type=%s reason_code=phase_failed %s",
+                model,
+                role,
+                phase,
+                elapsed,
+                exception_type.__name__,
+                safe_context,
+            )
+
+
+def _synthdata_loggers() -> list[logging.Logger]:
+    """Return instantiated SynthData loggers that may emit during evaluation."""
+    return [
+        logging.getLogger(),
+        *(
+            candidate
+            for name, candidate in logging.Logger.manager.loggerDict.items()
+            if (name == "synthdata" or name.startswith("synthdata."))
+            and isinstance(candidate, logging.Logger)
+        ),
+    ]
 
 
 def _semantic_metric_workspace(
@@ -572,6 +645,8 @@ def run_synthcity_metrics(
     semantic_context: Mapping[str, Any] | None = None,
     released_synthetic_df: pd.DataFrame | None = None,
     released_reference_df: pd.DataFrame | None = None,
+    model_name: str | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> pd.DataFrame:
     """Evaluate a cached synthetic DataFrame with synthcity's Metrics.evaluate.
 
@@ -585,19 +660,30 @@ def run_synthcity_metrics(
     from synthcity.metrics import Metrics
     from synthcity.plugins.core.dataloader import GenericDataLoader
 
-    if classification_score not in {"balanced_accuracy", "macro_f1"}:
-        raise ValueError(
-            "classification_score must be 'balanced_accuracy' or 'macro_f1', "
-            f"got {classification_score!r}"
-        )
-    if group_mode not in {"row", "patient_group"}:
-        raise ValueError(f"Invalid group mode {group_mode!r}. Supported: ['row', 'patient_group']")
-    if group_mode == "patient_group" and (
-        real_reference_group_ids is None or real_train_group_ids is None
+    model_identifier = model_name or "unspecified"
+    with _synthcity_phase(
+        "input_validation",
+        model=model_identifier,
+        role=evaluation_role,
+        synthetic_shape=synthetic_df.shape,
+        reference_shape=x_real_reference.shape,
+        train_shape=x_real_train.shape,
     ):
-        raise ValueError(
-            "Patient-group SynthCity evaluation requires group IDs for real reference and train roles"
-        )
+        if classification_score not in {"balanced_accuracy", "macro_f1"}:
+            raise ValueError(
+                "classification_score must be 'balanced_accuracy' or 'macro_f1', "
+                f"got {classification_score!r}"
+            )
+        if group_mode not in {"row", "patient_group"}:
+            raise ValueError(
+                f"Invalid group mode {group_mode!r}. Supported: ['row', 'patient_group']"
+            )
+        if group_mode == "patient_group" and (
+            real_reference_group_ids is None or real_train_group_ids is None
+        ):
+            raise ValueError(
+                "Patient-group SynthCity evaluation requires group IDs for real reference and train roles"
+            )
 
     released_synthetic_df = synthetic_df if released_synthetic_df is None else released_synthetic_df
     released_reference_df = (
@@ -606,39 +692,57 @@ def run_synthcity_metrics(
     adapter = _ExternalGeneratorAdapter(
         PregeneratedSyntheticModel(released_synthetic_df), random_state=random_state
     )
-    adapter.fit(x_real_train)
+    with _synthcity_phase(
+        "adapter_fit",
+        model=model_identifier,
+        role=evaluation_role,
+        train_shape=x_real_train.shape,
+    ):
+        adapter.fit(x_real_train)
 
-    x_real_reference = released_reference_df
-    x_syn_generated = released_synthetic_df.copy()[x_real_reference.columns]
-    reference_group_ids = _validated_group_ids(
-        real_reference_group_ids, len(x_real_reference), "real reference"
-    )
-    train_group_ids = _validated_group_ids(real_train_group_ids, len(x_real_train), "real train")
-    if (reference_group_ids is None) != (train_group_ids is None):
-        raise ValueError(
-            "real_reference_group_ids and real_train_group_ids must be provided together"
+    with _synthcity_phase(
+        "frame_alignment_group_validation",
+        model=model_identifier,
+        role=evaluation_role,
+        reference_shape=released_reference_df.shape,
+        train_shape=x_real_train.shape,
+        synthetic_shape=released_synthetic_df.shape,
+        reference_group_ids_provided=real_reference_group_ids is not None,
+        train_group_ids_provided=real_train_group_ids is not None,
+    ):
+        x_real_reference = released_reference_df
+        x_syn_generated = released_synthetic_df.copy()[x_real_reference.columns]
+        reference_group_ids = _validated_group_ids(
+            real_reference_group_ids, len(x_real_reference), "real reference"
         )
-    synthetic_group_ids = (
-        _synthetic_group_ids(len(x_syn_generated), "synthetic")
-        if reference_group_ids is not None
-        else None
-    )
-    schema_mismatch_score = _schema_mismatch_score(x_real_reference, x_syn_generated)
-    x_syn_raw = _align_dtypes(x_syn_generated, x_real_reference)
-    x_ref_syn_raw = _align_dtypes(
-        released_synthetic_df.copy()[x_real_reference.columns], x_real_reference
-    )
-    x_augmented_raw = pd.concat([x_real_train, x_syn_raw], ignore_index=True)
-    reference_synthetic_group_ids = (
-        _synthetic_group_ids(len(x_ref_syn_raw), "reference_synthetic")
-        if reference_group_ids is not None
-        else None
-    )
-    augmented_group_ids = (
-        train_group_ids + synthetic_group_ids
-        if train_group_ids is not None and synthetic_group_ids is not None
-        else None
-    )
+        train_group_ids = _validated_group_ids(
+            real_train_group_ids, len(x_real_train), "real train"
+        )
+        if (reference_group_ids is None) != (train_group_ids is None):
+            raise ValueError(
+                "real_reference_group_ids and real_train_group_ids must be provided together"
+            )
+        synthetic_group_ids = (
+            _synthetic_group_ids(len(x_syn_generated), "synthetic")
+            if reference_group_ids is not None
+            else None
+        )
+        schema_mismatch_score = _schema_mismatch_score(x_real_reference, x_syn_generated)
+        x_syn_raw = _align_dtypes(x_syn_generated, x_real_reference)
+        x_ref_syn_raw = _align_dtypes(
+            released_synthetic_df.copy()[x_real_reference.columns], x_real_reference
+        )
+        x_augmented_raw = pd.concat([x_real_train, x_syn_raw], ignore_index=True)
+        reference_synthetic_group_ids = (
+            _synthetic_group_ids(len(x_ref_syn_raw), "reference_synthetic")
+            if reference_group_ids is not None
+            else None
+        )
+        augmented_group_ids = (
+            train_group_ids + synthetic_group_ids
+            if train_group_ids is not None and synthetic_group_ids is not None
+            else None
+        )
 
     def _loader(df: pd.DataFrame, group_ids: Any = None):
         return GenericDataLoader(
@@ -651,17 +755,31 @@ def run_synthcity_metrics(
             source_table=dict(source_table or {}),
         )
 
-    results = Metrics.evaluate(
-        _loader(x_real_reference, reference_group_ids),
-        _loader(x_syn_raw, synthetic_group_ids),
-        _loader(x_real_train, train_group_ids),
-        _loader(x_ref_syn_raw, reference_synthetic_group_ids),
-        _loader(x_augmented_raw, augmented_group_ids),
-        metrics=metrics,
-        task_type=task_type,
-        group_mode=group_mode,
-        random_state=random_state,
-        workspace=_semantic_metric_workspace(
+    with _synthcity_phase(
+        "loader_construction",
+        model=model_identifier,
+        role=evaluation_role,
+        reference_shape=x_real_reference.shape,
+        synthetic_shape=x_syn_raw.shape,
+        train_shape=x_real_train.shape,
+        reference_synthetic_shape=x_ref_syn_raw.shape,
+        augmented_shape=x_augmented_raw.shape,
+    ):
+        loaders = (
+            _loader(x_real_reference, reference_group_ids),
+            _loader(x_syn_raw, synthetic_group_ids),
+            _loader(x_real_train, train_group_ids),
+            _loader(x_ref_syn_raw, reference_synthetic_group_ids),
+            _loader(x_augmented_raw, augmented_group_ids),
+        )
+
+    with _synthcity_phase(
+        "workspace_preparation",
+        model=model_identifier,
+        role=evaluation_role,
+        role_count=5,
+    ):
+        metric_workspace = _semantic_metric_workspace(
             workspace,
             target_column=target_column,
             sensitive_features=sensitive_features,
@@ -681,21 +799,40 @@ def run_synthcity_metrics(
                 "reference": reference_group_ids,
                 "train": train_group_ids,
             },
-        ),
-        quasi_identifier_columns=quasi_identifier_columns,
-        classification_score=classification_score,
-        sensitive_target_types=dict(sensitive_target_types or {}),
-        semantic_context=dict(semantic_context) if semantic_context is not None else None,
-        feature_types=dict(feature_types or {}),
-        source_table=dict(source_table or {}),
-        X_gt_group_ids=reference_group_ids,
-        X_syn_group_ids=synthetic_group_ids,
-        X_train_group_ids=train_group_ids,
-        X_ref_syn_group_ids=reference_synthetic_group_ids,
-        X_augmented_group_ids=augmented_group_ids,
-        structural_n_clusters=structural_n_clusters,
-        structural_min_rows_per_cluster=structural_min_rows_per_cluster,
-    )
+        )
+
+    with _synthcity_phase(
+        "Metrics.evaluate",
+        model=model_identifier,
+        role=evaluation_role,
+        reference_shape=x_real_reference.shape,
+        synthetic_shape=x_syn_raw.shape,
+        train_shape=x_real_train.shape,
+    ):
+        results = Metrics.evaluate(
+            *loaders,
+            metrics=metrics,
+            task_type=task_type,
+            group_mode=group_mode,
+            random_state=random_state,
+            workspace=metric_workspace,
+            quasi_identifier_columns=quasi_identifier_columns,
+            classification_score=classification_score,
+            sensitive_target_types=dict(sensitive_target_types or {}),
+            semantic_context=dict(semantic_context) if semantic_context is not None else None,
+            feature_types=dict(feature_types or {}),
+            source_table=dict(source_table or {}),
+            X_gt_group_ids=reference_group_ids,
+            X_syn_group_ids=synthetic_group_ids,
+            X_train_group_ids=train_group_ids,
+            X_ref_syn_group_ids=reference_synthetic_group_ids,
+            X_augmented_group_ids=augmented_group_ids,
+            structural_n_clusters=structural_n_clusters,
+            structural_min_rows_per_cluster=structural_min_rows_per_cluster,
+            progress_callback=progress_callback,
+            progress_model=model_name,
+            progress_role=evaluation_role,
+        )
     data_mismatch_key = "sanity.data_mismatch.score"
     if "data_mismatch" in metrics.get("sanity", []) and data_mismatch_key in results.index:
         for column in ("min", "max", "mean", "median"):
@@ -783,51 +920,133 @@ def run_synthcity_evaluation(
         else list(selection_cfg.quasi_identifier_columns)
     )
     resolved_classification_score = classification_score or selection_cfg.classification_score
-    for name, syn_df in synthetic_datasets.items():
-        n = n_samples or len(syn_df)
-        logger.info("[synthcity] evaluating %s against %s evidence", name, evaluation_role)
-        try:
-            results[name] = run_synthcity_metrics(
-                syn_df,
-                test_df,
-                train_df,
-                n,
-                target_column,
-                sensitive_features,
-                metric_config,
-                task_type=task_type,
-                group_mode=group_mode,
-                random_state=seed,
-                workspace=workspace,
-                quasi_identifier_columns=(resolved_quasi_identifier_columns or None),
-                classification_score=resolved_classification_score,
-                sensitive_target_types=resolved_sensitive_target_types,
-                feature_types=feature_types,
-                source_table=source_table,
-                semantic_context=semantic_context,
-                real_reference_group_ids=real_reference_group_ids,
-                real_train_group_ids=real_train_group_ids,
-                structural_n_clusters=selection_cfg.structural_n_clusters,
-                structural_min_rows_per_cluster=selection_cfg.structural_min_rows_per_cluster,
-                evaluation_role=evaluation_role,
-                released_synthetic_df=(
-                    released_synthetic_datasets.get(name)
-                    if released_synthetic_datasets is not None
-                    else None
-                ),
-                released_reference_df=released_reference_frame,
-            )
-        except (TypeError, ValueError, RuntimeError) as exc:
-            logger.warning(
-                "[synthcity] evaluation failed for %s; reason_code=metric_evaluation_failed "
-                "exception_type=%s",
+    model_count = len(synthetic_datasets)
+    interactive_progress = sys.stderr.isatty()
+    with (
+        logging_redirect_tqdm(loggers=_synthdata_loggers()),
+        tqdm(
+            total=model_count,
+            desc="SynthCity evaluation",
+            unit="model",
+            disable=not interactive_progress,
+            file=sys.stderr,
+        ) as model_progress,
+    ):
+        for model_number, (name, syn_df) in enumerate(synthetic_datasets.items(), start=1):
+            n = n_samples or len(syn_df)
+            logger.info(
+                "[synthcity] model progress start %d/%d model=%s evidence=%s",
+                model_number,
+                model_count,
                 name,
-                type(exc).__name__,
+                evaluation_role,
             )
-            results[name] = pd.DataFrame(
-                {
-                    "error": ["SynthCity metric evaluation failed."],
-                    "error_type": [type(exc).__name__],
-                }
-            )
+            succeeded = False
+
+            def log_metric_progress(event: dict[str, Any], model_identifier: str = name) -> None:
+                event_name = event["event"]
+                evaluator = event["evaluator"]
+                started_at = event.get("started_at")
+                ended_at = event.get("ended_at")
+                elapsed = event.get("elapsed_seconds")
+                exception_type = event.get("exception_type")
+                diagnostic = event.get("diagnostic_classification")
+                if event_name == "start":
+                    logger.info(
+                        "[synthcity] metric progress start model=%s evaluator=%s",
+                        model_identifier,
+                        evaluator,
+                    )
+                elif event_name == "completed":
+                    logger.info(
+                        "[synthcity] metric progress completed model=%s evaluator=%s "
+                        "elapsed_seconds=%.3f",
+                        model_identifier,
+                        evaluator,
+                        elapsed,
+                    )
+                else:
+                    logger.info(
+                        "[synthcity] metric progress failed model=%s evaluator=%s "
+                        "elapsed_seconds=%.3f exception_type=%s diagnostic=%s",
+                        model_identifier,
+                        evaluator,
+                        elapsed,
+                        exception_type,
+                        diagnostic,
+                    )
+                logger.debug(
+                    "[synthcity] metric diagnostic event=%s model=%s evaluator=%s "
+                    "started_at=%s ended_at=%s elapsed_seconds=%s outcome=%s "
+                    "exception_type=%s diagnostic=%s",
+                    event_name,
+                    model_identifier,
+                    evaluator,
+                    started_at,
+                    ended_at,
+                    elapsed,
+                    event.get("outcome", "running"),
+                    exception_type,
+                    diagnostic,
+                )
+
+            try:
+                results[name] = run_synthcity_metrics(
+                    syn_df,
+                    test_df,
+                    train_df,
+                    n,
+                    target_column,
+                    sensitive_features,
+                    metric_config,
+                    task_type=task_type,
+                    group_mode=group_mode,
+                    random_state=seed,
+                    workspace=workspace,
+                    quasi_identifier_columns=(resolved_quasi_identifier_columns or None),
+                    classification_score=resolved_classification_score,
+                    sensitive_target_types=resolved_sensitive_target_types,
+                    feature_types=feature_types,
+                    source_table=source_table,
+                    semantic_context=semantic_context,
+                    real_reference_group_ids=real_reference_group_ids,
+                    real_train_group_ids=real_train_group_ids,
+                    structural_n_clusters=selection_cfg.structural_n_clusters,
+                    structural_min_rows_per_cluster=selection_cfg.structural_min_rows_per_cluster,
+                    evaluation_role=evaluation_role,
+                    released_synthetic_df=(
+                        released_synthetic_datasets.get(name)
+                        if released_synthetic_datasets is not None
+                        else None
+                    ),
+                    released_reference_df=released_reference_frame,
+                    model_name=name,
+                    progress_callback=log_metric_progress,
+                )
+                succeeded = True
+            except (TypeError, ValueError, RuntimeError) as exc:
+                logger.warning(
+                    "[synthcity] evaluation failed for %s; reason_code=metric_evaluation_failed "
+                    "exception_type=%s diagnostic=%s",
+                    name,
+                    type(exc).__name__,
+                    _safe_exception_diagnostic(str(exc)),
+                )
+                results[name] = pd.DataFrame(
+                    {
+                        "error": ["SynthCity metric evaluation failed."],
+                        "error_type": [type(exc).__name__],
+                    }
+                )
+            finally:
+                status = "completed" if succeeded else "failed"
+                logger.info(
+                    "[synthcity] model progress %s %d/%d model=%s status=%s",
+                    status,
+                    model_number,
+                    model_count,
+                    name,
+                    status,
+                )
+                model_progress.update(1)
     return results

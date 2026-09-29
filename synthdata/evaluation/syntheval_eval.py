@@ -10,8 +10,10 @@ import json
 import math
 import multiprocessing
 import os
+import queue
 import re
 import socket
+import sys
 import time
 import uuid
 from collections import Counter
@@ -22,6 +24,7 @@ from typing import Any, cast
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from synthdata.data import Dataset, role_context_payload, semantic_context_digest
 from synthdata.evaluation.catalog import (
@@ -48,7 +51,7 @@ logger = get_logger(__name__)
 
 _RANK_COLUMNS = {"rank", "u_rank", "p_rank", "f_rank"}
 _CHECKPOINT_SCHEMA_VERSION = 1
-_PREPROCESSING_CONTRACT = "syntheval-fit-role-v3-categorical-support-audit"
+_PREPROCESSING_CONTRACT = "syntheval-fit-role-v4-real-holdout-unknown-nominal"
 
 
 def _model_artifact_id(model_name: str) -> str:
@@ -132,6 +135,9 @@ def _safe_value_digest(value: Any) -> str:
 _SAFE_FAILURE_MESSAGES = {
     "synthetic_unseen_categorical_values": "Synthetic data failed categorical support validation.",
     "synthetic_unknown_category": "Synthetic data failed categorical support validation.",
+    "real_holdout_unknown_category": (
+        "Real holdout contains categories absent from train; affected metric was blocked."
+    ),
     "synthetic_binary_target_invalid": "Synthetic data failed binary target validation.",
     "preprocessing_failure": "Synthetic data failed preprocessing validation.",
     "unknown_target": "Synthetic data failed target validation.",
@@ -150,6 +156,10 @@ def _safe_failure_evidence(
     text = reason.casefold() if isinstance(reason, str) else ""
     if text in _SAFE_FAILURE_MESSAGES:
         reason_code = _CANONICAL_FAILURE_CODES.get(text, text)
+    elif ("real holdout" in text or "real_holdout" in text) and (
+        "categor" in text or "unknown" in text
+    ):
+        reason_code = "real_holdout_unknown_category"
     elif "categor" in text and ("unseen" in text or "unknown" in text):
         reason_code = "synthetic_unknown_category"
     elif "unknown target" in text or "target" in text and "unknown" in text:
@@ -208,8 +218,11 @@ def _safe_metric_status(status: Mapping[str, Any]) -> dict[str, Any]:
                 "exception_type": evidence["error_type"],
                 "reason_code": evidence["reason_code"],
                 "failure_reason": evidence["failure_reason"],
+                "failure_class": evidence["reason_code"],
             }
         )
+        if "reason_detail_digest" in evidence:
+            sanitized["reason_detail_digest"] = evidence["reason_detail_digest"]
     return sanitized
 
 
@@ -244,6 +257,7 @@ def _sanitize_execution_payload(payload: dict[str, Any]) -> dict[str, Any]:
                         "exception_type": evidence["error_type"],
                         "reason_code": evidence["reason_code"],
                         "failure_reason": evidence["failure_reason"],
+                        "failure_class": evidence["reason_code"],
                     }
                 )
                 if "error_type" in result:
@@ -602,6 +616,18 @@ def _available_memory_gib() -> float | None:
     return None
 
 
+class InsufficientSynthEvalResourcesError(ValueError):
+    """Raised when automatic sizing cannot fit a SynthEval model process."""
+
+
+class InsufficientSynthEvalMemoryError(InsufficientSynthEvalResourcesError):
+    """Raised when automatic sizing cannot fit one SynthEval model process."""
+
+
+class InsufficientSynthEvalCPUError(InsufficientSynthEvalResourcesError):
+    """Raised when available CPUs cannot satisfy the configured per-model budget."""
+
+
 def resolve_model_workers(execution_cfg, *, n_models: int, n_columns: int) -> int:
     """Resolve a memory- and CPU-bounded number of concurrent model processes.
 
@@ -618,15 +644,29 @@ def resolve_model_workers(execution_cfg, *, n_models: int, n_columns: int) -> in
         return min(requested, execution_cfg.max_model_workers, n_models)
 
     cpu_count = os.cpu_count() or 1
-    cpu_bound = max(1, cpu_count // execution_cfg.cores_per_model)
+    if cpu_count < execution_cfg.cores_per_model:
+        raise InsufficientSynthEvalCPUError(
+            "Automatic SynthEval worker sizing cannot satisfy the per-model CPU budget: "
+            f"available CPUs={cpu_count}, "
+            f"cores per model={execution_cfg.cores_per_model}."
+        )
+    cpu_bound = cpu_count // execution_cfg.cores_per_model
     per_model_gib = execution_cfg.memory_per_model_gib or max(6.0, 0.0135 * n_columns)
     available_gib = _available_memory_gib()
     if available_gib is None:
         memory_bound = 1
     else:
-        budget_gib = max(0.0, available_gib - execution_cfg.memory_reserve_gib)
-        memory_bound = max(1, int(budget_gib // per_model_gib))
-    return max(1, min(n_models, execution_cfg.max_model_workers, cpu_bound, memory_bound))
+        budget_gib = available_gib - execution_cfg.memory_reserve_gib
+        memory_bound = int(max(0.0, budget_gib) // per_model_gib)
+        if memory_bound < 1:
+            raise InsufficientSynthEvalMemoryError(
+                "Automatic SynthEval worker sizing cannot fit one model: "
+                f"MemAvailable={available_gib:.2f} GiB, "
+                f"reserve={execution_cfg.memory_reserve_gib:.2f} GiB, "
+                f"per-model estimate={per_model_gib:.2f} GiB. "
+                "Free memory or lower the configured reserve/model estimate."
+            )
+    return min(n_models, execution_cfg.max_model_workers, cpu_bound, memory_bound)
 
 
 def _checkpoint_paths(
@@ -958,6 +998,110 @@ def _execution_payload_failed(
     return expected_manifest is None or set(methods) == set(expected_manifest)
 
 
+def _execution_payload_partial(
+    payload: dict,
+    *,
+    expected_manifest: dict | None = None,
+    expected_pass_id: str | None = None,
+    expected_target_view: str | None = None,
+) -> bool:
+    """Validate complete-attempt evidence containing only expected blocked metrics."""
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != "syntheval-execution-v1"
+        or payload.get("model_status") != "partial"
+        or payload.get("execution_complete") is not True
+        or payload.get("execution_succeeded") is not False
+        or payload.get("policy_eligible") is not False
+    ):
+        return False
+    if expected_pass_id is not None and payload.get("pass_id") != expected_pass_id:
+        return False
+    if expected_target_view is not None and payload.get("target_view") != expected_target_view:
+        return False
+    semantic_context = payload.get("semantic_context")
+    semantic_fingerprint = payload.get("semantic_context_digest")
+    if semantic_context is None:
+        if semantic_fingerprint is not None:
+            return False
+    else:
+        if not isinstance(semantic_context, Mapping) or not isinstance(semantic_fingerprint, str):
+            return False
+        try:
+            if semantic_fingerprint != semantic_context_digest(semantic_context):
+                return False
+        except (TypeError, ValueError):
+            return False
+    executions = payload.get("metric_executions")
+    if not isinstance(executions, list) or not executions:
+        return False
+    methods = []
+    has_expected_block = False
+    expected_block_reason = _SAFE_FAILURE_MESSAGES["real_holdout_unknown_category"]
+    for item in executions:
+        if not isinstance(item, dict) or not isinstance(item.get("method"), str):
+            return False
+        method = item["method"]
+        if not method or method in methods:
+            return False
+        methods.append(method)
+        status = item.get("status")
+        if not isinstance(status, dict) or status.get("method") != method:
+            return False
+        expected_keys = status.get("expected_keys")
+        if not _string_sequence(expected_keys) or not expected_keys:
+            return False
+        if expected_manifest is not None and tuple(expected_manifest.get(method, ())) != tuple(
+            expected_keys
+        ):
+            return False
+        failed_execution_probe = {
+            "schema_version": "syntheval-execution-v1",
+            "pass_id": payload.get("pass_id"),
+            "target_view": payload.get("target_view"),
+            "execution_complete": True,
+            "execution_succeeded": False,
+            "policy_eligible": False,
+            "failure_reason": (
+                "Real holdout contains categories absent from train; affected metric was blocked."
+            ),
+            "worker_exit": {
+                "state": "failed",
+                "exit_code": 0,
+                "error_type": "RealHoldoutUnknownCategoryError",
+                "reason_code": "real_holdout_unknown_category",
+                "failure_reason": (
+                    "Real holdout contains categories absent from train; affected metric was blocked."
+                ),
+                "failed_at": None,
+            },
+            "metric_executions": [item],
+        }
+        if not _execution_payload_failed(
+            failed_execution_probe,
+            expected_manifest={method: expected_keys},
+            expected_pass_id=expected_pass_id,
+            expected_target_view=expected_target_view,
+        ):
+            return False
+        if status.get("state") == "succeeded":
+            continue
+        elif status.get("state") == "blocked":
+            if (
+                status.get("exception_type") != "RealHoldoutUnknownCategoryError"
+                or status.get("reason_code") != "real_holdout_unknown_category"
+                or status.get("failure_class") != "real_holdout_unknown_category"
+                or status.get("failure_reason") != expected_block_reason
+            ):
+                return False
+            has_expected_block = True
+        else:
+            return False
+    return has_expected_block and (
+        expected_manifest is None or set(methods) == set(expected_manifest)
+    )
+
+
 def _execution_sidecar_payload(
     execution,
     model_name: str | None = None,
@@ -968,8 +1112,46 @@ def _execution_sidecar_payload(
     model_fingerprint: str | None = None,
 ) -> dict:
     """Serialize structured execution evidence without embedding large raw objects."""
+    failed_metrics = [item for item in execution.metric_executions if not item.status.succeeded]
+    expected_holdout_block = bool(failed_metrics) and all(
+        item.status.state == "blocked"
+        and item.status.exception_type == "RealHoldoutUnknownCategoryError"
+        for item in failed_metrics
+    )
+    failure_evidence = None
+    if failed_metrics:
+        failed_status = failed_metrics[0].status.to_dict()
+        failure_evidence = _safe_failure_evidence(
+            exception_type=failed_status.get("exception_type"),
+            reason=(
+                failed_status.get("reason_code")
+                or failed_status.get("failure_reason")
+                or failed_status.get("exception_message")
+            ),
+        )
+    execution_incomplete = bool(failed_metrics) and execution.execution_complete
+    worker_exit = None
+    if failure_evidence is not None and not expected_holdout_block:
+        worker_exit = {
+            "state": "failed",
+            "exit_code": None,
+            "error_type": failure_evidence["error_type"],
+            "reason_code": failure_evidence["reason_code"],
+            "failure_reason": failure_evidence["failure_reason"],
+            "failed_at": None,
+        }
     return {
         "model_name": model_name,
+        "model_status": (
+            "partial" if expected_holdout_block else "incomplete" if execution_incomplete else None
+        ),
+        "incomplete_reasons": (
+            ["real_holdout_unknown_category"]
+            if expected_holdout_block
+            else ["unexpected_metric_failure"]
+            if execution_incomplete
+            else []
+        ),
         "model_fingerprint": model_fingerprint,
         "group_context": group_context,
         "context_fingerprint": context_fingerprint,
@@ -984,6 +1166,10 @@ def _execution_sidecar_payload(
         "expected_manifest_digest": execution.expected_manifest_digest,
         "execution_complete": execution.execution_complete,
         "execution_succeeded": getattr(execution, "succeeded", False),
+        "failure_reason": (
+            failure_evidence["failure_reason"] if failure_evidence is not None else None
+        ),
+        "worker_exit": worker_exit,
         "policy_eligible": execution.policy_eligible,
         "preprocessing_fingerprint": getattr(execution, "preprocessing_fingerprint", None),
         "preprocessing_metadata": getattr(execution, "preprocessing_metadata", None),
@@ -1182,11 +1368,17 @@ def _valid_checkpoint(
     model_dir, status_path, result_path = _checkpoint_paths(checkpoint_root, pass_name, model_name)
     execution_path = _execution_checkpoint_path(model_dir)
     if not (status_path.exists() and result_path.exists() and execution_path.exists()):
+        logger.debug(
+            "[syntheval] checkpoint validation pass=%s model=%s result=miss reason=missing_files",
+            pass_name,
+            model_name,
+        )
         return None
     try:
         status = json.loads(status_path.read_text())
+        state = status.get("state")
         if (
-            status.get("state") != "succeeded"
+            state not in {"succeeded", "partial"}
             or status.get("schema_version") != _CHECKPOINT_SCHEMA_VERSION
             or status.get("model_name") != model_name
             or status.get("context_fingerprint") != context_fingerprint
@@ -1197,6 +1389,11 @@ def _valid_checkpoint(
             )
             or (require_plots and not status.get("plots_completed"))
         ):
+            logger.debug(
+                "[syntheval] checkpoint validation pass=%s model=%s result=miss reason=identity_or_status",
+                pass_name,
+                model_name,
+            )
             return None
         execution = json.loads(execution_path.read_text())
         if (
@@ -1207,13 +1404,27 @@ def _valid_checkpoint(
                 expected_manifest_digest is not None
                 and execution.get("expected_manifest_digest") != expected_manifest_digest
             )
-            or not _execution_payload_succeeded(
-                execution,
-                expected_manifest=expected_manifest,
-                expected_pass_id=pass_name,
-                expected_target_view=expected_target_view,
+            or not (
+                _execution_payload_succeeded(
+                    execution,
+                    expected_manifest=expected_manifest,
+                    expected_pass_id=pass_name,
+                    expected_target_view=expected_target_view,
+                )
+                if state == "succeeded"
+                else _execution_payload_partial(
+                    execution,
+                    expected_manifest=expected_manifest,
+                    expected_pass_id=pass_name,
+                    expected_target_view=expected_target_view,
+                )
             )
         ):
+            logger.debug(
+                "[syntheval] checkpoint validation pass=%s model=%s result=miss reason=execution_invalid",
+                pass_name,
+                model_name,
+            )
             logger.info(
                 "[syntheval] checkpoint for %s has incomplete or semantically invalid metric execution; "
                 "recomputing",
@@ -1221,10 +1432,23 @@ def _valid_checkpoint(
             )
             return None
         result = pd.read_parquet(result_path)
+        logger.debug(
+            "[syntheval] checkpoint validation pass=%s model=%s result=hit state=%s",
+            pass_name,
+            model_name,
+            state,
+        )
         return (result, execution) if return_execution else result
     except (OSError, ValueError, json.JSONDecodeError):
+        logger.debug(
+            "[syntheval] checkpoint validation pass=%s model=%s result=miss reason=read_error",
+            pass_name,
+            model_name,
+        )
         logger.warning(
-            "[syntheval] invalid checkpoint for %s at %s; recomputing", model_name, model_dir
+            "[syntheval] invalid checkpoint for pass=%s model=%s; recomputing",
+            pass_name,
+            model_name,
         )
         return None
 
@@ -1265,6 +1489,7 @@ def _model_worker(
     group_context: dict | None = None,
     role_context: dict | None = None,
     semantic_context: Mapping[str, Any] | None = None,
+    progress_queue=None,
 ) -> None:
     """Run exactly one model in a disposable child process and checkpoint it."""
     os.environ["LOKY_MAX_CPU_COUNT"] = str(cores_per_model)
@@ -1338,6 +1563,11 @@ def _model_worker(
             console="off",
             show_warnings=False,
         )
+
+        def report_method_progress(event: dict) -> None:
+            if progress_queue is not None:
+                progress_queue.put({**event, "model_name": model_name, "pass_id": pass_name})
+
         execution = se.evaluate(
             synthetic_frame,
             analysis_target=analysis_config,
@@ -1349,10 +1579,14 @@ def _model_worker(
             target_view=target_view,
             expected_manifest_digest=expected_manifest_digest,
             group_context=fairness_context,
+            progress_callback=report_method_progress,
         )
-        if execution.normalized_table is None:
-            raise RuntimeError("SynthEval returned no legacy normalized metric results")
-        _atomic_parquet(result_path, execution.normalized_table)
+        _atomic_parquet(
+            result_path,
+            execution.normalized_table
+            if execution.normalized_table is not None
+            else pd.DataFrame(),
+        )
         _atomic_json(
             execution_path,
             _execution_sidecar_payload(
@@ -1365,14 +1599,39 @@ def _model_worker(
                 model_fingerprint=model_fingerprint,
             ),
         )
+        logger.debug(
+            "[syntheval] result persistence pass=%s model=%s state=execution_written rows=%d",
+            pass_name,
+            model_name,
+            sum(
+                len(item.normalized_rows) + len(item.normalized_rows_v2)
+                for item in execution.metric_executions
+            ),
+        )
         if not execution.succeeded:
-            failed_methods = [
-                item.method for item in execution.metric_executions if not item.status.succeeded
+            failed_metrics = [
+                item for item in execution.metric_executions if not item.status.succeeded
             ]
-            raise RuntimeError(
-                "SynthEval returned incomplete or failed required metrics for "
-                f"model {model_name!r}: {', '.join(failed_methods) or 'unknown'}"
+            failed_methods = [item.method for item in failed_metrics]
+            expected_holdout_block = bool(failed_metrics) and all(
+                item.status.state == "blocked"
+                and item.status.exception_type == "RealHoldoutUnknownCategoryError"
+                for item in failed_metrics
             )
+            if expected_holdout_block:
+                logger.warning(
+                    "[syntheval] model=%s completed partially; blocked metric(s)=%s "
+                    "reason=real_holdout_unknown_category",
+                    model_name,
+                    ", ".join(failed_methods),
+                )
+            else:
+                raise RuntimeError(
+                    "SynthEval returned incomplete or failed required metrics for "
+                    f"model {model_name!r}: {', '.join(failed_methods) or 'unknown'}"
+                )
+        else:
+            expected_holdout_block = False
         plot_files = (
             sorted(
                 str(path.relative_to(plot_dir)) for path in plot_dir.rglob("*") if path.is_file()
@@ -1384,8 +1643,9 @@ def _model_worker(
             status_path,
             {
                 "schema_version": _CHECKPOINT_SCHEMA_VERSION,
-                "state": "succeeded",
+                "state": "partial" if expected_holdout_block else "succeeded",
                 "model_name": model_name,
+                "pass_id": pass_name,
                 "target_view": target_view,
                 "expected_manifest_digest": expected_manifest_digest,
                 "context_fingerprint": context_fingerprint,
@@ -1410,7 +1670,16 @@ def _model_worker(
                 "execution_complete": execution.execution_complete,
                 "execution_succeeded": execution.succeeded,
                 "policy_eligible": execution.policy_eligible,
+                "incomplete_reasons": (
+                    ["real_holdout_unknown_category"] if expected_holdout_block else []
+                ),
             },
+        )
+        logger.debug(
+            "[syntheval] checkpoint persistence pass=%s model=%s state=%s",
+            pass_name,
+            model_name,
+            "partial" if expected_holdout_block else "succeeded",
         )
     except Exception as exc:  # noqa: BLE001 -- process boundary must persist any worker failure before re-raising
         logger.error(
@@ -1425,6 +1694,7 @@ def _model_worker(
                 "schema_version": _CHECKPOINT_SCHEMA_VERSION,
                 "state": "failed",
                 "model_name": model_name,
+                "pass_id": pass_name,
                 "target_view": target_view,
                 "expected_manifest_digest": expected_manifest_digest,
                 "context_fingerprint": context_fingerprint,
@@ -1447,6 +1717,11 @@ def _model_worker(
                 "shape": list(synthetic_frame.shape),
                 "plots_completed": False,
             },
+        )
+        logger.debug(
+            "[syntheval] checkpoint persistence pass=%s model=%s state=failed",
+            pass_name,
+            model_name,
         )
         raise
     finally:
@@ -1562,7 +1837,11 @@ def _load_syntheval_cache(
     try:
         meta = json.loads(meta_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("[syntheval] %s cache meta unreadable (%s); treating as miss", prefix, exc)
+        logger.warning(
+            "[syntheval] %s cache meta unreadable (exception_type=%s); treating as miss",
+            prefix,
+            type(exc).__name__,
+        )
         return None
 
     if meta.get("cache_key") != cache_key:
@@ -1599,7 +1878,11 @@ def _load_syntheval_cache(
         results = pd.read_parquet(results_path)
         ranks = pd.read_parquet(ranks_path)
     except Exception as exc:  # noqa: BLE001 -- any parquet read error → cache miss
-        logger.warning("[syntheval] %s cache files unreadable (%s); recomputing", prefix, exc)
+        logger.warning(
+            "[syntheval] %s cache files unreadable (exception_type=%s); recomputing",
+            prefix,
+            type(exc).__name__,
+        )
         return None
 
     logger.info(
@@ -1632,12 +1915,11 @@ def _load_syntheval_execution_sidecars(
             payload = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning(
-                "[syntheval] %s execution sidecar unreadable for model %s at %s (%s); "
+                "[syntheval] %s execution sidecar unreadable for model %s (exception_type=%s); "
                 "treating cache as incomplete",
                 pass_name,
                 model_name,
-                path,
-                exc,
+                type(exc).__name__,
             )
             return None
         if (
@@ -1665,17 +1947,33 @@ def _load_syntheval_execution_sidecars(
                     expected_pass_id=pass_name,
                     expected_target_view=expected_target_view,
                 )
+                or _execution_payload_partial(
+                    payload,
+                    expected_manifest=expected_manifest,
+                    expected_pass_id=pass_name,
+                    expected_target_view=expected_target_view,
+                )
             )
         ):
+            logger.debug(
+                "[syntheval] sidecar validation pass=%s model=%s result=miss reason=identity_or_schema",
+                pass_name,
+                model_name,
+            )
             logger.warning(
-                "[syntheval] %s execution sidecar identity or semantic validation failed for model %s at %s; "
+                "[syntheval] %s execution sidecar identity or semantic validation failed for model %s; "
                 "treating cache as incomplete",
                 pass_name,
                 model_name,
-                path,
             )
             return None
         executions[model_name] = payload
+        logger.debug(
+            "[syntheval] sidecar validation pass=%s model=%s result=hit execution_succeeded=%s",
+            pass_name,
+            model_name,
+            payload.get("execution_succeeded"),
+        )
     return executions
 
 
@@ -1892,270 +2190,403 @@ def _run_resumable_syntheval(
     results: dict[str, pd.DataFrame] = {}
     executions: dict[str, dict] = {}
     pending: list[tuple[str, pd.DataFrame, str]] = []
-    for model_name, frame in synthetic_datasets.items():
-        model_fingerprint = (model_fingerprints or {}).get(model_name, _frame_fingerprint(frame))
-        preprocessing_violations = _synthetic_unseen_categorical_values(
-            frame, fit_frame, dataset.all_categorical_columns
-        )
-        if preprocessing_violations:
-            reason = (
-                "Synthetic categorical support is absent from real fit-role vocabulary; "
-                "evaluation rejected before SynthEval worker"
-            )
-            executions[model_name] = _preprocessing_failure(
-                model_name=model_name,
-                pass_name=pass_name,
-                target_view=target_view,
-                expected_manifest_digest=expected_manifest_digest,
-                expected_output_manifest=expected_output_manifest,
-                context_fingerprint=context_fingerprint,
-                model_fingerprint=model_fingerprint,
-                role_context=role_context,
-                group_context=group_context,
-                semantic_context=semantic_context,
-                metadata={
-                    "contract": _PREPROCESSING_CONTRACT,
-                    "reason_code": "synthetic_unseen_categorical_values",
-                    "columns": preprocessing_violations,
-                },
-                reason=reason,
-            )
-            model_dir, status_path, _result_path = _checkpoint_paths(
-                checkpoint_root, pass_name, model_name
-            )
-            ensure_dir(model_dir)
-            _atomic_json(
-                status_path,
-                {
-                    "schema_version": _CHECKPOINT_SCHEMA_VERSION,
-                    "state": "failed",
-                    "model_name": model_name,
-                    "target_view": target_view,
-                    "expected_manifest_digest": expected_manifest_digest,
-                    "context_fingerprint": context_fingerprint,
-                    "model_fingerprint": model_fingerprint,
-                    "exception_type": "SyntheticPreprocessingValidationError",
-                    "error_type": "SyntheticPreprocessingValidationError",
-                    "reason_code": executions[model_name]["preprocessing_metadata"].get(
-                        "reason_code", "preprocessing_failure"
-                    ),
-                    "failure_reason": "Synthetic data failed preprocessing validation.",
-                    "preprocessing_metadata": executions[model_name]["preprocessing_metadata"],
-                    "failure_class": executions[model_name]["preprocessing_metadata"].get(
-                        "failure_class"
-                    ),
-                },
-            )
-            _atomic_json(_execution_checkpoint_path(model_dir), executions[model_name])
-            logger.error(
-                "[syntheval] %s model=%s rejected synthetic categorical support in %d column(s)",
+    model_progress = tqdm(
+        total=len(synthetic_datasets),
+        desc=f"SynthEval {pass_name}",
+        unit="model",
+        disable=not sys.stderr.isatty(),
+    )
+    try:
+        completed_count = 0
+        started_count = 0
+
+        def record_model_start(model_name: str) -> None:
+            nonlocal started_count
+            started_count += 1
+            logger.info(
+                "[syntheval] %s model=%s status=started progress=%d/%d",
                 pass_name,
                 model_name,
-                len(preprocessing_violations),
+                started_count,
+                len(synthetic_datasets),
             )
-            continue
-        cached = _valid_checkpoint(
-            checkpoint_root,
-            pass_name,
-            model_name,
-            context_fingerprint,
-            model_fingerprint,
-            plots_enabled,
-            expected_manifest_digest=expected_manifest_digest,
-            return_execution=True,
-            expected_manifest=expected_output_manifest,
-            expected_target_view=target_view,
-        )
-        if cached is None:
-            pending.append((model_name, frame, model_fingerprint))
-        else:
-            logger.info("[syntheval] %s checkpoint hit for model %s", pass_name, model_name)
-            results[model_name], executions[model_name] = cached
 
-    if pending:
-        workers = resolve_model_workers(
-            execution_cfg,
-            n_models=len(pending),
-            n_columns=fit_frame.shape[1],
-        )
-        logger.info(
-            "[syntheval] %s scheduling %d missing model(s) with %d disposable worker(s) "
-            "(fit_role=train, tuning_role=tuning, fit=%s, tuning=%s, features=%d, plots=%s)",
-            pass_name,
-            len(pending),
-            workers,
-            fit_frame.shape,
-            tuning_frame.shape,
-            fit_frame.shape[1],
-            plots_enabled,
-        )
-        context = multiprocessing.get_context("spawn")
-        active: dict[str, multiprocessing.Process] = {}
-        pending_iter = iter(pending)
-
-        def start_next() -> bool:
-            try:
-                model_name, frame, model_fingerprint = next(pending_iter)
-            except StopIteration:
-                return False
-            process = cast(
-                multiprocessing.Process,
-                context.Process(
-                    target=_model_worker,
-                    args=(
-                        model_name,
-                        frame,
-                        fit_frame,
-                        tuning_frame,
-                        dataset.all_categorical_columns,
-                        dataset.target_column,
-                        dataset.sensitive_columns,
-                        dataset.protected_columns,
-                        str(preset_path.resolve()),
-                        str(checkpoint_root),
-                        pass_name,
-                        expected_output_manifest,
-                        target_view,
-                        expected_manifest_digest,
-                        context_fingerprint,
-                        model_fingerprint,
-                        str(plots_output_dir) if plots_output_dir else None,
-                        execution_cfg.cores_per_model,
-                        group_context,
-                        role_context,
-                        semantic_context,
-                    ),
-                    name=f"syntheval-{pass_name}-{model_name}",
-                ),
-            )
-            process.start()
-            active[model_name] = process
+        def record_model_completion(model_name: str, state: str) -> None:
+            nonlocal completed_count
+            completed_count += 1
+            model_progress.update(1)
             logger.info(
-                "[syntheval] %s started model=%s pid=%s", pass_name, model_name, process.pid
+                "[syntheval] %s model=%s status=%s progress=%d/%d",
+                pass_name,
+                model_name,
+                state,
+                completed_count,
+                len(synthetic_datasets),
             )
-            return True
 
-        for _ in range(workers):
-            if not start_next():
-                break
-
-        failures = []
-        while active:
-            completed = []
-            for model_name, process in active.items():
-                if process.is_alive():
-                    continue
-                process.join()
-                completed.append((model_name, process.exitcode))
-            if not completed:
-                time.sleep(0.1)
-                continue
-            for model_name, exitcode in completed:
-                del active[model_name]
-                model_fingerprint = (model_fingerprints or {}).get(
-                    model_name, _frame_fingerprint(synthetic_datasets[model_name])
+        for model_name, frame in synthetic_datasets.items():
+            model_fingerprint = (model_fingerprints or {}).get(
+                model_name, _frame_fingerprint(frame)
+            )
+            preprocessing_violations = _synthetic_unseen_categorical_values(
+                frame, fit_frame, dataset.all_categorical_columns
+            )
+            if preprocessing_violations:
+                record_model_start(model_name)
+                reason = (
+                    "Synthetic categorical support is absent from real fit-role vocabulary; "
+                    "evaluation rejected before SynthEval worker"
                 )
-                cached = _valid_checkpoint(
-                    checkpoint_root,
-                    pass_name,
-                    model_name,
-                    context_fingerprint,
-                    model_fingerprint,
-                    plots_enabled,
+                executions[model_name] = _preprocessing_failure(
+                    model_name=model_name,
+                    pass_name=pass_name,
+                    target_view=target_view,
                     expected_manifest_digest=expected_manifest_digest,
-                    return_execution=True,
-                    expected_manifest=expected_output_manifest,
-                    expected_target_view=target_view,
+                    expected_output_manifest=expected_output_manifest,
+                    context_fingerprint=context_fingerprint,
+                    model_fingerprint=model_fingerprint,
+                    role_context=role_context,
+                    group_context=group_context,
+                    semantic_context=semantic_context,
+                    metadata={
+                        "contract": _PREPROCESSING_CONTRACT,
+                        "reason_code": "synthetic_unseen_categorical_values",
+                        "columns": preprocessing_violations,
+                    },
+                    reason=reason,
                 )
-                if exitcode == 0 and cached is not None:
-                    results[model_name], executions[model_name] = cached
-                    logger.info("[syntheval] %s completed model=%s", pass_name, model_name)
-                else:
-                    model_dir, status_path, _ = _checkpoint_paths(
-                        checkpoint_root, pass_name, model_name
-                    )
-                    ensure_dir(model_dir)
-                    worker_status = {}
-                    try:
-                        loaded_status = json.loads(status_path.read_text())
-                        if isinstance(loaded_status, dict):
-                            worker_status = loaded_status
-                    except (OSError, json.JSONDecodeError) as exc:
-                        logger.warning(
-                            "[syntheval] failed to read worker status for model=%s; evidence=%s",
-                            model_name,
-                            type(exc).__name__,
-                        )
-                    worker_evidence = _safe_failure_evidence(
-                        exception_type=worker_status.get("exception_type")
-                        or worker_status.get("error_type"),
-                        reason=worker_status.get("reason_code")
-                        or worker_status.get("failure_reason"),
-                        exit_code=exitcode,
-                    )
-                    failure_status = {
+                model_dir, status_path, _result_path = _checkpoint_paths(
+                    checkpoint_root, pass_name, model_name
+                )
+                ensure_dir(model_dir)
+                _atomic_json(
+                    status_path,
+                    {
                         "schema_version": _CHECKPOINT_SCHEMA_VERSION,
                         "state": "failed",
                         "model_name": model_name,
                         "target_view": target_view,
                         "expected_manifest_digest": expected_manifest_digest,
                         "context_fingerprint": context_fingerprint,
-                        "role_context": role_context,
                         "model_fingerprint": model_fingerprint,
-                        "exit_code": worker_evidence["exit_code"],
-                        "failed_at": time.time(),
-                        **worker_evidence,
-                    }
-                    execution_path = _execution_checkpoint_path(model_dir)
-                    existing_execution = None
+                        "exception_type": "SyntheticPreprocessingValidationError",
+                        "error_type": "SyntheticPreprocessingValidationError",
+                        "reason_code": executions[model_name]["preprocessing_metadata"].get(
+                            "reason_code", "preprocessing_failure"
+                        ),
+                        "failure_reason": "Synthetic data failed preprocessing validation.",
+                        "preprocessing_metadata": executions[model_name]["preprocessing_metadata"],
+                        "failure_class": executions[model_name]["preprocessing_metadata"].get(
+                            "failure_class"
+                        ),
+                    },
+                )
+                _atomic_json(_execution_checkpoint_path(model_dir), executions[model_name])
+                logger.error(
+                    "[syntheval] %s model=%s rejected synthetic categorical support in %d column(s)",
+                    pass_name,
+                    model_name,
+                    len(preprocessing_violations),
+                )
+                record_model_completion(model_name, "failed")
+                continue
+            cached = _valid_checkpoint(
+                checkpoint_root,
+                pass_name,
+                model_name,
+                context_fingerprint,
+                model_fingerprint,
+                plots_enabled,
+                expected_manifest_digest=expected_manifest_digest,
+                return_execution=True,
+                expected_manifest=expected_output_manifest,
+                expected_target_view=target_view,
+            )
+            if cached is None:
+                pending.append((model_name, frame, model_fingerprint))
+            else:
+                record_model_start(model_name)
+                logger.info("[syntheval] %s checkpoint hit for model %s", pass_name, model_name)
+                results[model_name], executions[model_name] = cached
+                record_model_completion(
+                    model_name,
+                    "partial" if cached[1].get("model_status") == "partial" else "cached",
+                )
+
+        if pending:
+            workers = resolve_model_workers(
+                execution_cfg,
+                n_models=len(pending),
+                n_columns=fit_frame.shape[1],
+            )
+            logger.info(
+                "[syntheval] %s scheduling %d missing model(s) with %d disposable worker(s) "
+                "(fit_role=train, tuning_role=tuning, fit=%s, tuning=%s, features=%d, plots=%s)",
+                pass_name,
+                len(pending),
+                workers,
+                fit_frame.shape,
+                tuning_frame.shape,
+                fit_frame.shape[1],
+                plots_enabled,
+            )
+            progress_queue = None
+            active: dict[str, multiprocessing.Process] = {}
+            try:
+                context = multiprocessing.get_context("spawn")
+                progress_queue: Any = getattr(context, "Queue", queue.Queue)()
+                pending_iter = iter(pending)
+
+                def record_method_progress() -> None:
+                    while True:
+                        try:
+                            event = progress_queue.get_nowait()
+                        except queue.Empty:
+                            return
+                        if not isinstance(event, dict):
+                            continue
+                        model = event.get("model_name")
+                        method = event.get("method")
+                        event_name = event.get("event")
+                        outcome = event.get("outcome")
+                        if (
+                            not isinstance(model, str)
+                            or model not in synthetic_datasets
+                            or not isinstance(method, str)
+                            or event_name not in {"started", "completed", "failure"}
+                            or outcome
+                            not in {"running", "succeeded", "failed", "blocked", "timed_out"}
+                        ):
+                            continue
+                        duration = event.get("duration_seconds")
+                        if not _finite_number(duration):
+                            duration = 0.0
+                        failure_class = event.get("failure_class")
+                        if not isinstance(failure_class, str) or not re.fullmatch(
+                            r"[A-Za-z_][A-Za-z0-9_.]*", failure_class
+                        ):
+                            failure_class = "none"
+                        safe_method = (
+                            method if re.fullmatch(r"[A-Za-z0-9_.-]+", method) else "unknown_method"
+                        )
+                        line = (
+                            f"[syntheval] {pass_name} model={model} method={safe_method} "
+                            f"event={event_name} duration_seconds={float(duration):.3f} "
+                            f"outcome={outcome} failure_class={failure_class}"
+                        )
+                        model_progress.write(line)
+                        logger.debug("%s", line)
+
+                def start_next() -> bool:
                     try:
-                        loaded_execution = json.loads(execution_path.read_text())
-                        if isinstance(loaded_execution, dict):
-                            existing_execution = loaded_execution
-                    except (OSError, json.JSONDecodeError) as exc:
-                        if execution_path.exists():
-                            logger.warning(
-                                "[syntheval] failed to read child execution evidence for model=%s "
-                                "; evidence=%s",
+                        model_name, frame, model_fingerprint = next(pending_iter)
+                    except StopIteration:
+                        return False
+                    process = cast(
+                        multiprocessing.Process,
+                        context.Process(
+                            target=_model_worker,
+                            args=(
                                 model_name,
-                                type(exc).__name__,
-                            )
-                    _atomic_json(status_path, failure_status)
-                    _atomic_json(
-                        execution_path,
-                        _failed_execution_payload(
-                            model_name=model_name,
-                            pass_name=pass_name,
-                            target_view=target_view,
-                            expected_manifest_digest=expected_manifest_digest,
-                            expected_output_manifest=expected_output_manifest,
-                            context_fingerprint=context_fingerprint,
-                            model_fingerprint=model_fingerprint,
-                            role_context=role_context,
-                            group_context=group_context,
-                            semantic_context=semantic_context,
-                            failure_status=failure_status,
-                            existing_execution=existing_execution,
-                            worker_status=worker_status,
+                                frame,
+                                fit_frame,
+                                tuning_frame,
+                                dataset.all_categorical_columns,
+                                dataset.target_column,
+                                dataset.sensitive_columns,
+                                dataset.protected_columns,
+                                str(preset_path.resolve()),
+                                str(checkpoint_root),
+                                pass_name,
+                                expected_output_manifest,
+                                target_view,
+                                expected_manifest_digest,
+                                context_fingerprint,
+                                model_fingerprint,
+                                str(plots_output_dir) if plots_output_dir else None,
+                                execution_cfg.cores_per_model,
+                                group_context,
+                                role_context,
+                                semantic_context,
+                                progress_queue,
+                            ),
+                            name=f"syntheval-{pass_name}-{model_name}",
                         ),
                     )
-                    executions[model_name] = json.loads(execution_path.read_text())
-                    failures.append(f"{model_name} (exit={worker_evidence['exit_code']})")
-                    logger.error(
-                        "[syntheval] %s model=%s exited %s; safe failure evidence persisted",
+                    active[model_name] = process
+                    process.start()
+                    record_model_start(model_name)
+                    logger.info(
+                        "[syntheval] %s worker_started model=%s pid=%s",
                         pass_name,
                         model_name,
-                        worker_evidence["exit_code"],
+                        process.pid,
                     )
-                start_next()
-        if failures:
-            logger.error(
-                "[syntheval] %s returned partial results after %d failed model(s): %s. "
-                "Completed model checkpoints remain resumable",
-                pass_name,
-                len(failures),
-                ", ".join(failures),
-            )
+                    return True
+
+                for _ in range(workers):
+                    if not start_next():
+                        break
+
+                failures = []
+                while active:
+                    record_method_progress()
+                    completed = []
+                    for model_name, process in active.items():
+                        if process.is_alive():
+                            continue
+                        process.join()
+                        record_method_progress()
+                        completed.append((model_name, process.exitcode))
+                    if not completed:
+                        time.sleep(0.1)
+                        continue
+                    for model_name, exitcode in completed:
+                        del active[model_name]
+                        model_fingerprint = (model_fingerprints or {}).get(
+                            model_name, _frame_fingerprint(synthetic_datasets[model_name])
+                        )
+                        cached = _valid_checkpoint(
+                            checkpoint_root,
+                            pass_name,
+                            model_name,
+                            context_fingerprint,
+                            model_fingerprint,
+                            plots_enabled,
+                            expected_manifest_digest=expected_manifest_digest,
+                            return_execution=True,
+                            expected_manifest=expected_output_manifest,
+                            expected_target_view=target_view,
+                        )
+                        if exitcode == 0 and cached is not None:
+                            results[model_name], executions[model_name] = cached
+                            record_model_completion(
+                                model_name,
+                                "partial"
+                                if cached[1].get("model_status") == "partial"
+                                else "completed",
+                            )
+                        else:
+                            model_dir, status_path, _ = _checkpoint_paths(
+                                checkpoint_root, pass_name, model_name
+                            )
+                            ensure_dir(model_dir)
+                            worker_status = {}
+                            try:
+                                loaded_status = json.loads(status_path.read_text())
+                                if isinstance(loaded_status, dict):
+                                    worker_status = loaded_status
+                            except (OSError, json.JSONDecodeError) as exc:
+                                logger.warning(
+                                    "[syntheval] failed to read worker status for model=%s; evidence=%s",
+                                    model_name,
+                                    type(exc).__name__,
+                                )
+                            worker_evidence = _safe_failure_evidence(
+                                exception_type=worker_status.get("exception_type")
+                                or worker_status.get("error_type"),
+                                reason=worker_status.get("reason_code")
+                                or worker_status.get("failure_reason"),
+                                exit_code=exitcode,
+                            )
+                            failure_status = {
+                                "schema_version": _CHECKPOINT_SCHEMA_VERSION,
+                                "state": "failed",
+                                "model_name": model_name,
+                                "pass_id": pass_name,
+                                "target_view": target_view,
+                                "expected_manifest_digest": expected_manifest_digest,
+                                "context_fingerprint": context_fingerprint,
+                                "role_context": role_context,
+                                "model_fingerprint": model_fingerprint,
+                                "exit_code": worker_evidence["exit_code"],
+                                "failed_at": time.time(),
+                                **worker_evidence,
+                            }
+                            execution_path = _execution_checkpoint_path(model_dir)
+                            existing_execution = None
+                            try:
+                                loaded_execution = json.loads(execution_path.read_text())
+                                if isinstance(loaded_execution, dict):
+                                    existing_execution = loaded_execution
+                            except (OSError, json.JSONDecodeError) as exc:
+                                if execution_path.exists():
+                                    logger.warning(
+                                        "[syntheval] failed to read child execution evidence for model=%s "
+                                        "; evidence=%s",
+                                        model_name,
+                                        type(exc).__name__,
+                                    )
+                            _atomic_json(status_path, failure_status)
+                            logger.debug(
+                                "[syntheval] checkpoint persistence pass=%s model=%s state=failed",
+                                pass_name,
+                                model_name,
+                            )
+                            _atomic_json(
+                                execution_path,
+                                _failed_execution_payload(
+                                    model_name=model_name,
+                                    pass_name=pass_name,
+                                    target_view=target_view,
+                                    expected_manifest_digest=expected_manifest_digest,
+                                    expected_output_manifest=expected_output_manifest,
+                                    context_fingerprint=context_fingerprint,
+                                    model_fingerprint=model_fingerprint,
+                                    role_context=role_context,
+                                    group_context=group_context,
+                                    semantic_context=semantic_context,
+                                    failure_status=failure_status,
+                                    existing_execution=existing_execution,
+                                    worker_status=worker_status,
+                                ),
+                            )
+                            executions[model_name] = json.loads(execution_path.read_text())
+                            logger.debug(
+                                "[syntheval] result persistence pass=%s model=%s state=failure_evidence_written "
+                                "child_sidecar_present=%s",
+                                pass_name,
+                                model_name,
+                                existing_execution is not None,
+                            )
+                            failures.append(f"{model_name} (exit={worker_evidence['exit_code']})")
+                            logger.error(
+                                "[syntheval] %s model=%s exited %s; safe failure evidence persisted",
+                                pass_name,
+                                model_name,
+                                worker_evidence["exit_code"],
+                            )
+                            record_model_completion(model_name, "failed")
+                        start_next()
+                if failures:
+                    logger.error(
+                        "[syntheval] %s returned partial results after %d failed model(s): %s. "
+                        "Completed model checkpoints remain resumable",
+                        pass_name,
+                        len(failures),
+                        ", ".join(failures),
+                    )
+
+                record_method_progress()
+            finally:
+                try:
+                    for process in active.values():
+                        is_alive = process.pid is not None and process.is_alive()
+                        if is_alive:
+                            process.terminate()
+                        if process.pid is not None and (is_alive or process.exitcode is not None):
+                            process.join()
+                finally:
+                    if progress_queue is not None:
+                        try:
+                            if hasattr(progress_queue, "close"):
+                                progress_queue.close()
+                        finally:
+                            if hasattr(progress_queue, "join_thread"):
+                                progress_queue.join_thread()
+
+    finally:
+        model_progress.close()
 
     ordered_executions = {name: executions[name] for name in synthetic_datasets}
     benchmark_results, benchmark_ranks = build_syntheval_tables_from_executions(
@@ -3064,30 +3495,51 @@ def build_syntheval_tables_from_executions(
         ):
             eligible_models.append(model_name)
 
-    if not eligible_models:
-        result_columns = pd.MultiIndex.from_tuples(
-            [(metric, level) for metric in metric_keys for level in ("value", "error")]
-            + [(level, "") for level in ("rank", "u_rank")]
-        )
-        rank_columns = pd.Index([*metric_keys, "rank", "u_rank", "p_rank", "f_rank"])
-        return (
-            pd.DataFrame(index=pd.Index(model_names), columns=result_columns, dtype=float),
-            pd.DataFrame(index=pd.Index(model_names), columns=rank_columns, dtype=float),
-        )
-
-    eligible_results, eligible_ranks = aggregate_benchmark_results(
-        {model_name: benchmark_frames[model_name] for model_name in eligible_models},
+    # Keep supported raw values visible for partial attempts, but derive
+    # rankings only from models with complete, policy-eligible metric coverage.
+    benchmark_results, all_ranks = aggregate_benchmark_results(
+        benchmark_frames,
         ranking_strategy,
     )
-    # SynthEval assigns zero ranks to all-NaN input frames. Reindexing the
-    # complete inventory after excluding failed/ineligible executions prevents
-    # those rows from becoming rankable while retaining their audit presence.
-    benchmark_results = eligible_results.reindex(model_names)
-    benchmark_ranks = eligible_ranks.reindex(model_names)
-    failed_models = [model_name for model_name in model_names if model_name not in eligible_models]
-    if failed_models:
-        benchmark_results.loc[failed_models, :] = np.nan
-        benchmark_ranks.loc[failed_models, :] = np.nan
+    benchmark_results = benchmark_results.reindex(model_names)
+    if eligible_models:
+        eligible_results, eligible_ranks = aggregate_benchmark_results(
+            {model_name: benchmark_frames[model_name] for model_name in eligible_models},
+            ranking_strategy,
+        )
+        benchmark_ranks = eligible_ranks.reindex(model_names)
+    else:
+        eligible_results = None
+        benchmark_ranks = all_ranks.reindex(model_names)
+        benchmark_ranks.loc[:, :] = np.nan
+
+    # SynthEval assigns zero ranks to all-NaN input frames. Clear rank columns
+    # from all-model results, then restore ranks calculated on complete models.
+    result_rank_columns = [column for column in benchmark_results if column[0] in _RANK_COLUMNS]
+    if result_rank_columns:
+        benchmark_results.loc[:, result_rank_columns] = np.nan
+        if eligible_results is not None:
+            benchmark_results.loc[eligible_models, result_rank_columns] = eligible_results.reindex(
+                eligible_models
+            ).loc[:, result_rank_columns]
+    ineligible_models = [
+        model_name for model_name in model_names if model_name not in eligible_models
+    ]
+    logger.debug(
+        "[syntheval] aggregate eligibility eligible=%d ineligible=%d total=%d",
+        len(eligible_models),
+        len(ineligible_models),
+        len(model_names),
+    )
+    if ineligible_models:
+        benchmark_ranks.loc[ineligible_models, :] = np.nan
+        non_partial_failures = [
+            model_name
+            for model_name in ineligible_models
+            if executions[model_name].get("model_status") not in {"partial", "incomplete"}
+        ]
+        if non_partial_failures:
+            benchmark_results.loc[non_partial_failures, :] = np.nan
     return benchmark_results, benchmark_ranks
 
 
@@ -3109,9 +3561,9 @@ def _validated_cached_syntheval_tables(
     except (KeyError, TypeError, ValueError) as exc:
         logger.warning(
             "[syntheval] %s aggregate cache could not be rebuilt from structured executions "
-            "(%s); treating cache as incomplete",
+            "(exception_type=%s); treating cache as incomplete",
             cache_label,
-            exc,
+            type(exc).__name__,
         )
         return None
 
@@ -3124,10 +3576,11 @@ def _validated_cached_syntheval_tables(
         _assert_cached_frame_equal(cached_ranks, rebuilt_ranks)
     except AssertionError as exc:
         logger.warning(
-            "[syntheval] %s aggregate cache differs from structured execution tables (%s); "
+            "[syntheval] %s aggregate cache differs from structured execution tables "
+            "(exception_type=%s); "
             "treating cache as incomplete",
             cache_label,
-            exc,
+            type(exc).__name__,
         )
         return None
     return rebuilt_results, rebuilt_ranks

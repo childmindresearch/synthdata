@@ -1,6 +1,10 @@
 """Unit tests for synthcity metric selection and native category names."""
 
+import logging
 import math
+from concurrent.futures import ThreadPoolExecutor
+from io import StringIO
+from threading import Event
 
 import numpy as np
 import pandas as pd
@@ -30,6 +34,636 @@ pytestmark = pytest.mark.unit
 
 
 class TestResolveMetricConfig:
+    @pytest.mark.parametrize(
+        ("phase", "patch_target"),
+        [
+            ("adapter_fit", "adapter_fit"),
+            ("frame_alignment_group_validation", "frame_alignment"),
+            ("loader_construction", "loader_construction"),
+            ("workspace_preparation", "workspace_preparation"),
+            ("Metrics.evaluate", "metrics_evaluate"),
+        ],
+    )
+    def test_root_pre_callback_phases_localize_safe_failure(
+        self, monkeypatch, tmp_path, phase, patch_target
+    ):
+        from synthcity.metrics import Metrics
+        from synthcity.plugins.core.dataloader import GenericDataLoader
+
+        from synthdata.evaluation import synthcity_eval
+
+        sensitive_literal = "patient/HMAC_private-marker"
+
+        def fail_with_sensitive_detail(*_args, **_kwargs):
+            raise ValueError(f"unrecognized category {sensitive_literal}")
+
+        if patch_target == "adapter_fit":
+            monkeypatch.setattr(
+                synthcity_eval._ExternalGeneratorAdapter, "fit", fail_with_sensitive_detail
+            )
+        elif patch_target == "frame_alignment":
+            monkeypatch.setattr(
+                synthcity_eval, "_schema_mismatch_score", fail_with_sensitive_detail
+            )
+        elif patch_target == "loader_construction":
+            monkeypatch.setattr(GenericDataLoader, "__init__", fail_with_sensitive_detail)
+        elif patch_target == "workspace_preparation":
+            monkeypatch.setattr(
+                synthcity_eval, "_semantic_metric_workspace", fail_with_sensitive_detail
+            )
+        else:
+            monkeypatch.setattr(Metrics, "evaluate", staticmethod(fail_with_sensitive_detail))
+
+        frame = pd.DataFrame({"private-column-label": [0, 1], "target": [0, 1]})
+        stream = StringIO()
+        monkeypatch.setattr(synthcity_eval.logger, "handlers", [logging.StreamHandler(stream)])
+        monkeypatch.setattr(synthcity_eval.logger, "level", logging.DEBUG)
+        monkeypatch.setattr(synthcity_eval.logger, "propagate", False)
+        with pytest.raises(ValueError):
+            run_synthcity_metrics(
+                frame,
+                frame,
+                frame,
+                n_samples=2,
+                target_column="target",
+                sensitive_features=[],
+                metrics={"sanity": ["common_rows_proportion"]},
+                workspace=tmp_path,
+                evaluation_role="tuning",
+                model_name="model-debug-test",
+            )
+
+        output = stream.getvalue()
+        assert f"phase start model=model-debug-test role=tuning phase={phase}" in output
+        assert f"phase failed model=model-debug-test role=tuning phase={phase}" in output
+        assert "exception_type=ValueError reason_code=phase_failed" in output
+        assert "patient/HMAC_private-marker" not in output
+        assert "private-column-label" not in output
+
+    def test_root_preparation_phases_log_success_with_safe_shapes(self, monkeypatch, tmp_path):
+        from synthdata.evaluation import synthcity_eval
+
+        frame = pd.DataFrame({"private-column-label": [0, 1], "target": [0, 1]})
+        stream = StringIO()
+        monkeypatch.setattr(synthcity_eval.logger, "handlers", [logging.StreamHandler(stream)])
+        monkeypatch.setattr(synthcity_eval.logger, "level", logging.DEBUG)
+        monkeypatch.setattr(synthcity_eval.logger, "propagate", False)
+
+        result = run_synthcity_metrics(
+            frame,
+            frame,
+            frame,
+            n_samples=2,
+            target_column="target",
+            sensitive_features=[],
+            metrics={"sanity": ["common_rows_proportion"]},
+            workspace=tmp_path,
+            evaluation_role="tuning",
+            model_name="model-debug-test",
+        )
+
+        output = stream.getvalue()
+        for phase in (
+            "input_validation",
+            "adapter_fit",
+            "frame_alignment_group_validation",
+            "loader_construction",
+            "workspace_preparation",
+            "Metrics.evaluate",
+        ):
+            assert f"phase start model=model-debug-test role=tuning phase={phase}" in output
+            assert f"phase completed model=model-debug-test role=tuning phase={phase}" in output
+        assert "reference_shape=(2, 2)" in output
+        assert "private-column-label" not in output
+        assert result.loc["sanity.common_rows_proportion.score", "mean"] == pytest.approx(1.0)
+
+    def test_model_progress_bar_completes_for_interactive_run(self, monkeypatch):
+        from synthdata.evaluation import synthcity_eval
+
+        class TTYStream(StringIO):
+            def isatty(self):
+                return True
+
+        stream = TTYStream()
+        monkeypatch.setattr(synthcity_eval.sys, "stderr", stream)
+        monkeypatch.setattr(
+            synthcity_eval.logger,
+            "handlers",
+            [logging.StreamHandler(stream)],
+        )
+        monkeypatch.setattr(
+            synthcity_eval,
+            "run_synthcity_metrics",
+            lambda synthetic_df, *_args, **_kwargs: pd.DataFrame(
+                {"mean": [float(synthetic_df.iloc[0, 0])]}
+            ),
+        )
+        frame = pd.DataFrame({"feature": [0], "target": [0]})
+        selection = FrameworkSelectionConfig(metrics=["common_rows_proportion"])
+
+        results = run_synthcity_evaluation(
+            {"model_a": frame, "model_b": frame},
+            frame,
+            frame,
+            target_column="target",
+            sensitive_features=[],
+            selection_cfg=selection,
+        )
+
+        assert set(results) == {"model_a", "model_b"}
+        assert "SynthCity evaluation" in stream.getvalue()
+        assert "100%" in stream.getvalue()
+
+    @pytest.mark.parametrize("final_model_fails", [False, True])
+    def test_model_progress_advances_after_final_evaluation_finishes(
+        self, monkeypatch, final_model_fails
+    ):
+        from synthdata.evaluation import synthcity_eval
+
+        class TTYStream(StringIO):
+            def isatty(self):
+                return True
+
+        class RecordingTqdm(synthcity_eval.tqdm):
+            instances = []
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.close_called = False
+                self.instances.append(self)
+
+            def close(self):
+                self.close_called = True
+                super().close()
+
+        stream = TTYStream()
+        monkeypatch.setattr(synthcity_eval.sys, "stderr", stream)
+        monkeypatch.setattr(
+            synthcity_eval.logger,
+            "handlers",
+            [logging.StreamHandler(stream)],
+        )
+        monkeypatch.setattr(synthcity_eval, "tqdm", RecordingTqdm)
+        evaluation_started = Event()
+        finish_evaluation = Event()
+
+        def evaluate_model(synthetic_df, *_args, **_kwargs):
+            if synthetic_df.iloc[0, 0] == 1:
+                evaluation_started.set()
+                assert finish_evaluation.wait(timeout=5)
+                if final_model_fails:
+                    raise ValueError("controlled evaluation failure")
+            return pd.DataFrame({"mean": [0.5]})
+
+        monkeypatch.setattr(synthcity_eval, "run_synthcity_metrics", evaluate_model)
+        frame = pd.DataFrame({"feature": [0], "target": [0]})
+        final_frame = pd.DataFrame({"feature": [1], "target": [0]})
+        selection = FrameworkSelectionConfig(metrics=["common_rows_proportion"])
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            evaluation = executor.submit(
+                run_synthcity_evaluation,
+                {"model_first": frame, "model_final": final_frame},
+                frame,
+                frame,
+                target_column="target",
+                sensitive_features=[],
+                selection_cfg=selection,
+            )
+            try:
+                assert evaluation_started.wait(timeout=5)
+                progress = RecordingTqdm.instances[0]
+                assert progress.total == 2
+                assert progress.n == 1
+                assert progress.n < progress.total
+            finally:
+                finish_evaluation.set()
+
+            results = evaluation.result(timeout=5)
+
+        progress = RecordingTqdm.instances[0]
+        assert progress.n == progress.total == 2
+        assert progress.close_called
+        if final_model_fails:
+            assert results["model_final"].iloc[0]["error_type"] == "ValueError"
+
+    def test_interactive_caught_model_failure_reports_status_and_counter(self, monkeypatch):
+        from synthdata.evaluation import synthcity_eval
+
+        class TTYStream(StringIO):
+            def isatty(self):
+                return True
+
+        stream = TTYStream()
+        monkeypatch.setattr(synthcity_eval.sys, "stderr", stream)
+        monkeypatch.setattr(
+            synthcity_eval.logger,
+            "handlers",
+            [logging.StreamHandler(stream)],
+        )
+
+        def fail_evaluation(*_args, **_kwargs):
+            raise ValueError("unrecognized category patient-secret")
+
+        monkeypatch.setattr(synthcity_eval, "run_synthcity_metrics", fail_evaluation)
+        frame = pd.DataFrame({"feature": [0], "target": [0]})
+        selection = FrameworkSelectionConfig(metrics=["common_rows_proportion"])
+
+        results = run_synthcity_evaluation(
+            {"model_failed": frame},
+            frame,
+            frame,
+            target_column="target",
+            sensitive_features=[],
+            selection_cfg=selection,
+        )
+
+        output = stream.getvalue()
+        assert "model progress failed 1/1 model=model_failed status=failed" in output
+        assert "patient-secret" not in output
+        assert results["model_failed"].iloc[0]["error_type"] == "ValueError"
+
+    def test_interactive_uncaught_model_failure_reports_status_and_propagates(self, monkeypatch):
+        from synthdata.evaluation import synthcity_eval
+
+        class TTYStream(StringIO):
+            def isatty(self):
+                return True
+
+        stream = TTYStream()
+        monkeypatch.setattr(synthcity_eval.sys, "stderr", stream)
+        monkeypatch.setattr(
+            synthcity_eval.logger,
+            "handlers",
+            [logging.StreamHandler(stream)],
+        )
+        exception = LookupError("private exception detail")
+
+        def fail_evaluation(*_args, **_kwargs):
+            raise exception
+
+        monkeypatch.setattr(synthcity_eval, "run_synthcity_metrics", fail_evaluation)
+        frame = pd.DataFrame({"feature": [0], "target": [0]})
+        selection = FrameworkSelectionConfig(metrics=["common_rows_proportion"])
+
+        with pytest.raises(LookupError) as raised:
+            run_synthcity_evaluation(
+                {"model_uncaught": frame},
+                frame,
+                frame,
+                target_column="target",
+                sensitive_features=[],
+                selection_cfg=selection,
+            )
+
+        assert raised.value is exception
+        output = stream.getvalue()
+        assert "model progress failed 1/1 model=model_uncaught status=failed" in output
+        assert "private exception detail" not in output
+
+    def test_redirected_model_progress_logs_completion_and_failure(self, monkeypatch):
+        from synthdata.evaluation import synthcity_eval
+
+        stream = StringIO()
+        monkeypatch.setattr(synthcity_eval.sys, "stderr", stream)
+        monkeypatch.setattr(
+            synthcity_eval.logger,
+            "handlers",
+            [logging.StreamHandler(stream)],
+        )
+
+        def evaluate_model(synthetic_df, *_args, **_kwargs):
+            if synthetic_df.iloc[0, 0] == 1:
+                raise ValueError("unrecognized category patient-secret")
+            return pd.DataFrame({"mean": [0.5]})
+
+        monkeypatch.setattr(synthcity_eval, "run_synthcity_metrics", evaluate_model)
+        frame = pd.DataFrame({"feature": [0], "target": [0]})
+        failed_frame = pd.DataFrame({"feature": [1], "target": [0]})
+        selection = FrameworkSelectionConfig(metrics=["common_rows_proportion"])
+
+        results = run_synthcity_evaluation(
+            {"model_ok": frame, "model_failed": failed_frame},
+            frame,
+            frame,
+            target_column="target",
+            sensitive_features=[],
+            selection_cfg=selection,
+        )
+
+        output = stream.getvalue()
+        assert "model progress start 1/2 model=model_ok" in output
+        assert "model progress completed 1/2 model=model_ok status=completed" in output
+        assert "model progress start 2/2 model=model_failed" in output
+        assert "model progress failed 2/2 model=model_failed status=failed" in output
+        assert "patient-secret" not in output
+        assert results["model_failed"].iloc[0]["error_type"] == "ValueError"
+        assert results["model_failed"].iloc[0]["error"] == "SynthCity metric evaluation failed."
+
+    @pytest.mark.parametrize("metric_fails", [False, True])
+    def test_metric_progress_logs_safe_model_attributed_events(
+        self, monkeypatch, tmp_path, metric_fails
+    ):
+        from synthcity.metrics.eval_sanity import CommonRowsProportion
+
+        from synthdata.evaluation import synthcity_eval
+
+        stream = StringIO()
+        monkeypatch.setattr(synthcity_eval.sys, "stderr", stream)
+        monkeypatch.setattr(
+            synthcity_eval.logger,
+            "handlers",
+            [logging.StreamHandler(stream)],
+        )
+        if metric_fails:
+
+            def fail_metric(self, _X_gt, _X_syn):
+                raise ValueError("unknown category patient-secret")
+
+            monkeypatch.setattr(CommonRowsProportion, "evaluate", fail_metric)
+
+        frame = pd.DataFrame({"feature": [0, 1], "target": [0, 1]})
+        results = run_synthcity_evaluation(
+            {"model_with_metric_events": frame},
+            frame,
+            frame,
+            target_column="target",
+            sensitive_features=[],
+            selection_cfg=FrameworkSelectionConfig(metrics=["common_rows_proportion"]),
+            workspace=str(tmp_path),
+        )
+
+        output = stream.getvalue()
+        assert (
+            "metric progress start model=model_with_metric_events "
+            "evaluator=sanity.common_rows_proportion"
+        ) in output
+        assert "elapsed_seconds=" in output
+        assert "\r" not in output
+        assert "patient-secret" not in output
+        if metric_fails:
+            assert (
+                "metric progress failed model=model_with_metric_events "
+                "evaluator=sanity.common_rows_proportion"
+            ) in output
+            assert "exception_type=ValueError diagnostic=value_error" in output
+            assert (
+                results["model_with_metric_events"].loc["sanity.common_rows_proportion", "errors"]
+                == 1
+            )
+        else:
+            assert (
+                "metric progress completed model=model_with_metric_events "
+                "evaluator=sanity.common_rows_proportion"
+            ) in output
+            assert results["model_with_metric_events"].loc[
+                "sanity.common_rows_proportion.score", "mean"
+            ] == pytest.approx(1.0)
+
+    @pytest.mark.parametrize("metric_fails", [False, True])
+    def test_metric_callback_logging_failure_preserves_evaluation_semantics(
+        self, monkeypatch, tmp_path, metric_fails
+    ):
+        from synthcity.metrics import scores as scores_module
+        from synthcity.metrics.eval_sanity import CommonRowsProportion
+
+        from synthdata.evaluation import synthcity_eval
+
+        stream = StringIO()
+        monkeypatch.setattr(synthcity_eval.sys, "stderr", stream)
+        monkeypatch.setattr(
+            synthcity_eval.logger,
+            "handlers",
+            [logging.StreamHandler(stream)],
+        )
+        callback_failures = []
+        monkeypatch.setattr(
+            scores_module.log,
+            "error",
+            lambda *args: callback_failures.append(args),
+        )
+        original_info = synthcity_eval.logger.info
+
+        def fail_metric_progress_logging(message, *args, **kwargs):
+            if "[synthcity] metric progress" in message:
+                raise RuntimeError("private callback detail")
+            original_info(message, *args, **kwargs)
+
+        monkeypatch.setattr(synthcity_eval.logger, "info", fail_metric_progress_logging)
+        if metric_fails:
+
+            def fail_metric(self, _X_gt, _X_syn):
+                raise ValueError("private metric detail")
+
+            monkeypatch.setattr(CommonRowsProportion, "evaluate", fail_metric)
+
+        frame = pd.DataFrame({"feature": [0, 1], "target": [0, 1]})
+        results = run_synthcity_evaluation(
+            {"model_with_callback_failure": frame},
+            frame,
+            frame,
+            target_column="target",
+            sensitive_features=[],
+            selection_cfg=FrameworkSelectionConfig(metrics=["common_rows_proportion"]),
+            workspace=str(tmp_path),
+        )
+
+        progress_failures = [
+            call for call in callback_failures if "Progress callback failed" in call[0]
+        ]
+        assert len(progress_failures) == 2
+        assert all("exception_type={}" in call[0] for call in progress_failures)
+        assert all("RuntimeError" in call for call in progress_failures)
+        assert "private callback detail" not in repr(progress_failures)
+        assert "private callback detail" not in stream.getvalue()
+        if metric_fails:
+            row = results["model_with_callback_failure"].loc["sanity.common_rows_proportion"]
+            assert row["errors"] == 1
+            assert row["error_types"] == "ValueError"
+            assert row["error_messages"] == "private metric detail"
+        else:
+            row = results["model_with_callback_failure"].loc["sanity.common_rows_proportion.score"]
+            assert row["mean"] == pytest.approx(1.0)
+            assert row["errors"] == 0
+
+    def test_uncaught_model_exception_logs_failure_before_propagating(self, monkeypatch):
+        from synthdata.evaluation import synthcity_eval
+
+        stream = StringIO()
+        monkeypatch.setattr(synthcity_eval.sys, "stderr", stream)
+        monkeypatch.setattr(
+            synthcity_eval.logger,
+            "handlers",
+            [logging.StreamHandler(stream)],
+        )
+        exception = LookupError("private exception detail")
+
+        def fail_evaluation(*_args, **_kwargs):
+            raise exception
+
+        monkeypatch.setattr(synthcity_eval, "run_synthcity_metrics", fail_evaluation)
+        frame = pd.DataFrame({"feature": [0], "target": [0]})
+        selection = FrameworkSelectionConfig(metrics=["common_rows_proportion"])
+
+        with pytest.raises(LookupError) as raised:
+            run_synthcity_evaluation(
+                {"model_uncaught": frame},
+                frame,
+                frame,
+                target_column="target",
+                sensitive_features=[],
+                selection_cfg=selection,
+            )
+
+        assert raised.value is exception
+        output = stream.getvalue()
+        assert "model progress start 1/1 model=model_uncaught" in output
+        assert "model progress failed 1/1 model=model_uncaught status=failed" in output
+        assert "private exception detail" not in output
+
+    def test_non_root_synthdata_logger_uses_tqdm_safe_redirection(self, monkeypatch):
+        from synthdata.evaluation import synthcity_eval
+
+        stream = StringIO()
+        redirected_messages = []
+        worker_logger = logging.getLogger("synthdata.evaluation.progress_test_worker")
+        monkeypatch.setattr(synthcity_eval.sys, "stderr", stream)
+        monkeypatch.setattr(
+            synthcity_eval.logger,
+            "handlers",
+            [logging.StreamHandler(stream)],
+        )
+        monkeypatch.setattr(worker_logger, "handlers", [logging.StreamHandler(stream)])
+        monkeypatch.setattr(worker_logger, "propagate", False)
+        monkeypatch.setattr(worker_logger, "level", logging.INFO)
+        monkeypatch.setattr(
+            synthcity_eval.tqdm,
+            "write",
+            lambda message, **_kwargs: redirected_messages.append(message),
+        )
+
+        def evaluate_model(*_args, **_kwargs):
+            worker_logger.info("worker output marker")
+            return pd.DataFrame({"mean": [0.5]})
+
+        monkeypatch.setattr(synthcity_eval, "run_synthcity_metrics", evaluate_model)
+        frame = pd.DataFrame({"feature": [0], "target": [0]})
+        selection = FrameworkSelectionConfig(metrics=["common_rows_proportion"])
+
+        run_synthcity_evaluation(
+            {"model_a": frame},
+            frame,
+            frame,
+            target_column="target",
+            sensitive_features=[],
+            selection_cfg=selection,
+        )
+
+        assert any("worker output marker" in message for message in redirected_messages)
+        assert "worker output marker" not in stream.getvalue()
+
+    def test_model_failure_logs_sanitized_actionable_diagnostic(self, monkeypatch, tmp_path):
+        from synthdata.evaluation import synthcity_eval
+
+        category_value = "patient/HMAC_deadbeef"
+        assigned_value = "income-secret"
+        warning_calls = []
+
+        def fail_evaluation(*_args, **_kwargs):
+            raise ValueError(
+                "Found unknown categories ['patient/HMAC_deadbeef'] in column 0; "
+                "category=income-secret; see /private/traceback.py:7"
+            )
+
+        monkeypatch.setattr(synthcity_eval, "run_synthcity_metrics", fail_evaluation)
+        monkeypatch.setattr(
+            synthcity_eval.logger, "warning", lambda *args: warning_calls.append(args)
+        )
+        frame = pd.DataFrame({"feature": [0, 1], "target": [0, 1]})
+        selection = FrameworkSelectionConfig(metrics=["common_rows_proportion"])
+
+        results = run_synthcity_evaluation(
+            {"model_a": frame},
+            frame,
+            frame,
+            target_column="target",
+            sensitive_features=[],
+            selection_cfg=selection,
+            workspace=str(tmp_path),
+        )
+
+        assert len(warning_calls) == 1
+        message_template, *message_args = warning_calls[0]
+        log_message = message_template % tuple(message_args)
+        assert "exception_type=ValueError" in log_message
+        assert "Unrecognized category reported by metric evaluation" in log_message
+        assert category_value not in log_message
+        assert assigned_value not in log_message
+        assert "/private/traceback.py" not in log_message
+
+        # The diagnostic is log-only; failure evidence remains generic and cannot
+        # influence scoring or ranking.
+        assert results["model_a"].iloc[0]["error_type"] == "ValueError"
+        assert results["model_a"].iloc[0]["error"] == "SynthCity metric evaluation failed."
+        validation = validate_synthcity_report(
+            "model_a",
+            results["model_a"],
+            expected_base_keys=["sanity.common_rows_proportion"],
+        )
+        assert validation.expected_records[0].error == "reason_code=metric_evaluation_failed"
+
+    @pytest.mark.parametrize(
+        ("exception_message", "sensitive_value", "safe_context"),
+        [
+            (
+                "Unknown category income-secret",
+                "income-secret",
+                "Unrecognized category reported by metric evaluation",
+            ),
+            (
+                "Found unknown category 12345",
+                "12345",
+                "Unrecognized category reported by metric evaluation",
+            ),
+            (
+                "unknown label patient/HMAC_deadbeef",
+                "patient/HMAC_deadbeef",
+                "Unrecognized label reported by metric evaluation",
+            ),
+        ],
+    )
+    def test_model_failure_redacts_unquoted_category_and_row_values(
+        self, monkeypatch, tmp_path, exception_message, sensitive_value, safe_context
+    ):
+        from synthdata.evaluation import synthcity_eval
+
+        warning_calls = []
+
+        def fail_evaluation(*_args, **_kwargs):
+            raise ValueError(exception_message)
+
+        monkeypatch.setattr(synthcity_eval, "run_synthcity_metrics", fail_evaluation)
+        monkeypatch.setattr(
+            synthcity_eval.logger, "warning", lambda *args: warning_calls.append(args)
+        )
+        frame = pd.DataFrame({"feature": [0, 1], "target": [0, 1]})
+        selection = FrameworkSelectionConfig(metrics=["common_rows_proportion"])
+
+        run_synthcity_evaluation(
+            {"model_a": frame},
+            frame,
+            frame,
+            target_column="target",
+            sensitive_features=[],
+            selection_cfg=selection,
+            workspace=str(tmp_path),
+        )
+
+        message_template, *message_args = warning_calls[0]
+        log_message = message_template % tuple(message_args)
+        assert "exception_type=ValueError" in log_message
+        assert safe_context in log_message
+        assert sensitive_value not in log_message
+
     def test_failed_metric_report_does_not_persist_native_exception_text(self):
         sentinel = "category=patient/HMAC_deadbeef /private/traceback.py:7"
         report = pd.DataFrame(

@@ -2,7 +2,9 @@
 
 import hashlib
 import json
+import logging
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NoReturn, cast
@@ -30,6 +32,10 @@ from synthdata.evaluation import (
 from synthdata.evaluation import tstr as tstr_module
 from synthdata.evaluation.release import transform_release_roles
 from synthdata.evaluation.release_score import compute_release_score
+from synthdata.evaluation.syntheval_eval import (
+    InsufficientSynthEvalCPUError,
+    InsufficientSynthEvalMemoryError,
+)
 from synthdata.generation import pipeline as generation_pipeline
 
 pytestmark = pytest.mark.unit
@@ -233,6 +239,10 @@ def test_evaluation_cli_hands_candidate_and_final_phase_roles_to_evaluator(
     candidate_roles = {role: frame.copy() for role, frame in candidate.roles.items()}
     candidate_roles["train"].loc[:, "feature"] = -1
     candidate_roles["tuning"].loc[:, "feature"] = -2
+    candidate_roles["train"]["target"] = candidate_roles["train"]["target"].astype(object)
+    candidate_roles["train"].loc[candidate_roles["train"].index[0], "target"] = (
+        "SENSITIVE_CATEGORY_SENTINEL"
+    )
     candidate.set_imputed_roles(candidate_roles)
     final_roles = {role: frame.copy() for role, frame in final.roles.items()}
     final_roles["final_holdout"].loc[:, "feature"] = -3
@@ -242,6 +252,40 @@ def test_evaluation_cli_hands_candidate_and_final_phase_roles_to_evaluator(
     evaluated = {}
     preflight_calls = []
     lineage_calls = []
+    records = []
+    unrelated_logger = logging.getLogger("synthdata.unrelated_debug_test")
+    unrelated_logger.setLevel(logging.WARNING)
+    unrelated_handler = logging.StreamHandler(StringIO())
+    unrelated_handler.setLevel(logging.ERROR)
+    monkeypatch.setattr(unrelated_logger, "handlers", [unrelated_handler])
+    log_stream = StringIO()
+    evaluation_loggers = [
+        candidate_logger
+        for name, candidate_logger in logging.Logger.manager.loggerDict.items()
+        if (name == "synthdata.evaluation" or name.startswith("synthdata.evaluation."))
+        and isinstance(candidate_logger, logging.Logger)
+    ]
+    evaluation_loggers.append(evaluation_cli.logger)
+    prior_logger_levels = {
+        candidate_logger: candidate_logger.level for candidate_logger in evaluation_loggers
+    }
+    prior_handler_levels = {
+        handler: handler.level
+        for candidate_logger in evaluation_loggers
+        for handler in candidate_logger.handlers
+    }
+    unrelated_handler_levels = {handler: handler.level for handler in unrelated_logger.handlers}
+    monkeypatch.setattr(evaluation_cli.logger, "level", evaluation_cli.logger.level)
+    for handler in evaluation_cli.logger.handlers:
+        monkeypatch.setattr(handler, "level", handler.level)
+        monkeypatch.setattr(handler, "stream", log_stream)
+    for name, candidate_logger in logging.Logger.manager.loggerDict.items():
+        if (
+            name == "synthdata.evaluation" or name.startswith("synthdata.evaluation.")
+        ) and isinstance(candidate_logger, logging.Logger):
+            monkeypatch.setattr(candidate_logger, "level", candidate_logger.level)
+            for handler in candidate_logger.handlers:
+                monkeypatch.setattr(handler, "level", handler.level)
 
     def load_splits(dataset, expected_cache_key=None, phase="candidate"):
         phases.append((phase, expected_cache_key))
@@ -273,7 +317,7 @@ def test_evaluation_cli_hands_candidate_and_final_phase_roles_to_evaluator(
         evaluation_dir=cfg.evaluation.output_dir,
         plots_dir=cfg.plots.output_dir,
         manifest_path=Path("manifest.json"),
-        record=lambda *args, **kwargs: None,
+        record=lambda *args, **kwargs: records.append((args, kwargs)),
     )
     monkeypatch.setattr(evaluation_cli, "load_experiment", lambda *_args, **_kwargs: experiment)
     inventory = artifacts.GenerationInventory(
@@ -311,6 +355,333 @@ def test_evaluation_cli_hands_candidate_and_final_phase_roles_to_evaluator(
     assert len(lineage_calls) == 1
     assert lineage_calls[0][1] == {"cache_key": "candidate"}
     assert lineage_calls[0][2] is True
+    assert {
+        candidate_logger: candidate_logger.level for candidate_logger in evaluation_loggers
+    } == (prior_logger_levels)
+    assert {
+        handler: handler.level
+        for candidate_logger in evaluation_loggers
+        for handler in candidate_logger.handlers
+    } == prior_handler_levels
+    assert unrelated_logger.level == logging.WARNING
+    assert {handler: handler.level for handler in unrelated_logger.handlers} == (
+        unrelated_handler_levels
+    )
+    log_output = log_stream.getvalue()
+    assert "event=evaluation.cache.validation_complete phase=candidate" in log_output
+    assert "dataset_version=" in log_output
+    assert "dataset=canonical_fixture" in log_output
+    assert "train_shape=(12, 3)" in log_output
+    assert "event=evaluation.final_holdout.setup_start" in log_output
+    assert "event=evaluation.stage.schedule framework=syntheval" in log_output
+    assert "checkpoint_policy=validated_successful_only" in log_output
+    assert "event=evaluation.ranking.eligibility" in log_output
+    assert "SENSITIVE_CATEGORY_SENTINEL" not in log_output
+    evaluation_record = next(kwargs for args, kwargs in records if args[0] == "evaluation")
+    assert evaluation_record["status"] == "complete"
+
+
+@pytest.mark.parametrize(
+    ("resource_error", "failure_reason"),
+    [
+        (InsufficientSynthEvalMemoryError, "Cannot fit one SynthEval model process"),
+        (
+            InsufficientSynthEvalCPUError,
+            "Automatic SynthEval worker sizing cannot satisfy the per-model CPU budget: "
+            "available CPUs=3, cores per model=4.",
+        ),
+    ],
+)
+def test_evaluation_cli_persists_resource_failure_and_exits_nonzero(
+    make_config, make_canonical_dataset, monkeypatch, tmp_path, resource_error, failure_reason
+):
+    cfg = make_config()
+    candidate = make_canonical_dataset()
+    final = make_canonical_dataset()
+    datasets = iter((candidate, final))
+    records = []
+    experiment = SimpleNamespace(
+        id="resource-limit-test",
+        generation_dir=tmp_path / "generation",
+        evaluation_dir=tmp_path / "evaluation",
+        plots_dir=tmp_path / "plots",
+        manifest_path=tmp_path / "generation" / "manifest.json",
+        record=lambda *args, **kwargs: records.append((args, kwargs)),
+    )
+    monkeypatch.setattr(evaluation_cli, "load_config", lambda _path: cfg)
+    monkeypatch.setattr(evaluation_cli, "load_dataset", lambda _cfg: next(datasets))
+    monkeypatch.setattr(evaluation_cli, "load_imputed_splits", lambda dataset, **_kwargs: dataset)
+    monkeypatch.setattr(
+        evaluation_cli, "validate_imputation_cache_lineage", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        evaluation_cli, "_cache_key_record", lambda *_args, **_kwargs: {"cache_key": "key"}
+    )
+    monkeypatch.setattr(evaluation_cli, "run_imputation", lambda _cfg, dataset, **_kwargs: dataset)
+    monkeypatch.setattr(evaluation_cli, "load_experiment", lambda *_args, **_kwargs: experiment)
+    monkeypatch.setattr(
+        evaluation_cli.artifacts,
+        "load_generation_inventory",
+        lambda *_args: artifacts.GenerationInventory(
+            expected_outputs=("model_a",),
+            produced_outputs=("model_a",),
+            failed_outputs=(),
+        ),
+    )
+    monkeypatch.setattr(
+        evaluation_cli,
+        "_load_synthetic_datasets",
+        lambda *_args, **_kwargs: {"model_a": candidate.role_frame("train", imputed=True)},
+    )
+
+    def fail_for_resources(*_args, **_kwargs):
+        raise resource_error(failure_reason)
+
+    monkeypatch.setattr(evaluation_cli, "run_evaluation", fail_for_resources)
+    monkeypatch.setattr("sys.argv", ["run_evaluation", "--config", "config.yaml"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        evaluation_cli.main()
+
+    assert exc_info.value.code == 1
+    assert len(records) == 1
+    stage, payload = records[0]
+    assert stage == ("evaluation",)
+    assert payload["status"] == "incomplete"
+    assert payload["failure_stage"] == "syntheval_resource_resolution"
+    assert payload["failure_type"] == resource_error.__name__
+    assert payload["failure_reason"] == failure_reason
+    assert payload["artifacts"] == {"evaluation_dir": str(experiment.evaluation_dir)}
+
+
+def test_evaluation_cli_restores_debug_levels_after_failure(monkeypatch):
+    evaluation_loggers = [
+        candidate_logger
+        for name, candidate_logger in logging.Logger.manager.loggerDict.items()
+        if (name == "synthdata.evaluation" or name.startswith("synthdata.evaluation."))
+        and isinstance(candidate_logger, logging.Logger)
+    ]
+    evaluation_loggers.append(evaluation_cli.logger)
+    prior_logger_levels = {
+        candidate_logger: candidate_logger.level for candidate_logger in evaluation_loggers
+    }
+    prior_handler_levels = {
+        handler: handler.level
+        for candidate_logger in evaluation_loggers
+        for handler in candidate_logger.handlers
+    }
+    unrelated_logger = logging.getLogger("synthdata.unrelated_failure_test")
+    unrelated_logger.setLevel(logging.WARNING)
+    unrelated_handler = logging.StreamHandler(StringIO())
+    unrelated_handler.setLevel(logging.ERROR)
+    monkeypatch.setattr(unrelated_logger, "handlers", [unrelated_handler])
+    monkeypatch.setattr("sys.argv", ["run_evaluation", "--config", "config.yaml"])
+
+    def fail_config(_path):
+        assert evaluation_cli.logger.level == logging.DEBUG
+        assert all(handler.level == logging.DEBUG for handler in evaluation_cli.logger.handlers)
+        assert unrelated_logger.level == logging.WARNING
+        assert unrelated_handler.level == logging.ERROR
+        raise RuntimeError("config load failed")
+
+    monkeypatch.setattr(evaluation_cli, "load_config", fail_config)
+
+    with pytest.raises(RuntimeError, match="config load failed"):
+        evaluation_cli.main()
+
+    assert {
+        candidate_logger: candidate_logger.level for candidate_logger in evaluation_loggers
+    } == prior_logger_levels
+    assert {
+        handler: handler.level
+        for candidate_logger in evaluation_loggers
+        for handler in candidate_logger.handlers
+    } == prior_handler_levels
+    assert unrelated_logger.level == logging.WARNING
+    assert unrelated_handler.level == logging.ERROR
+
+
+@pytest.mark.parametrize(
+    (
+        "incomplete_metrics",
+        "partial_generation_coverage",
+        "final_holdout_metric_state",
+        "final_holdout_score_state",
+        "expected_exit",
+        "plot_exception",
+    ),
+    [
+        (False, False, None, None, None, False),
+        (True, False, None, None, 1, False),
+        (False, True, None, None, 1, False),
+        (True, False, None, None, 1, True),
+        (False, False, "incomplete", "indeterminate", 1, True),
+        (False, False, "complete", "indeterminate", 1, False),
+        (False, False, "complete", "complete", None, False),
+    ],
+)
+def test_evaluation_cli_persists_status_before_returning_for_incomplete_coverage(
+    make_config,
+    make_canonical_dataset,
+    monkeypatch,
+    incomplete_metrics,
+    partial_generation_coverage,
+    final_holdout_metric_state,
+    final_holdout_score_state,
+    expected_exit,
+    plot_exception,
+):
+    cfg = make_config()
+    candidate = make_canonical_dataset()
+    final = make_canonical_dataset()
+    datasets = iter((candidate, final))
+    records = []
+    experiment = SimpleNamespace(
+        id="evaluation-cli-test",
+        generation_dir=Path(cfg.generation.output_dir),
+        evaluation_dir=Path(cfg.evaluation.output_dir),
+        plots_dir=Path(cfg.plots.output_dir),
+        manifest_path=Path(cfg.generation.output_dir) / "manifest.json",
+        record=lambda *args, **kwargs: records.append((args, kwargs)),
+    )
+    extras = {"artifact_manifest": "evaluation_artifacts-v1/manifest.json"}
+    if incomplete_metrics:
+        extras["synthcity_validation"] = {
+            "model_a": {
+                "complete": False,
+                "failed_keys": ["privacy.metric"],
+                "indeterminate_keys": [],
+            }
+        }
+    if partial_generation_coverage:
+        extras["evaluation_coverage"] = {
+            "status": "partial",
+            "requested_models": ["model_a", "model_b"],
+            "evaluated_models": ["model_a"],
+            "failed_outputs": ["model_b"],
+        }
+    if final_holdout_metric_state is not None:
+        extras["final_holdout_evidence"] = {
+            "state": (
+                "succeeded"
+                if final_holdout_metric_state == "complete"
+                and final_holdout_score_state == "complete"
+                else "failed"
+            ),
+            "selected_model": "model_a",
+            "metric_completeness_state": final_holdout_metric_state,
+            "score_completeness_state": final_holdout_score_state,
+            "failed_metric_keys": (
+                ["privacy.metric"] if final_holdout_metric_state == "incomplete" else []
+            ),
+            "indeterminate_metric_keys": [],
+        }
+
+    monkeypatch.setattr(evaluation_cli, "load_config", lambda _path: cfg)
+    monkeypatch.setattr(evaluation_cli, "load_dataset", lambda _cfg: next(datasets))
+    monkeypatch.setattr(
+        evaluation_cli,
+        "load_imputed_splits",
+        lambda dataset, **_kwargs: dataset,
+    )
+    monkeypatch.setattr(
+        evaluation_cli, "validate_imputation_cache_lineage", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        evaluation_cli,
+        "_cache_key_record",
+        lambda *_args, **_kwargs: {"cache_key": "key"},
+    )
+    monkeypatch.setattr(evaluation_cli, "run_imputation", lambda _cfg, dataset, **_kwargs: dataset)
+    monkeypatch.setattr(evaluation_cli, "load_experiment", lambda *_args, **_kwargs: experiment)
+    monkeypatch.setattr(
+        evaluation_cli.artifacts,
+        "load_generation_inventory",
+        lambda *_args: artifacts.GenerationInventory(
+            expected_outputs=("model_a",),
+            produced_outputs=("model_a",),
+            failed_outputs=(),
+        ),
+    )
+    monkeypatch.setattr(
+        evaluation_cli,
+        "_load_synthetic_datasets",
+        lambda *_args, **_kwargs: {"model_a": candidate.role_frame("train", imputed=True)},
+    )
+    monkeypatch.setattr(
+        evaluation_cli,
+        "run_evaluation",
+        lambda *_args, **_kwargs: (pd.DataFrame(index=["model_a"]), extras),
+    )
+    monkeypatch.setattr(evaluation_cli, "simple_rank_summary", lambda frame: frame)
+    argv = ["run_evaluation", "--config", "config.yaml"]
+    if plot_exception:
+
+        def fail_plot(*_args, **_kwargs):
+            if final_holdout_metric_state is not None:
+                assert [record_args[0] for record_args, _ in records] == [
+                    "final_holdout_evidence",
+                    "evaluation",
+                ]
+            raise RuntimeError("plotting failed")
+
+        monkeypatch.setattr(
+            "synthdata.plotting.evaluation_plots.save_rank_tradeoff_plots", fail_plot
+        )
+        argv.append("--plot")
+    monkeypatch.setattr("sys.argv", argv)
+
+    if plot_exception:
+        with pytest.raises(RuntimeError, match="plotting failed"):
+            evaluation_cli.main()
+    elif expected_exit is None:
+        evaluation_cli.main()
+    else:
+        with pytest.raises(SystemExit) as exc_info:
+            evaluation_cli.main()
+        assert exc_info.value.code == expected_exit
+
+    records_by_stage = {stage[0]: payload for stage, payload in records}
+    assert "evaluation" in records_by_stage
+    if final_holdout_metric_state is not None:
+        expected_evidence_state = (
+            "succeeded"
+            if final_holdout_metric_state == "complete" and final_holdout_score_state == "complete"
+            else "failed"
+        )
+        assert records_by_stage["final_holdout_evidence"]["state"] == expected_evidence_state
+    payload = records_by_stage["evaluation"]
+    assert payload["status"] == ("partial" if expected_exit else "complete")
+    assert payload["metric_coverage"]["status"] == (
+        "incomplete"
+        if incomplete_metrics
+        or final_holdout_metric_state == "incomplete"
+        or final_holdout_score_state == "indeterminate"
+        else "complete"
+    )
+    if final_holdout_metric_state == "incomplete":
+        assert payload["metric_coverage"]["incomplete_validations"] == [
+            {
+                "section": "final_holdout_evidence",
+                "group": "final_holdout",
+                "model": "model_a",
+                "failed_keys": ["privacy.metric"],
+                "indeterminate_keys": [],
+                "score_completeness_state": "indeterminate",
+            }
+        ]
+    if final_holdout_metric_state == "complete" and final_holdout_score_state == "indeterminate":
+        assert payload["metric_coverage"]["incomplete_validations"] == [
+            {
+                "section": "final_holdout_evidence",
+                "group": "final_holdout",
+                "model": "model_a",
+                "failed_keys": [],
+                "indeterminate_keys": [],
+                "score_completeness_state": "indeterminate",
+            }
+        ]
+    assert payload["evaluation_coverage"] == extras.get("evaluation_coverage")
 
 
 def test_evaluation_cli_rejects_invalid_candidate_fit_state_before_evaluator(

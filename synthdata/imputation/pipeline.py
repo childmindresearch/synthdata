@@ -472,11 +472,16 @@ def run_imputation(cfg: Config, dataset: Dataset, phase: str = "candidate") -> D
     cached_record = _load_cache_record(cache_key_path)
     cached_key = cached_record.get("cache_key") if cached_record is not None else None
 
-    cached_paths = (
-        [paths[f"{role}_imputed"] for role in ROLE_NAMES]
+    cached_frame_paths = (
+        {role: paths[f"{role}_imputed"] for role in ROLE_NAMES}
         if dataset.has_canonical_roles
-        else [paths["full_imputed"], paths["train_imputed"], paths["test_imputed"]]
+        else {
+            "full": paths["full_imputed"],
+            "train": paths["train_imputed"],
+            "test": paths["test_imputed"],
+        }
     )
+    cached_paths = list(cached_frame_paths.values())
     cached_csvs_exist = all(path.exists() for path in cached_paths)
 
     if cfg.imputation.cache and cached_csvs_exist and cached_key == current_key:
@@ -631,6 +636,14 @@ def run_imputation(cfg: Config, dataset: Dataset, phase: str = "candidate") -> D
             "train": len(train_imputed),
             "test": len(test_imputed),
         }
+
+    # Fingerprint the parsed CSV representation that downstream cache loads consume.
+    # This captures both values and inferred dtypes without depending on the
+    # pre-serialization in-memory dtypes.
+    cache_record["imputed_frame_fingerprints"] = {
+        name: dataframe_fingerprint(pd.read_csv(path, low_memory=False))
+        for name, path in cached_frame_paths.items()
+    }
 
     with open(cache_key_path, "w") as f:
         json.dump(cache_record, f, indent=2, sort_keys=True, default=str)

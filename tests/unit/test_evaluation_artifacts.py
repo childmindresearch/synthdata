@@ -3287,6 +3287,33 @@ def test_strict_bundle_validation_accepts_matching_context(tmp_path):
     assert manifest["combined_evaluation"]["models"] == ["model_a"]
 
 
+@pytest.mark.parametrize(
+    ("expected_fingerprints", "expected_hashes", "message"),
+    [
+        ({"candidate": "foreign-context"}, None, "role-context fingerprints"),
+        (None, {"train": "foreign-train-hash", "tuning": "tuning-hash"}, "role hashes"),
+    ],
+)
+def test_strict_bundle_validation_rejects_context_or_role_hash_mismatch(
+    tmp_path, expected_fingerprints, expected_hashes, message
+):
+    evaluation_dir, config_path, role_hashes = _persist_strict_bundle(tmp_path)
+
+    with pytest.raises(ValueError, match=message):
+        validate_evaluation_bundle(
+            evaluation_dir,
+            expected_config_path=config_path,
+            expected_role_context_fingerprints=(
+                expected_fingerprints
+                if expected_fingerprints is not None
+                else {"candidate": "candidate-context"}
+            ),
+            expected_role_hashes=expected_hashes if expected_hashes is not None else role_hashes,
+            expected_population_unit="row",
+            expected_group_mode="row",
+        )
+
+
 def test_strict_bundle_validation_rejects_status_identity_missing_from_table(tmp_path):
     evaluation_dir = tmp_path / "evaluation"
     evaluation_dir.mkdir()

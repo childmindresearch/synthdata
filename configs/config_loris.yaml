@@ -214,9 +214,9 @@ evaluation:
 
   # Resource cap for resumable per-model SynthEval processes.
   syntheval_execution:
-    model_workers: 1
-    max_model_workers: 1
-    cores_per_model: 2
+    model_workers: auto
+    max_model_workers: 6
+    cores_per_model: 4
     memory_reserve_gib: 16
     memory_per_model_gib: 14
 

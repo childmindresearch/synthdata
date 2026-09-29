@@ -22,7 +22,11 @@ Usage:
 """
 
 import argparse
+import hashlib
+import json
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -35,6 +39,109 @@ from synthdata.utils import get_logger, set_global_seed
 logger = get_logger("run_plots")
 
 _EXPERIMENT_SECTIONS = {"generation", "hpo", "evaluation"}
+
+
+def _mapping_digest(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(dict(payload), sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _matches_final_holdout_handoff(
+    candidate_context: Mapping[str, Any], evaluation_context: Mapping[str, Any]
+) -> bool:
+    """Check evaluation context differs from candidate cache only at final-holdout imputation."""
+    if set(candidate_context) != set(evaluation_context):
+        return False
+    for field, candidate_value in candidate_context.items():
+        evaluation_value = evaluation_context[field]
+        if field != "roles":
+            if candidate_value != evaluation_value:
+                return False
+            continue
+        if not isinstance(candidate_value, Mapping) or not isinstance(evaluation_value, Mapping):
+            return False
+        if set(candidate_value) != set(evaluation_value):
+            return False
+        for role, candidate_role in candidate_value.items():
+            evaluation_role = evaluation_value[role]
+            if not isinstance(candidate_role, Mapping) or not isinstance(evaluation_role, Mapping):
+                return False
+            if set(candidate_role) != set(evaluation_role):
+                return False
+            if role != "final_holdout":
+                if dict(candidate_role) != dict(evaluation_role):
+                    return False
+                continue
+            for role_field, candidate_value in candidate_role.items():
+                evaluation_value = evaluation_role[role_field]
+                if role_field == "imputed_fingerprint":
+                    raw_fingerprint = candidate_role.get("raw_fingerprint")
+                    if candidate_value != raw_fingerprint:
+                        return False
+                    if not isinstance(evaluation_value, str) or not evaluation_value:
+                        return False
+                elif candidate_value != evaluation_value:
+                    return False
+    return True
+
+
+def _expected_plot_context(dataset, evaluation_dir: str | Path) -> dict[str, Any]:
+    """Use validated evaluation identity, allowing only its recorded holdout handoff."""
+    from synthdata.data import role_context_payload
+    from synthdata.evaluation.artifacts import artifact_bundle_dir, expected_evaluation_context
+
+    expected = expected_evaluation_context(dataset)
+    if getattr(dataset, "legacy_two_role", True):
+        return expected
+
+    manifest_path = artifact_bundle_dir(evaluation_dir) / "manifest.json"
+    if not manifest_path.is_file():
+        return expected
+    manifest = json.loads(manifest_path.read_text())
+    recorded_fingerprints = manifest.get("role_context_fingerprint")
+    if (
+        not isinstance(recorded_fingerprints, Mapping)
+        or dict(recorded_fingerprints) == expected["role_context_fingerprints"]
+        or "final_holdout_evidence" not in manifest
+        or set(recorded_fingerprints) != set(expected["role_context_fingerprints"])
+    ):
+        return expected
+
+    recorded_contexts = manifest.get("role_context")
+    if not isinstance(recorded_contexts, Mapping) or set(recorded_contexts) != set(
+        expected["role_context_fingerprints"]
+    ):
+        return expected
+    recorded_candidate = recorded_contexts.get("candidate")
+    recorded_full = recorded_contexts.get("full")
+    current_candidate = role_context_payload(dataset, ("train", "tuning"))
+    current_full = role_context_payload(
+        dataset, ("train", "tuning", "final_holdout"), candidate_phase=True
+    )
+    from synthdata.data import dataframe_fingerprint
+
+    raw_final_holdout = dataset.role_frame("final_holdout", imputed=False)
+    imputed_final_holdout = dataset.role_frame("final_holdout", imputed=True)
+    if raw_final_holdout is None or (
+        imputed_final_holdout is not None
+        and dataframe_fingerprint(imputed_final_holdout) != dataframe_fingerprint(raw_final_holdout)
+    ):
+        return expected
+    if (
+        not isinstance(recorded_candidate, Mapping)
+        or not isinstance(recorded_full, Mapping)
+        or dict(recorded_candidate) != current_candidate
+        or recorded_fingerprints.get("candidate")
+        != expected["role_context_fingerprints"].get("candidate")
+        or _mapping_digest(recorded_candidate) != recorded_fingerprints.get("candidate")
+        or _mapping_digest(recorded_full) != recorded_fingerprints.get("full")
+        or not _matches_final_holdout_handoff(current_full, recorded_full)
+    ):
+        return expected
+
+    handoff_expected = dict(expected)
+    handoff_expected["role_context_fingerprints"] = dict(recorded_fingerprints)
+    return handoff_expected
 
 
 def _load_synthetic_datasets(cfg) -> dict:
@@ -92,7 +199,7 @@ def main() -> None:
 
     experiment = None
     if sections & _EXPERIMENT_SECTIONS:
-        experiment = load_experiment(cfg, dataset=dataset)
+        experiment = load_experiment(cfg, dataset=dataset, allow_final_holdout_handoff=True)
         cfg.generation.output_dir = str(experiment.generation_dir)
         cfg.evaluation.output_dir = str(experiment.evaluation_dir)
         cfg.plots.output_dir = str(experiment.plots_dir)
@@ -116,7 +223,6 @@ def main() -> None:
     if "evaluation" in sections:
         from synthdata.evaluation.artifacts import (
             artifact_bundle_dir,
-            expected_evaluation_context,
             load_generation_inventory,
             load_log_disparity_reports,
             validate_evaluation_bundle,
@@ -134,7 +240,7 @@ def main() -> None:
                 f"Evaluation table not found at {combined_path}. "
                 "Run `synthdata-evaluate --config <path>` first."
             )
-        expected_context = expected_evaluation_context(dataset)
+        expected_context = _expected_plot_context(dataset, cfg.evaluation.output_dir)
         evaluation_manifest = validate_evaluation_bundle(
             cfg.evaluation.output_dir,
             expected_config_path=cfg.config_path,

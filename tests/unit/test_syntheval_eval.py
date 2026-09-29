@@ -6,6 +6,7 @@ and the syntheval benchmark result caching helpers.
 
 import json
 import os
+import queue
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -26,12 +27,14 @@ from synthdata.evaluation.catalog import (
 from synthdata.evaluation.metric_contracts import MetricValidationResult
 from synthdata.evaluation.syntheval_eval import (
     BINARY_ONLY_METRICS,
+    InsufficientSynthEvalCPUError,
     _atomic_parquet,
     _checkpoint_paths,
     _compute_cache_key,
     _evaluation_context_fingerprint,
     _evaluation_role_frames,
     _execution_payload_failed,
+    _execution_payload_partial,
     _execution_payload_succeeded,
     _execution_sidecar_payload,
     _failed_execution_payload,
@@ -41,12 +44,14 @@ from synthdata.evaluation.syntheval_eval import (
     _native_plot_dir,
     _run_resumable_syntheval,
     _safe_failure_evidence,
+    _safe_metric_status,
     _safe_value_digest,
     _sanitize_execution_payload,
     _save_syntheval_cache,
     _shutdown_nested_joblib_executor,
     _structured_observations,
     _synthetic_unseen_categorical_values,
+    _valid_checkpoint,
     _validated_cached_syntheval_tables,
     build_binary_preset,
     build_binary_target_series,
@@ -95,6 +100,183 @@ def test_runtime_unknown_category_exception_is_classified_and_redacted():
         f"Found unknown categories: {sentinel}"
     )
     assert sentinel not in serialized
+
+
+def test_real_holdout_unknown_category_has_distinct_failure_classification():
+    evidence = _safe_failure_evidence(
+        exception_type="RealHoldoutUnknownCategoryError",
+        reason=(
+            "real_holdout_unknown_category: Real holdout contains categorical values "
+            "absent from train"
+        ),
+        exit_code=1,
+    )
+
+    assert evidence["reason_code"] == "real_holdout_unknown_category"
+    assert evidence["failure_reason"] == (
+        "Real holdout contains categories absent from train; affected metric was blocked."
+    )
+    assert evidence["error_type"] == "RealHoldoutUnknownCategoryError"
+    status = _safe_metric_status(
+        {
+            "method": "cls_acc",
+            "state": "blocked",
+            "exception_type": "RealHoldoutUnknownCategoryError",
+            "exception_message": "Real holdout contains categorical values absent from train",
+        }
+    )
+    assert status["reason_code"] == "real_holdout_unknown_category"
+    assert status["failure_class"] == "real_holdout_unknown_category"
+
+
+def test_expected_holdout_block_persists_partial_worker_checkpoint(
+    monkeypatch, tmp_path, make_canonical_dataset
+):
+    import syntheval
+
+    import synthdata.evaluation.syntheval_eval as syntheval_eval
+
+    frame = make_canonical_dataset().role_frame("train", imputed=True).copy()
+    expected_manifest = {
+        "supported": ("metric_a",),
+        "holdout_sensitive": ("cls_acc",),
+    }
+
+    class MetricStatus:
+        def __init__(self, method, state, key):
+            self.method = method
+            self.state = state
+            self.succeeded = state == "succeeded"
+            self.exception_type = "RealHoldoutUnknownCategoryError" if state == "blocked" else None
+            self.exception_message = (
+                "Real holdout contains categories absent from train" if state == "blocked" else None
+            )
+            self.key = key
+
+        def to_dict(self):
+            succeeded = self.succeeded
+            payload = {
+                "method": self.method,
+                "state": self.state,
+                "expected_keys": [self.key],
+                "observed_keys": [self.key] if succeeded else [],
+                "completed_keys": [self.key] if succeeded else [],
+                "failed_keys": [] if succeeded else [self.key],
+                "missing_keys": [] if succeeded else [self.key],
+                "duplicate_keys": [],
+                "non_finite_keys": [],
+                "unexpected_keys": [],
+            }
+            if not succeeded:
+                payload.update(
+                    {
+                        "exception_type": self.exception_type,
+                        "exception_message": self.exception_message,
+                    }
+                )
+            return payload
+
+    def metric(method, state, key, rows):
+        return SimpleNamespace(
+            method=method,
+            status=MetricStatus(method, state, key),
+            normalized_rows=rows,
+            normalized_rows_v2=[],
+        )
+
+    execution = SimpleNamespace(
+        schema_version="syntheval-execution-v1",
+        pass_id="main",
+        target_view="native",
+        expected_manifest_digest="manifest-digest",
+        execution_complete=True,
+        succeeded=False,
+        policy_eligible=False,
+        preprocessing_fingerprint=None,
+        preprocessing_metadata=None,
+        normalized_table=pd.DataFrame(),
+        metric_executions=[
+            metric(
+                "supported",
+                "succeeded",
+                "metric_a",
+                [
+                    {
+                        "metric": "metric_a",
+                        "dim": "u",
+                        "val": 0.5,
+                        "err": 0.0,
+                        "n_val": 0.5,
+                        "n_err": 0.0,
+                    }
+                ],
+            ),
+            metric("holdout_sensitive", "blocked", "cls_acc", []),
+        ],
+    )
+
+    class FakeSynthEval:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def evaluate(self, *_args, **_kwargs):
+            return execution
+
+    monkeypatch.setattr(syntheval, "AnalysisConfig", lambda **_kwargs: object())
+    monkeypatch.setattr(syntheval, "SynthEval", FakeSynthEval)
+    monkeypatch.setattr(syntheval_eval, "_shutdown_nested_joblib_executor", lambda: None)
+    checkpoint_root = tmp_path / "checkpoints"
+
+    syntheval_eval._model_worker(
+        "partial_model",
+        frame,
+        frame,
+        frame,
+        [],
+        "target",
+        [],
+        [],
+        str(tmp_path / "preset.json"),
+        str(checkpoint_root),
+        "main",
+        expected_manifest,
+        "native",
+        "manifest-digest",
+        "context-fingerprint",
+        "model-fingerprint",
+        None,
+        1,
+    )
+
+    model_dir, status_path, _result_path = _checkpoint_paths(
+        checkpoint_root, "main", "partial_model"
+    )
+    status = json.loads(status_path.read_text())
+    payload = json.loads((model_dir / "execution.json").read_text())
+    assert status["state"] == "partial"
+    assert status["execution_succeeded"] is False
+    assert status["policy_eligible"] is False
+    assert status["incomplete_reasons"] == ["real_holdout_unknown_category"]
+    blocked_status = payload["metric_executions"][1]["status"]
+    assert blocked_status["state"] == "blocked"
+    assert blocked_status["reason_code"] == "real_holdout_unknown_category"
+    assert payload["model_status"] == "partial"
+    assert _execution_payload_partial(payload, expected_manifest=expected_manifest)
+    assert (
+        _valid_checkpoint(
+            checkpoint_root,
+            "main",
+            "partial_model",
+            "context-fingerprint",
+            "model-fingerprint",
+            False,
+            expected_manifest_digest="manifest-digest",
+            return_execution=True,
+            expected_manifest=expected_manifest,
+            expected_target_view="native",
+        )
+        is not None
+    )
 
 
 def test_safe_failure_evidence_preserves_safe_classification_only():
@@ -1177,6 +1359,711 @@ class TestEvaluationRoleContext:
 
         assert results.loc["bad"].isna().all()
         assert ranks.loc["bad"].isna().all()
+
+    def test_partial_blocked_metric_keeps_supported_values_but_is_unranked(self):
+        expected = {
+            "supported": ["metric_a"],
+            "holdout_sensitive": ["cls_acc"],
+        }
+        semantic_context = {
+            "schema_version": "semantic-context-v1",
+            "sensitive_columns": ["protected"],
+        }
+
+        def row(metric, value):
+            return {
+                "metric": metric,
+                "dim": "u",
+                "val": value,
+                "err": 0.0,
+                "n_val": value,
+                "n_err": 0.0,
+            }
+
+        def status(method, key, state):
+            values = {
+                "method": method,
+                "state": state,
+                "expected_keys": [key],
+                "observed_keys": [key] if state == "succeeded" else [],
+                "completed_keys": [key] if state == "succeeded" else [],
+                "failed_keys": [] if state == "succeeded" else [key],
+                "missing_keys": [key] if state == "blocked" else [],
+                "duplicate_keys": [],
+                "non_finite_keys": [],
+                "unexpected_keys": [],
+            }
+            if state == "blocked":
+                values.update(
+                    {
+                        "exception_type": "RealHoldoutUnknownCategoryError",
+                        "reason_code": "real_holdout_unknown_category",
+                        "failure_class": "real_holdout_unknown_category",
+                        "failure_reason": (
+                            "Real holdout contains categories absent from train; "
+                            "affected metric was blocked."
+                        ),
+                    }
+                )
+            return values
+
+        partial = {
+            "schema_version": "syntheval-execution-v1",
+            "model_status": "partial",
+            "incomplete_reasons": ["real_holdout_unknown_category"],
+            "execution_complete": True,
+            "execution_succeeded": False,
+            "policy_eligible": False,
+            "semantic_context": semantic_context,
+            "semantic_context_digest": semantic_context_digest(semantic_context),
+            "metric_executions": [
+                {
+                    "method": "supported",
+                    "status": status("supported", "metric_a", "succeeded"),
+                    "normalized_rows": [row("metric_a", 0.25)],
+                    "normalized_rows_v2": [],
+                },
+                {
+                    "method": "holdout_sensitive",
+                    "status": status("holdout_sensitive", "cls_acc", "blocked"),
+                    "normalized_rows": [],
+                    "normalized_rows_v2": [],
+                },
+            ],
+        }
+        complete = {
+            **partial,
+            "model_status": "complete",
+            "incomplete_reasons": [],
+            "execution_succeeded": True,
+            "policy_eligible": True,
+            "metric_executions": [
+                {
+                    "method": "supported",
+                    "status": status("supported", "metric_a", "succeeded"),
+                    "normalized_rows": [row("metric_a", 0.75)],
+                    "normalized_rows_v2": [],
+                },
+                {
+                    "method": "holdout_sensitive",
+                    "status": status("holdout_sensitive", "cls_acc", "succeeded"),
+                    "normalized_rows": [row("cls_acc", 0.5)],
+                    "normalized_rows_v2": [],
+                },
+            ],
+        }
+
+        assert _execution_payload_partial(partial, expected_manifest=expected)
+        for field, value in (
+            ("exception_type", "ValueError"),
+            ("exception_type", None),
+            ("failure_reason", "Another failure was recorded."),
+            ("failure_class", "synthetic_unknown_category"),
+        ):
+            forged = {
+                **partial,
+                "metric_executions": [dict(item) for item in partial["metric_executions"]],
+            }
+            blocked = forged["metric_executions"][1]
+            blocked["status"] = {**blocked["status"]}
+            if value is None:
+                blocked["status"].pop(field)
+            else:
+                blocked["status"][field] = value
+            assert not _execution_payload_partial(forged, expected_manifest=expected)
+
+        mismatched_semantic_context = {
+            **partial,
+            "semantic_context": {"sensitive_columns": ["changed"]},
+        }
+        assert not _execution_payload_partial(
+            mismatched_semantic_context,
+            expected_manifest=expected,
+        )
+        results, ranks = build_syntheval_tables_from_executions(
+            {"partial": partial, "complete": complete}, ["partial", "complete"], "linear"
+        )
+
+        assert results.loc["partial", ("metric_a", "value")] == pytest.approx(0.25)
+        assert pd.isna(results.loc["partial", ("cls_acc", "value")])
+        assert pd.isna(ranks.loc["partial"]).all()
+        assert pd.notna(ranks.loc["complete", "metric_a"])
+        assert pd.notna(results.loc["complete", ("cls_acc", "value")])
+
+    def test_mixed_child_failure_preserves_method_evidence_and_supported_values(
+        self, make_canonical_dataset, monkeypatch, tmp_path
+    ):
+        import syntheval
+
+        import synthdata.evaluation.syntheval_eval as syntheval_eval
+
+        dataset = make_canonical_dataset()
+        frame = dataset.role_frame("train", imputed=True).copy()
+        sentinel = "private-category-error-detail"
+        diagnostic_messages = []
+
+        def capture_diagnostic(message, *args):
+            diagnostic_messages.append(message % args if args else message)
+
+        expected_manifest = {
+            "supported": ("avg_dwm_diff",),
+            "pca": ("pca",),
+            "cls_acc": ("cls_acc",),
+            "mia": ("mia",),
+            "att_discl": ("att_discl",),
+        }
+
+        class MetricStatus:
+            def __init__(self, method, key, state, exception_type=None, message=None):
+                self.method = method
+                self.state = state
+                self.succeeded = state == "succeeded"
+                self.exception_type = exception_type
+                self.exception_message = message
+                self.key = key
+
+            def to_dict(self):
+                payload = {
+                    "method": self.method,
+                    "state": self.state,
+                    "expected_keys": [self.key],
+                    "observed_keys": [self.key] if self.succeeded else [],
+                    "completed_keys": [self.key] if self.succeeded else [],
+                    "failed_keys": [] if self.succeeded else [self.key],
+                    "missing_keys": [] if self.succeeded else [self.key],
+                    "duplicate_keys": [],
+                    "non_finite_keys": [],
+                    "unexpected_keys": [],
+                }
+                if not self.succeeded:
+                    payload.update(
+                        {
+                            "exception_type": self.exception_type,
+                            "exception_message": self.exception_message,
+                        }
+                    )
+                return payload
+
+        def metric(method, key, state, rows, exception_type=None, message=None):
+            return SimpleNamespace(
+                method=method,
+                status=MetricStatus(method, key, state, exception_type, message),
+                normalized_rows=rows,
+                normalized_rows_v2=[],
+            )
+
+        class FakeSynthEval:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def evaluate(self, *_args, **kwargs):
+                rows = [
+                    {
+                        "metric": "avg_dwm_diff",
+                        "dim": "u",
+                        "val": 0.75,
+                        "err": 0.0,
+                        "n_val": 0.75,
+                        "n_err": 0.0,
+                    }
+                ]
+                executions = [
+                    metric("supported", "avg_dwm_diff", "succeeded", rows),
+                    metric(
+                        "pca",
+                        "pca",
+                        "failed",
+                        [],
+                        "ValueError",
+                        f"metric failed for {sentinel}",
+                    ),
+                    *[
+                        metric(
+                            method,
+                            method,
+                            "blocked",
+                            [],
+                            "RealHoldoutUnknownCategoryError",
+                            "Real holdout contains categorical values absent from train",
+                        )
+                        for method in ("cls_acc", "mia", "att_discl")
+                    ],
+                ]
+                return SimpleNamespace(
+                    schema_version="syntheval-execution-v1",
+                    pass_id=kwargs["pass_id"],
+                    target_view=kwargs["target_view"],
+                    expected_manifest_digest=kwargs["expected_manifest_digest"],
+                    execution_complete=True,
+                    succeeded=False,
+                    policy_eligible=False,
+                    preprocessing_fingerprint="fit-fingerprint",
+                    preprocessing_metadata={"fit_role": "train"},
+                    normalized_table=pd.DataFrame(rows),
+                    metric_executions=executions,
+                )
+
+        class FakeProcess:
+            def __init__(self, target, args, **_kwargs):
+                self.target = target
+                self.args = args
+                self.exitcode = None
+                self.pid = 1
+
+            def start(self):
+                try:
+                    self.target(*self.args)
+                except RuntimeError:
+                    self.exitcode = 1
+                else:
+                    self.exitcode = 0
+
+            def is_alive(self):
+                return False
+
+            def join(self):
+                return None
+
+        class FakeContext:
+            Process = FakeProcess
+            Queue = staticmethod(queue.Queue)
+
+        monkeypatch.setattr(syntheval, "AnalysisConfig", lambda **_kwargs: object())
+        monkeypatch.setattr(syntheval, "SynthEval", FakeSynthEval)
+        monkeypatch.setattr(syntheval_eval, "_shutdown_nested_joblib_executor", lambda: None)
+        monkeypatch.setattr(
+            syntheval_eval,
+            "logger",
+            SimpleNamespace(
+                debug=capture_diagnostic,
+                info=capture_diagnostic,
+                warning=capture_diagnostic,
+                error=capture_diagnostic,
+            ),
+        )
+        monkeypatch.setattr(
+            syntheval_eval.multiprocessing, "get_context", lambda _method: FakeContext()
+        )
+
+        results, ranks, executions = _run_resumable_syntheval(
+            {"mixed_model": frame},
+            dataset,
+            {},
+            tmp_path / "preset.json",
+            tmp_path / "checkpoints",
+            "linear",
+            SynthEvalExecutionConfig(model_workers=1, max_model_workers=1, cores_per_model=1),
+            "main",
+            expected_output_manifest=expected_manifest,
+        )
+
+        model_dir, status_path, _result_path = _checkpoint_paths(
+            tmp_path / "checkpoints", "main", "mixed_model"
+        )
+        worker_status = json.loads(status_path.read_text())
+        payload = executions["mixed_model"]
+        states = {item["method"]: item["status"]["state"] for item in payload["metric_executions"]}
+        assert worker_status["pass_id"] == "main"
+        assert worker_status["failure_reason"]
+        assert payload["pass_id"] == "main"
+        assert payload["model_status"] == "incomplete"
+        assert payload["execution_complete"] is True
+        assert payload["execution_succeeded"] is False
+        assert payload["failure_reason"]
+        assert states == {
+            "supported": "succeeded",
+            "pca": "failed",
+            "cls_acc": "blocked",
+            "mia": "blocked",
+            "att_discl": "blocked",
+        }
+        status_by_method = {item["method"]: item["status"] for item in payload["metric_executions"]}
+        assert status_by_method["pca"]["reason_code"] == "unknown_exception"
+        assert len(status_by_method["pca"]["reason_detail_digest"]) == 64
+        for method in ("cls_acc", "mia", "att_discl"):
+            assert status_by_method[method]["reason_code"] == "real_holdout_unknown_category"
+            assert status_by_method[method]["failed_keys"] == [method]
+        assert status_by_method["pca"]["failed_keys"] == ["pca"]
+        assert _execution_payload_failed(
+            payload,
+            expected_manifest=expected_manifest,
+            expected_pass_id="main",
+            expected_target_view="native",
+        )
+        assert results.loc["mixed_model", ("avg_dwm_diff", "value")] == pytest.approx(0.75)
+        assert pd.isna(ranks.loc["mixed_model"]).all()
+        saved = (model_dir / "execution.json").read_text()
+        assert sentinel not in saved
+        assert "private-category-error-detail" not in str(payload)
+        assert any("state=execution_written rows=1" in item for item in diagnostic_messages)
+        assert any("state=failed" in item for item in diagnostic_messages)
+        assert any(
+            "state=failure_evidence_written child_sidecar_present=True" in item
+            for item in diagnostic_messages
+        )
+        assert any(
+            "aggregate eligibility eligible=0 ineligible=1 total=1" in item
+            for item in diagnostic_messages
+        )
+        assert sentinel not in "\n".join(diagnostic_messages)
+
+    @pytest.mark.parametrize("interactive", [True, False])
+    def test_model_supervisor_logs_progress_for_success_and_failure(
+        self, interactive, make_canonical_dataset, monkeypatch, tmp_path
+    ):
+        import synthdata.evaluation.syntheval_eval as syntheval_eval
+
+        dataset = make_canonical_dataset()
+        frame = dataset.role_frame("train", imputed=True).copy()
+        progress_instances = []
+        log_messages = []
+        progress_lines = []
+
+        def capture_log(message, *args):
+            log_messages.append(message % args if args else message)
+
+        class Progress:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.updates = 0
+                self.closed = False
+                progress_instances.append(self)
+
+            def update(self, amount):
+                self.updates += amount
+
+            def close(self):
+                self.closed = True
+
+            def write(self, message):
+                progress_lines.append(message)
+
+        monkeypatch.setattr(syntheval_eval, "tqdm", Progress)
+        monkeypatch.setattr(
+            syntheval_eval,
+            "logger",
+            SimpleNamespace(
+                info=capture_log,
+                warning=capture_log,
+                error=capture_log,
+                debug=capture_log,
+            ),
+        )
+        monkeypatch.setattr(
+            syntheval_eval,
+            "sys",
+            SimpleNamespace(stderr=SimpleNamespace(isatty=lambda: interactive)),
+        )
+
+        def fake_worker(*args):
+            model_name = args[0]
+            progress_queue = args[-1]
+            progress_queue.put(
+                {
+                    "model_name": model_name,
+                    "method": "supported",
+                    "event": "started",
+                    "duration_seconds": 0.0,
+                    "outcome": "running",
+                }
+            )
+            if model_name == "bad_model":
+                progress_queue.put(
+                    {
+                        "model_name": model_name,
+                        "method": "supported",
+                        "event": "failure",
+                        "duration_seconds": 0.25,
+                        "outcome": "failed",
+                        "failure_class": "ValueError",
+                    }
+                )
+                raise RuntimeError("worker failure")
+            progress_queue.put(
+                {
+                    "model_name": model_name,
+                    "method": "supported",
+                    "event": "completed",
+                    "duration_seconds": 0.5,
+                    "outcome": "succeeded",
+                }
+            )
+            checkpoint_root = Path(args[9])
+            pass_name = args[10]
+            expected_manifest = args[11]
+            target_view = args[12]
+            expected_manifest_digest = args[13]
+            context_fingerprint = args[14]
+            model_fingerprint = args[15]
+            model_dir, status_path, result_path = _checkpoint_paths(
+                checkpoint_root, pass_name, model_name
+            )
+            model_dir.mkdir(parents=True, exist_ok=True)
+            metric_keys = list(expected_manifest["supported"])
+            execution = {
+                "model_name": model_name,
+                "model_status": "complete",
+                "schema_version": "syntheval-execution-v1",
+                "pass_id": pass_name,
+                "target_view": target_view,
+                "expected_manifest_digest": expected_manifest_digest,
+                "context_fingerprint": context_fingerprint,
+                "model_fingerprint": model_fingerprint,
+                "execution_complete": True,
+                "execution_succeeded": True,
+                "policy_eligible": True,
+                "metric_executions": [
+                    {
+                        "method": "supported",
+                        "status": {
+                            "method": "supported",
+                            "state": "succeeded",
+                            "expected_keys": metric_keys,
+                            "observed_keys": metric_keys,
+                            "completed_keys": metric_keys,
+                            "failed_keys": [],
+                            "missing_keys": [],
+                            "duplicate_keys": [],
+                            "non_finite_keys": [],
+                            "unexpected_keys": [],
+                        },
+                        "normalized_rows": [
+                            {
+                                "metric": key,
+                                "dim": "u",
+                                "val": 0.5,
+                                "err": 0.0,
+                                "n_val": 0.5,
+                                "n_err": 0.0,
+                            }
+                            for key in metric_keys
+                        ],
+                        "normalized_rows_v2": [],
+                    }
+                ],
+            }
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "state": "succeeded",
+                        "model_name": model_name,
+                        "context_fingerprint": context_fingerprint,
+                        "model_fingerprint": model_fingerprint,
+                        "expected_manifest_digest": expected_manifest_digest,
+                        "plots_completed": False,
+                    }
+                )
+            )
+            pd.DataFrame().to_parquet(result_path)
+            (model_dir / "execution.json").write_text(json.dumps(execution))
+
+        class FakeProcess:
+            next_pid = 100
+
+            def __init__(self, target, args, **_kwargs):
+                self.target = target
+                self.args = args
+                self.exitcode = None
+                self.pid = FakeProcess.next_pid
+                FakeProcess.next_pid += 1
+
+            def start(self):
+                try:
+                    self.target(*self.args)
+                except RuntimeError:
+                    self.exitcode = 1
+                else:
+                    self.exitcode = 0
+
+            def is_alive(self):
+                return False
+
+            def join(self):
+                return None
+
+        class FakeContext:
+            Process = FakeProcess
+
+        monkeypatch.setattr(
+            syntheval_eval.multiprocessing, "get_context", lambda _method: FakeContext()
+        )
+        monkeypatch.setattr(syntheval_eval, "_model_worker", fake_worker)
+
+        results, ranks, executions = _run_resumable_syntheval(
+            {"good_model": frame, "bad_model": frame},
+            dataset,
+            {},
+            tmp_path / "preset.json",
+            tmp_path / "checkpoints",
+            "linear",
+            SynthEvalExecutionConfig(model_workers=1, max_model_workers=1, cores_per_model=1),
+            "main",
+            expected_output_manifest={"supported": ("metric_a",)},
+        )
+
+        output = "\n".join(log_messages)
+        assert "model=good_model status=started progress=1/2" in output
+        assert "model=good_model status=completed progress=1/2" in output
+        assert "model=bad_model status=started progress=2/2" in output
+        assert "model=bad_model status=failed progress=2/2" in output
+        assert progress_instances[0].kwargs["total"] == 2
+        assert progress_instances[0].kwargs["disable"] is (not interactive)
+        assert progress_instances[0].updates == 2
+        assert progress_instances[0].closed
+        assert any(
+            "model=good_model method=supported event=completed" in line for line in progress_lines
+        )
+        assert any(
+            "model=bad_model method=supported event=failure" in line
+            and "failure_class=ValueError" in line
+            for line in progress_lines
+        )
+        assert any(
+            "checkpoint validation pass=main model=good_model result=miss" in message
+            for message in log_messages
+        )
+        assert any(
+            "aggregate eligibility eligible=1 ineligible=1 total=2" in message
+            for message in log_messages
+        )
+        assert "worker failure" not in "\n".join(progress_lines)
+        assert "worker failure" not in "\n".join(log_messages)
+        assert pd.notna(results.loc["good_model", ("metric_a", "value")])
+        assert pd.isna(ranks.loc["bad_model"]).all()
+        assert executions["bad_model"]["execution_succeeded"] is False
+
+    @pytest.mark.parametrize(
+        "failure_point",
+        ["preflight_validation", "worker_resolution", "process_start", "checkpoint_validation"],
+    )
+    def test_model_supervisor_cleans_owned_resources_on_errors(
+        self, failure_point, make_canonical_dataset, monkeypatch, tmp_path
+    ):
+        import synthdata.evaluation.syntheval_eval as syntheval_eval
+
+        dataset = make_canonical_dataset()
+        frame = dataset.role_frame("train", imputed=True).copy()
+        process_instances = []
+        progress_instances = []
+        progress_queues = []
+        checkpoint_calls = 0
+
+        class Progress:
+            def __init__(self, **_kwargs):
+                self.closed = False
+                self.close_calls = 0
+                progress_instances.append(self)
+
+            def update(self, _amount):
+                pass
+
+            def close(self):
+                self.closed = True
+                self.close_calls += 1
+
+            def write(self, _message):
+                pass
+
+        class TrackedQueue(queue.Queue):
+            def __init__(self):
+                super().__init__()
+                self.closed = False
+                self.joined = False
+
+            def close(self):
+                self.closed = True
+
+            def join_thread(self):
+                self.joined = True
+
+        def make_queue():
+            created_queue = TrackedQueue()
+            progress_queues.append(created_queue)
+            return created_queue
+
+        class FakeProcess:
+            def __init__(self, target, args, **_kwargs):
+                self.target = target
+                self.args = args
+                self.exitcode = None
+                self.pid = 123
+                self.alive = False
+                self.terminated = False
+                self.joined = False
+                process_instances.append(self)
+
+            def start(self):
+                if failure_point == "process_start":
+                    self.alive = True
+                    raise RuntimeError("process start failed")
+                self.exitcode = 0
+
+            def is_alive(self):
+                return self.alive
+
+            def terminate(self):
+                self.terminated = True
+                self.alive = False
+
+            def join(self):
+                self.joined = True
+
+        class FakeContext:
+            Process = FakeProcess
+            Queue = staticmethod(make_queue)
+
+        monkeypatch.setattr(syntheval_eval, "tqdm", Progress)
+        monkeypatch.setattr(
+            syntheval_eval,
+            "logger",
+            SimpleNamespace(info=lambda *_args: None, debug=lambda *_args: None),
+        )
+        monkeypatch.setattr(
+            syntheval_eval.multiprocessing, "get_context", lambda _method: FakeContext()
+        )
+
+        def checkpoint_validation(*_args, **_kwargs):
+            nonlocal checkpoint_calls
+            checkpoint_calls += 1
+            if failure_point == "preflight_validation" or (
+                failure_point == "checkpoint_validation" and checkpoint_calls == 2
+            ):
+                raise RuntimeError("checkpoint validation failed")
+            return None
+
+        monkeypatch.setattr(syntheval_eval, "_valid_checkpoint", checkpoint_validation)
+        if failure_point == "worker_resolution":
+
+            def fail_worker_resolution(*_args, **_kwargs):
+                raise RuntimeError("worker resolution failed")
+
+            monkeypatch.setattr(syntheval_eval, "resolve_model_workers", fail_worker_resolution)
+
+        with pytest.raises(RuntimeError, match="failed"):
+            _run_resumable_syntheval(
+                {"model": frame},
+                dataset,
+                {},
+                tmp_path / "preset.json",
+                tmp_path / "checkpoints",
+                "linear",
+                SynthEvalExecutionConfig(model_workers=1, max_model_workers=1, cores_per_model=1),
+                "main",
+                expected_output_manifest={"method": ("metric",)},
+            )
+
+        resources_created = failure_point in {"process_start", "checkpoint_validation"}
+        assert len(process_instances) == (1 if resources_created else 0)
+        assert len(progress_queues) == (1 if resources_created else 0)
+        if resources_created:
+            process = process_instances[0]
+            assert process.joined
+            assert process.terminated is (failure_point == "process_start")
+            assert progress_queues[0].closed
+            assert progress_queues[0].joined
+        assert progress_instances[0].closed
+        assert progress_instances[0].close_calls == 1
 
     def test_preprocessing_contract_changes_context_identity(self, make_canonical_dataset):
         dataset = make_canonical_dataset()
@@ -2499,6 +3386,80 @@ class TestResolveModelWorkers:
             "synthdata.evaluation.syntheval_eval._available_memory_gib", lambda: 118.0
         )
         assert resolve_model_workers(cfg, n_models=18, n_columns=1038) == 6
+
+    def test_auto_rejects_memory_budget_that_cannot_fit_one_model(self, monkeypatch):
+        cfg = SynthEvalExecutionConfig(
+            model_workers="auto",
+            max_model_workers=6,
+            cores_per_model=4,
+            memory_reserve_gib=16,
+            memory_per_model_gib=14,
+        )
+        monkeypatch.setattr("synthdata.evaluation.syntheval_eval.os.cpu_count", lambda: 24)
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval._available_memory_gib", lambda: 29.9
+        )
+
+        with pytest.raises(ValueError, match="cannot fit one model") as exc_info:
+            resolve_model_workers(cfg, n_models=18, n_columns=664)
+
+        assert "MemAvailable=29.90 GiB" in str(exc_info.value)
+        assert "reserve=16.00 GiB" in str(exc_info.value)
+        assert "per-model estimate=14.00 GiB" in str(exc_info.value)
+
+    @pytest.mark.parametrize("cpu_count", [1, 2, 3])
+    def test_auto_rejects_cpu_budget_below_cores_per_model(self, monkeypatch, cpu_count):
+        cfg = SynthEvalExecutionConfig(
+            model_workers="auto",
+            max_model_workers=6,
+            cores_per_model=4,
+            memory_reserve_gib=16,
+            memory_per_model_gib=14,
+        )
+        monkeypatch.setattr("synthdata.evaluation.syntheval_eval.os.cpu_count", lambda: cpu_count)
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval._available_memory_gib", lambda: 200.0
+        )
+
+        with pytest.raises(ValueError, match="cannot satisfy the per-model CPU budget") as exc_info:
+            resolve_model_workers(cfg, n_models=18, n_columns=664)
+
+        assert f"available CPUs={cpu_count}" in str(exc_info.value)
+        assert "cores per model=4" in str(exc_info.value)
+
+    def test_cpu_preflight_fails_before_worker_context_creation(
+        self, make_canonical_dataset, monkeypatch, tmp_path
+    ):
+        import synthdata.evaluation.syntheval_eval as syntheval_eval
+
+        dataset = make_canonical_dataset()
+        frame = dataset.role_frame("train", imputed=True).copy()
+        monkeypatch.setattr(syntheval_eval.os, "cpu_count", lambda: 3)
+        monkeypatch.setattr(syntheval_eval, "_available_memory_gib", lambda: 200.0)
+
+        def fail_worker_context(*_args, **_kwargs):
+            raise AssertionError("worker context must not be created before CPU preflight")
+
+        monkeypatch.setattr(syntheval_eval.multiprocessing, "get_context", fail_worker_context)
+
+        with pytest.raises(InsufficientSynthEvalCPUError):
+            _run_resumable_syntheval(
+                {"model": frame},
+                dataset,
+                {},
+                tmp_path / "preset.json",
+                tmp_path / "checkpoints",
+                "linear",
+                SynthEvalExecutionConfig(
+                    model_workers="auto",
+                    max_model_workers=6,
+                    cores_per_model=4,
+                    memory_reserve_gib=16,
+                    memory_per_model_gib=14,
+                ),
+                "main",
+                expected_output_manifest={"method": ("metric",)},
+            )
 
     def test_auto_does_not_read_total_memory_after_available_memory(self, monkeypatch):
         cfg = SynthEvalExecutionConfig(

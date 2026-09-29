@@ -25,6 +25,7 @@ from synthdata.config import (
     _validate,
     load_config,
 )
+from synthdata.evaluation.syntheval_eval import resolve_model_workers
 
 pytestmark = pytest.mark.unit
 
@@ -1004,6 +1005,35 @@ class TestLoadConfig:
         assert cfg.data.source == "csv"
         assert cfg.data.target_column == "outcome"
         assert cfg.config_path == yaml_path.resolve()
+
+    def test_loris_syntheval_execution_uses_cpu_and_live_memory_bounds(self, monkeypatch):
+        config_path = Path(__file__).parents[2] / "configs" / "config_loris.yaml"
+        execution = load_config(config_path).evaluation.syntheval_execution
+
+        assert execution.model_workers == "auto"
+        assert execution.max_model_workers == 6
+        assert execution.cores_per_model == 4
+        assert execution.memory_reserve_gib == 16
+        assert execution.memory_per_model_gib == 14
+
+        monkeypatch.setattr("synthdata.evaluation.syntheval_eval.os.cpu_count", lambda: 24)
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval._available_memory_gib", lambda: 100.0
+        )
+        assert resolve_model_workers(execution, n_models=20, n_columns=664) == 6
+
+        # Live available memory below the six-worker budget lowers concurrency.
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval._available_memory_gib", lambda: 72.0
+        )
+        assert resolve_model_workers(execution, n_models=20, n_columns=664) == 4
+
+        # CPU availability independently limits workers even with ample memory.
+        monkeypatch.setattr("synthdata.evaluation.syntheval_eval.os.cpu_count", lambda: 16)
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval._available_memory_gib", lambda: 200.0
+        )
+        assert resolve_model_workers(execution, n_models=20, n_columns=664) == 4
 
     def test_null_drop_columns_loads_as_empty_list(self, tmp_path):
         yaml_path = tmp_path / "config.yaml"

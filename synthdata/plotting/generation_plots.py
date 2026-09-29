@@ -179,6 +179,92 @@ def _load_study(study_name: str, storage: str):
         return None
 
 
+def _trial_outcomes_figure(study):
+    """Build an evidence table from persisted Optuna trial states and reasons."""
+    import plotly.graph_objects as go
+
+    classifications = []
+    states = []
+    objectives = []
+    reasons = []
+    fills = []
+    colors = {
+        "Completed": "#d9ead3",
+        "Pruned": "#fff2cc",
+        "Rejected": "#f4cccc",
+        "Failed": "#eadcf8",
+    }
+
+    for trial in study.trials:
+        state = trial.state.name
+        attrs = trial.user_attrs or {}
+        raw_reasons = attrs.get("stage_a_prune_reasons")
+        if raw_reasons is None:
+            trial_reasons = []
+        elif isinstance(raw_reasons, list) and all(
+            isinstance(reason, str) for reason in raw_reasons
+        ):
+            trial_reasons = raw_reasons
+        else:
+            raise ValueError(
+                f"HPO trial {trial.number} has malformed persisted Stage A prune reasons"
+            )
+
+        is_rejection = (
+            state == "PRUNED"
+            and attrs.get("stage_a_state") == "pruned"
+            and bool(trial_reasons)
+            and any(not reason.startswith("stage_a_screen_exception:") for reason in trial_reasons)
+        )
+        if is_rejection:
+            classification = "Rejected"
+        elif state == "COMPLETE":
+            classification = "Completed"
+        elif state == "PRUNED":
+            classification = "Pruned"
+        elif state == "FAIL":
+            classification = "Failed"
+        else:
+            classification = state.title()
+
+        classifications.append(classification)
+        states.append(state)
+        objectives.append(trial.value if trial.value is not None else "—")
+        reasons.append("\n".join(trial_reasons) if trial_reasons else "—")
+        fills.append(colors.get(classification, "#eeeeee"))
+
+    count_summary = ", ".join(
+        f"{label.lower()}: {classifications.count(label)}"
+        for label in ("Completed", "Pruned", "Rejected", "Failed")
+        if label in classifications
+    )
+    fig = go.Figure(
+        data=[
+            go.Table(
+                header={
+                    "values": ["Trial", "Optuna state", "Classification", "Objective", "Reason"],
+                    "fill_color": "#d9e2f3",
+                    "align": "left",
+                },
+                cells={
+                    "values": [
+                        [trial.number for trial in study.trials],
+                        states,
+                        classifications,
+                        objectives,
+                        reasons,
+                    ],
+                    "fill_color": [fills] * 5,
+                    "align": "left",
+                    "height": 28,
+                },
+            )
+        ]
+    )
+    fig.update_layout(title=f"HPO trial outcomes ({count_summary})")
+    return fig
+
+
 def save_hpo_plots(
     cfg: Config,
     output_dir: str | Path,
@@ -264,9 +350,17 @@ def save_hpo_plots(
                 output_dir / f"{model_id}_history.html",
                 output_dir / f"{model_id}_param_importances.html",
                 output_dir / f"{model_id}_slice.html",
+                output_dir / f"{model_id}_trial_outcomes.html",
             ]
             if any(path.is_symlink() for path in output_paths):
                 raise ValueError("HPO plot output must not be a symlink")
+            # Persist state/rejection evidence before Optuna's value-based
+            # diagnostics, which may have no completed trials to visualize.
+            save_plotly_figure(
+                _trial_outcomes_figure(study),
+                output_dir / f"{model_id}_trial_outcomes",
+                ("html",),
+            )
             save_plotly_figure(
                 plot_optimization_history(study),
                 output_dir / f"{model_id}_history",

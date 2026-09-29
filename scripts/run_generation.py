@@ -21,9 +21,10 @@ from synthdata.data import (
     load_imputed_splits,
     validate_imputation_cache_lineage,
 )
+from synthdata.evaluation import artifacts
 from synthdata.experiment import start_experiment
 from synthdata.generation import run_generation
-from synthdata.generation.pipeline import needs_imputed_data
+from synthdata.generation.pipeline import _expected_generation_outputs, needs_imputed_data
 from synthdata.imputation.pipeline import _cache_key_record
 from synthdata.utils import get_logger, set_global_seed
 
@@ -115,8 +116,54 @@ def main() -> None:
             )
             plt.close(fig)
 
-    synthetic_datasets = run_generation(
-        cfg, dataset, plot_callback=plot_callback, experiment=experiment
+    try:
+        synthetic_datasets = run_generation(
+            cfg, dataset, plot_callback=plot_callback, experiment=experiment
+        )
+    except Exception as exc:
+        expected_outputs = _expected_generation_outputs(cfg.generation)
+        observed_outputs = [
+            name
+            for name in expected_outputs
+            if (experiment.generation_dir / f"{name}.csv").is_file()
+        ]
+        observed_artifacts = {
+            name: [
+                path.name
+                for path in (
+                    experiment.generation_dir / f"{name}.csv",
+                    experiment.generation_dir / f"{name}.cache.json",
+                )
+                if path.is_file()
+            ]
+            for name in expected_outputs
+        }
+        observed_artifacts = {name: paths for name, paths in observed_artifacts.items() if paths}
+        logger.exception(
+            "Generation raised %s: %s; recording incomplete attempt for experiment %s",
+            type(exc).__name__,
+            exc,
+            experiment.id,
+        )
+        experiment.record(
+            "generation_attempt",
+            artifacts={
+                "synthetic_data_dir": str(experiment.generation_dir),
+                "observed_artifacts": observed_artifacts,
+            },
+            status="failed",
+            coverage_state="incomplete",
+            expected_outputs=expected_outputs,
+            observed_outputs=observed_outputs,
+            missing_outputs=[name for name in expected_outputs if name not in observed_outputs],
+            exception_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+        raise
+
+    generation_inventory = artifacts.load_generation_inventory(
+        experiment.manifest_path,
+        experiment.generation_dir,
     )
 
     if args.plot:
@@ -135,6 +182,16 @@ def main() -> None:
         experiment.id,
         experiment.id,
     )
+    if generation_inventory.failed_outputs:
+        logger.error(
+            "Generation completed with partial outputs: expected=%s produced=%s failed=%s; "
+            "artifacts and status are persisted under %s",
+            list(generation_inventory.expected_outputs),
+            list(generation_inventory.produced_outputs),
+            list(generation_inventory.failed_outputs),
+            experiment.generation_dir,
+        )
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
