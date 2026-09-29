@@ -697,6 +697,19 @@ def _string_sequence(value) -> bool:
     return isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value)
 
 
+def _normalized_metric_version(emitted_key: str) -> str | None:
+    """Return structured-normalizer version for keys stored in normalized_rows_v2."""
+    if emitted_key.startswith("auroc_") and emitted_key.endswith("_ovr_v3"):
+        return "macro_ovr_v3"
+    if emitted_key.endswith(("_v2", "_v2_hout")):
+        return "v2"
+    return None
+
+
+def _uses_versioned_normalized_rows(expected_keys) -> bool:
+    return any(_normalized_metric_version(str(key)) is not None for key in expected_keys)
+
+
 def _execution_payload_succeeded(
     payload: dict,
     *,
@@ -777,7 +790,7 @@ def _execution_payload_succeeded(
         if status.get("exception_type") or status.get("exception_message"):
             return False
 
-        versioned = any("_v2" in key for key in expected)
+        versioned = _uses_versioned_normalized_rows(expected)
         field = "normalized_rows_v2" if versioned else "normalized_rows"
         rows = item.get(field)
         if not isinstance(rows, (list, tuple)) or not rows:
@@ -804,8 +817,9 @@ def _execution_payload_succeeded(
                 for field_name in ("err", "n_err", "raw_value", "normalized_value")
             ):
                 return False
-            if versioned and (
-                row.get("metric_version") != "v2"
+            metric_version = _normalized_metric_version(emitted_key)
+            if metric_version is not None and (
+                row.get("metric_version") != metric_version
                 or not _finite_number(row.get("raw_value"))
                 or not _finite_number(row.get("normalized_value"))
             ):
@@ -956,7 +970,7 @@ def _execution_payload_failed(
             for field in ("exception", "exception_message", "exception_traceback", "traceback")
         ):
             return False
-        versioned = any("_v2" in key for key in expected)
+        versioned = _uses_versioned_normalized_rows(expected)
         field = "normalized_rows_v2" if versioned else "normalized_rows"
         rows = item.get(field)
         if not isinstance(rows, (list, tuple)):
@@ -983,8 +997,9 @@ def _execution_payload_failed(
                 for field_name in ("err", "n_err", "raw_value", "normalized_value")
             ):
                 return False
-            if versioned and (
-                row.get("metric_version") != "v2"
+            metric_version = _normalized_metric_version(emitted_key)
+            if metric_version is not None and (
+                row.get("metric_version") != metric_version
                 or not _finite_number(row.get("raw_value"))
                 or not _finite_number(row.get("normalized_value"))
             ):
@@ -1977,14 +1992,9 @@ def _load_syntheval_execution_sidecars(
     return executions
 
 
-#: Metrics that syntheval refuses to run unless the target has EXACTLY 2
-#: classes (see e.g. metric_auroc_difference.py / metric_statistical_parity.py
-#: / metric_equalized_odds.py / metric_equal_opportunity.py's own
-#: `target_types.items() if value == 2` filtering) -- these are the only ones
-#: a binary-target evaluation pass (see run_binary_target_syntheval_evaluation)
-#: can newly enable; every other metric already runs fine against a 3+ class
-#: target and must NOT be re-run against the collapsed binary one (which
-#: would silently double-count/duplicate their results).
+#: Metrics historically restricted to exactly 2 classes by SynthEval. These
+#: also run natively on multiclass targets through their OvR implementations;
+#: this set identifies metrics repeated in the explicit binary-target pass.
 BINARY_ONLY_METRICS = frozenset(
     {"auroc_diff", "statistical_parity", "equalized_odds", "equal_opportunity"}
 )
@@ -1995,6 +2005,7 @@ def build_preset(
     positive_class=1,
     *,
     target_is_binary: bool | None = None,
+    target_is_multiclass: bool = False,
 ) -> dict:
     """Filter the full SynthEval preset down to the configured selection.
 
@@ -2005,6 +2016,10 @@ def build_preset(
     target column is already exactly 2 classes (e.g. hepatitis). It does NOT
     apply to the separate binary_target pass (see build_binary_preset), whose
     collapsed target is always 1=positive/0=negative by construction.
+
+    ``target_is_multiclass`` opts the four historically binary-only metrics
+    into their native one-vs-rest implementations. Other non-binary targets
+    retain prior filtering behavior.
     """
     all_names = list(SYNTHEVAL_PRESET.keys())
     selected = resolve_selection(
@@ -2015,7 +2030,7 @@ def build_preset(
         SYNTHEVAL_METRIC_TYPE,
     )
     preset = {k: v for k, v in SYNTHEVAL_PRESET.items() if k in selected}
-    if target_is_binary is False:
+    if target_is_binary is False and not target_is_multiclass:
         preset = {
             name: values for name, values in preset.items() if name not in BINARY_ONLY_METRICS
         }
@@ -2652,10 +2667,16 @@ def run_syntheval_evaluation(
         and target_frame is not None
         and target_frame[dataset.target_column].nunique(dropna=False) == 2
     )
+    target_is_multiclass = (
+        dataset.target_is_categorical
+        and target_frame is not None
+        and target_frame[dataset.target_column].nunique(dropna=False) > 2
+    )
     preset = build_preset(
         selection_cfg,
         positive_class,
         target_is_binary=target_is_binary,
+        target_is_multiclass=target_is_multiclass,
     )
     if not preset:
         logger.info("[syntheval] no metrics selected; skipping")
@@ -2692,6 +2713,7 @@ def run_syntheval_evaluation(
         include_holdout_outputs=tuning_frame is not None,
         target_columns=[dataset.target_column],
         protected_columns=dataset.protected_columns,
+        target_is_binary=False if target_is_multiclass else target_is_binary,
     )
     expected_manifest_digest = _execution_manifest_digest(expected_output_manifest)
 
@@ -3045,6 +3067,7 @@ def run_binary_target_syntheval_evaluation(
         include_holdout_outputs=evidence_frame is not None,
         target_columns=[binary_dataset.target_column],
         protected_columns=binary_dataset.protected_columns,
+        target_is_binary=True,
     )
     expected_manifest_digest = _execution_manifest_digest(expected_output_manifest)
     cache_dir = (
@@ -3344,7 +3367,7 @@ def _scalar_value(frame: pd.DataFrame, model_name: str, metric: str):
 def _structured_rows_for_item(item: dict) -> list[dict]:
     status = item.get("status") or {}
     expected_keys = [str(key) for key in status.get("expected_keys", ())]
-    versioned = any("_v2" in key for key in expected_keys)
+    versioned = _uses_versioned_normalized_rows(expected_keys)
     field = "normalized_rows_v2" if versioned else "normalized_rows"
     return list(item.get(field) or ())
 

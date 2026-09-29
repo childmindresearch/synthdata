@@ -166,6 +166,14 @@ def _candidate_role_frames(
     return train_frame, tuning_frame, final_holdout_frame
 
 
+def _syntheval_target_type_flags(dataset: Dataset, train_frame: pd.DataFrame) -> tuple[bool, bool]:
+    """Resolve SynthEval binary/multiclass routing from the training target."""
+    class_count = train_frame[dataset.target_column].nunique(dropna=False)
+    target_is_binary = dataset.target_is_categorical and class_count == 2
+    target_is_multiclass = dataset.target_is_categorical and class_count > 2
+    return target_is_binary, target_is_multiclass
+
+
 def _generation_metadata(cfg: Config, model_names: list[str]) -> dict[str, dict]:
     """Load complete generator cache envelopes for evaluation provenance."""
     metadata_by_model = {}
@@ -659,7 +667,7 @@ def _run_final_holdout_evidence(
         transform_release_roles(
             refit_frame,
             {"final_holdout": raw_final_holdout_frame},
-            eval_cfg.release_generalization.columns,
+            dataset.release_generalization,
         )
     )
     released_final_dataset = {selected_model: released_final_synthetic}
@@ -786,14 +794,19 @@ def _run_final_holdout_evidence(
         final_syntheval_executions = {}
     final_syntheval_validations = {}
     if eval_cfg.syntheval.enabled:
+        target_is_binary, target_is_multiclass = _syntheval_target_type_flags(dataset, train_frame)
         final_syntheval_preset = syntheval_eval.build_preset(
-            eval_cfg.syntheval, positive_class=eval_cfg.positive_class
+            eval_cfg.syntheval,
+            positive_class=eval_cfg.positive_class,
+            target_is_binary=target_is_binary,
+            target_is_multiclass=target_is_multiclass,
         )
         final_syntheval_manifest = syntheval_execution_manifest(
             final_syntheval_preset,
             include_holdout_outputs=True,
             target_columns=[dataset.target_column],
             protected_columns=dataset.protected_columns,
+            target_is_binary=False if target_is_multiclass else target_is_binary,
         )
         final_syntheval_validations = syntheval_eval.validate_syntheval_results(
             final_benchmark_results,
@@ -815,92 +828,6 @@ def _run_final_holdout_evidence(
             resolved_configuration=group_configuration,
         )
 
-    final_binary_executions = {}
-    final_binary_validations = {}
-    if eval_cfg.syntheval.enabled and eval_cfg.binary_target.enabled:
-        try:
-            final_binary_output = syntheval_eval.run_binary_target_syntheval_evaluation(
-                selected_dataset,
-                dataset,
-                eval_cfg.syntheval,
-                eval_cfg.binary_target,
-                preset_dir=output_dir,
-                ranking_strategy=eval_cfg.ranking_strategy,
-                output_folder=output_dir / "syntheval_final_holdout",
-                execution_cfg=eval_cfg.syntheval_execution,
-                return_execution=True,
-                group_context=final_group_context,
-                semantic_context=synthcity_semantics,
-                evaluation_role="final_holdout",
-                fit_frame=real_fit_frame,
-                fit_roles=("train", "tuning"),
-                released_final_holdout_frame=released_final_roles["final_holdout"],
-                released_synthetic_datasets=released_final_dataset,
-            )
-        except Exception as exc:  # noqa: BLE001 - preserve process-control exceptions
-            exception_type = type(exc).__name__
-            logger.error(
-                "[final holdout] SynthEval binary-target pass failed for selected model=%s; "
-                "reason_code=%s; exception_type=%s",
-                selected_model,
-                "final_holdout_execution_failed",
-                exception_type,
-            )
-            final_execution_failures.append(
-                {
-                    "stage": "final_holdout",
-                    "framework": "syntheval",
-                    "execution_pass": "binary_target",
-                    "model": selected_model,
-                    "status": "failed",
-                    "policy_eligible": False,
-                    "error_type": "SynthEvalExecutionError",
-                    "exception_type": exception_type,
-                    "reason_code": "final_holdout_execution_failed",
-                    "failure_reason": "Final-holdout SynthEval execution failed.",
-                }
-            )
-            final_binary_output = (None, None, {})
-        if len(final_binary_output) == 3:
-            final_binary_results, final_binary_ranks, final_binary_executions = final_binary_output
-        else:
-            final_binary_results, final_binary_ranks = final_binary_output
-        final_binary_preset = syntheval_eval.build_binary_preset(eval_cfg.syntheval)
-        final_binary_manifest = syntheval_execution_manifest(
-            final_binary_preset,
-            include_holdout_outputs=True,
-            target_columns=[dataset.target_column],
-            protected_columns=dataset.protected_columns,
-        )
-        final_binary_expected_keys = syntheval_eval.extend_syntheval_expected_diagnostics(
-            syntheval_execution_keys_by_framework(final_binary_manifest),
-            final_binary_results,
-            structured_executions=final_binary_executions,
-        )
-        final_binary_validations = syntheval_eval.validate_syntheval_results(
-            final_binary_results,
-            final_binary_ranks,
-            final_binary_expected_keys,
-            role_hashes=final_role_hashes,
-            model_names=[selected_model],
-            execution_pass="binary_target",
-            target_view="binary_collapsed",
-            evaluation_role="final_holdout",
-            requested_use="audit",
-            structured_executions=final_binary_executions,
-            population_unit=population_unit,
-            group_mode=group_mode,
-            resolved_configuration={
-                **group_configuration,
-                "binary_target_mapping": {
-                    "column": eval_cfg.binary_target.column or dataset.target_column,
-                    "positive_classes": list(eval_cfg.binary_target.positive_classes),
-                    "negative_classes": list(eval_cfg.binary_target.negative_classes),
-                    "encoding": {"positive": 1, "negative": 0},
-                },
-            },
-        )
-        final_syntheval_validations.update(final_binary_validations)
     final_syntheval_validations = {
         key: value for key, value in final_syntheval_validations.items() if key[0] == "syntheval"
     }
@@ -931,7 +858,7 @@ def _run_final_holdout_evidence(
         selected_dataset,
         dataset,
         evaluation_role="final_holdout",
-        generalization=eval_cfg.release_generalization.columns,
+        generalization=dataset.release_generalization,
         quasi_identifiers=list(dataset.quasi_identifier_columns),
         sensitive_fields=list(dataset.sensitive_columns),
         protected_columns=list(dataset.protected_columns),
@@ -952,15 +879,6 @@ def _run_final_holdout_evidence(
         group_mode=group_mode,
         requested_use="audit",
     )
-
-    binary_target_mapping = None
-    if eval_cfg.binary_target.enabled:
-        binary_target_mapping = {
-            "column": eval_cfg.binary_target.column or dataset.target_column,
-            "positive_classes": list(eval_cfg.binary_target.positive_classes),
-            "negative_classes": list(eval_cfg.binary_target.negative_classes),
-            "encoding": {"positive": 1, "negative": 0},
-        }
 
     final_validation_failures = list(final_execution_failures)
     final_validation_failures.extend(
@@ -1056,7 +974,7 @@ def _run_final_holdout_evidence(
                 "final_holdout_rows": len(released_final_roles["final_holdout"]),
                 "release_transform": release_transform_metadata,
             },
-            "intervals": dict(eval_cfg.release_generalization.columns),
+            "intervals": dict(dataset.release_generalization),
             "invalid_reasons": final_validation_failures,
             "selected_model_provenance": {
                 "model": selected_model,
@@ -1076,10 +994,7 @@ def _run_final_holdout_evidence(
             },
             "syntheval": {
                 "validation": _validation_payloads(final_syntheval_validations),
-                "execution": {
-                    "main": final_syntheval_executions,
-                    "binary_target": final_binary_executions,
-                },
+                "execution": {"main": final_syntheval_executions},
             },
             "custom": {
                 "validation": _single_framework_validation_payload(final_custom_validations),
@@ -1095,8 +1010,6 @@ def _run_final_holdout_evidence(
     }
     if final_validation_failures:
         evidence["failure_reasons"] = final_validation_failures
-    if binary_target_mapping is not None:
-        evidence["binary_target_mapping"] = binary_target_mapping
     return evidence
 
 
@@ -1413,15 +1326,19 @@ def run_evaluation(
         syntheval_executions = {}
     syntheval_validations = {}
     if eval_cfg.syntheval.enabled:
+        target_is_binary, target_is_multiclass = _syntheval_target_type_flags(dataset, train_frame)
         syntheval_preset = syntheval_eval.build_preset(
             eval_cfg.syntheval,
             positive_class=eval_cfg.positive_class,
+            target_is_binary=target_is_binary,
+            target_is_multiclass=target_is_multiclass,
         )
         syntheval_manifest = syntheval_execution_manifest(
             syntheval_preset,
             include_holdout_outputs=tuning_frame is not None,
             target_columns=[dataset.target_column],
             protected_columns=dataset.protected_columns,
+            target_is_binary=False if target_is_multiclass else target_is_binary,
         )
         syntheval_expected_keys = syntheval_eval.extend_syntheval_expected_diagnostics(
             syntheval_execution_keys_by_framework(syntheval_manifest),
@@ -1443,69 +1360,6 @@ def run_evaluation(
             population_unit=population_unit,
             group_mode=group_mode,
             resolved_configuration=group_configuration,
-        )
-
-    binary_executions = {}
-    if eval_cfg.syntheval.enabled and eval_cfg.binary_target.enabled:
-        binary_output = syntheval_eval.run_binary_target_syntheval_evaluation(
-            selected_datasets,
-            dataset,
-            eval_cfg.syntheval,
-            eval_cfg.binary_target,
-            preset_dir=output_dir,
-            ranking_strategy=eval_cfg.ranking_strategy,
-            output_folder=output_dir / "syntheval_benchmark",
-            execution_cfg=eval_cfg.syntheval_execution,
-            return_execution=True,
-            group_context=group_context,
-            semantic_context=synthcity_semantics,
-        )
-        if len(binary_output) == 3:
-            binary_results, binary_ranks, binary_executions = binary_output
-        else:
-            binary_results, binary_ranks = binary_output
-            binary_executions = {}
-        binary_preset = syntheval_eval.build_binary_preset(eval_cfg.syntheval)
-        binary_manifest = syntheval_execution_manifest(
-            binary_preset,
-            include_holdout_outputs=tuning_frame is not None,
-            target_columns=[dataset.target_column],
-            protected_columns=dataset.protected_columns,
-        )
-        binary_expected_keys = syntheval_eval.extend_syntheval_expected_diagnostics(
-            syntheval_execution_keys_by_framework(binary_manifest),
-            binary_results,
-            structured_executions=binary_executions,
-        )
-        binary_validations = syntheval_eval.validate_syntheval_results(
-            binary_results,
-            binary_ranks,
-            binary_expected_keys,
-            role_hashes=candidate_role_hashes,
-            role_hashes_by_framework={
-                "syntheval": candidate_role_hashes,
-                "custom": raw_candidate_role_hashes,
-            },
-            model_names=model_names,
-            execution_pass="binary_target",
-            target_view="binary_collapsed",
-            requested_use="audit",
-            structured_executions=binary_executions,
-            population_unit=population_unit,
-            group_mode=group_mode,
-            resolved_configuration={
-                **group_configuration,
-                "binary_target_mapping": {
-                    "column": eval_cfg.binary_target.column or dataset.target_column,
-                    "positive_classes": list(eval_cfg.binary_target.positive_classes),
-                    "negative_classes": list(eval_cfg.binary_target.negative_classes),
-                    "encoding": {"positive": 1, "negative": 0},
-                },
-            },
-        )
-        syntheval_validations.update(binary_validations)
-        benchmark_results, benchmark_ranks = syntheval_eval.merge_binary_target_results(
-            benchmark_results, benchmark_ranks, binary_results, binary_ranks
         )
 
     log_disparity_reports = (
@@ -1542,7 +1396,7 @@ def run_evaluation(
             selected_datasets,
             dataset,
             evaluation_role="tuning",
-            generalization=eval_cfg.release_generalization.columns,
+            generalization=dataset.release_generalization,
             quasi_identifiers=list(dataset.quasi_identifier_columns),
             sensitive_fields=list(dataset.sensitive_columns),
             protected_columns=list(dataset.protected_columns),
@@ -1655,8 +1509,6 @@ def run_evaluation(
     syntheval_execution_artifacts = {}
     if syntheval_executions:
         syntheval_execution_artifacts[("syntheval", "main")] = syntheval_executions
-    if eval_cfg.binary_target.enabled and binary_executions:
-        syntheval_execution_artifacts[("syntheval", "binary_target")] = binary_executions
     artifact_manifest = artifacts.persist_evaluation_artifacts(
         output_dir,
         combined,

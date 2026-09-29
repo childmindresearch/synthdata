@@ -6,14 +6,15 @@ from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
+import pandas as pd
 import pytest
 import yaml
 
 from synthdata.config import (
-    BinaryTargetConfig,
     Config,
     DataConfig,
     DataSplitConfig,
+    EvaluationConfig,
     GenerationConfig,
     HPOConfig,
     ImputationConfig,
@@ -22,9 +23,12 @@ from synthdata.config import (
     StageAScreenConfig,
     SynthEvalExecutionConfig,
     _from_dict,
+    _protected_attribute_bin_intervals,
     _validate,
     load_config,
 )
+from synthdata.data import _configured_stratification_frame
+from synthdata.evaluation.release import transform_release_roles
 from synthdata.evaluation.syntheval_eval import resolve_model_workers
 
 pytestmark = pytest.mark.unit
@@ -58,27 +62,17 @@ class TestFromDict:
         cfg = _from_dict(Config, {})
         assert cfg == Config()
 
-    def test_default_hpo_objective_uses_approved_utility_metrics(self):
+    def test_default_hpo_objective_is_tstr_only(self):
         cfg = _from_dict(Config, {})
 
-        assert cfg.generation.hpo.metric_config == {
-            "canonical_objectives": [
-                "tstr_macro_f1.v1",
-                "mixed_mmd.v1",
-                "elastic_net_jsd.v1",
-            ]
-        }
+        assert cfg.generation.hpo.metric_config == {"canonical_objectives": ["tstr_macro_f1.v1"]}
         metrics = [
             metric for values in cfg.generation.hpo.metric_config.values() for metric in values
         ]
-        assert len(metrics) == len(set(metrics)) == 3
+        assert metrics == ["tstr_macro_f1.v1"]
         assert cfg.generation.hpo.utility_policy == {
-            "metrics": [
-                "tstr_macro_f1.v1",
-                "mixed_mmd.v1",
-                "elastic_net_jsd.v1",
-            ],
-            "weights": [1 / 3, 1 / 3, 1 / 3],
+            "metrics": ["tstr_macro_f1.v1"],
+            "weights": [1.0],
         }
 
     def test_flat_fields_applied(self):
@@ -184,21 +178,7 @@ class TestFromDict:
             {
                 "generation": {
                     "hpo": {
-                        "metric_config": {
-                            "canonical_objectives": [
-                                "tstr_macro_f1.v1",
-                                "mixed_mmd.v1",
-                                "elastic_net_jsd.v1",
-                            ]
-                        },
-                        "utility_policy": {
-                            "metrics": [
-                                "tstr_macro_f1.v1",
-                                "mixed_mmd.v1",
-                                "elastic_net_jsd.v1",
-                            ],
-                            "weights": [1 / 3, 1 / 3, 1 / 3],
-                        },
+                        "metric_config": {"canonical_objectives": ["tstr_macro_f1.v1"]},
                     }
                 }
             },
@@ -206,59 +186,39 @@ class TestFromDict:
         metric_config = cfg.generation.hpo.metric_config
         metrics = [metric for values in metric_config.values() for metric in values]
 
-        assert metric_config == {
-            "canonical_objectives": [
-                "tstr_macro_f1.v1",
-                "mixed_mmd.v1",
-                "elastic_net_jsd.v1",
-            ]
-        }
-        assert len(metrics) == len(set(metrics)) == 3
+        assert metric_config == {"canonical_objectives": ["tstr_macro_f1.v1"]}
+        assert metrics == ["tstr_macro_f1.v1"]
         assert all(metric.endswith(".v1") for metric in metrics)
         assert cfg.generation.hpo.utility_policy == {
             "metrics": metrics,
-            "weights": [1 / 3, 1 / 3, 1 / 3],
+            "weights": [1.0],
         }
 
-    def test_native_hpo_metrics_use_test_owned_settings(self):
+    def test_hpo_scoring_policy_is_derived_from_canonical_objectives(self):
         cfg = _from_dict(
             Config,
             {
                 "generation": {
-                    "hpo": {
-                        "metric_config": {
-                            "stats": ["wasserstein_dist", "inv_kl_divergence"],
-                            "sanity": ["nearest_syn_neighbor_distance"],
-                            "performance": ["xgb"],
-                        }
-                    }
+                    "hpo": {"metric_config": {"canonical_objectives": ["tstr_macro_f1.v1"]}}
                 }
             },
         )
 
-        assert cfg.generation.hpo.metric_config == {
-            "stats": ["wasserstein_dist", "inv_kl_divergence"],
-            "sanity": ["nearest_syn_neighbor_distance"],
-            "performance": ["xgb"],
+        assert cfg.generation.hpo.utility_policy == {
+            "metrics": ["tstr_macro_f1.v1"],
+            "weights": [1.0],
         }
 
-    def test_evaluation_binary_target_nested_dict_builds_nested_dataclass(self):
+    def test_noncanonical_hpo_metric_categories_are_rejected(self):
         cfg = _from_dict(
             Config,
             {
-                "evaluation": {
-                    "binary_target": {
-                        "enabled": True,
-                        "positive_classes": [0, 1],
-                        "negative_classes": [2],
-                    }
-                }
+                "data": {"source": "csv", "path": "x.csv"},
+                "generation": {"hpo": {"metric_config": {"stats": ["wasserstein_dist"]}}},
             },
         )
-        assert isinstance(cfg.evaluation.binary_target, BinaryTargetConfig)
-        assert cfg.evaluation.binary_target.enabled is True
-        assert cfg.evaluation.binary_target.positive_classes == [0, 1]
-        assert cfg.evaluation.binary_target.negative_classes == [2]
+        with pytest.raises(ValueError, match="only canonical_objectives"):
+            _validate(cfg)
 
     def test_structural_privacy_settings_load(self):
         cfg = _from_dict(
@@ -312,6 +272,86 @@ class TestValidate:
 
     def test_valid_config_passes(self):
         _validate(self._base_valid())  # should not raise
+
+    def test_stratification_declarations_allow_null_bins(self):
+        cfg = self._base_valid()
+        cfg.data.stratification_variables = ["target", "sex"]
+        cfg.data.stratification_bins = [None, ["female", "male"]]
+
+        _validate(cfg)
+
+    def test_protected_attribute_bins_use_aligned_age_labels(self):
+        cfg = self._base_valid()
+        cfg.data.protected_columns = ["sex", "Age", "ethnicity"]
+        cfg.data.protected_attribute_bins = [
+            None,
+            ["<18", "18-30", "30-45", "45-60", "60+"],
+            None,
+        ]
+
+        _validate(cfg)
+
+    def test_greater_than_age_label_is_alias_for_inclusive_upper_open_bin(self):
+        cfg = self._base_valid()
+        cfg.data.protected_columns = ["Age"]
+        cfg.data.protected_attribute_bins = [["<18", "18-30", "30-45", "45-60", ">60"]]
+        cfg.data.stratification_variables = ["Age"]
+        cfg.data.stratification_bins = [["<18", "18-30", "30-45", "45-60", ">60"]]
+
+        _validate(cfg)
+
+        parsed = _protected_attribute_bin_intervals(
+            cfg.data.protected_columns, cfg.data.protected_attribute_bins
+        )
+        assert parsed["Age"]["intervals"][-1] == {
+            "label": ">60",
+            "lower": 60,
+            "upper": None,
+        }
+
+    def test_misaligned_protected_attribute_bins_raise(self):
+        cfg = self._base_valid()
+        cfg.data.protected_columns = ["sex", "Age"]
+        cfg.data.protected_attribute_bins = [None]
+
+        with pytest.raises(ValueError, match="aligned with data.protected_columns"):
+            _validate(cfg)
+
+    def test_shared_protected_stratification_labels_must_match(self):
+        cfg = self._base_valid()
+        cfg.data.protected_columns = ["Age"]
+        cfg.data.protected_attribute_bins = [["<18", "18-30", "30+"]]
+        cfg.data.stratification_variables = ["Age"]
+        cfg.data.stratification_bins = [None]
+
+        with pytest.raises(ValueError, match="must match data.protected_attribute_bins"):
+            _validate(cfg)
+
+    def test_misaligned_stratification_bins_raise(self):
+        cfg = self._base_valid()
+        cfg.data.stratification_variables = ["target", "age"]
+        cfg.data.stratification_bins = [None]
+
+        with pytest.raises(ValueError, match="aligned"):
+            _validate(cfg)
+
+    @pytest.mark.parametrize(
+        "labels",
+        [
+            ["<18", "18-18", "18+"],
+            ["<18", "19-30", "30+"],
+            ["<18", "30-45", "18-30", "45+"],
+            ["<18", "18-30", "18-30", "30+"],
+            ["under 18", "18+"],
+        ],
+    )
+    def test_invalid_protected_attribute_intervals_raise(self, labels):
+        cfg = self._base_valid()
+        cfg.data.protected_columns = ["Age"]
+        cfg.data.protected_attribute_bins = [labels]
+
+        with pytest.raises(ValueError, match="data.protected_attribute_bins"):
+            _validate(cfg)
 
     @pytest.mark.parametrize(
         "field, value",
@@ -631,37 +671,38 @@ class TestValidate:
         with pytest.raises(ValueError, match="no longer supported"):
             _validate(cfg)
 
-    def test_binary_target_disabled_by_default_passes(self):
-        cfg = self._base_valid()
-        _validate(cfg)  # should not raise
+    @pytest.mark.parametrize("removed_key", ["binary_target", "release_generalization"])
+    def test_removed_evaluation_config_is_rejected(self, tmp_path, removed_key):
+        path = tmp_path / "removed-evaluation-config.yaml"
+        path.write_text(
+            f"data:\n  source: csv\n  path: data.csv\nevaluation:\n  {removed_key}: {{}}\n"
+        )
 
-    def test_binary_target_enabled_without_classes_raises(self):
-        cfg = self._base_valid()
-        cfg.evaluation.binary_target.enabled = True
-        with pytest.raises(ValueError, match="binary_target"):
-            _validate(cfg)
+        with pytest.raises(ValueError, match=f"evaluation\\.{removed_key}"):
+            load_config(path)
 
-    def test_binary_target_enabled_with_only_positive_raises(self):
-        cfg = self._base_valid()
-        cfg.evaluation.binary_target.enabled = True
-        cfg.evaluation.binary_target.positive_classes = [0, 1]
-        with pytest.raises(ValueError, match="binary_target"):
-            _validate(cfg)
+    def test_release_generalization_is_not_a_public_config_field(self):
+        evaluation_fields = {field.name for field in dataclasses.fields(EvaluationConfig)}
+        assert "release_generalization" not in evaluation_fields
 
-    def test_binary_target_overlapping_classes_raises(self):
-        cfg = self._base_valid()
-        cfg.evaluation.binary_target.enabled = True
-        cfg.evaluation.binary_target.positive_classes = [0, 1]
-        cfg.evaluation.binary_target.negative_classes = [1, 2]
-        with pytest.raises(ValueError, match="binary_target"):
-            _validate(cfg)
+        with pytest.raises(TypeError, match="unexpected keyword argument 'release_generalization'"):
+            EvaluationConfig(release_generalization={"columns": {}})
+        with pytest.raises(ValueError, match="Unknown config key 'release_generalization'"):
+            _from_dict(Config, {"evaluation": {"release_generalization": {"columns": {}}}})
 
-    def test_binary_target_valid_config_passes(self):
-        cfg = self._base_valid()
-        cfg.evaluation.binary_target.enabled = True
-        cfg.evaluation.binary_target.positive_classes = [0, 1]
-        cfg.evaluation.binary_target.negative_classes = [2]
-        _validate(cfg)  # should not raise
+    def test_binary_target_is_not_a_supported_python_config_field(self):
+        evaluation_fields = {field.name for field in dataclasses.fields(EvaluationConfig)}
+        assert "binary_target" not in evaluation_fields
+
+        with pytest.raises(TypeError, match="unexpected keyword argument 'binary_target'"):
+            EvaluationConfig(binary_target={"enabled": True})
+        with pytest.raises(ValueError, match="Unknown config key 'binary_target'"):
+            _from_dict(Config, {"evaluation": {"binary_target": {"enabled": True}}})
+        evaluation = Config().evaluation
+        with pytest.raises(AttributeError, match="binary_target"):
+            _ = evaluation.binary_target
+        with pytest.raises(AttributeError, match="binary_target"):
+            evaluation.binary_target = {"enabled": True}
 
     def test_rank_weights_default_passes(self):
         cfg = self._base_valid()
@@ -734,18 +775,13 @@ class TestLoadConfig:
             target_column="target",
             canonical=True,
             patient_id_column="patient_id",
+            protected_columns=["Age"],
             split=DataSplitConfig(mode="patient_group"),
         )
         cfg = Config(data=data)
         cfg.imputation.method = "hyperimpute"
-        cfg.evaluation.release_generalization.columns = {
-            "Age": {
-                "intervals": [
-                    {"label": "<18", "lower": None, "upper": 18},
-                    {"label": ">=18", "lower": 18, "upper": None},
-                ]
-            }
-        }
+        cfg.data.protected_attribute_bins = [["<18", "18+"]]
+        cfg.generation.hpo.metric_config = {"canonical_objectives": ["tstr_macro_f1.v1"]}
         return cfg
 
     @classmethod
@@ -753,8 +789,6 @@ class TestLoadConfig:
         """Return YAML-compatible data derived only from the canonical test fixture."""
         raw = dataclasses.asdict(cls._canonical_fixture())
         raw.pop("config_path")
-        # Serialization includes dataclass defaults, but this field must be absent
-        # from YAML to represent canonical direct identity rather than nested identity.
         raw["data"]["split"].pop("patient_id_column")
         return raw
 
@@ -837,41 +871,41 @@ class TestLoadConfig:
         cfg = self._canonical_fixture()
         cfg.data.quasi_identifier_columns = ["age"]
         cfg.data.protected_columns = ["age"]
+        cfg.data.protected_attribute_bins = [["<18", "18+"]]
         _validate(cfg)
 
     def test_canonical_protected_sensitive_overlap_is_allowed(self):
         cfg = self._canonical_fixture()
         cfg.data.protected_columns = ["age"]
+        cfg.data.protected_attribute_bins = [["<18", "18+"]]
         cfg.data.sensitive_columns = ["age"]
         _validate(cfg)
 
     def test_canonical_rejects_malformed_release_intervals(self):
         cfg = self._canonical_fixture()
-        cfg.evaluation.release_generalization.columns = {
-            "Age": {"intervals": [{"label": "bad", "lower": 2, "upper": 1}]}
-        }
+        cfg.data.protected_attribute_bins = [["<18", "30-20", "20+"]]
         with pytest.raises(ValueError, match="lower >= upper"):
             _validate(cfg)
 
+    def test_protected_attribute_bins_accept_lower_inclusive_upper_exclusive_intervals(self):
+        cfg = self._canonical_fixture()
+        cfg.data.protected_attribute_bins = [["<18", "18-30", "30+"]]
+
+        _validate(cfg)
+
     @pytest.mark.parametrize(
-        "intervals",
+        "labels",
         [
-            [
-                {"label": "<18", "lower": None, "upper": None},
-                {"label": ">60", "lower": 61, "upper": None},
-            ],
-            [
-                {"label": "<18", "lower": None, "upper": 18},
-                {"label": "middle", "lower": 18, "upper": None},
-                {"label": ">60", "lower": 61, "upper": None},
-            ],
+            ["<18", "19+"],
+            ["<18", "18-30", "29-60", "60+"],
+            ["18-30", "30+"],
         ],
     )
-    def test_canonical_rejects_misordered_open_ended_release_intervals(self, intervals):
+    def test_canonical_rejects_misordered_open_ended_release_intervals(self, labels):
         cfg = self._canonical_fixture()
-        cfg.evaluation.release_generalization.columns = {"Age": {"intervals": intervals}}
+        cfg.data.protected_attribute_bins = [labels]
 
-        with pytest.raises(ValueError, match="unbounded|contiguous"):
+        with pytest.raises(ValueError, match="open|contiguous|ordered"):
             _validate(cfg)
 
     def test_canonical_invalid_support_setting_is_rejected(self):
@@ -932,8 +966,8 @@ class TestLoadConfig:
         [
             ("evaluation", "privacy_policy"),
             ("evaluation", "scoring_policy"),
-            ("evaluation", "release_generalization"),
-            ("generation", "hpo", "utility_policy"),
+            ("data", "protected_attribute_bins"),
+            ("generation", "hpo", "metric_config", "canonical_objectives"),
         ],
     )
     def test_canonical_omitted_required_policy_fields_fail_closed(self, tmp_path, path_parts):
@@ -1034,6 +1068,70 @@ class TestLoadConfig:
             "synthdata.evaluation.syntheval_eval._available_memory_gib", lambda: 200.0
         )
         assert resolve_model_workers(execution, n_models=20, n_columns=664) == 4
+
+    def test_shipped_profiles_declare_stratification_and_tstr_only_hpo(self):
+        root = Path(__file__).parents[2]
+        loris = load_config(root / "configs" / "config_loris.yaml")
+        hepatitis = load_config(root / "configs" / "config_hepatitis.yaml")
+
+        assert loris.data.stratification_variables == ["CGAS_class", "Sex", "Age"]
+        assert loris.data.stratification_bins == [
+            None,
+            None,
+            ["<18", "18-30", "30-45", "45-60", ">60"],
+        ]
+        assert loris.data.protected_attribute_bins == [
+            None,
+            ["<18", "18-30", "30-45", "45-60", ">60"],
+            None,
+        ]
+        runtime_bins = _protected_attribute_bin_intervals(
+            loris.data.protected_columns,
+            loris.data.protected_attribute_bins,
+        )
+        age_intervals = runtime_bins["Age"]["intervals"]
+        assert [(interval["lower"], interval["upper"]) for interval in age_intervals] == [
+            (None, 18),
+            (18, 30),
+            (30, 45),
+            (45, 60),
+            (60, None),
+        ]
+        assert [interval["label"] for interval in age_intervals] == [
+            "<18",
+            "18-30",
+            "30-45",
+            "45-60",
+            ">60",
+        ]
+
+        age_values = [17, 18, 29, 30, 44, 45, 59, 60]
+        age_frame = pd.DataFrame({"Age": age_values})
+        stratified, _policy = _configured_stratification_frame(
+            age_frame,
+            ["Age"],
+            [loris.data.stratification_bins[2]],
+            runtime_bins,
+        )
+        assert stratified is not None
+        released_synthetic, released_roles, _metadata = transform_release_roles(
+            age_frame,
+            {"train": age_frame},
+            runtime_bins,
+        )
+        assert released_synthetic["Age"].tolist() == stratified["Age"].tolist()
+        assert released_roles["train"]["Age"].tolist() == stratified["Age"].tolist()
+
+        assert hepatitis.data.stratification_variables == ["target"]
+        assert hepatitis.data.stratification_bins == [None]
+        for cfg in (loris, hepatitis):
+            assert cfg.generation.hpo.metric_config == {
+                "canonical_objectives": ["tstr_macro_f1.v1"]
+            }
+            assert cfg.generation.hpo.utility_policy == {
+                "metrics": ["tstr_macro_f1.v1"],
+                "weights": [1.0],
+            }
 
     def test_null_drop_columns_loads_as_empty_list(self, tmp_path):
         yaml_path = tmp_path / "config.yaml"

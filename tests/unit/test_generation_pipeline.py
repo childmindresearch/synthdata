@@ -624,11 +624,7 @@ def test_tabpfgen_hpo_forwards_canonical_evaluation_contract(
     pd.testing.assert_frame_equal(arguments[1], dataset.role_frame("tuning", imputed=True))
     assert keyword_arguments["release_generalization"] == dataset.release_generalization
     assert keyword_arguments["utility_policy"] == cfg.generation.hpo.utility_policy
-    assert keyword_arguments["expected_emitted_keys"] == [
-        "tstr_macro_f1.v1",
-        "mixed_mmd.v1",
-        "elastic_net_jsd.v1",
-    ]
+    assert keyword_arguments["expected_emitted_keys"] == ["tstr_macro_f1.v1"]
 
 
 @pytest.mark.parametrize("variant", ["standard", "custom"])
@@ -1708,10 +1704,6 @@ def test_hpo_generated_cache_rejects_changed_objective_context(
     cfg.generation.tabpfgen.enabled = False
     cfg.generation.hpo.n_trials = 1
     cfg.generation.n_samples = 4
-    cfg.generation.hpo.utility_policy = {
-        "metrics": ["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"],
-        "weights": [1 / 3, 1 / 3, 1 / 3],
-    }
     dataset = make_canonical_dataset()
     synthetic = pd.DataFrame(
         {
@@ -1751,16 +1743,54 @@ def test_hpo_generated_cache_rejects_changed_objective_context(
     assert run_study.call_args.kwargs["hpo_context"]["objective_context"]["n_iter_cap"] == 301
 
 
+def test_native_report_directions_follow_metric_contracts_and_reject_mismatch():
+    metric_keys = ("sanity.close_values_probability", "sanity.data_mismatch")
+    report = pd.DataFrame(
+        {"mean": (0.2, 0.1), "direction": ("maximize", "minimize")},
+        index=pd.Index(metric_keys),
+    )
+    report.attrs["hpo_provenance"] = {
+        "release_transform_digest": "release-a",
+        "role_hashes": {"train": "train-a", "tuning": "tuning-a"},
+        "contracts": {
+            "fit_roles": ["train"],
+            "comparison_role": "tuning",
+            "excluded_roles": ["final_holdout"],
+        },
+        "objective_version": "native-v1",
+    }
+    report.attrs["metric_metadata"] = {
+        key: {
+            "metric_name": key,
+            "status": "complete",
+            "finite": True,
+            "eligible": True,
+            "error_reason_code": None,
+        }
+        for key in metric_keys
+    }
+    report.attrs["result_metadata"] = dict(report.attrs["metric_metadata"])
+
+    assert (
+        sc._validate_native_benchmark_report(
+            {"trial_0": report}, "trial_0", expected_keys=list(metric_keys)
+        )
+        is report
+    )
+
+    report.loc[metric_keys[0], "direction"] = "minimize"
+    with pytest.raises(sc.HPOMetricNotEligibleError, match="invalid directions"):
+        sc._validate_native_benchmark_report(
+            {"trial_0": report}, "trial_0", expected_keys=list(metric_keys)
+        )
+
+
 def test_synthcity_stage_a_screen_runs_before_canonical_metric_evaluation(
     mocker, make_config, tmp_path
 ):
     cfg = make_config()
     hpo_cfg = cfg.generation.hpo
-    hpo_cfg.metric_config = {"utility": ["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"]}
-    hpo_cfg.utility_policy = {
-        "metrics": ["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"],
-        "weights": [1 / 3, 1 / 3, 1 / 3],
-    }
+    hpo_cfg.metric_config = {"canonical_objectives": ["tstr_macro_f1.v1"]}
     events = []
     metric_kwargs = {}
     metric_frames = {}
@@ -1785,8 +1815,8 @@ def test_synthcity_stage_a_screen_runs_before_canonical_metric_evaluation(
 
     candidate = pd.DataFrame({"feature": [1.0], "target": [0]})
     report = pd.DataFrame(
-        {"mean": (0.1, 0.2, 0.3), "direction": ("maximize", "minimize", "minimize")},
-        index=pd.Index(("tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1")),
+        {"mean": (0.1,), "direction": ("maximize",)},
+        index=pd.Index(("tstr_macro_f1.v1",)),
     )
     report.attrs["canonical_hpo"] = True
     report.attrs["canonical_hpo_keys"] = tuple(report.index)
@@ -1851,7 +1881,10 @@ def test_synthcity_stage_a_screen_runs_before_canonical_metric_evaluation(
     screen.assert_called_once()
     assert metric_kwargs["sensitive_features"] == ()
     assert metric_kwargs["release_generalization"] == {"feature": {"kind": "bin", "bins": [0, 1]}}
-    assert metric_kwargs["utility_policy"] == hpo_cfg.utility_policy
+    assert metric_kwargs["utility_policy"] == {
+        "metrics": ["tstr_macro_f1.v1"],
+        "direction": "maximize",
+    }
     assert metric_frames["train"].equals(pd.DataFrame({"feature": [0.0], "target": [0]}))
     assert metric_frames["tuning"].equals(pd.DataFrame({"feature": [1.0], "target": [1]}))
     assert not metric_frames["train"].equals(metric_frames["tuning"])
@@ -1860,11 +1893,7 @@ def test_synthcity_stage_a_screen_runs_before_canonical_metric_evaluation(
 def test_synthcity_stage_a_prune_skips_canonical_metric_evaluation(mocker, make_config, tmp_path):
     cfg = make_config()
     hpo_cfg = cfg.generation.hpo
-    hpo_cfg.metric_config = {"utility": ["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"]}
-    hpo_cfg.utility_policy = {
-        "metrics": ["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"],
-        "weights": [1 / 3, 1 / 3, 1 / 3],
-    }
+    hpo_cfg.metric_config = {"canonical_objectives": ["tstr_macro_f1.v1"]}
 
     class Plugin:
         @staticmethod
@@ -1927,10 +1956,6 @@ def test_hpo_context_carries_canonical_exclusions_and_provenance(
     cfg.generation.tabpfgen.enabled = False
     cfg.generation.hpo.n_trials = 1
     cfg.generation.n_samples = 4
-    cfg.generation.hpo.utility_policy = {
-        "metrics": ["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"],
-        "weights": [1 / 3, 1 / 3, 1 / 3],
-    }
     dataset = make_canonical_dataset()
     synthetic = dataset.role_frame("train", imputed=True).head(4).copy()
     mocker.patch("synthdata.generation.pipeline.sc.make_loader", return_value=object())
@@ -1967,6 +1992,14 @@ def test_hpo_context_carries_canonical_exclusions_and_provenance(
         "contract": "train_frozen_v1",
     }
     assert objective_context["objective_version"]
+    assert objective_context["utility_policy"] == {
+        "metrics": ["tstr_macro_f1.v1"],
+        "direction": "maximize",
+    }
+    assert context["objective"] == {
+        "metric_name": "tstr_macro_f1.v1",
+        "direction": "maximize",
+    }
     assert context["release_transform_digest"] == objective_context["release_transform_digest"]
     assert context["role_hashes"] == objective_context["role_hashes"]
     assert context["contracts"] == objective_context["contracts"]
@@ -1994,10 +2027,6 @@ def test_stage_a_exhausted_hpo_output_does_not_stop_sibling_generation(
     cfg.generation.tabpfgen.enabled = False
     cfg.generation.hpo.n_trials = 1
     cfg.generation.n_samples = 4
-    cfg.generation.hpo.utility_policy = {
-        "metrics": ["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"],
-        "weights": [1 / 3, 1 / 3, 1 / 3],
-    }
     dataset = make_canonical_dataset()
     synthetic = dataset.role_frame("train", imputed=True).head(4).copy()
     mocker.patch("synthdata.generation.pipeline.sc.make_loader", return_value=object())
@@ -2092,7 +2121,7 @@ def test_stage_a_exhausted_hpo_output_does_not_stop_sibling_generation(
 def _complete_hpo_cache_context():
     return hpo_mod.build_hpo_context(
         task_type="classification",
-        metric_config={"task12": ["mixed_mmd.v1"]},
+        metric_config={"canonical_objectives": ["tstr_macro_f1.v1"]},
         registry_digest="registry-a",
         stage_a_contract_digest="stage-a",
         group_context={"group_mode": "row"},
@@ -2113,7 +2142,7 @@ def _complete_hpo_cache_context():
             "comparison_role": "tuning",
             "contract": "train_frozen_v1",
         },
-        objective_version="release-utility-v1",
+        objective_version="configured-objective-v1",
     )
 
 
@@ -2280,7 +2309,7 @@ def test_best_params_cache_context_identity_preserves_complete_provenance(
         "comparison_role": "tuning",
         "contract": "train_frozen_v1",
     }
-    assert context["objective_version"] == "release-utility-v1"
+    assert context["objective_version"] == "configured-objective-v1"
 
 
 def test_generation_cache_rejects_changed_semantic_context(

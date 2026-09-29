@@ -19,6 +19,8 @@ data:
 
   # Modeling columns
   target_column: target
+  stratification_variables: [target]
+  stratification_bins: [null]
   raw_target_column: CLASS
   sensitive_columns: [AGE, SEX]
   drop_columns: []
@@ -90,9 +92,7 @@ generation:
     model_iter_caps: { pategan: 5 }
     sgld_step_cap: 500
     metric_config:
-      stats: [wasserstein_dist, inv_kl_divergence]
-      sanity: [nearest_syn_neighbor_distance]
-      performance: [xgb]
+      canonical_objectives: [tstr_macro_f1.v1]
     stage_a:
       minimum_class_count: 1
       minimum_protected_group_count: 1
@@ -128,10 +128,6 @@ evaluation:
     target_map: { 0: died, 1: survived }
     protected_map: [{ 0: male, 1: female }, null]
     protected_bins: [null, [7, 18, 30, 45, 60, 78]]
-
-  # Used only for targets with more than two classes.
-  binary_target:
-    { enabled: false, column: null, positive_classes: [], negative_classes: [] }
 
   syntheval_execution:
     model_workers: auto

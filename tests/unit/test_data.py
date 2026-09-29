@@ -13,6 +13,7 @@ import pytest
 
 from synthdata.config import Config, DataConfig, DataSplitConfig
 from synthdata.data import (
+    _configured_stratification_frame,
     _load_local_file,
     cast_integer_like_columns,
     decode_label_encoded_columns,
@@ -338,6 +339,244 @@ class TestVariableSchema:
         assert dataset.legacy_two_role is True
         assert set(dataset.roles) == {"train", "final_holdout"}
 
+    @pytest.mark.parametrize("upper_open_label", ["60+", ">60"])
+    def test_stratification_intervals_use_half_open_ranges(self, upper_open_label):
+        frame = pd.DataFrame({"age": [17.9, 18, 29.9, 30, 44.9, 45, 59.9, 60]})
+        strata, policy = _configured_stratification_frame(
+            frame,
+            ["age"],
+            [["<18", "18-30", "30-45", "45-60", upper_open_label]],
+            {
+                "age": {
+                    "intervals": [
+                        {"label": "<18", "lower": None, "upper": 18},
+                        {"label": "18-30", "lower": 18, "upper": 30},
+                        {"label": "30-45", "lower": 30, "upper": 45},
+                        {"label": "45-60", "lower": 45, "upper": 60},
+                        {"label": upper_open_label, "lower": 60, "upper": None},
+                    ]
+                }
+            },
+        )
+
+        assert strata is not None
+        assert strata["age"].tolist() == [
+            "<18",
+            "18-30",
+            "18-30",
+            "30-45",
+            "30-45",
+            "45-60",
+            "45-60",
+            upper_open_label,
+        ]
+        assert policy["age"]["intervals"][1] == {
+            "label": "18-30",
+            "lower": 18,
+            "upper": 30,
+        }
+
+    @pytest.mark.parametrize("labels", [None, ["<18", "18-30", "30+"]])
+    def test_stratification_labels_must_match_protected_bins(self, labels):
+        with pytest.raises(ValueError, match="do not match configured intervals"):
+            _configured_stratification_frame(
+                pd.DataFrame({"age": [17, 18, 30]}),
+                ["age"],
+                [labels],
+                {
+                    "age": {
+                        "intervals": [
+                            {"label": "<18", "lower": None, "upper": 18},
+                            {"label": "18-30", "lower": 18, "upper": 30},
+                            {"label": "30-45", "lower": 30, "upper": 45},
+                            {"label": "45-60", "lower": 45, "upper": 60},
+                            {"label": "60+", "lower": 60, "upper": None},
+                        ]
+                    }
+                },
+            )
+
+    @pytest.mark.parametrize(
+        ("values", "message"),
+        [([-1, 20], "outside configured half-open")],
+    )
+    def test_stratification_rejects_out_of_range_values(self, values, message):
+        frame = pd.DataFrame({"age": values})
+        with pytest.raises(ValueError, match=message):
+            _configured_stratification_frame(
+                frame,
+                ["age"],
+                [["0-10", "10-20"]],
+                {
+                    "age": {
+                        "intervals": [
+                            {"label": "0-10", "lower": 0, "upper": 10},
+                            {"label": "10-20", "lower": 10, "upper": 20},
+                        ]
+                    }
+                },
+            )
+
+    def test_missing_stratification_values_are_retained_for_split_only_category(self):
+        frame = pd.DataFrame({"sex": ["F", None, "M"]})
+
+        strata, _ = _configured_stratification_frame(frame, ["sex"], [None], {})
+
+        assert strata is not None
+        assert strata["sex"].tolist()[0] == "F"
+        assert pd.isna(strata["sex"].tolist()[1])
+        assert strata["sex"].tolist()[2] == "M"
+        assert frame["sex"].tolist()[0] == "F"
+        assert pd.isna(frame["sex"].tolist()[1])
+
+    def test_missing_age_is_retained_but_finite_out_of_range_age_fails(self):
+        intervals = {
+            "age": {
+                "intervals": [
+                    {"label": "0-10", "lower": 0, "upper": 10},
+                    {"label": "10+", "lower": 10, "upper": None},
+                ]
+            }
+        }
+        strata, _ = _configured_stratification_frame(
+            pd.DataFrame({"age": [5, None, 10]}),
+            ["age"],
+            [["0-10", "10+"]],
+            intervals,
+        )
+
+        assert strata is not None
+        assert strata["age"].tolist()[0] == "0-10"
+        assert pd.isna(strata["age"].tolist()[1])
+        assert strata["age"].tolist()[2] == "10+"
+        with pytest.raises(ValueError, match="outside configured half-open intervals"):
+            _configured_stratification_frame(
+                pd.DataFrame({"age": [5, 20]}),
+                ["age"],
+                [["0-10"]],
+                {"age": {"intervals": [{"label": "0-10", "lower": 0, "upper": 10}]}},
+            )
+
+    def test_legacy_split_uses_joint_strata_and_records_policy_fingerprint(self, tmp_path):
+        raw_path = tmp_path / "joint.csv"
+        rows = [
+            {"target": target, "sex": sex, "age": age, "feature": index}
+            for index, (target, sex, age) in enumerate(
+                (target, sex, age)
+                for target in (0, 1)
+                for sex in ("F", "M")
+                for age in (10, 25)
+                for _ in range(10)
+            )
+        ]
+        pd.DataFrame(rows).to_csv(raw_path, index=False)
+        schema_path = tmp_path / "schema.csv"
+        schema_path.write_text(
+            "column,kind\nfeature,continuous\ntarget,categorical\nsex,categorical\nage,continuous\n"
+        )
+        interval_declaration = {
+            "age": {
+                "intervals": [
+                    {"label": "<18", "lower": None, "upper": 18},
+                    {"label": "18+", "lower": 18, "upper": None},
+                ]
+            }
+        }
+        cfg = Config(
+            name="joint_legacy_strata",
+            seed=19,
+            data=DataConfig(
+                source="csv",
+                path=str(raw_path),
+                target_column="target",
+                variable_schema_path=str(schema_path),
+                data_dir=str(tmp_path / "derived"),
+                train_size=0.5,
+                legacy_two_role=True,
+                protected_columns=["age"],
+                protected_attribute_bins=[["<18", "18+"]],
+                stratification_variables=["target", "sex", "age"],
+                stratification_bins=[None, None, ["<18", "18+"]],
+            ),
+        )
+
+        dataset = load_dataset(cfg)
+        manifest = json.loads((dataset.data_dir / "dataset_manifest.json").read_text())
+        binned_age, _ = _configured_stratification_frame(
+            dataset.full_df,
+            ["age"],
+            [["<18", "18+"]],
+            interval_declaration,
+        )
+        assert binned_age is not None
+        joint = pd.DataFrame(
+            {
+                "target": dataset.full_df["target"],
+                "sex": dataset.full_df["sex"],
+                "age": binned_age["age"],
+            }
+        )
+        for role_frame in (dataset.train_df, dataset.test_df):
+            role_counts = (
+                role_frame.merge(joint, left_index=True, right_index=True)
+                .groupby(["target_y", "sex_y", "age_y"], observed=True)
+                .size()
+            )
+            assert role_counts.eq(5).all()
+        assert manifest["split_metadata"]["assignment_policy"]["stratification_variables"] == [
+            "target",
+            "sex",
+            "age",
+        ]
+        original_policy_fingerprint = dataset.assignment_policy_fingerprint
+
+        cfg.data.stratification_bins = [None, None, ["<25", "25+"]]
+        cfg.data.protected_attribute_bins = [["<25", "25+"]]
+        changed = load_dataset(cfg)
+        assert changed.assignment_policy_fingerprint != original_policy_fingerprint
+
+    def test_legacy_split_preserves_missing_strata_and_records_missing_policy(self, tmp_path):
+        raw_path = tmp_path / "missing_sex.csv"
+        categories = ["F", "M", "__SPLIT_MISSING__", None]
+        rows = [
+            {"target": target, "sex": sex, "feature": index}
+            for index, (target, sex) in enumerate(
+                (target, sex) for target in (0, 1) for sex in categories for _ in range(10)
+            )
+        ]
+        pd.DataFrame(rows).to_csv(raw_path, index=False)
+        schema_path = tmp_path / "schema.csv"
+        schema_path.write_text(
+            "column,kind\nfeature,continuous\ntarget,categorical\nsex,categorical\n"
+        )
+        cfg = Config(
+            name="legacy_missing_strata",
+            seed=27,
+            data=DataConfig(
+                source="csv",
+                path=str(raw_path),
+                target_column="target",
+                variable_schema_path=str(schema_path),
+                data_dir=str(tmp_path / "derived"),
+                train_size=0.5,
+                legacy_two_role=True,
+                stratification_variables=["sex"],
+                stratification_bins=[None],
+            ),
+        )
+
+        dataset = load_dataset(cfg)
+        split_metadata = dataset.role_metadata["split"]
+        assert len(dataset.full_df) == len(rows)
+        assert dataset.full_df["sex"].isna().sum() == 20
+        assert dataset.train_df["sex"].isna().sum() + dataset.test_df["sex"].isna().sum() == 20
+        assert "__SPLIT_MISSING__" in set(dataset.full_df["sex"].dropna())
+        assert split_metadata["assignment_policy"]["stratification_missing_policy"] == (
+            "dedicated_tagged_category_v1"
+        )
+        assert split_metadata["assignment_policy"]["stratification_missing_counts"] == {"sex": 20}
+        assert dataset.assignment_policy_fingerprint
+
     def test_continuous_target_remains_continuous_in_dataset_metadata(self, tmp_path):
         raw_path = tmp_path / "raw.csv"
         pd.DataFrame(
@@ -371,7 +610,7 @@ class TestVariableSchema:
         assert pd.api.types.is_float_dtype(dataset.full_df["target"])
 
     @staticmethod
-    def _write_canonical_inputs(tmp_path, *, release_generalization=None):
+    def _write_canonical_inputs(tmp_path, *, protected_attribute_bins=None):
         tmp_path.mkdir(parents=True, exist_ok=True)
         patients = np.repeat(np.arange(1, 13), 2)
         raw_path = tmp_path / "canonical.csv"
@@ -400,6 +639,7 @@ class TestVariableSchema:
                 canonical=True,
                 sensitive_columns=["sensitive"],
                 protected_columns=["protected"],
+                protected_attribute_bins=[None],
                 variable_schema_path=str(schema_path),
                 data_dir=str(tmp_path / "derived"),
                 split=DataSplitConfig(
@@ -412,8 +652,9 @@ class TestVariableSchema:
                 ),
             ),
         )
-        if release_generalization is not None:
-            cfg.evaluation.release_generalization.columns = release_generalization
+        if protected_attribute_bins is not None:
+            cfg.data.protected_columns = ["feature"]
+            cfg.data.protected_attribute_bins = [protected_attribute_bins]
         return cfg
 
     def test_canonical_loader_keeps_identity_sidecar_out_of_all_artifacts(self, tmp_path):
@@ -565,14 +806,23 @@ class TestVariableSchema:
         assert payload["sensitive_target_types"] == {"sensitive": "categorical"}
 
     def test_release_generalization_is_copied_and_changes_semantic_context(self, tmp_path):
-        mapping = {"feature": {"kind": "bin", "bins": [0, 10]}}
+        mapping = {
+            "feature": {
+                "intervals": [
+                    {"label": "<10", "lower": None, "upper": 10},
+                    {"label": "10+", "lower": 10, "upper": None},
+                ]
+            }
+        }
         first = load_dataset(
-            self._write_canonical_inputs(tmp_path / "first", release_generalization=mapping)
+            self._write_canonical_inputs(
+                tmp_path / "first", protected_attribute_bins=["<10", "10+"]
+            )
         )
         second = load_dataset(
             self._write_canonical_inputs(
                 tmp_path / "second",
-                release_generalization={"feature": {"kind": "bin", "bins": [0, 5]}},
+                protected_attribute_bins=["<5", "5+"],
             )
         )
 
@@ -581,11 +831,18 @@ class TestVariableSchema:
         assert semantic_context_fingerprint(first) != semantic_context_fingerprint(second)
 
     @pytest.mark.parametrize(
-        "mapping", [{"target": {"kind": "bin"}}, {"patient_id": {"kind": "bin"}}]
+        "protected_columns",
+        [
+            ["target"],
+            ["patient_id"],
+        ],
     )
-    def test_release_generalization_rejects_target_and_identity(self, tmp_path, mapping):
-        with pytest.raises(ValueError, match="model features only|identity columns"):
-            load_dataset(self._write_canonical_inputs(tmp_path, release_generalization=mapping))
+    def test_protected_attribute_bins_reject_target_and_identity(self, tmp_path, protected_columns):
+        cfg = self._write_canonical_inputs(tmp_path)
+        cfg.data.protected_columns = protected_columns
+        cfg.data.protected_attribute_bins = [["<10", "10+"]]
+        with pytest.raises(ValueError, match="target|identity"):
+            load_dataset(cfg)
 
     @staticmethod
     def _canonical_config(raw_path, schema_path, data_dir, split):
@@ -678,6 +935,7 @@ class TestVariableSchema:
         )
         cfg = self._canonical_config(raw_path, schema_path, tmp_path / "derived", split)
         cfg.data.protected_columns = ["patient_id"]
+        cfg.data.protected_attribute_bins = [None]
 
         with pytest.raises(ValueError, match="protected_columns/identity"):
             load_dataset(cfg)

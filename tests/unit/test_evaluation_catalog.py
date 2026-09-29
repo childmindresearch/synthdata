@@ -4,11 +4,15 @@ SynthEval result-column classification helpers.
 """
 
 import pytest
+from syntheval.execution import build_metric_execution
 
 from synthdata.evaluation.catalog import (
     LEGACY_AUDIT_MANIFEST,
     LOG_DISPARITY_METRICS,
     SYNTHCITY_METRIC_CONFIG,
+    SYNTHEVAL_CUSTOM_FAIRNESS_KEYS,
+    SYNTHEVAL_EMITTED_KEY_DIRECTION,
+    SYNTHEVAL_EMITTED_KEY_TYPE,
     TASK12_EXPECTED_MANIFEST,
     TASK12_HPO_ALLOWLIST,
     classify_syntheval_metric,
@@ -17,6 +21,7 @@ from synthdata.evaluation.catalog import (
     is_redundant_synthcity_submetric,
     resolve_selection,
     syntheval_execution_manifest,
+    syntheval_framework_for_emitted_key,
 )
 from synthdata.evaluation.metric_contracts import (
     DEFAULT_METRIC_CONTRACT_REGISTRY,
@@ -87,6 +92,35 @@ class TestClassifySynthevalMetric:
     def test_unknown_metric_fails_closed(self):
         with pytest.raises(UnknownMetricContractError, match="some_unrecognised_metric"):
             classify_syntheval_metric("some_unrecognised_metric")
+
+    @pytest.mark.parametrize(
+        ("emitted_key", "category", "direction"),
+        [
+            ("auroc_macro_ovr_v3", "utility", "maximize"),
+            ("statistical_parity_macro_ovr_v1", "fairness", "minimize"),
+            ("equalized_odds_macro_ovr_v1", "fairness", "minimize"),
+            ("equal_opportunity_macro_ovr_v1", "fairness", "minimize"),
+        ],
+    )
+    def test_multiclass_ovr_identity_has_category_and_contract_direction(
+        self, emitted_key, category, direction
+    ):
+        assert classify_syntheval_metric(emitted_key) == category
+        assert SYNTHEVAL_EMITTED_KEY_TYPE[emitted_key] == category
+        contract = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
+            framework=syntheval_framework_for_emitted_key(emitted_key),
+            emitted_key=emitted_key,
+        )
+        assert SYNTHEVAL_EMITTED_KEY_DIRECTION[emitted_key] == direction
+        assert SYNTHEVAL_EMITTED_KEY_DIRECTION[emitted_key] == contract.direction
+
+    def test_multiclass_custom_fairness_metrics_keep_custom_framework_owner(self):
+        for emitted_key in (
+            "equalized_odds_macro_ovr_v1",
+            "equal_opportunity_macro_ovr_v1",
+        ):
+            assert emitted_key in SYNTHEVAL_CUSTOM_FAIRNESS_KEYS
+            assert syntheval_framework_for_emitted_key(emitted_key) == "custom"
 
 
 class TestIsCustomSynthevalMetric:
@@ -194,6 +228,114 @@ class TestContextualEmittedKeys:
             "sp_target_label_Sex",
         )
         assert manifest["dwm"] == ("avg_dwm_diff",)
+
+    def test_syntheval_manifest_uses_ovr_identities_only_for_multiclass_native_pass(self):
+        preset = {
+            "auroc_diff": {},
+            "statistical_parity": {"full_output": True},
+            "equalized_odds": {"full_output": True},
+            "equal_opportunity": {"full_output": True},
+        }
+
+        multiclass_manifest = syntheval_execution_manifest(
+            preset,
+            include_holdout_outputs=False,
+            target_columns=["Target Label"],
+            protected_columns=["Sex"],
+            target_is_binary=False,
+        )
+        binary_manifest = syntheval_execution_manifest(
+            preset,
+            include_holdout_outputs=False,
+            target_columns=["Target Label"],
+            protected_columns=["Sex"],
+            target_is_binary=True,
+        )
+
+        assert multiclass_manifest["auroc_diff"] == ("auroc_macro_ovr_v3",)
+        assert multiclass_manifest["statistical_parity"] == ("statistical_parity_macro_ovr_v1",)
+        assert multiclass_manifest["equalized_odds"] == ("equalized_odds_macro_ovr_v1",)
+        assert multiclass_manifest["equal_opportunity"] == ("equal_opportunity_macro_ovr_v1",)
+        assert binary_manifest["auroc_diff"] == ("auroc_v2",)
+        assert binary_manifest["statistical_parity"] == (
+            "statistical_parity",
+            "sp_target_label_Sex",
+        )
+        assert binary_manifest["equalized_odds"] == (
+            "equalized_odds",
+            "eqo_target_label_Sex",
+        )
+        assert binary_manifest["equal_opportunity"] == (
+            "equal_opportunity",
+            "eo_target_label_Sex",
+        )
+
+    @pytest.mark.parametrize(
+        ("preset_name", "aggregate_key", "diagnostic_key"),
+        [
+            (
+                "statistical_parity",
+                "statistical_parity_macro_ovr_v1",
+                "sp_ovr_v1_target_label_a_Sex",
+            ),
+            (
+                "equalized_odds",
+                "equalized_odds_macro_ovr_v1",
+                "eqo_ovr_v1_target_label_a_Sex",
+            ),
+            (
+                "equal_opportunity",
+                "equal_opportunity_macro_ovr_v1",
+                "eo_ovr_v1_target_label_a_Sex",
+            ),
+        ],
+    )
+    def test_multiclass_fairness_status_accepts_classwise_diagnostics_but_requires_aggregate(
+        self, preset_name, aggregate_key, diagnostic_key
+    ):
+        normalized_rows = [
+            {
+                "metric": aggregate_key,
+                "dim": "f",
+                "val": 0.2,
+                "err": 0.01,
+                "n_val": 0.8,
+                "n_err": 0.01,
+            },
+            {
+                "metric": diagnostic_key,
+                "dim": "f",
+                "val": 0.3,
+                "err": 0.02,
+                "n_val": 0.7,
+                "n_err": 0.02,
+            },
+        ]
+
+        expected_keys = syntheval_execution_manifest(
+            {preset_name: {"full_output": True}},
+            include_holdout_outputs=False,
+            target_columns=["Target Label"],
+            protected_columns=["Sex"],
+            target_is_binary=False,
+        )[preset_name]
+        successful = build_metric_execution(
+            preset_name,
+            normalized_rows,
+            expected_keys=expected_keys,
+        )
+        missing_aggregate = build_metric_execution(
+            preset_name,
+            normalized_rows[1:],
+            expected_keys=expected_keys,
+        )
+
+        assert successful.status.succeeded is True
+        assert successful.status.expected_keys == (aggregate_key,)
+        assert successful.status.observed_keys == (aggregate_key, diagnostic_key)
+        assert successful.status.unexpected_keys == ()
+        assert missing_aggregate.status.succeeded is False
+        assert missing_aggregate.status.missing_keys == (aggregate_key,)
 
 
 class TestSynthcityEmittedKeyFixtures:

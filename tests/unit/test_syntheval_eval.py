@@ -407,11 +407,173 @@ class TestBuildPreset:
         preset = build_preset(self._selection(enabled=False))
         assert preset == {}
 
-    def test_multiclass_native_preset_excludes_binary_only_metrics(self):
+    def test_multiclass_native_preset_includes_ovr_metrics(self):
+        preset = build_preset(self._selection(), target_is_binary=False, target_is_multiclass=True)
+
+        assert set(BINARY_ONLY_METRICS) <= set(preset)
+        assert "dwm" in preset
+
+    def test_non_multiclass_nonbinary_target_still_excludes_binary_metrics(self):
         preset = build_preset(self._selection(), target_is_binary=False)
 
         assert not set(BINARY_ONLY_METRICS) & set(preset)
-        assert "dwm" in preset
+
+    def test_binary_target_preset_retains_existing_metric_methods(self):
+        preset = build_preset(self._selection(), target_is_binary=True)
+
+        assert set(BINARY_ONLY_METRICS) <= set(preset)
+
+    def test_auroc_macro_ovr_rows_require_matching_normalizer_version(self):
+        key = "auroc_macro_ovr_v3"
+        payload = {
+            "schema_version": "syntheval-execution-v1",
+            "execution_complete": True,
+            "execution_succeeded": True,
+            "metric_executions": [
+                {
+                    "method": "auroc_diff",
+                    "status": {
+                        "method": "auroc_diff",
+                        "state": "succeeded",
+                        "expected_keys": [key],
+                        "observed_keys": [key],
+                        "completed_keys": [key],
+                        "failed_keys": [],
+                        "missing_keys": [],
+                        "duplicate_keys": [],
+                        "non_finite_keys": [],
+                        "unexpected_keys": [],
+                    },
+                    "normalized_rows": [],
+                    "normalized_rows_v2": [
+                        {
+                            "metric": key,
+                            "dim": "u",
+                            "val": 0.2,
+                            "n_val": 0.8,
+                            "raw_value": 0.2,
+                            "normalized_value": 0.8,
+                            "metric_version": "macro_ovr_v3",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        assert _execution_payload_succeeded(payload)
+        payload["metric_executions"][0]["normalized_rows_v2"][0]["metric_version"] = "v2"
+        assert not _execution_payload_succeeded(payload)
+
+    def test_auroc_class_ovr_diagnostic_rows_require_macro_normalizer_version(self):
+        key = "auroc_income_class_0_ovr_v3"
+        row = {
+            "metric": key,
+            "dim": "u",
+            "val": 0.2,
+            "n_val": 0.8,
+            "raw_value": 0.2,
+            "normalized_value": 0.8,
+            "metric_version": "macro_ovr_v3",
+        }
+        payload = {
+            "schema_version": "syntheval-execution-v1",
+            "execution_complete": True,
+            "execution_succeeded": True,
+            "metric_executions": [
+                {
+                    "method": "auroc_diff",
+                    "status": {
+                        "method": "auroc_diff",
+                        "state": "succeeded",
+                        "expected_keys": [key],
+                        "observed_keys": [key],
+                        "completed_keys": [key],
+                        "failed_keys": [],
+                        "missing_keys": [],
+                        "duplicate_keys": [],
+                        "non_finite_keys": [],
+                        "unexpected_keys": [],
+                    },
+                    "normalized_rows": [row.copy()],
+                    "normalized_rows_v2": [row.copy()],
+                }
+            ],
+        }
+
+        assert _execution_payload_succeeded(payload)
+        payload["metric_executions"][0]["normalized_rows"][0]["metric_version"] = "v2"
+        payload["metric_executions"][0]["normalized_rows_v2"][0]["metric_version"] = "v2"
+        assert not _execution_payload_succeeded(payload)
+
+    @pytest.mark.parametrize("payload_state", ["succeeded", "failed"])
+    @pytest.mark.parametrize(
+        ("field", "invalid_value"),
+        [
+            ("metric_version", "unexpected"),
+            ("raw_value", float("nan")),
+            ("normalized_value", float("inf")),
+        ],
+    )
+    def test_legacy_holdout_rows_enforce_v2_contract_in_success_and_failure_payloads(
+        self, payload_state, field, invalid_value
+    ):
+        key = "avg_macro_F1_diff_v2_hout"
+
+        def make_payload():
+            succeeded = payload_state == "succeeded"
+            row = {
+                "metric": key,
+                "dim": "u",
+                "val": 0.2,
+                "n_val": 0.8,
+                "raw_value": 0.2,
+                "normalized_value": 0.8,
+                "metric_version": "v2",
+            }
+            status = {
+                "method": "tstr",
+                "state": "succeeded" if succeeded else "failed",
+                "expected_keys": [key],
+                "observed_keys": [key],
+                "completed_keys": [key] if succeeded else [],
+                "failed_keys": [] if succeeded else [key],
+                "missing_keys": [],
+                "duplicate_keys": [],
+                "non_finite_keys": [],
+                "unexpected_keys": [],
+            }
+            payload = {
+                "schema_version": "syntheval-execution-v1",
+                "execution_complete": True,
+                "execution_succeeded": succeeded,
+                "metric_executions": [
+                    {
+                        "method": "tstr",
+                        "status": status,
+                        "normalized_rows": [],
+                        "normalized_rows_v2": [row],
+                    }
+                ],
+            }
+            if not succeeded:
+                payload.update(
+                    policy_eligible=False,
+                    failure_reason="Metric execution failed.",
+                )
+            return payload
+
+        valid_payload = make_payload()
+        if payload_state == "succeeded":
+            assert _execution_payload_succeeded(valid_payload)
+        else:
+            assert _execution_payload_failed(valid_payload)
+
+        invalid_payload = make_payload()
+        invalid_payload["metric_executions"][0]["normalized_rows_v2"][0][field] = invalid_value
+        if payload_state == "succeeded":
+            assert not _execution_payload_succeeded(invalid_payload)
+        else:
+            assert not _execution_payload_failed(invalid_payload)
 
 
 class TestEvaluationRoleContext:

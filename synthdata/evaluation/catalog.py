@@ -476,6 +476,9 @@ def classify_syntheval_metric(name: str) -> str:
     registered under the root ``custom`` framework. Unknown emitted keys fail
     closed instead of being silently treated as utility.
     """
+    if name in SYNTHEVAL_EMITTED_KEY_TYPE:
+        return SYNTHEVAL_EMITTED_KEY_TYPE[name]
+
     from synthdata.evaluation.metric_contracts import (
         DEFAULT_METRIC_CONTRACT_REGISTRY,
         UnknownMetricContractError,
@@ -506,6 +509,38 @@ def is_custom_syntheval_metric(name: str) -> bool:
 #: are computed via SynthEval's `evaluate()` call but re-tagged framework="custom"
 #: in the combined evaluation table, since they are not part of upstream SynthEval.
 SYNTHEVAL_CUSTOM_FAIRNESS_KEYS = {"equalized_odds", "equal_opportunity"}
+
+# Exact identities emitted by multiclass one-vs-rest implementations. Binary
+# passes continue to use identities in SYNTHEVAL_PRESET_EMITTED_KEYS.
+SYNTHEVAL_MULTICLASS_EMITTED_KEYS = {
+    "auroc_diff": ("auroc_macro_ovr_v3",),
+    "statistical_parity": ("statistical_parity_macro_ovr_v1",),
+    "equalized_odds": ("equalized_odds_macro_ovr_v1",),
+    "equal_opportunity": ("equal_opportunity_macro_ovr_v1",),
+}
+
+SYNTHEVAL_EMITTED_KEY_TYPE = {
+    "auroc_macro_ovr_v3": "utility",
+    "statistical_parity_macro_ovr_v1": "fairness",
+    "equalized_odds_macro_ovr_v1": "fairness",
+    "equal_opportunity_macro_ovr_v1": "fairness",
+}
+
+# Directions match the registered metric contracts. OvR AUROC agreement is
+# transformed with one_minus_absolute, so larger (closer to zero) is preferable;
+# lower fairness disparity is preferable.
+SYNTHEVAL_EMITTED_KEY_DIRECTION = {
+    "auroc_macro_ovr_v3": "maximize",
+    "statistical_parity_macro_ovr_v1": "minimize",
+    "equalized_odds_macro_ovr_v1": "minimize",
+    "equal_opportunity_macro_ovr_v1": "minimize",
+}
+SYNTHEVAL_CUSTOM_FAIRNESS_KEYS.update(
+    {
+        "equalized_odds_macro_ovr_v1",
+        "equal_opportunity_macro_ovr_v1",
+    }
+)
 
 # SynthEval's preset names identify evaluator classes, not the normalized
 # metric identities written to benchmark results. Keep this translation
@@ -562,6 +597,7 @@ def _syntheval_qualified_output_keys(
     *,
     target_columns: Sequence[str] | None,
     protected_columns: Sequence[str] | None,
+    multiclass: bool = False,
 ) -> tuple[str, ...]:
     if not isinstance(parameters, Mapping):
         raise ValueError(f"SynthEval preset {preset_name!r} parameters must be a mapping")
@@ -570,13 +606,20 @@ def _syntheval_qualified_output_keys(
     targets = tuple(target_columns or ())
     protected = tuple(protected_columns or ())
     if preset_name == "auroc_diff":
-        return tuple(f"auroc_{_syntheval_key_component(target)}_v2" for target in targets)
+        suffix = "macro_ovr_v3" if multiclass else "v2"
+        return tuple(f"auroc_{_syntheval_key_component(target)}_{suffix}" for target in targets)
     fairness_prefix = {
         "statistical_parity": "sp_",
         "equalized_odds": "eqo_",
         "equal_opportunity": "eo_",
     }.get(preset_name)
     if fairness_prefix is None:
+        return ()
+    if multiclass:
+        # Classwise OvR diagnostics include observed class values, which are
+        # intentionally not inferred from the declared target column. Their
+        # aggregate identity remains required; the executor accounts for the
+        # classwise diagnostic prefixes as optional outputs.
         return ()
     return tuple(
         f"{fairness_prefix}{_syntheval_key_component(target)}_{protected_attribute}"
@@ -591,13 +634,15 @@ def syntheval_execution_manifest(
     include_holdout_outputs: bool,
     target_columns: Sequence[str] | None = None,
     protected_columns: Sequence[str] | None = None,
+    target_is_binary: bool | None = None,
 ) -> dict[str, tuple[str, ...]]:
     """Build static per-method output expectations for structured SynthEval runs.
 
     The manifest is resolved from the selected preset and declared evaluation
-    context before evaluation. Qualified diagnostics are required only when
-    the selected preset explicitly requests full output and the corresponding
-    target/protected columns are declared.
+    context before evaluation. Binary qualified diagnostics are required only
+    when the selected preset explicitly requests full output and the
+    corresponding target/protected columns are declared. Multiclass fairness
+    diagnostics include observed classes, so only aggregate keys are required.
     """
     manifest = {}
     for preset_name, parameters in preset.items():
@@ -622,12 +667,15 @@ def syntheval_execution_manifest(
                 ) from exc
             if include_holdout_outputs:
                 expected.extend(SYNTHEVAL_HOLDOUT_EMITTED_KEYS.get(preset_name, ()))
+        if target_is_binary is False:
+            expected = list(SYNTHEVAL_MULTICLASS_EMITTED_KEYS.get(preset_name, expected))
         expected.extend(
             _syntheval_qualified_output_keys(
                 preset_name,
                 parameters,
                 target_columns=target_columns,
                 protected_columns=protected_columns,
+                multiclass=target_is_binary is False,
             )
         )
         manifest[preset_name] = tuple(dict.fromkeys(expected))

@@ -59,6 +59,7 @@ class _CandidateRecord(TypedDict):
     violations: list[str]
     ratio_errors: dict[str, float]
     target_balance_error: float
+    stratification_balance_error: float
     encounter_metrics: dict[str, float]
     encounter_balance_error: float
 
@@ -66,6 +67,41 @@ class _CandidateRecord(TypedDict):
 def _stable_value(value: Any) -> str:
     """Serialize a scalar consistently for validation and fingerprints."""
     return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def _joint_stratification_keys(stratification_frame: pd.DataFrame) -> list[str]:
+    """Serialize joint cells with distinct, collision-safe missing tags."""
+    keys = []
+    for row in stratification_frame.itertuples(index=False, name=None):
+        tagged_values = []
+        for value in row:
+            if not pd.api.types.is_scalar(value):
+                raise ValueError("Stratification values must be scalar")
+            if pd.isna(value):
+                tagged_values.append({"tag": "missing"})
+            else:
+                tagged_values.append({"tag": "value", "value": value})
+        keys.append(
+            json.dumps(
+                {"schema": "joint-stratum-v1", "values": tagged_values},
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            )
+        )
+    return keys
+
+
+def _stratification_missing_counts(
+    stratification_frame: pd.DataFrame | None,
+    variables: list[str],
+) -> dict[str, int]:
+    if stratification_frame is None:
+        return {}
+    return {
+        variable: int(stratification_frame.iloc[:, position].isna().sum())
+        for position, variable in enumerate(variables)
+    }
 
 
 TOKENIZATION_ALGORITHM = "hmac-sha256"
@@ -689,42 +725,64 @@ def _target_balance_error(
     return float(np.mean(errors)) if errors else 0.0
 
 
+def _stratification_balance_error(
+    positions_by_role: dict[str, np.ndarray],
+    stratum_keys: list[str],
+    split: DataSplitConfig,
+) -> float:
+    """Measure row-cell distribution error against requested role fractions."""
+    full_counts = pd.Series(stratum_keys).value_counts()
+    fractions = dict(
+        zip(
+            ROLE_NAMES,
+            [split.train_fraction, split.tuning_fraction, split.final_holdout_fraction],
+            strict=True,
+        )
+    )
+    errors = []
+    for role, positions in positions_by_role.items():
+        keys = [stratum_keys[index] for index in positions]
+        counts = pd.Series(keys).value_counts()
+        for key, total in full_counts.items():
+            errors.append(abs(counts.get(key, 0) / total - fractions[role]))
+    return float(np.mean(errors)) if errors else 0.0
+
+
 def _build_row_candidate(
     frame: pd.DataFrame,
     target_column: str,
     counts: dict[str, int],
     rng: np.random.Generator,
+    strata: list[str] | None = None,
 ) -> dict[str, np.ndarray]:
     fractions = np.array(
         [counts[role] / len(frame) for role in ROLE_NAMES],
         dtype=float,
     )
-    target_values = frame[target_column].unique().tolist()
+    stratum_values = strata or frame[target_column].map(_stable_value).tolist()
+    unique_strata = list(dict.fromkeys(stratum_values))
     assignments: dict[str, list[int]] = {role: [] for role in ROLE_NAMES}
-    target_counts = {role: {value: 0 for value in target_values} for role in ROLE_NAMES}
-    desired_target_counts = {
-        role: {
-            value: len(frame[frame[target_column] == value]) * fractions[index]
-            for value in target_values
-        }
+    current_stratum_counts = {role: {value: 0 for value in unique_strata} for role in ROLE_NAMES}
+    desired_counts = {
+        role: {value: stratum_values.count(value) * fractions[index] for value in unique_strata}
         for index, role in enumerate(ROLE_NAMES)
     }
 
-    for value in target_values:
-        positions = np.flatnonzero(frame[target_column].to_numpy() == value)
+    for value in unique_strata:
+        positions = np.flatnonzero(np.asarray(stratum_values, dtype=object) == value)
         positions = rng.permutation(positions)
         raw_counts = len(positions) * fractions
-        stratum_counts = np.floor(raw_counts).astype(int)
-        remainder = len(positions) - int(stratum_counts.sum())
-        order = np.argsort(-(raw_counts - stratum_counts), kind="stable")
+        allocation_counts = np.floor(raw_counts).astype(int)
+        remainder = len(positions) - int(allocation_counts.sum())
+        order = np.argsort(-(raw_counts - allocation_counts), kind="stable")
         for index in order[:remainder]:
-            stratum_counts[index] += 1
+            allocation_counts[index] += 1
         cursor = 0
         for index, role in enumerate(ROLE_NAMES):
-            selected = positions[cursor : cursor + stratum_counts[index]]
+            selected = positions[cursor : cursor + allocation_counts[index]]
             assignments[role].extend(selected.tolist())
-            target_counts[role][value] += len(selected)
-            cursor += stratum_counts[index]
+            current_stratum_counts[role][value] += len(selected)
+            cursor += allocation_counts[index]
 
     while True:
         role_surplus = {role: len(assignments[role]) - counts[role] for role in ROLE_NAMES}
@@ -742,24 +800,31 @@ def _build_row_candidate(
             underfull,
             key=lambda role: (role_surplus[role], ROLE_NAMES.index(role)),
         )
+        movable = [
+            value for value in unique_strata if current_stratum_counts[source_role][value] > 0
+        ]
+        if not movable:
+            raise RuntimeError(
+                "Jointly stratified row allocation cannot satisfy requested role counts"
+            )
         value = max(
-            target_values,
+            movable,
             key=lambda candidate: (
-                desired_target_counts[destination_role][candidate]
-                - target_counts[destination_role][candidate],
-                str(candidate),
+                desired_counts[destination_role][candidate]
+                - current_stratum_counts[destination_role][candidate],
+                candidate,
             ),
         )
         source_positions = assignments[source_role]
         move_index = next(
             index
             for index, position in enumerate(source_positions)
-            if frame.iloc[position][target_column] == value
+            if stratum_values[position] == value
         )
         position = source_positions.pop(move_index)
         assignments[destination_role].append(position)
-        target_counts[source_role][value] -= 1
-        target_counts[destination_role][value] += 1
+        current_stratum_counts[source_role][value] -= 1
+        current_stratum_counts[destination_role][value] += 1
 
     return {role: np.array(sorted(positions), dtype=int) for role, positions in assignments.items()}
 
@@ -821,6 +886,7 @@ def _build_group_candidate(
     group_values: pd.Series,
     split: DataSplitConfig,
     rng: np.random.Generator,
+    strata: list[str] | None = None,
 ) -> dict[str, np.ndarray]:
     normalized_groups = group_values
     group_positions = {
@@ -841,6 +907,13 @@ def _build_group_candidate(
     )
     group_target_counts = {
         group: frame.iloc[positions][target_column].value_counts(dropna=False)
+        for group, positions in group_positions.items()
+    }
+    stratum_values = strata or frame[target_column].map(_stable_value).tolist()
+    unique_strata = list(dict.fromkeys(stratum_values))
+    full_stratum_counts = pd.Series(stratum_values).value_counts()
+    group_stratum_counts = {
+        group: pd.Series([stratum_values[position] for position in positions]).value_counts()
         for group, positions in group_positions.items()
     }
     encounter_column = split.encounter_label_column
@@ -884,6 +957,7 @@ def _build_group_candidate(
     current_target_counts = {
         role: {value: 0 for value in target_values.index.tolist()} for role in ROLE_NAMES
     }
+    current_stratum_counts = {role: {value: 0 for value in unique_strata} for role in ROLE_NAMES}
     current_encounter_counts = {
         role: {encounter: 0 for encounter in encounter_values} for role in ROLE_NAMES
     }
@@ -907,7 +981,7 @@ def _build_group_candidate(
                 positions: list[int] = positions,
                 group_targets: pd.Series = group_targets,
                 group_name: str = group,
-            ) -> tuple[float, float, float, float, int]:
+            ) -> tuple[float, float, float, float, float, int]:
                 role_index = ROLE_NAMES.index(candidate)
                 proposed_rows = current_counts[candidate] + len(positions)
                 row_error = abs(proposed_rows / len(frame) - target_fractions[role_index])
@@ -920,6 +994,22 @@ def _build_group_candidate(
                         abs(proposed / max(proposed_rows, 1) - full_target_distribution[value])
                     )
                 target_error = float(np.mean(proposed_distribution))
+                proposed_strata = {
+                    value: current_stratum_counts[candidate][value]
+                    + int(group_stratum_counts[group_name].get(value, 0))
+                    for value in unique_strata
+                }
+                stratum_error = float(
+                    np.mean(
+                        [
+                            abs(
+                                proposed_strata[value] / max(proposed_rows, 1)
+                                - full_stratum_counts[value] / len(frame)
+                            )
+                            for value in unique_strata
+                        ]
+                    )
+                )
                 encounter_error = 0.0
                 if encounter_column is not None:
                     encounter_count_errors = []
@@ -958,13 +1048,22 @@ def _build_group_candidate(
                 current_fill_ratio = current_counts[candidate] / max(
                     target_row_counts[candidate], 1
                 )
-                return current_fill_ratio, encounter_error, target_error, row_error, role_index
+                return (
+                    current_fill_ratio,
+                    encounter_error,
+                    stratum_error,
+                    target_error,
+                    row_error,
+                    role_index,
+                )
 
             role = min(ROLE_NAMES, key=assignment_cost)
         assignments[role].extend(positions)
         current_counts[role] += len(positions)
         for value in target_values.index:
             current_target_counts[role][value] += int(group_target_counts[group].get(value, 0))
+        for value in unique_strata:
+            current_stratum_counts[role][value] += int(group_stratum_counts[group].get(value, 0))
         if encounter_column is not None:
             for encounter in encounter_values:
                 current_encounter_counts[role][encounter] += int(
@@ -984,6 +1083,10 @@ def allocate_roles(
     protected_columns: list[str] | None = None,
     groups: pd.Series | None = None,
     seed: int = 0,
+    stratification_frame: pd.DataFrame | None = None,
+    stratification_variables: list[str] | None = None,
+    stratification_bins: list[list[str] | None] | None = None,
+    stratification_interval_policy: dict[str, Any] | None = None,
 ) -> RoleAssignment:
     """Allocate deterministic train/tuning/final-holdout roles."""
     if target_column not in frame.columns:
@@ -994,6 +1097,30 @@ def allocate_roles(
             "three-role allocation requires an observed target"
         )
     protected_columns = list(protected_columns or [])
+    variables = list(stratification_variables or [])
+    bins = list(stratification_bins or [])
+    if len(bins) != len(variables):
+        raise ValueError("stratification bins must align with configured variables")
+    if bool(variables) != (stratification_frame is not None):
+        raise ValueError("stratification variables and row-aligned stratification frame must agree")
+    if stratification_frame is not None:
+        if len(stratification_frame) != len(frame):
+            raise ValueError("stratification frame row count does not match split frame")
+        if stratification_frame.shape[1] != len(variables):
+            raise ValueError("stratification frame columns do not match configured variables")
+        for position, labels in enumerate(bins):
+            if labels is None:
+                continue
+            observed = stratification_frame.iloc[:, position].dropna().unique().tolist()
+            unknown = [value for value in observed if value not in labels]
+            if unknown:
+                raise ValueError(
+                    f"Stratification variable {variables[position]!r} contains value(s) outside "
+                    f"configured labels: {unknown[:5]}"
+                )
+        strata = _joint_stratification_keys(stratification_frame)
+    else:
+        strata = None
     if split.encounter_label_column is not None:
         if split.encounter_label_column not in frame.columns:
             raise KeyError(
@@ -1013,9 +1140,11 @@ def allocate_roles(
     for candidate_number in range(n_candidates):
         rng = np.random.default_rng(rng_seed + candidate_number)
         if groups is None:
-            positions_by_role = _build_row_candidate(frame, target_column, counts, rng)
+            positions_by_role = _build_row_candidate(frame, target_column, counts, rng, strata)
         else:
-            positions_by_role = _build_group_candidate(frame, target_column, groups, split, rng)
+            positions_by_role = _build_group_candidate(
+                frame, target_column, groups, split, rng, strata
+            )
         candidate_frames = {
             role: frame.iloc[positions].reset_index(drop=True)
             for role, positions in positions_by_role.items()
@@ -1036,6 +1165,11 @@ def allocate_roles(
             )
         }
         target_error = _target_balance_error(candidate_frames, frame, target_column, split)
+        stratum_error = (
+            _stratification_balance_error(positions_by_role, strata, split)
+            if strata is not None
+            else 0.0
+        )
         encounter_metrics = _encounter_balance_metrics(
             candidate_frames,
             frame,
@@ -1054,6 +1188,7 @@ def allocate_roles(
                 "violations": violations,
                 "ratio_errors": ratio_errors,
                 "target_balance_error": target_error,
+                "stratification_balance_error": stratum_error,
                 "encounter_metrics": encounter_metrics,
                 "encounter_balance_error": encounter_error,
             }
@@ -1065,6 +1200,7 @@ def allocate_roles(
         if not record["violations"]
         and max(record["ratio_errors"].values()) <= split.ratio_tolerance
         and record["target_balance_error"] <= split.target_balance_tolerance
+        and record["stratification_balance_error"] <= split.target_balance_tolerance
         and record["encounter_balance_error"] <= split.encounter_balance_tolerance
     ]
     if not feasible:
@@ -1074,6 +1210,7 @@ def allocate_roles(
                 len(record["violations"]),
                 max(record["ratio_errors"].values()),
                 record["target_balance_error"],
+                record["stratification_balance_error"],
                 record["encounter_balance_error"],
                 record["candidate_number"],
             ),
@@ -1084,6 +1221,7 @@ def allocate_roles(
             f"{best['candidate_number']}, violations={best['violations'][:8]}, "
             f"ratio_errors={best['ratio_errors']}, "
             f"target_balance_error={best['target_balance_error']:.6f}, "
+            f"stratification_balance_error={best['stratification_balance_error']:.6f}, "
             f"encounter_balance_error={best['encounter_balance_error']:.6f}, "
             f"tolerances=(ratio={split.ratio_tolerance}, "
             f"target_balance={split.target_balance_tolerance}, "
@@ -1094,6 +1232,7 @@ def allocate_roles(
         key=lambda record: (
             max(record["ratio_errors"].values()),
             record["target_balance_error"],
+            record["stratification_balance_error"],
             record["encounter_balance_error"],
             record["candidate_number"],
         ),
@@ -1121,11 +1260,20 @@ def allocate_roles(
         raise TypeError("role assignment JSON payload must be a string")
     assignment_fingerprint = hashlib.sha256(assignment_payload.encode()).hexdigest()
     assignment_policy = {
-        "schema_version": "role-assignment-policy-v2",
-        "algorithm": "candidate_shuffle_v2_stratified_encounter",
+        "schema_version": "role-assignment-policy-v3",
+        "algorithm": "candidate_shuffle_v3_joint_stratification",
         "mode": split.mode,
         "target_column": target_column,
         "protected_columns": protected_columns,
+        "stratification_variables": variables,
+        "stratification_bins": bins,
+        "stratification_interval_policy": stratification_interval_policy or {},
+        "stratification_missing_policy": (
+            "dedicated_tagged_category_v1" if variables else "not_configured"
+        ),
+        "stratification_missing_counts": _stratification_missing_counts(
+            stratification_frame, variables
+        ),
         "groups_provided": groups is not None,
         "effective_seed": rng_seed,
         "split": dataclasses.asdict(split),
@@ -1168,6 +1316,9 @@ def allocate_roles(
             "selected_candidate_violations": selected["violations"],
             "selected_candidate_ratio_errors": selected["ratio_errors"],
             "selected_candidate_target_balance_error": selected["target_balance_error"],
+            "selected_candidate_stratification_balance_error": selected[
+                "stratification_balance_error"
+            ],
             "selected_candidate_encounter_metrics": selected["encounter_metrics"],
             "selected_candidate_encounter_balance_error": selected["encounter_balance_error"],
         },

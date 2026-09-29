@@ -647,6 +647,196 @@ def test_row_roles_are_target_stratified_and_keep_requested_counts():
         assert abs(assignment.frames[role]["target"].mean() - full_rate) <= 0.20
 
 
+def test_joint_row_strata_balance_target_sex_and_age_bin_cells():
+    rows = [
+        {"target": target, "sex": sex, "age_bin": age_bin, "feature": index}
+        for index, (target, sex, age_bin) in enumerate(
+            (target, sex, age_bin)
+            for target in (0, 1)
+            for sex in ("F", "M")
+            for age_bin in ("young", "adult")
+            for _ in range(8)
+        )
+    ]
+    frame = pd.DataFrame(rows)
+    split = DataSplitConfig(
+        train_fraction=0.5,
+        tuning_fraction=0.25,
+        final_holdout_fraction=0.25,
+        candidate_count=4,
+        target_balance_tolerance=0.1,
+    )
+    strata = frame[["target", "sex", "age_bin"]]
+
+    result = allocate_roles(
+        frame,
+        "target",
+        split,
+        seed=17,
+        stratification_frame=strata,
+        stratification_variables=["target", "sex", "Age"],
+        stratification_bins=[None, None, ["young", "adult"]],
+        stratification_interval_policy={
+            "Age": {
+                "intervals": [
+                    {"label": "young", "lower": None, "upper": 18},
+                    {"label": "adult", "lower": 18, "upper": None},
+                ]
+            }
+        },
+    )
+
+    expected_counts = {"train": 4, "tuning": 2, "final_holdout": 2}
+    for role, role_frame in result.frames.items():
+        cells = role_frame.groupby(["target", "sex", "age_bin"], observed=True).size()
+        assert cells.eq(expected_counts[role]).all()
+    policy = result.metadata["assignment_policy"]
+    assert policy["stratification_variables"] == ["target", "sex", "Age"]
+    assert policy["stratification_bins"][2] == ["young", "adult"]
+    assert result.metadata["preflight"]["selected_candidate_stratification_balance_error"] == 0
+
+    renamed_strata = strata.copy()
+    renamed_strata["age_bin"] = renamed_strata["age_bin"].map(
+        {"young": "under-30", "adult": "30-plus"}
+    )
+    changed = allocate_roles(
+        frame,
+        "target",
+        split,
+        seed=17,
+        stratification_frame=renamed_strata,
+        stratification_variables=["target", "sex", "Age"],
+        stratification_bins=[None, None, ["under-30", "30-plus"]],
+        stratification_interval_policy={
+            "Age": {
+                "intervals": [
+                    {"label": "under-30", "lower": None, "upper": 30},
+                    {"label": "30-plus", "lower": 30, "upper": None},
+                ]
+            }
+        },
+    )
+    assert changed.assignment_policy_fingerprint != result.assignment_policy_fingerprint
+
+
+def test_grouped_joint_strata_balance_rows_without_splitting_patients():
+    rows = []
+    patient = 0
+    for sex in ("F", "M"):
+        for age_bin in ("young", "middle", "older"):
+            for _ in range(4):
+                rows.extend(
+                    [
+                        {"patient": patient, "target": 0, "sex": sex, "age_bin": age_bin},
+                        {"patient": patient, "target": 1, "sex": sex, "age_bin": age_bin},
+                    ]
+                )
+                patient += 1
+    frame = pd.DataFrame(rows)
+    groups = frame.pop("patient")
+    strata = frame[["target", "sex", "age_bin"]]
+    split = DataSplitConfig(
+        mode="patient_group",
+        train_fraction=0.5,
+        tuning_fraction=0.25,
+        final_holdout_fraction=0.25,
+        candidate_count=16,
+        target_balance_tolerance=0.2,
+    )
+
+    result = allocate_roles(
+        frame,
+        "target",
+        split,
+        groups=groups,
+        seed=21,
+        stratification_frame=strata,
+        stratification_variables=["target", "sex", "Age"],
+        stratification_bins=[None, None, ["young", "middle", "older"]],
+    )
+
+    assigned = result.assignment.assign(patient=groups.to_numpy())
+    assert assigned.groupby("patient")["role"].nunique().eq(1).all()
+    assert result.metadata["preflight"]["selected_candidate_stratification_balance_error"] < 0.2
+    for role, role_groups in result.groups.items():
+        assert role_groups is not None
+        assert len(role_groups) == len(result.frames[role])
+    for left_role in ROLE_NAMES:
+        for right_role in ROLE_NAMES:
+            if left_role < right_role:
+                assert set(result.groups[left_role]).isdisjoint(set(result.groups[right_role]))
+
+
+def test_grouped_joint_strata_fail_when_balance_is_impossible():
+    frame = pd.DataFrame(
+        {
+            "target": [0, 0, 0, 0],
+            "feature": range(4),
+            "cell": ["a", "b", "c", "d"],
+        }
+    )
+    groups = pd.Series(["p1", "p2", "p3", "p4"])
+    split = DataSplitConfig(
+        mode="patient_group",
+        train_fraction=0.5,
+        tuning_fraction=0.25,
+        final_holdout_fraction=0.25,
+        candidate_count=1,
+        target_balance_tolerance=0,
+    )
+
+    with pytest.raises(ValueError, match="No deterministic three-role assignment"):
+        allocate_roles(
+            frame,
+            "target",
+            split,
+            groups=groups,
+            stratification_frame=frame[["cell"]],
+            stratification_variables=["cell"],
+            stratification_bins=[["a", "b", "c", "d"]],
+        )
+
+
+def test_role_allocation_uses_collision_safe_missing_stratum_without_changing_frame():
+    categories = ["F", "M", "__SPLIT_MISSING__", None]
+    frame = pd.DataFrame(
+        [
+            {"target": target, "sex": sex, "feature": index}
+            for index, (target, sex) in enumerate(
+                (target, sex) for target in (0, 1) for sex in categories for _ in range(8)
+            )
+        ]
+    )
+    split = DataSplitConfig(
+        train_fraction=0.5,
+        tuning_fraction=0.25,
+        final_holdout_fraction=0.25,
+        candidate_count=2,
+        target_balance_tolerance=0.1,
+    )
+
+    result = allocate_roles(
+        frame,
+        "target",
+        split,
+        stratification_frame=frame[["target", "sex"]],
+        stratification_variables=["target", "sex"],
+        stratification_bins=[None, None],
+    )
+
+    assert len(frame) == sum(len(role_frame) for role_frame in result.frames.values())
+    assert frame["sex"].isna().sum() == 16
+    policy = result.metadata["assignment_policy"]
+    assert policy["stratification_missing_policy"] == "dedicated_tagged_category_v1"
+    assert policy["stratification_missing_counts"] == {"target": 0, "sex": 16}
+    expected_cell_counts = {"train": 4, "tuning": 2, "final_holdout": 2}
+    for role, role_frame in result.frames.items():
+        counts = role_frame.groupby(["target", "sex"], dropna=False).size()
+        assert counts.eq(expected_cell_counts[role]).all()
+        assert role_frame["sex"].isna().sum() == expected_cell_counts[role] * 2
+        assert "__SPLIT_MISSING__" in set(role_frame["sex"].dropna())
+
+
 def test_encounter_label_balance_is_recorded_and_deterministic():
     frame = pd.DataFrame(
         {

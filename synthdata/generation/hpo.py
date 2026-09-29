@@ -1,8 +1,8 @@
 """Generic Optuna study management shared by all generation backends.
 
 Provides:
-- ``hpo_score``: the direction-aware composite objective used throughout the
-  hepatitis notebooks (orient every metric so higher = better, then average).
+- ``hpo_score``: the configured single-objective score, with direction derived
+  from the objective's registered metric contract.
 - ``build_synthetic_eval_fn``: scores an arbitrary candidate synthetic DataFrame
   via synthcity's ``Metrics.evaluate`` (used as the HPO objective for generators,
   like TabPFGen, that don't go through synthcity's ``Benchmarks``).
@@ -42,7 +42,6 @@ import pandas as pd
 
 from synthdata.config import HPOConfig
 from synthdata.data import dataframe_fingerprint
-from synthdata.evaluation.catalog import CANONICAL_HPO_ALLOWLIST
 from synthdata.evaluation.metric_contracts import (
     DEFAULT_METRIC_CONTRACT_REGISTRY,
     MetricContractError,
@@ -55,7 +54,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 STAGE_A_SCREEN_SCHEMA_VERSION = "hpo-stage-a-v1"
-HPO_CONTEXT_SCHEMA_VERSION = "hpo-context-v2"
+HPO_CONTEXT_SCHEMA_VERSION = "hpo-context-v3"
 HPO_TRIAL_CHECKPOINT_SCHEMA_VERSION = "hpo-trial-checkpoint-v1"
 LEGACY_GENERATOR_METADATA_SCHEMA_VERSION = "generator-metadata-v1"
 HPO_GENERATOR_METADATA_SCHEMA_VERSION = "generator-metadata-v2"
@@ -142,7 +141,7 @@ class StageAExhaustionError(RuntimeError):
         super().__init__(f"HPO study {study_name!r} exhausted all trials through Stage A screening")
 
 
-_CANONICAL_HPO_METRIC_KEYS = frozenset({"tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"})
+HPO_OBJECTIVE_METRICS = frozenset({"tstr_macro_f1.v1"})
 _SAFE_METRIC_METADATA_FIELDS = frozenset(
     {
         "metric_name",
@@ -178,15 +177,15 @@ def is_canonical_hpo_context(
     expected_keys: Sequence[str] | None = None,
     utility_policy: Mapping[str, Any] | None = None,
 ) -> bool:
-    """Return whether resolved HPO identities exactly match canonical utility."""
+    """Return whether resolved HPO identities match the canonical objective."""
     if not isinstance(metric_config, Mapping):
         return False
-    configured_keys = [
-        str(metric_name)
-        for metric_names in metric_config.values()
-        if isinstance(metric_names, (list, tuple))
-        for metric_name in metric_names
-    ]
+    if set(metric_config) != {"canonical_objectives"}:
+        return False
+    metric_names = metric_config.get("canonical_objectives")
+    if not isinstance(metric_names, (list, tuple)):
+        return False
+    configured_keys = [str(metric_name) for metric_name in metric_names]
     try:
         policy = _resolve_utility_policy(utility_policy)
     except (TypeError, ValueError):
@@ -194,16 +193,12 @@ def is_canonical_hpo_context(
     resolved_expected = (
         list(expected_keys) if expected_keys is not None else list(policy["metrics"])
     )
+    canonical_keys = sorted(HPO_OBJECTIVE_METRICS)
     return (
         len(configured_keys) == len(set(configured_keys))
-        and set(configured_keys) == _CANONICAL_HPO_METRIC_KEYS
+        and configured_keys == canonical_keys
         and resolved_expected == list(policy["metrics"])
-        and list(policy["metrics"])
-        == [
-            "tstr_macro_f1.v1",
-            "mixed_mmd.v1",
-            "elastic_net_jsd.v1",
-        ]
+        and list(policy["metrics"]) == canonical_keys
     )
 
 
@@ -211,7 +206,7 @@ def sanitize_hpo_metric_metadata(
     value: Any, *, allowed_keys: Sequence[str] | None = None
 ) -> dict[str, dict[str, Any]]:
     """Keep bounded per-metric status and role provenance for HPO artifacts."""
-    expected = frozenset(allowed_keys or _CANONICAL_HPO_METRIC_KEYS)
+    expected = frozenset(allowed_keys or HPO_OBJECTIVE_METRICS)
     if not isinstance(value, Mapping):
         raise HPOMetricNotEligibleError("canonical metric metadata is not a mapping")
     if set(value) != expected:
@@ -226,7 +221,7 @@ def sanitize_hpo_metric_metadata(
             raise HPOMetricNotEligibleError("canonical metric metadata identity mismatch")
         if raw["fit_roles"] != ["train"] or raw["evaluation_role"] != "tuning":
             raise HPOMetricNotEligibleError("canonical metric metadata roles are invalid")
-        expected_direction = "maximize" if metric_name == "tstr_macro_f1.v1" else "minimize"
+        expected_direction = _metric_contract_direction(metric_name)
         direction = raw.get("direction")
         if direction != expected_direction:
             raise HPOMetricNotEligibleError("canonical metric metadata direction is invalid")
@@ -273,7 +268,7 @@ def _validate_bounded_hpo_metric_metadata(
     """Validate normalized canonical metric metadata at the durable boundary."""
     if value is None:
         return None
-    expected = frozenset(expected_keys or _CANONICAL_HPO_METRIC_KEYS)
+    expected = frozenset(expected_keys or HPO_OBJECTIVE_METRICS)
     if not isinstance(value, Mapping) or set(value) != expected:
         raise RuntimeError("HPO trial checkpoint metric metadata is unbounded or empty")
     validated: dict[str, dict[str, Any]] = {}
@@ -286,7 +281,7 @@ def _validate_bounded_hpo_metric_metadata(
             raise RuntimeError("HPO trial checkpoint metric metadata identity mismatch")
         if raw["status"] not in {"complete", "failed"}:
             raise RuntimeError("HPO trial checkpoint metric metadata has unsafe status")
-        expected_direction = "maximize" if metric_name == "tstr_macro_f1.v1" else "minimize"
+        expected_direction = _metric_contract_direction(metric_name)
         if raw["direction"] != expected_direction:
             raise RuntimeError("HPO trial checkpoint metric metadata has unsafe direction")
         if not isinstance(raw["finite"], bool) or not isinstance(raw["eligible"], bool):
@@ -1913,14 +1908,7 @@ def prepare_stage_a_screen(
     persist_stage_a_contract(Path(root) / study_name, contract)
 
 
-HPO_OBJECTIVE_METRICS = frozenset(CANONICAL_HPO_ALLOWLIST)
-TUNING_UTILITY_METRICS = (
-    "tstr_macro_f1.v1",
-    "mixed_mmd.v1",
-    "elastic_net_jsd.v1",
-)
-TUNING_UTILITY_WEIGHTS = (1 / 3, 1 / 3, 1 / 3)
-TUNING_OBJECTIVE_VERSION = "release-utility-v1"
+TUNING_OBJECTIVE_VERSION = "configured-objective-v1"
 
 
 def _evaluate_train_frozen_mmd(
@@ -2010,32 +1998,78 @@ def _effective_metric_feature_types(
     return effective, generalized_columns
 
 
-def _resolve_utility_policy(policy: Mapping[str, Any] | None = None) -> dict[str, list]:
-    """Resolve fixed release utility policy, rejecting unsafe substitutions."""
-    expected = list(TUNING_UTILITY_METRICS)
-    expected_weights = list(TUNING_UTILITY_WEIGHTS)
-    if policy is None:
-        return {"metrics": expected, "weights": expected_weights}
-    if not isinstance(policy, Mapping):
-        raise ValueError("HPO utility_policy must be a mapping")
-    metrics = policy.get("metrics")
-    weights = policy.get("weights")
-    if not isinstance(metrics, Sequence) or isinstance(metrics, (str, bytes)):
-        raise ValueError("HPO utility_policy.metrics must be a sequence")
-    if not isinstance(weights, Sequence) or isinstance(weights, (str, bytes)):
-        raise ValueError("HPO utility_policy.weights must be a sequence")
-    metrics = [str(metric) for metric in metrics]
-    weights = list(weights)
-    if metrics != expected or weights != expected_weights:
-        raise ValueError("HPO utility_policy is fixed to equal thirds of TSTR, MMD, and JSD")
-    if len(metrics) != len(set(metrics)):
-        raise ValueError("HPO utility_policy.metrics must not contain duplicates")
-    if any(
-        isinstance(weight, bool) or not isinstance(weight, Real) or not math.isfinite(float(weight))
-        for weight in weights
+def _metric_contract_direction(metric_key: str) -> str:
+    """Resolve objective direction from its registered metric contract."""
+    framework = "syntheval" if metric_key == "tstr_macro_f1.v1" else "synthcity"
+    try:
+        contract = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
+            framework=framework, emitted_key=metric_key
+        )
+    except MetricContractError as exc:
+        raise ValueError(f"Unsupported canonical HPO objective {metric_key!r}") from exc
+    if (
+        contract.lifecycle_state != "operational"
+        or contract.value_role != "policy_scalar"
+        or "hpo_objective" not in contract.allowed_uses
     ):
-        raise ValueError("HPO utility_policy.weights must be finite real numbers")
-    return {"metrics": metrics, "weights": [float(weight) for weight in weights]}
+        raise ValueError(f"HPO objective {metric_key!r} is not operationally eligible")
+    direction = contract.direction
+    if direction not in {"maximize", "minimize"}:
+        raise ValueError(f"HPO objective {metric_key!r} has no valid metric direction")
+    return direction
+
+
+def _resolve_utility_policy(policy: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Resolve one configured HPO objective and its contract direction."""
+    if policy is None:
+        metrics = sorted(HPO_OBJECTIVE_METRICS)
+    else:
+        if not isinstance(policy, Mapping):
+            raise ValueError("HPO utility_policy must be a mapping")
+        metrics = policy.get("metrics")
+        if not isinstance(metrics, Sequence) or isinstance(metrics, (str, bytes)):
+            raise ValueError("HPO utility_policy.metrics must be a sequence")
+        metrics = [str(metric) for metric in metrics]
+        if "weights" in policy:
+            weights = policy["weights"]
+            if not isinstance(weights, Sequence) or isinstance(weights, (str, bytes)):
+                raise ValueError("HPO single-objective weight must be a sequence")
+            if (
+                len(weights) != 1
+                or isinstance(weights[0], bool)
+                or not isinstance(weights[0], Real)
+            ):
+                raise ValueError("HPO single-objective weight must be exactly 1.0")
+            if not math.isfinite(float(weights[0])) or float(weights[0]) != 1.0:
+                raise ValueError("HPO single-objective weight must be exactly 1.0")
+
+    if len(metrics) != 1:
+        raise ValueError("HPO requires exactly one configured objective metric")
+    if len(metrics) != len(set(metrics)):
+        raise ValueError("HPO objective metrics must not contain duplicates")
+    metric = metrics[0]
+    if metric not in HPO_OBJECTIVE_METRICS:
+        raise ValueError(f"HPO objective {metric!r} is not in the configured objective allowlist")
+    direction = _metric_contract_direction(metric)
+    if policy is not None and "direction" in policy and policy["direction"] != direction:
+        raise ValueError(f"HPO objective direction for {metric!r} must be {direction!r}")
+    return {"metrics": metrics, "direction": direction}
+
+
+def _resolve_configured_objective(
+    metric_config: Mapping[str, Sequence[str]],
+    utility_policy: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve configured objective identities and reject policy mismatches."""
+    configured = [
+        str(metric_name) for metric_names in metric_config.values() for metric_name in metric_names
+    ]
+    resolved = _resolve_utility_policy({"metrics": configured})
+    if utility_policy is not None:
+        supplied = _resolve_utility_policy(utility_policy)
+        if supplied != resolved:
+            raise ValueError("HPO utility_policy must match metric_config.canonical_objectives")
+    return resolved
 
 
 def _canonical_metric_framework(metric_key: str) -> str:
@@ -2070,7 +2104,7 @@ def evaluate_canonical_hpo_metrics(
     failed row rather than being replaced by a row-level approximation.
     """
     validate_hpo_metric_config(dict(metric_config))
-    policy = _resolve_utility_policy(utility_policy)
+    policy = _resolve_configured_objective(metric_config, utility_policy)
 
     group_mode = group_context.get("group_mode", "row") if group_context else "row"
     group_safety: dict[str, Any] | None = None
@@ -2229,7 +2263,9 @@ def evaluate_canonical_hpo_metrics(
             "fit_roles": ["train"],
             "evaluation_role": "tuning",
             "objective_version": TUNING_OBJECTIVE_VERSION,
-            "orientation": ("maximize_score" if key == "tstr_macro_f1.v1" else "minimize_distance"),
+            "orientation": (
+                "maximize_score" if policy["direction"] == "maximize" else "minimize_distance"
+            ),
             "contracts": {
                 "fit_roles": ["train"],
                 "comparison_role": "tuning",
@@ -2372,7 +2408,7 @@ def evaluate_canonical_hpo_metrics(
                 metadata["orientation"] = "maximize_score"
             rows[key] = {
                 "mean": float(value),
-                "direction": "maximize" if key == "tstr_macro_f1.v1" else "minimize",
+                "direction": policy["direction"],
                 "errors": 0,
                 **metadata,
             }
@@ -2381,7 +2417,7 @@ def evaluate_canonical_hpo_metrics(
             rows[key] = {
                 **metadata,
                 "mean": float("nan"),
-                "direction": "maximize" if key == "tstr_macro_f1.v1" else "minimize",
+                "direction": policy["direction"],
                 "errors": 1,
                 "error_type": type(exc).__name__,
                 "error_messages": _safe_exception_message(reason_code),
@@ -2392,7 +2428,7 @@ def evaluate_canonical_hpo_metrics(
             rows[key] = {
                 **metadata,
                 "mean": float("nan"),
-                "direction": "maximize" if key == "tstr_macro_f1.v1" else "minimize",
+                "direction": policy["direction"],
                 "errors": 1,
                 "error_type": type(exc).__name__,
                 "error_messages": _safe_exception_message(reason_code),
@@ -2462,6 +2498,10 @@ def evaluate_canonical_hpo_metrics(
                 "contract": "train_frozen_v1",
                 "bandwidth": rows.get("mixed_mmd.v1", {}).get("bandwidth"),
             },
+            "objective": {
+                "metric_name": keys[0],
+                "direction": policy["direction"],
+            },
             "objective_version": TUNING_OBJECTIVE_VERSION,
         }
     report.attrs["metric_metadata"] = {
@@ -2481,10 +2521,10 @@ def validate_hpo_metric_config(
     *,
     group_context: Mapping[str, Any] | None = None,
 ) -> None:
-    """Reject HPO selections without an operational policy contract.
+    """Require the sole TSTR objective and validate its operational contract.
 
-    Patient-group searches may use only metrics whose contract declares that
-    the implementation preserves group-safe evaluation semantics.
+    Patient-group searches additionally require objective implementations that
+    preserve group-safe evaluation semantics.
     """
     if not metric_config:
         raise ValueError(
@@ -2499,7 +2539,7 @@ def validate_hpo_metric_config(
     invalid: list[str] = []
     configured_keys = []
     for category, metric_names in metric_config.items():
-        if not isinstance(metric_names, (list, tuple)):
+        if not isinstance(metric_names, list):
             raise ValueError(
                 f"HPO metric_config[{category!r}] must be a list of canonical metric identities"
             )
@@ -2536,6 +2576,10 @@ def validate_hpo_metric_config(
             "HPO metric_config contains metrics that are not approved operational objectives: "
             + "; ".join(invalid)
         )
+    if set(metric_config) != {"canonical_objectives"}:
+        raise ValueError("HPO metric_config must use exactly the 'canonical_objectives' category")
+    if configured_keys != sorted(HPO_OBJECTIVE_METRICS):
+        raise ValueError("HPO metric_config must select only tstr_macro_f1.v1")
 
 
 def hpo_context_digest(context: Mapping[str, Any]) -> str:
@@ -2673,16 +2717,41 @@ def _require_hpo_provenance(context: Mapping[str, Any], *, label: str) -> dict[s
     return {field: _provenance_value(context, field) for field in _HPO_PROVENANCE_FIELDS}
 
 
-def _require_validated_hpo_context(context: Any, *, label: str) -> dict[str, Any]:
+def _require_validated_hpo_context(
+    context: Any,
+    *,
+    label: str,
+    allow_historical: bool = False,
+) -> dict[str, Any]:
     """Require canonical context before reading or writing durable HPO state."""
     if not isinstance(context, Mapping):
         raise ValueError(f"{label} must be a canonical hpo_context")
-    if context.get("schema_version") != HPO_CONTEXT_SCHEMA_VERSION:
+    schema_version = context.get("schema_version")
+    if schema_version == "hpo-context-v2" and allow_historical:
+        fingerprint = context.get("role_context_fingerprint")
+        if not isinstance(fingerprint, str) or not fingerprint.strip():
+            raise ValueError(f"{label}.role_context_fingerprint must be a non-empty string")
+        _require_hpo_provenance(context, label=label)
+        return dict(context)
+    if schema_version != HPO_CONTEXT_SCHEMA_VERSION:
         raise ValueError(f"{label} has an unsupported schema")
     fingerprint = context.get("role_context_fingerprint")
     if not isinstance(fingerprint, str) or not fingerprint.strip():
         raise ValueError(f"{label}.role_context_fingerprint must be a non-empty string")
     _require_hpo_provenance(context, label=label)
+    metric_config = context.get("metric_config")
+    if not isinstance(metric_config, Mapping):
+        raise ValueError(f"{label}.metric_config must be an object")
+    validate_hpo_metric_config(dict(metric_config), group_context=context.get("group_context"))
+    objective = _resolve_configured_objective(metric_config)
+    expected_identity = {
+        "metric_name": objective["metrics"][0],
+        "direction": objective["direction"],
+    }
+    if context.get("objective") != expected_identity:
+        raise ValueError(f"{label}.objective does not match configured metric identity/direction")
+    if context.get("expected_emitted_keys") != objective["metrics"]:
+        raise ValueError(f"{label}.expected_emitted_keys do not match configured objective")
     return dict(context)
 
 
@@ -2720,7 +2789,7 @@ def build_hpo_context(
         for category, metric_names in metric_config.items()
     }
     validate_hpo_metric_config(resolved_metric_config, group_context=group_context)
-    policy = _resolve_utility_policy(utility_policy)
+    policy = _resolve_configured_objective(resolved_metric_config, utility_policy)
     context = {
         "schema_version": HPO_CONTEXT_SCHEMA_VERSION,
         "task_type": task_type,
@@ -2728,12 +2797,14 @@ def build_hpo_context(
         "stage_a_contract_digest": stage_a_contract_digest,
         "metric_config": resolved_metric_config,
         "expected_emitted_keys": list(policy["metrics"]),
-        "utility_expected_emitted_keys": list(policy["metrics"]),
+        "objective": {
+            "metric_name": policy["metrics"][0],
+            "direction": policy["direction"],
+        },
         "group_context": dict(group_context) if group_context is not None else None,
         "role_context_fingerprint": role_context_fingerprint,
         "role_context": dict(role_context),
         "objective_version": objective_version,
-        "utility_policy": policy,
     }
     context["canonical_hpo"] = is_canonical_hpo_context(
         resolved_metric_config,
@@ -2787,13 +2858,13 @@ def hpo_score(
     expected_keys: Sequence[str] | None = None,
     utility_policy: Mapping[str, Any] | None = None,
 ) -> float:
-    """Direction-aware composite score: orient metrics so higher=better, negate mean.
+    """Return the configured objective value after contract validation.
 
     ``report_df`` must have ``mean`` and ``direction`` columns (as returned by
     synthcity's ``Metrics.evaluate``/``Benchmarks.evaluate``). When
-    ``expected_keys`` is supplied, the report must contain exactly one row for
-    every statically declared emitted identity before any score is calculated.
-    The result is suitable as an Optuna objective under ``direction="minimize"``.
+    ``expected_keys`` is supplied, the report must contain exactly its single
+    configured objective before a score is calculated. Optuna direction is
+    recorded separately from the metric contract.
     """
     if not isinstance(report_df, pd.DataFrame):
         raise HPOMetricNotEligibleError("HPO evaluation report has an invalid shape")
@@ -2812,135 +2883,59 @@ def hpo_score(
                 "HPO evaluation provenance is not decision-eligible"
             ) from exc
         raise
-    policy = _resolve_utility_policy(utility_policy)
     if report_df.empty or report_df.columns.duplicated().any():
         raise HPOMetricNotEligibleError("HPO evaluation emitted no metric rows")
     if "mean" not in report_df.columns or "direction" not in report_df.columns:
         raise HPOMetricNotEligibleError("HPO evaluation must emit mean and direction columns")
-
-    canonical_keys = set(report_df.attrs.get("canonical_hpo_keys", ()))
-    if not canonical_keys and expected_keys is not None:
-        canonical_keys = set(expected_keys) & HPO_OBJECTIVE_METRICS
-    if not canonical_keys and report_df.attrs.get("canonical_hpo") is True:
-        canonical_keys = set(HPO_OBJECTIVE_METRICS)
-    observed_canonical = {str(key) for key in report_df.index} & canonical_keys
-    if report_df.attrs.get("canonical_hpo") is True and (
-        not canonical_keys or observed_canonical != canonical_keys
-    ):
-        raise HPOMetricNotEligibleError(
-            "HPO evaluation is not decision-eligible: incomplete metric set; "
-            "canonical utility objective requires the complete metric set: "
-            f"missing={sorted(canonical_keys - observed_canonical)}"
+    configured_objective = provenance.get("objective")
+    if configured_objective is not None and not isinstance(configured_objective, Mapping):
+        raise HPOMetricNotEligibleError("HPO provenance objective identity/direction is invalid")
+    if isinstance(configured_objective, Mapping):
+        configured_keys = [configured_objective.get("metric_name")]
+    elif expected_keys is not None:
+        configured_keys = list(expected_keys)
+    else:
+        raise HPOMetricNotEligibleError("HPO provenance is missing objective identity/direction")
+    try:
+        policy = _resolve_utility_policy(
+            utility_policy if utility_policy is not None else {"metrics": configured_keys}
         )
-
-    if expected_keys is not None:
-        required_keys = tuple(expected_keys)
-        if len(required_keys) != len(set(required_keys)):
-            raise HPOMetricNotEligibleError("HPO expected emitted metric keys must be unique")
-        observed_keys = [str(key) for key in report_df.index]
-        missing_keys = [key for key in required_keys if key not in observed_keys]
-        duplicate_keys = sorted({key for key in observed_keys if observed_keys.count(key) > 1})
-        unexpected_keys = sorted(set(observed_keys) - set(required_keys))
-        if missing_keys or duplicate_keys or unexpected_keys:
-            details = []
-            if missing_keys:
-                details.append(f"missing={missing_keys}")
-            if duplicate_keys:
-                details.append(f"duplicate={duplicate_keys}")
-            if unexpected_keys:
-                details.append(f"unexpected={unexpected_keys}")
-            raise HPOMetricNotEligibleError(
-                "HPO evaluation emitted an incomplete metric set: " + ", ".join(details)
-            )
-
-    scores = []
-    legacy_aggregate_scores: list[tuple[str, float]] = []
-    candidate_dependent_keys: set[str] = set()
-    invalid: list[str] = []
-    for emitted_key, row in report_df.iterrows():
-        emitted_key = str(emitted_key)
-        try:
-            framework = "syntheval" if emitted_key == "tstr_macro_f1.v1" else "synthcity"
-            contract = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
-                framework=framework, emitted_key=emitted_key
-            )
-        except MetricContractError as exc:
-            invalid.append(f"{emitted_key}: {exc}")
-            continue
-
-        error = _hpo_row_error(row)
-        raw_value = row.get("mean")
-        direction = row.get("direction")
-        if error:
-            invalid.append(f"{emitted_key}: {error}")
-            continue
-        if (
-            isinstance(raw_value, bool)
-            or not isinstance(raw_value, Real)
-            or not math.isfinite(float(raw_value))
-        ):
-            invalid.append(f"{emitted_key}: mean is not a finite real number")
-            continue
-        if contract.value_role == "diagnostic" and "candidate_independent" in contract.qualifiers:
-            continue
-        if (
-            contract.lifecycle_state != "operational"
-            or contract.value_role != "policy_scalar"
-            or "hpo_objective" not in contract.allowed_uses
-        ):
-            invalid.append(
-                f"{emitted_key}: state={contract.lifecycle_state}, "
-                f"role={contract.value_role}, allowed={sorted(contract.allowed_uses)}"
-            )
-        elif direction != contract.direction:
-            invalid.append(
-                f"{emitted_key}: direction={direction!r}, expected={contract.direction!r}"
-            )
-        else:
-            sign = 1.0 if direction == "maximize" else -1.0
-            oriented_value = sign * float(raw_value)
-            if "legacy_aggregate" in contract.qualifiers:
-                legacy_aggregate_scores.append((emitted_key, oriented_value))
-            else:
-                scores.append(oriented_value)
-                if "candidate_dependent" in contract.qualifiers:
-                    candidate_dependent_keys.add(emitted_key)
-
-    if invalid:
+    except (TypeError, ValueError) as exc:
+        raise HPOMetricNotEligibleError("HPO objective policy is invalid") from exc
+    if expected_keys is not None and list(expected_keys) != policy["metrics"]:
         raise HPOMetricNotEligibleError(
-            "HPO evaluation is not decision-eligible: " + "; ".join(invalid)
+            "HPO evaluation is not decision-eligible: expected metric identity does not match objective"
         )
-    for emitted_key, oriented_value in legacy_aggregate_scores:
-        base_key = emitted_key.rsplit(".", 1)[0]
-        if any(
-            candidate_key.startswith(f"{base_key}.") for candidate_key in candidate_dependent_keys
-        ):
-            continue
-        scores.append(oriented_value)
-    if not scores:
-        raise HPOMetricNotEligibleError("HPO evaluation emitted no eligible objective rows")
-    required_utility_keys = tuple(policy["metrics"])
+    expected_objective = {
+        "metric_name": policy["metrics"][0],
+        "direction": policy["direction"],
+    }
+    if configured_objective is not None and dict(configured_objective) != expected_objective:
+        raise HPOMetricNotEligibleError("HPO provenance objective identity/direction mismatch")
+
     observed_keys = [str(key) for key in report_df.index]
-    if len(observed_keys) != len(set(observed_keys)):
-        raise HPOMetricNotEligibleError("HPO evaluation emitted duplicate utility evidence")
-    missing_utility_keys = set(required_utility_keys) - set(observed_keys)
-    unexpected_utility_keys = set(observed_keys) - set(required_utility_keys)
-    if missing_utility_keys or unexpected_utility_keys:
+    required_key = policy["metrics"][0]
+    if observed_keys.count(required_key) > 1:
+        raise HPOMetricNotEligibleError("HPO evaluation emitted duplicate objective evidence")
+    if observed_keys != [required_key]:
         raise HPOMetricNotEligibleError(
-            "HPO evaluation must emit exactly fixed release utility metrics: "
-            f"missing={sorted(missing_utility_keys)}, "
-            f"unexpected={sorted(unexpected_utility_keys)}"
+            "HPO evaluation is not decision-eligible; it must emit exactly its configured objective: "
+            f"expected={[required_key]}, observed={observed_keys}"
         )
-    utility = []
-    for key in required_utility_keys:
-        row = report_df.loc[key]
-        value = float(row["mean"])
-        if key in {"elastic_net_jsd.v1", "mixed_mmd.v1"}:
-            value = 1.0 - value
-        utility.append(value)
-    if not all(math.isfinite(value) for value in utility):
-        raise HPOMetricNotEligibleError("HPO evaluation emitted non-finite utility evidence")
-    return -sum(weight * value for weight, value in zip(policy["weights"], utility, strict=True))
+    row = report_df.iloc[0]
+    error = _hpo_row_error(row)
+    if error:
+        raise HPOMetricNotEligibleError(
+            f"HPO evaluation is not decision-eligible: {required_key}: {error}"
+        )
+    value = row.get("mean")
+    if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(float(value)):
+        raise HPOMetricNotEligibleError(f"{required_key}: mean is not a finite real number")
+    if row.get("direction") != policy["direction"]:
+        raise HPOMetricNotEligibleError(
+            f"{required_key}: direction={row.get('direction')!r}, expected={policy['direction']!r}"
+        )
+    return float(value)
 
 
 def _validate_aligned_group_ids(
@@ -3026,17 +3021,12 @@ def build_synthetic_eval_fn(
     they must never be translated to native SynthCity aliases.
     """
     validate_hpo_metric_config(metric_config, group_context=group_context)
-    configured_keys = {
-        str(metric_name) for values in metric_config.values() for metric_name in values
-    }
-    policy = _resolve_utility_policy(utility_policy)
+    policy = _resolve_configured_objective(metric_config, utility_policy)
     expected_keys = list(policy["metrics"])
     if expected_emitted_keys is not None:
         supplied_keys = [str(key) for key in expected_emitted_keys]
         if supplied_keys != expected_keys:
-            raise ValueError(
-                "HPO expected emitted metric keys are fixed to the release utility policy"
-            )
+            raise ValueError("HPO expected emitted metric keys must match configured objective")
     if len(expected_keys) != len(set(expected_keys)):
         raise ValueError("HPO expected emitted metric keys must be unique")
     group_mode = group_context.get("group_mode", "row") if group_context else "row"
@@ -3050,15 +3040,11 @@ def build_synthetic_eval_fn(
         train_group_ids = _validate_aligned_group_ids(train_reference_df, train_group_ids, "train")
         holdout_group_ids = _validate_aligned_group_ids(holdout_df, holdout_group_ids, "tuning")
 
-    canonical_keys = {
-        "elastic_net_jsd.v1",
-        "mixed_mmd.v1",
-        "tstr_macro_f1.v1",
-    }
-    configured_keys = {
-        str(metric_name) for metric_names in metric_config.values() for metric_name in metric_names
-    }
-    if configured_keys == canonical_keys:
+    if is_canonical_hpo_context(
+        metric_config,
+        expected_keys=expected_keys,
+        utility_policy=policy,
+    ):
 
         def canonical_eval_fn(syn_df: pd.DataFrame) -> float:
             report = evaluate_canonical_hpo_metrics(
@@ -3500,9 +3486,10 @@ def create_study(
     context_payload = _require_validated_hpo_context(hpo_context, label="HPO study context")
     storage = hpo_cfg.storage or default_storage_url(output_dir)
     contextual_name = contextual_study_name(study_name, context_payload)
+    objective = context_payload["objective"]
     study = optuna.create_study(
         study_name=contextual_name,
-        direction="minimize",
+        direction=objective["direction"],
         sampler=optuna.samplers.TPESampler(seed=seed),
         storage=storage,
         load_if_exists=True,
@@ -3756,7 +3743,9 @@ def _validate_hpo_trial_checkpoint(
         raise RuntimeError("HPO trial checkpoint requires canonical hpo_context")
     try:
         validated_context = _require_validated_hpo_context(
-            context, label="HPO trial checkpoint hpo_context"
+            context,
+            label="HPO trial checkpoint hpo_context",
+            allow_historical=True,
         )
     except (TypeError, ValueError) as exc:
         raise RuntimeError(str(exc)) from exc
@@ -3793,21 +3782,30 @@ def _validate_hpo_trial_checkpoint(
         not isinstance(expected_metric_keys, list) or not expected_metric_keys
     ):
         raise RuntimeError("HPO trial checkpoint context has no expected metric identities")
-    canonical_checkpoint = bool(expected_metric_keys) and is_canonical_hpo_context(
-        validated_context.get("metric_config"),
-        expected_keys=expected_metric_keys,
-        utility_policy=validated_context.get("utility_policy"),
+    historical_context = validated_context.get("schema_version") == "hpo-context-v2"
+    canonical_checkpoint = (
+        not historical_context
+        and bool(expected_metric_keys)
+        and is_canonical_hpo_context(
+            validated_context.get("metric_config"),
+            expected_keys=expected_metric_keys,
+            utility_policy=validated_context.get("utility_policy"),
+        )
     )
-    # ``hpo-context-v2`` predates explicit canonical identity fields.  Keep
-    # those historical contexts readable; enforce new fields when present.
+    # Historical objective policy must remain readable but cannot be resumed as
+    # a current study because its score and direction semantics differ.
     if (
-        "canonical_hpo" in validated_context
+        not historical_context
+        and "canonical_hpo" in validated_context
         and validated_context.get("canonical_hpo") != canonical_checkpoint
     ):
         raise RuntimeError("HPO trial checkpoint canonical context flag is inconsistent")
-    if "canonical_expected_keys" in validated_context and validated_context.get(
-        "canonical_expected_keys"
-    ) != (list(expected_metric_keys) if canonical_checkpoint else []):
+    if (
+        "canonical_expected_keys" in validated_context
+        and validated_context.get("canonical_expected_keys")
+        != (list(expected_metric_keys) if canonical_checkpoint else [])
+        and not historical_context
+    ):
         raise RuntimeError("HPO trial checkpoint canonical metric identities are inconsistent")
     validated_metric_metadata = (
         _validate_bounded_hpo_metric_metadata(metric_metadata, expected_keys=expected_metric_keys)
@@ -3997,7 +3995,11 @@ def load_hpo_trial_checkpoint(
 ) -> dict[str, Any]:
     """Load and validate a durable HPO trial checkpoint."""
     checkpoint_path = Path(path)
-    context = _require_validated_hpo_context(hpo_context, label="HPO checkpoint context")
+    context = _require_validated_hpo_context(
+        hpo_context,
+        label="HPO checkpoint context",
+        allow_historical=True,
+    )
     try:
         expected_study_name = _validate_study_name(checkpoint_path.parents[1].name)
         trial_directory = checkpoint_path.parents[0].name

@@ -232,8 +232,8 @@ class MetricAnchors:
 class MetricContract:
     """Semantic and eligibility metadata for one emitted metric identity.
 
-    ``emitted_key_pattern`` is either an exact key or an explicit prefix ending
-    in ``*``. Prefix contracts are used only where a framework emits qualified
+    ``emitted_key_pattern`` is either an exact key or a pattern with one
+    ``*`` wildcard. Wildcards are used only where a framework emits qualified
     target, class, subgroup, or submetric keys.
     """
 
@@ -279,8 +279,8 @@ class MetricContract:
 
         if not self.contract_id or not self.framework or not self.emitted_key_pattern:
             raise ValueError("Metric contracts require an id, framework, and emitted key pattern")
-        if "*" in self.emitted_key_pattern and not self.emitted_key_pattern.endswith("*"):
-            raise ValueError("Metric key wildcards are only allowed as a trailing prefix marker")
+        if self.emitted_key_pattern.count("*") > 1:
+            raise ValueError("Metric key patterns may contain at most one wildcard")
         if self.lifecycle_state not in CONTRACT_STATES:
             raise ValueError(f"Unknown metric contract lifecycle state: {self.lifecycle_state!r}")
         if not self.allowed_uses or not self.allowed_uses <= METRIC_USES:
@@ -366,8 +366,13 @@ class MetricContract:
         """Return whether this contract owns an emitted identity."""
         if self.framework != framework or self.execution_pass != execution_pass:
             return False
-        if self.emitted_key_pattern.endswith("*"):
-            return emitted_key.startswith(self.emitted_key_pattern[:-1])
+        if "*" in self.emitted_key_pattern:
+            prefix, suffix = self.emitted_key_pattern.split("*", maxsplit=1)
+            return (
+                emitted_key.startswith(prefix)
+                and emitted_key.endswith(suffix)
+                and len(emitted_key) >= len(prefix) + len(suffix)
+            )
         return emitted_key == self.emitted_key_pattern
 
     def to_dict(self) -> dict[str, Any]:
@@ -451,10 +456,10 @@ class MetricContractRegistry:
         """Resolve the most specific contract or fail closed.
 
         Exact emitted identities intentionally take precedence over wildcard
-        diagnostic families. This lets a versioned aggregate such as
-        ``auroc_v2`` coexist with a qualified ``auroc_*`` diagnostic family
-        without making either identity ambiguous. Duplicate exact contracts
-        and multiple wildcard matches remain configuration errors.
+        diagnostic families. Among wildcard matches, the pattern with the most
+        literal characters owns the key. This lets versioned diagnostic families
+        coexist with their broader historical family; equally specific matches
+        remain configuration errors.
         """
         matches = self.matching(
             framework=framework,
@@ -478,10 +483,20 @@ class MetricContractRegistry:
                 f"{[contract.contract_id for contract in exact_matches]}"
             )
         if len(matches) > 1:
+            specificity = max(
+                len(contract.emitted_key_pattern.replace("*", "")) for contract in matches
+            )
+            most_specific = tuple(
+                contract
+                for contract in matches
+                if len(contract.emitted_key_pattern.replace("*", "")) == specificity
+            )
+            if len(most_specific) == 1:
+                return most_specific[0]
             raise AmbiguousMetricContractError(
                 f"Multiple wildcard metric contracts match framework={framework!r}, "
                 f"emitted_key={emitted_key!r}, execution_pass={execution_pass!r}: "
-                f"{[contract.contract_id for contract in matches]}"
+                f"{[contract.contract_id for contract in most_specific]}"
             )
         return matches[0]
 
@@ -2222,6 +2237,39 @@ def _build_default_contracts() -> tuple[MetricContract, ...]:
                 ),
             )
         )
+    # OvR aggregates have their own identities and semantics. Keep them exact
+    # so qualified per-target/class diagnostics remain diagnostics rather than
+    # inheriting aggregate policy metadata from a broad wildcard.
+    contracts.append(
+        _audit_contract(
+            contract_id="syntheval.auroc_macro_ovr_v3",
+            framework="syntheval",
+            emitted_key_pattern="auroc_macro_ovr_v3",
+            semantic_family="utility",
+            direction="maximize",
+            raw_range=(-1.0, 1.0),
+            qualifiers=("macro_ovr", "v3"),
+            metric_version="macro_ovr_v3",
+            policy_transform="one_minus_absolute",
+        )
+    )
+    for key, framework in (
+        ("statistical_parity_macro_ovr_v1", "syntheval"),
+        ("equalized_odds_macro_ovr_v1", "custom"),
+        ("equal_opportunity_macro_ovr_v1", "custom"),
+    ):
+        contracts.append(
+            _audit_contract(
+                contract_id=f"{framework}.{key}",
+                framework=framework,
+                emitted_key_pattern=key,
+                semantic_family="fairness",
+                direction="minimize",
+                raw_range=(-1.0, 1.0),
+                qualifiers=("macro_ovr", "v1"),
+                metric_version="macro_ovr_v1",
+            )
+        )
     for key in ("frac_ks_sigs_v2",):
         contracts.append(
             _audit_contract(
@@ -2259,6 +2307,19 @@ def _build_default_contracts() -> tuple[MetricContract, ...]:
                 metric_version="v2",
             )
         )
+    contracts.append(
+        _audit_contract(
+            contract_id="syntheval.auroc_macro_ovr_v3.diagnostic",
+            framework="syntheval",
+            emitted_key_pattern="auroc_*_ovr_v3",
+            semantic_family="utility",
+            direction=None,
+            value_role="diagnostic",
+            raw_range=(-1.0, 1.0),
+            qualifiers=("target", "class", "ovr", "v3"),
+            metric_version="macro_ovr_v3",
+        )
+    )
 
     syntheval_privacy = {
         "nnaa": "minimize",
@@ -2310,6 +2371,39 @@ def _build_default_contracts() -> tuple[MetricContract, ...]:
                 direction="minimize",
                 value_role="diagnostic",
                 qualifiers=("target", "protected_group", "cell", "ovr"),
+            )
+        )
+    for contract_id, framework, pattern, version in (
+        (
+            "syntheval.statistical_parity_macro_ovr_v1.diagnostic",
+            "syntheval",
+            "sp_ovr_v1_*",
+            "macro_ovr_v1",
+        ),
+        (
+            "custom.equalized_odds_macro_ovr_v1.diagnostic",
+            "custom",
+            "eqo_ovr_v1_*",
+            "macro_ovr_v1",
+        ),
+        (
+            "custom.equal_opportunity_macro_ovr_v1.diagnostic",
+            "custom",
+            "eo_ovr_v1_*",
+            "macro_ovr_v1",
+        ),
+    ):
+        contracts.append(
+            _audit_contract(
+                contract_id=contract_id,
+                framework=framework,
+                emitted_key_pattern=pattern,
+                semantic_family="fairness",
+                direction=None,
+                value_role="diagnostic",
+                raw_range=(-1.0, 1.0),
+                qualifiers=("target", "protected_group", "cell", "ovr", "v1"),
+                metric_version=version,
             )
         )
 
@@ -2485,10 +2579,25 @@ def _build_default_contracts() -> tuple[MetricContract, ...]:
         if contract.emitted_key_pattern not in {
             "auroc",
             "auroc_v2",
+            "auroc_macro_ovr_v3",
             "statistical_parity",
+            "statistical_parity_macro_ovr_v1",
             "equalized_odds",
+            "equalized_odds_macro_ovr_v1",
             "equal_opportunity",
-        } and not contract.emitted_key_pattern.endswith(("auroc_*", "sp_*", "eo_*", "eqo_*")):
+            "equal_opportunity_macro_ovr_v1",
+        } and not contract.emitted_key_pattern.endswith(
+            (
+                "auroc_*",
+                "auroc_*_ovr_v3",
+                "sp_*",
+                "sp_ovr_v1_*",
+                "eo_*",
+                "eo_ovr_v1_*",
+                "eqo_*",
+                "eqo_ovr_v1_*",
+            )
+        ):
             continue
         binary_contracts.append(
             dataclasses.replace(

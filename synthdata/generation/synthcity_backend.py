@@ -9,7 +9,7 @@ import math
 from collections.abc import Mapping
 from numbers import Real
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 import optuna
 import pandas as pd
@@ -18,6 +18,7 @@ import torch
 from synthdata.config import HPOConfig
 from synthdata.data import semantic_context_digest
 from synthdata.evaluation.catalog import emitted_keys_for_synthcity_metrics
+from synthdata.evaluation.metric_contracts import DEFAULT_METRIC_CONTRACT_REGISTRY
 from synthdata.generation.hpo import (
     HPO_GENERATOR_METADATA_SCHEMA_VERSION,
     HPOGroupUnsafeError,
@@ -137,10 +138,13 @@ def _validate_native_benchmark_report(
         raise HPOMetricNotEligibleError("SynthCity metric report has non-finite means")
     if expected_keys is not None:
         expected_directions = {
-            key: "maximize" if key == "tstr_macro_f1.v1" else "minimize" for key in expected_keys
+            key: DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
+                framework="synthcity", emitted_key=key
+            ).direction
+            for key in expected_keys
         }
         if any(
-            metric_report.loc[key, "direction"] != expected_directions.get(key)
+            metric_report.loc[key, "direction"] != expected_directions[key]
             for key in metric_report.index
         ):
             raise HPOMetricNotEligibleError("SynthCity metric report has invalid directions")
@@ -261,7 +265,7 @@ def make_loader(
 ):
     from synthcity.plugins.core.dataloader import GenericDataLoader
 
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         target_column=target_column,
         sensitive_features=sensitive_features,
         random_state=random_state,

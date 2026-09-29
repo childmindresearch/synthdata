@@ -167,7 +167,9 @@ def _materialize_validation_records(
 
     missing_keys = [key for key in record_keys if key not in raw.columns]
     if missing_keys:
-        missing = pd.DataFrame(pd.NA, index=raw.index, columns=missing_keys, dtype="object")
+        missing = pd.DataFrame(
+            pd.NA, index=raw.index, columns=pd.Index(missing_keys), dtype="object"
+        )
         raw = pd.concat([raw, missing], axis=1)
 
     for model_name, records in records_by_model.items():

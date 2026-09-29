@@ -7,19 +7,21 @@ device: auto
 
 experiment:
   tag: refactored_loris_v2
-  id: "1.5"
+  id: "1.8"
 
 data:
   # Source and schema
   source: csv
-  path: data/loris/loris_v2_664_features_us_id.csv # Input file; canonical load stage; invalid/missing path fails closed.
+  path: data/loris/loris_v2_664_features_us_id.csv # Input file.
   version: "2.0"
   variable_schema_path: data/loris/loris_v2_variable_schema_us.csv
 
   # Modeling columns
-  target_column: CGAS_class # Outcome; modeling/evaluation stage; missing target fails closed.
+  target_column: CGAS_class # Outcome.
+  stratification_variables: [CGAS_class, Sex, Age]
+  stratification_bins: [null, null, ["<18", "18-30", "30-45", "45-60", ">60"]]
   canonical: true # Enables strict leakage-safe policy; validation failures abort loading.
-  patient_id_column: patient_id # Direct patient identity; split stage only; missing/indirect identity fails closed.
+  patient_id_column: patient_id # Direct patient identity.
   # QIs are attacker-observable predictors and release equivalence-class fields;
   # they must not overlap sensitive fields, target, or patient ID. They may
   # overlap protected fields. Attribute inference uses QIs as predictors.
@@ -28,7 +30,7 @@ data:
       Sex,
       region,
       PreInt_Demos_Fam__Child_Ethnicity,
-    ] # Release QIs; privacy stage; absent/overlapping QIs fail closed.
+    ]
   sensitive_columns: [
       Income,
       PreInt_TxHx__suicide,
@@ -36,7 +38,8 @@ data:
     ] # Sensitive disclosure/attribute-inference targets; must not overlap QIs or target.
   # Protected fields define fairness groups. Explicit overlap with QIs or
   # sensitive fields is allowed; protected fields are not inferred from either.
-  protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Ethnicity] # Fairness slices; invalid role declarations fail closed.
+  protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Ethnicity]
+  protected_attribute_bins: [null, ["<18", "18-30", "30-45", "45-60", ">60"], null]
   drop_rows_missing_target: true
   drop_columns: null
 
@@ -58,7 +61,7 @@ data:
 
 imputation:
   enabled: true
-  method: hyperimpute # Canonical imputation backend; unsupported methods fail closed.
+  method: hyperimpute # Canonical imputation backend.
   device: auto
   cache: true
   validation_margin: 0.2
@@ -129,7 +132,7 @@ generation:
     model_iter_caps: { pategan: 5 }
     sgld_step_cap: 2000
     metric_config:
-      canonical_objectives: [tstr_macro_f1.v1, mixed_mmd.v1, elastic_net_jsd.v1]
+      canonical_objectives: [tstr_macro_f1.v1]
     stage_a:
       minimum_class_count: 1
       minimum_protected_group_count: 1
@@ -138,10 +141,6 @@ generation:
     storage: null
     best_params_path: null
     final_n_iter_override: null
-    utility_policy:
-      # Canonical equal-thirds utility policy; canonical HPO policy must consume this metadata; mismatches fail closed.
-      metrics: [tstr_macro_f1.v1, mixed_mmd.v1, elastic_net_jsd.v1]
-      weights: [0.3333333333333333, 0.3333333333333333, 0.3333333333333333]
 
 evaluation:
   output_dir: output/loris/evaluation
@@ -171,18 +170,6 @@ evaluation:
     protected_map: [null, null, null]
     protected_bins: null
 
-  # Named release transformation; privacy stage; malformed/non-contiguous intervals fail closed.
-  release_generalization:
-    columns:
-      Age:
-        # Bounds are years; lower inclusive and upper exclusive except open ends.
-        intervals:
-          - { label: "<18", lower: null, upper: 18 }
-          - { label: "18-30", lower: 18, upper: 31 }
-          - { label: "31-45", lower: 31, upper: 46 }
-          - { label: "46-60", lower: 46, upper: 61 }
-          - { label: ">60", lower: 61, upper: null }
-
   # Formal release thresholds; privacy stage; invalid values fail closed.
   # Unsupported synthetic categorical values are never coerced: affected
   # evidence is failed or indeterminate, never succeeded. Succeeded requires
@@ -204,13 +191,6 @@ evaluation:
     bh_alpha: 0.05 # BH familywise threshold; (0,1]; representation stage; invalid values fail closed.
     practical_log_disparity_floor: 0.22314355131 # Material log-gap floor; non-negative; representation stage; invalid values fail closed.
     valid_comparison_fraction: 0.80 # Required valid-leaf fraction; (0,1]; representation stage; invalid values fail closed.
-
-  # Separate binary SynthEval pass: severe/moderate versus typical.
-  binary_target:
-    enabled: true
-    column: null
-    positive_classes: [0, 1]
-    negative_classes: [2]
 
   # Resource cap for resumable per-model SynthEval processes.
   syntheval_execution:

@@ -21,15 +21,18 @@ from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-from synthdata.config import Config
+from synthdata.config import Config, _protected_attribute_bin_intervals
 from synthdata.data_roles import (
     ROLE_NAMES,
     RoleAssignment,
+    _joint_stratification_keys,
+    _stratification_missing_counts,
     allocate_roles,
     resolve_population_identity,
 )
@@ -1743,6 +1746,85 @@ def _validate_loader_column_declarations(
     return declarations
 
 
+def _configured_stratification_frame(
+    frame: pd.DataFrame,
+    variables: list[str],
+    bins: list[list[str] | None],
+    interval_declarations: Mapping,
+) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    """Resolve validated, row-aligned labels for configured split strata."""
+    if len(variables) != len(bins):
+        raise ValueError("data.stratification_bins must align with data.stratification_variables")
+    if not variables:
+        return None, {}
+    strata = {}
+    interval_policy: dict[str, Any] = {}
+    for variable, labels in zip(variables, bins, strict=True):
+        if variable not in frame.columns:
+            raise KeyError(
+                f"data.stratification_variables references missing column {variable!r}; "
+                f"available columns: {list(frame.columns)}"
+            )
+        values = frame[variable]
+        declaration = interval_declarations.get(variable)
+        intervals = declaration.get("intervals", []) if isinstance(declaration, Mapping) else []
+        if intervals:
+            declared_labels = [interval.get("label") for interval in intervals]
+            if declared_labels != labels:
+                raise ValueError(
+                    f"Stratification labels for {variable!r} do not match configured intervals: "
+                    f"labels={labels}, interval_labels={declared_labels}"
+                )
+            numeric = pd.to_numeric(values, errors="coerce")
+            invalid = numeric.isna() & values.notna()
+            if invalid.any():
+                examples = values.loc[invalid].tolist()[:5]
+                raise ValueError(
+                    f"Stratification variable {variable!r} contains non-numeric value(s): "
+                    f"{examples}"
+                )
+            binned = pd.Series(index=values.index, dtype=object)
+            normalized_intervals = []
+            for interval in intervals:
+                lower = interval.get("lower")
+                upper = interval.get("upper")
+                mask = pd.Series(True, index=values.index)
+                if lower is not None:
+                    mask &= numeric >= lower
+                if upper is not None:
+                    mask &= numeric < upper
+                binned.loc[mask] = interval["label"]
+                normalized_intervals.append(
+                    {"label": interval["label"], "lower": lower, "upper": upper}
+                )
+            outside = binned.isna() & values.notna()
+            if outside.any():
+                examples = values.loc[outside].tolist()[:5]
+                raise ValueError(
+                    f"Stratification variable {variable!r} has value(s) outside configured "
+                    f"half-open intervals: {examples}"
+                )
+            strata[variable] = binned.reset_index(drop=True)
+            interval_policy[variable] = {"intervals": normalized_intervals}
+        elif labels is None:
+            strata[variable] = values.reset_index(drop=True)
+        else:
+            unknown = [value for value in values.dropna().unique().tolist() if value not in labels]
+            if unknown:
+                raise ValueError(
+                    f"Stratification variable {variable!r} has values outside configured labels: "
+                    f"{unknown[:5]}"
+                )
+            strata[variable] = values.reset_index(drop=True)
+            interval_policy[variable] = {"labels": list(labels), "intervals": []}
+    return pd.DataFrame(strata), interval_policy
+
+
+def _legacy_split_policy_fingerprint(policy: Mapping) -> str:
+    encoded = json.dumps(dict(policy), sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
 def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
     """Record which dataset version/source produced ``dataset.data_dir``.
 
@@ -1802,6 +1884,9 @@ def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
             {
                 "compatibility_mode": "legacy_two_role",
                 "role_names": ["train", "final_holdout"],
+                "assignment_fingerprint": dataset.assignment_fingerprint,
+                "assignment_policy_fingerprint": dataset.assignment_policy_fingerprint,
+                "split_metadata": dataset.role_metadata.get("split", {}),
                 "n_train": int(len(dataset.train_df)) if dataset.train_df is not None else 0,
                 "n_test": int(len(dataset.test_df)) if dataset.test_df is not None else 0,
                 "legacy_restrictions": [
@@ -2049,30 +2134,77 @@ def load_dataset(cfg: Config) -> Dataset:
                 f"data.{declaration_name} must not contain target column {target_column!r}"
             )
 
-    release_generalization = json.loads(
-        json.dumps(cfg.evaluation.release_generalization.columns, sort_keys=True, default=str)
+    release_generalization = _protected_attribute_bin_intervals(
+        cfg.data.protected_columns,
+        cfg.data.protected_attribute_bins,
     )
     invalid_release_columns = sorted(set(release_generalization) - set(feature_columns))
     if invalid_release_columns:
         raise ValueError(
-            "evaluation.release_generalization.columns must reference model features only; "
+            "data.protected_attribute_bins must reference model features only; "
             f"invalid column(s): {invalid_release_columns}"
         )
     identity_columns = _configured_identity_columns(split_cfg)
     identity_release_columns = sorted(set(release_generalization) & identity_columns)
     if identity_release_columns:
         raise ValueError(
-            "evaluation.release_generalization.columns must not reference identity columns: "
+            "data.protected_attribute_bins must not reference identity columns: "
             f"{identity_release_columns}"
         )
 
     if split_cfg is None:
+        df = df.reset_index(drop=True)
+        stratification_frame, interval_policy = _configured_stratification_frame(
+            df,
+            cfg.data.stratification_variables,
+            cfg.data.stratification_bins,
+            release_generalization,
+        )
+        configured_strata = (
+            _joint_stratification_keys(stratification_frame)
+            if stratification_frame is not None
+            else None
+        )
         train_df, test_df = train_test_split(
             df,
             train_size=cfg.data.train_size,
             random_state=cfg.seed,
-            stratify=df[target_column] if cfg.data.stratify else None,
+            stratify=(
+                configured_strata
+                if configured_strata is not None
+                else (df[target_column] if cfg.data.stratify else None)
+            ),
         )
+        role_labels = np.full(len(df), "", dtype=object)
+        role_labels[train_df.index.to_numpy(dtype=int)] = "train"
+        role_labels[test_df.index.to_numpy(dtype=int)] = "final_holdout"
+        legacy_assignment = pd.DataFrame(
+            {"row_key": np.arange(len(df), dtype=np.int64), "role": role_labels}
+        )
+        assignment_payload = legacy_assignment.to_json(orient="records")
+        if not isinstance(assignment_payload, str):
+            raise TypeError("legacy role assignment JSON payload must be a string")
+        assignment_fingerprint = hashlib.sha256(assignment_payload.encode()).hexdigest()
+        split_policy = {
+            "schema_version": "legacy-role-assignment-policy-v2",
+            "algorithm": "train_test_split_joint_stratification_missing_tag",
+            "target_column": target_column,
+            "train_size": cfg.data.train_size,
+            "stratify": bool(configured_strata is not None or cfg.data.stratify),
+            "stratification_variables": list(cfg.data.stratification_variables),
+            "stratification_bins": cfg.data.stratification_bins,
+            "stratification_interval_policy": interval_policy,
+            "stratification_missing_policy": (
+                "dedicated_tagged_category_v1"
+                if cfg.data.stratification_variables
+                else "not_configured"
+            ),
+            "stratification_missing_counts": _stratification_missing_counts(
+                stratification_frame, cfg.data.stratification_variables
+            ),
+            "seed": cfg.seed,
+        }
+        assignment_policy_fingerprint = _legacy_split_policy_fingerprint(split_policy)
         dataset = Dataset(
             name=cfg.name,
             target_column=target_column,
@@ -2093,7 +2225,13 @@ def load_dataset(cfg: Config) -> Dataset:
             role_metadata={
                 "compatibility_mode": "legacy_two_role",
                 "identity": identity.metadata,
+                "split": {
+                    "assignment_policy": split_policy,
+                    "assignment_policy_fingerprint": assignment_policy_fingerprint,
+                },
             },
+            assignment_fingerprint=assignment_fingerprint,
+            assignment_policy_fingerprint=assignment_policy_fingerprint,
             identity_sidecar=identity.identity_sidecar,
             identity_fingerprint=identity.metadata.get("identity_fingerprint"),
             release_generalization=release_generalization,
@@ -2110,6 +2248,12 @@ def load_dataset(cfg: Config) -> Dataset:
         df = df.reset_index(drop=True)
         if groups is not None:
             groups = groups.reset_index(drop=True)
+        stratification_frame, interval_policy = _configured_stratification_frame(
+            df,
+            cfg.data.stratification_variables,
+            cfg.data.stratification_bins,
+            release_generalization,
+        )
         role_assignment = allocate_roles(
             df,
             target_column,
@@ -2117,6 +2261,10 @@ def load_dataset(cfg: Config) -> Dataset:
             protected_columns=protected_columns,
             groups=groups,
             seed=cfg.seed,
+            stratification_frame=stratification_frame,
+            stratification_variables=cfg.data.stratification_variables,
+            stratification_bins=cfg.data.stratification_bins,
+            stratification_interval_policy=interval_policy,
         )
         resolved_semantics, semantic_fingerprint = resolve_schema_metadata(
             variable_schema, role_assignment.frames["train"]

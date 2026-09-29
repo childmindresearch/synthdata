@@ -414,11 +414,11 @@ def test_canonical_hpo_evaluator_is_train_fit_tuning_only_and_excludes_holdout(m
 
     def fake_canonical(train_df, tuning_df, synthetic_df, **kwargs):
         captured.update(train=train_df, tuning=tuning_df, synthetic=synthetic_df, kwargs=kwargs)
-        metric_keys = ["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"]
+        metric_keys = ["tstr_macro_f1.v1"]
         report = pd.DataFrame(
             {
-                "mean": np.asarray([0.8, 0.2, 0.4]),
-                "direction": np.asarray(["maximize", "minimize", "minimize"]),
+                "mean": np.asarray([0.8]),
+                "direction": np.asarray(["maximize"]),
             },
             index=pd.Index(metric_keys),
         )
@@ -445,7 +445,8 @@ def test_canonical_hpo_evaluator_is_train_fit_tuning_only_and_excludes_holdout(m
                 "comparison_role": "tuning",
                 "contract": "train_frozen_v1",
             },
-            "objective_version": "release-utility-v1",
+            "objective_version": "configured-objective-v1",
+            "objective": {"metric_name": "tstr_macro_f1.v1", "direction": "maximize"},
         }
         return report
 
@@ -455,16 +456,19 @@ def test_canonical_hpo_evaluator_is_train_fit_tuning_only_and_excludes_holdout(m
         tuning,
         "target",
         [],
-        {"task12": ["tstr_macro_f1.v1", "mixed_mmd.v1", "elastic_net_jsd.v1"]},
+        {"canonical_objectives": ["tstr_macro_f1.v1"]},
         seed=7,
         feature_types={"feature": "continuous", "target": "categorical"},
     )
 
-    assert evaluate(candidate) == pytest.approx(-((0.8 + 0.8 + 0.6) / 3))
+    assert evaluate(candidate) == pytest.approx(0.8)
     pd.testing.assert_frame_equal(captured["train"], train)
     pd.testing.assert_frame_equal(captured["tuning"], tuning)
     pd.testing.assert_frame_equal(captured["synthetic"], candidate)
-    assert captured["kwargs"]["utility_policy"]["weights"] == pytest.approx([1 / 3] * 3)
+    assert captured["kwargs"]["utility_policy"] == {
+        "metrics": ["tstr_macro_f1.v1"],
+        "direction": "maximize",
+    }
 
 
 @pytest.mark.parametrize("role", ["train", "tuning", "synthetic"])
@@ -480,7 +484,7 @@ def test_canonical_hpo_evaluator_rejects_final_holdout_metadata(role):
             frames["train"],
             frames["tuning"],
             frames["synthetic"],
-            metric_config={"task12": ["tstr_macro_f1.v1"]},
+            metric_config={"canonical_objectives": ["tstr_macro_f1.v1"]},
             target_column="target",
         )
 
@@ -493,7 +497,7 @@ def test_canonical_hpo_evaluator_rejects_nested_privacy_or_fairness_metadata(met
     with pytest.raises(ValueError, match="forbidden objective metadata"):
         hpo_module.evaluate_canonical_hpo_metrics(
             *frames,
-            metric_config={"task12": ["tstr_macro_f1.v1"]},
+            metric_config={"canonical_objectives": ["tstr_macro_f1.v1"]},
             target_column="target",
         )
 

@@ -4402,8 +4402,8 @@ def validate_evaluation_bundle(
     Low-level loaders verify each file independently. This stricter entry point
     additionally proves that the recorded contract registry, configuration,
     role context, model inventory, and validation contexts describe the same
-    evaluation. ``allow_legacy`` is an explicit compatibility path for blocked
-    historical bundles that contain no validation sidecars.
+    evaluation. ``allow_legacy`` explicitly permits an embedded, internally
+    consistent prior contract registry or bundles predating validation sidecars.
     """
     bundle_dir, manifest = _load_manifest(evaluation_dir)
     combined_models = _string_list(
@@ -4474,7 +4474,7 @@ def validate_evaluation_bundle(
             bundle_dir,
         )
         return manifest
-    if registry.digest() != DEFAULT_METRIC_CONTRACT_REGISTRY.digest():
+    if registry.digest() != DEFAULT_METRIC_CONTRACT_REGISTRY.digest() and not allow_legacy:
         raise ValueError(
             "Evaluation bundle metric contract registry does not match the current registry"
         )

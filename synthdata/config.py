@@ -11,6 +11,7 @@ or pass absolute paths).
 """
 
 import dataclasses
+import re
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +99,14 @@ class DataConfig:
     #: Explicit protected attributes for fairness. ``sensitive_columns`` remains
     #: a compatibility alias for historical configurations.
     protected_columns: list = dataclasses.field(default_factory=list)
+    #: Columns used to balance dataset roles and optional labels for binning
+    #: their observed values. Both lists are positionally aligned.
+    stratification_variables: list = dataclasses.field(default_factory=list)
+    stratification_bins: list = dataclasses.field(default_factory=list)
+    #: Optional numeric interval labels for protected columns, positionally
+    #: aligned with ``protected_columns``. Bounds are lower-inclusive and
+    #: upper-exclusive; Age labels use explicit forms such as ``18-30``.
+    protected_attribute_bins: list = dataclasses.field(default_factory=list)
     #: Explicit quasi-identifiers for privacy protocols. These are distinct from
     #: protected attributes even when a named protocol intentionally overlaps.
     quasi_identifier_columns: list = dataclasses.field(default_factory=list)
@@ -360,31 +369,20 @@ class HPOConfig:
     model_iter_caps: dict = dataclasses.field(default_factory=lambda: {"pategan": 50})
     #: Cap on TabPFGen custom variant's SGLD step count during search.
     sgld_step_cap: int = 500
-    #: Composite objective: only explicitly approved operational utility metrics
-    #: may be used; privacy/calibration metrics fail closed at objective setup.
+    #: The single configured HPO objective. Its optimization direction is derived
+    #: from the registered metric contract; privacy/calibration metrics are rejected.
     metric_config: dict = dataclasses.field(
         default_factory=lambda: {
-            "canonical_objectives": [
-                "tstr_macro_f1.v1",
-                "mixed_mmd.v1",
-                "elastic_net_jsd.v1",
-            ],
+            "canonical_objectives": ["tstr_macro_f1.v1"],
         }
     )
 
-    def __post_init__(self) -> None:
-        """Canonicalize legacy objective key while rejecting ambiguous input."""
-        legacy = self.metric_config.get("task12")
-        canonical = self.metric_config.get("canonical_objectives")
-        if legacy is not None and canonical is not None and legacy != canonical:
-            raise ValueError(
-                "generation.hpo.metric_config cannot define conflicting task12 and canonical_objectives"
-            )
-        if legacy is not None:
-            self.metric_config = {
-                **{key: value for key, value in self.metric_config.items() if key != "task12"},
-                "canonical_objectives": legacy,
-            }
+    @property
+    def utility_policy(self) -> dict[str, list]:
+        """Expose the configured objective in the legacy policy shape."""
+        objectives = self.metric_config.get("canonical_objectives", [])
+        weight = 1 / len(objectives) if objectives else 0
+        return {"metrics": list(objectives), "weights": [weight] * len(objectives)}
 
     #: Deterministic candidate screens run before any objective metrics.
     stage_a: StageAScreenConfig = dataclasses.field(default_factory=StageAScreenConfig)
@@ -395,17 +393,6 @@ class HPOConfig:
     best_params_path: str | None = None
     #: Override n_iter for the final "optimized" build of iterative models (None = no override).
     final_n_iter_override: int | None = None
-    #: Canonical HPO objective policy; canonical profiles may not replace its metrics.
-    utility_policy: dict = dataclasses.field(
-        default_factory=lambda: {
-            "metrics": [
-                "tstr_macro_f1.v1",
-                "mixed_mmd.v1",
-                "elastic_net_jsd.v1",
-            ],
-            "weights": [1 / 3, 1 / 3, 1 / 3],
-        }
-    )
 
 
 @dataclasses.dataclass
@@ -484,42 +471,6 @@ class ScoringPolicyConfig:
     bh_alpha: float = 0.05
     practical_log_disparity_floor: float = 0.22314355131
     valid_comparison_fraction: float = 0.80
-
-
-@dataclasses.dataclass
-class ReleaseGeneralizationConfig:
-    """Named, deterministic release-form column transformations."""
-
-    columns: dict = dataclasses.field(default_factory=dict)
-
-
-@dataclasses.dataclass
-class BinaryTargetConfig:
-    """Collapse a multi-class target into a binary (0/1) variable for a
-    *second, separate* SynthEval pass, so metrics that require exactly 2
-    target classes (auroc_diff, statistical_parity, equalized_odds,
-    equal_opportunity) can run even when the real target has 3+ classes.
-
-    This is evaluation-only: it never touches ``data.target_column``,
-    generation, or any other metric's target -- the collapse is applied to
-    disposable copies of the real/synthetic dataframes used only for this
-    extra pass, replacing the target column's values in place (same column
-    name, so it still gets excluded from the model's feature set exactly
-    like the original target -- no leakage risk from the original,
-    finer-grained labels lingering as a feature).
-
-    ``positive_classes``/``negative_classes`` must together cover every
-    observed value of the target column (fails loudly otherwise -- see
-    :func:`synthdata.evaluation.syntheval_eval.build_binary_target_series`).
-    """
-
-    enabled: bool = False
-    #: Column to collapse; defaults to data.target_column if left None.
-    column: str | None = None
-    #: Original class values mapped to the binary "positive" (1) outcome.
-    positive_classes: list = dataclasses.field(default_factory=list)
-    #: Original class values mapped to the binary "negative"/reference (0) outcome.
-    negative_classes: list = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -617,7 +568,6 @@ class EvaluationConfig:
     ranking_strategy: str = "linear"
     log_disparity: LogDisparityConfig = dataclasses.field(default_factory=LogDisparityConfig)
     save_per_model_syntheval_plots: bool = True
-    binary_target: BinaryTargetConfig = dataclasses.field(default_factory=BinaryTargetConfig)
     syntheval_execution: SynthEvalExecutionConfig = dataclasses.field(
         default_factory=SynthEvalExecutionConfig
     )
@@ -634,9 +584,6 @@ class EvaluationConfig:
         default_factory=lambda: {"utility": 1.0, "privacy": 1.0, "fairness": 1.0}
     )
     privacy_gate: PrivacyGateConfig = dataclasses.field(default_factory=PrivacyGateConfig)
-    release_generalization: ReleaseGeneralizationConfig = dataclasses.field(
-        default_factory=ReleaseGeneralizationConfig
-    )
     privacy_policy: PrivacyPolicyConfig = dataclasses.field(default_factory=PrivacyPolicyConfig)
     scoring_policy: ScoringPolicyConfig = dataclasses.field(default_factory=ScoringPolicyConfig)
     #: Whether to generate a human-readable Markdown evaluation report
@@ -645,6 +592,12 @@ class EvaluationConfig:
     generate_report: bool = True
     #: Final SynthEval is a mandatory audit pass, even when ordinary selection is disabled.
     final_syntheval_mandatory: bool = True
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Reject attempts to restore the removed binary-target setting."""
+        if name == "binary_target":
+            raise AttributeError("evaluation.binary_target is no longer configurable")
+        super().__setattr__(name, value)
 
 
 # ---------------------------------------------------------------------------
@@ -765,10 +718,8 @@ _NESTED_DATACLASSES = {
     (EvaluationConfig, "syntheval"): FrameworkSelectionConfig,
     (EvaluationConfig, "custom"): FrameworkSelectionConfig,
     (EvaluationConfig, "log_disparity"): LogDisparityConfig,
-    (EvaluationConfig, "binary_target"): BinaryTargetConfig,
     (EvaluationConfig, "syntheval_execution"): SynthEvalExecutionConfig,
     (EvaluationConfig, "privacy_gate"): PrivacyGateConfig,
-    (EvaluationConfig, "release_generalization"): ReleaseGeneralizationConfig,
     (EvaluationConfig, "privacy_policy"): PrivacyPolicyConfig,
     (EvaluationConfig, "scoring_policy"): ScoringPolicyConfig,
     (DataConfig, "split"): DataSplitConfig,
@@ -783,6 +734,16 @@ def load_config(path: str | Path) -> Config:
 
     with open(config_path) as f:
         raw = yaml.safe_load(f) or {}
+
+    evaluation = raw.get("evaluation", {}) if isinstance(raw, dict) else {}
+    if isinstance(evaluation, dict):
+        removed = sorted({"release_generalization", "binary_target"} & set(evaluation))
+        if removed:
+            raise ValueError(
+                "Removed evaluation config key(s): "
+                + ", ".join(f"evaluation.{key}" for key in removed)
+                + "; use data.protected_attribute_bins for release bins"
+            )
 
     cfg = _from_dict(Config, raw)
     cfg.config_path = config_path
@@ -847,9 +808,8 @@ def _validate_policy_config(cfg: Any) -> None:
             required = {
                 "evaluation.privacy_policy",
                 "evaluation.scoring_policy",
-                "evaluation.release_generalization",
-                "evaluation.release_generalization.columns",
-                "generation.hpo.utility_policy",
+                "data.protected_attribute_bins",
+                "generation.hpo.metric_config.canonical_objectives",
             }
             required.update(
                 f"evaluation.privacy_policy.{name}"
@@ -882,7 +842,7 @@ def _validate_policy_config(cfg: Any) -> None:
     if cfg.data.canonical and cfg.evaluation.log_disparity.protected_bins is not None:
         raise ValueError(
             "Canonical evaluation rejects positional evaluation.log_disparity.protected_bins; "
-            "declare named column-based release_generalization instead"
+            "declare named column-based data.protected_attribute_bins instead"
         )
     for name in (
         "k_required",
@@ -915,62 +875,118 @@ def _validate_policy_config(cfg: Any) -> None:
         or not 0 < scoring.valid_comparison_fraction <= 1
     ):
         raise ValueError("evaluation.scoring_policy.valid_comparison_fraction must be in (0, 1]")
-    generalization = cfg.evaluation.release_generalization.columns
-    if not isinstance(generalization, dict):
-        raise ValueError("evaluation.release_generalization.columns must be a mapping")
-    for column, spec in generalization.items():
-        if not isinstance(column, str) or not column.strip() or not isinstance(spec, dict):
-            raise ValueError("evaluation.release_generalization.columns must map names to mappings")
-        intervals = spec.get("intervals")
-        if not isinstance(intervals, list) or not intervals:
-            raise ValueError(f"release generalization for {column!r} requires non-empty intervals")
-        previous_upper = None
-        for index, interval in enumerate(intervals):
-            if not isinstance(interval, dict) or not isinstance(interval.get("label"), str):
-                raise ValueError(f"release generalization interval for {column!r} is malformed")
-            lower, upper = interval.get("lower"), interval.get("upper")
-            if lower is not None and not isinstance(lower, (int, float)):
-                raise ValueError(
-                    f"release generalization lower bound for {column!r} must be numeric/null"
-                )
-            if upper is not None and not isinstance(upper, (int, float)):
-                raise ValueError(
-                    f"release generalization upper bound for {column!r} must be numeric/null"
-                )
-            if lower is not None and upper is not None and lower >= upper:
-                raise ValueError(
-                    f"release generalization interval for {column!r} has lower >= upper"
-                )
-            if lower is None and index != 0:
-                raise ValueError(
-                    f"release generalization lower-unbounded interval for {column!r} must be first"
-                )
-            if upper is None and index != len(intervals) - 1:
-                raise ValueError(
-                    f"release generalization upper-unbounded interval for {column!r} must be last"
-                )
-            if index > 0 and previous_upper is None:
-                raise ValueError(
-                    f"release generalization intervals for {column!r} have an upper-unbounded interval before later intervals"
-                )
-            if index > 0 and lower != previous_upper:
-                raise ValueError(
-                    f"release generalization intervals for {column!r} must be contiguous"
-                )
-            previous_upper = upper
-    if cfg.data.canonical:
-        utility = cfg.generation.hpo.utility_policy
-        if utility != {
-            "metrics": [
-                "tstr_macro_f1.v1",
-                "mixed_mmd.v1",
-                "elastic_net_jsd.v1",
-            ],
-            "weights": [1 / 3, 1 / 3, 1 / 3],
-        }:
+    if cfg.data.canonical and cfg.generation.hpo.metric_config != {
+        "canonical_objectives": ["tstr_macro_f1.v1"]
+    }:
+        raise ValueError("Canonical HPO metric_config.canonical_objectives must select TSTR only")
+
+
+def _protected_attribute_bin_intervals(
+    protected_columns: list[str],
+    value: Any,
+) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    """Parse aligned age interval labels into the stable runtime declaration shape."""
+    field_name = "data.protected_attribute_bins"
+    if not isinstance(value, list) or len(value) != len(protected_columns):
+        raise ValueError(f"{field_name} must be a list aligned with data.protected_columns")
+    result: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    label_patterns = (
+        re.compile(r"<([0-9]+)"),
+        re.compile(r"([0-9]+)-([0-9]+)"),
+        re.compile(r"(?:([0-9]+)\+|>([0-9]+))"),
+    )
+    for column, labels in zip(protected_columns, value, strict=True):
+        if labels is None:
+            continue
+        if (
+            not isinstance(labels, list)
+            or not labels
+            or any(not isinstance(label, str) or not label.strip() for label in labels)
+        ):
             raise ValueError(
-                "Canonical HPO utility_policy is fixed to equal thirds of TSTR, MMD, and JSD"
+                f"{field_name} entry for {column!r} must be null or a non-empty list of labels"
             )
+        if len(labels) != len(set(labels)):
+            raise ValueError(f"{field_name} labels for {column!r} must not contain duplicates")
+
+        intervals: list[dict[str, Any]] = []
+        for index, label in enumerate(labels):
+            matched_pattern = None
+            match = None
+            for pattern_index, pattern in enumerate(label_patterns):
+                match = pattern.fullmatch(label)
+                if match is not None:
+                    matched_pattern = pattern_index
+                    break
+            if match is None:
+                raise ValueError(
+                    f"{field_name} label {label!r} for {column!r} must use explicit age interval syntax"
+                )
+            if matched_pattern == 0:
+                if index != 0:
+                    raise ValueError(f"{field_name} lower-open label for {column!r} must be first")
+                lower, upper = None, int(match.group(1))
+            elif matched_pattern == 1:
+                lower, upper = int(match.group(1)), int(match.group(2))
+                if lower >= upper:
+                    raise ValueError(
+                        f"{field_name} interval {label!r} for {column!r} has lower >= upper"
+                    )
+            else:
+                if index != len(labels) - 1:
+                    raise ValueError(f"{field_name} upper-open label for {column!r} must be last")
+                lower, upper = int(match.group(1) or match.group(2)), None
+            if index and intervals[-1]["upper"] != lower:
+                raise ValueError(
+                    f"{field_name} intervals for {column!r} must be ordered and contiguous"
+                )
+            intervals.append({"label": label, "lower": lower, "upper": upper})
+        if intervals[0]["lower"] is not None or intervals[-1]["upper"] is not None:
+            raise ValueError(f"{field_name} intervals for {column!r} must cover both open ends")
+        result[column] = {"intervals": intervals}
+    return result
+
+
+def _validate_stratification_config(
+    data: DataConfig,
+    protected_intervals: dict[str, dict[str, list[dict[str, Any]]]],
+) -> None:
+    """Validate positional stratification columns and their optional labels."""
+    variables = data.stratification_variables
+    bins = data.stratification_bins
+    if not isinstance(variables, list) or any(
+        not isinstance(variable, str) or not variable.strip() for variable in variables
+    ):
+        raise ValueError("data.stratification_variables must be a list of non-empty column names")
+    if len(variables) != len(set(variables)):
+        raise ValueError("data.stratification_variables must not contain duplicates")
+    if not isinstance(bins, list) or len(variables) != len(bins):
+        raise ValueError(
+            "data.stratification_bins must be a list aligned with data.stratification_variables"
+        )
+    for index, labels in enumerate(bins):
+        if labels is not None:
+            if (
+                not isinstance(labels, list)
+                or not labels
+                or any(not isinstance(label, str) or not label.strip() for label in labels)
+            ):
+                raise ValueError(
+                    f"data.stratification_bins[{index}] must be null or a non-empty list of labels"
+                )
+            if len(labels) != len(set(labels)):
+                raise ValueError(
+                    f"data.stratification_bins[{index}] must not contain duplicate labels"
+                )
+        variable = variables[index]
+        declaration = protected_intervals.get(variable)
+        if declaration is not None:
+            interval_labels = [interval["label"] for interval in declaration["intervals"]]
+            if labels != interval_labels:
+                raise ValueError(
+                    f"data.stratification_bins for {variable!r} must match "
+                    "data.protected_attribute_bins labels in order"
+                )
 
 
 def _validate_data_split_config(cfg: DataConfig) -> None:
@@ -1221,6 +1237,11 @@ def _validate(cfg: Config) -> None:
             "Conflicting data column declarations: "
             + "; ".join(f"{name}={values}" for name, values in conflicts.items())
         )
+    protected_intervals = _protected_attribute_bin_intervals(
+        cfg.data.protected_columns,
+        cfg.data.protected_attribute_bins,
+    )
+    _validate_stratification_config(cfg.data, protected_intervals)
     if cfg.device not in ("auto", "cpu", "cuda", "mps"):
         raise ValueError(f"device must be one of auto/cpu/cuda/mps, got {cfg.device!r}")
     if cfg.imputation.method not in ("tabimpute", "refidiff", "hyperimpute"):
@@ -1340,6 +1361,22 @@ def _validate(cfg: Config) -> None:
                 f"generation.hpo.stage_a.dependency_rules[{index}].parents must be a non-empty "
                 "list of strings"
             )
+    metric_config = cfg.generation.hpo.metric_config
+    if not isinstance(metric_config, dict) or set(metric_config) != {"canonical_objectives"}:
+        raise ValueError("generation.hpo.metric_config must declare only canonical_objectives")
+    objectives = metric_config["canonical_objectives"]
+    if (
+        not isinstance(objectives, list)
+        or not objectives
+        or any(not isinstance(metric, str) or not metric.strip() for metric in objectives)
+    ):
+        raise ValueError(
+            "generation.hpo.metric_config.canonical_objectives must be a non-empty list of metric identities"
+        )
+    if len(objectives) != len(set(objectives)):
+        raise ValueError(
+            "generation.hpo.metric_config.canonical_objectives must not contain duplicates"
+        )
     if cfg.evaluation.ranking_strategy not in ("linear", "summation"):
         raise ValueError(
             "evaluation.ranking_strategy must be 'linear' or 'summation', "
@@ -1432,19 +1469,6 @@ def _validate(cfg: Config) -> None:
             raise ValueError(
                 f"data.ordinal_column_categories[{col!r}] must be a list of unique values, "
                 f"got {categories!r}"
-            )
-    if cfg.evaluation.binary_target.enabled:
-        bt = cfg.evaluation.binary_target
-        if not bt.positive_classes or not bt.negative_classes:
-            raise ValueError(
-                "evaluation.binary_target.positive_classes and .negative_classes must both be "
-                "non-empty when evaluation.binary_target.enabled is true."
-            )
-        overlap = set(bt.positive_classes) & set(bt.negative_classes)
-        if overlap:
-            raise ValueError(
-                "evaluation.binary_target.positive_classes and .negative_classes must not "
-                f"overlap: {sorted(overlap, key=str)}"
             )
     structural = cfg.evaluation.synthcity
     if structural.classification_score not in {"balanced_accuracy", "macro_f1"}:

@@ -830,7 +830,7 @@ def _stage_a_failure_setup(
     assert result.pruned
     context = hpo.build_hpo_context(
         task_type="classification",
-        metric_config={"task12": ["mixed_mmd.v1"]},
+        metric_config={"canonical_objectives": ["tstr_macro_f1.v1"]},
         registry_digest="registry-a",
         stage_a_contract_digest=contract.digest,
         group_context={"group_mode": "row"},
@@ -851,7 +851,7 @@ def _stage_a_failure_setup(
             "comparison_role": "tuning",
             "contract": "train_frozen_v1",
         },
-        objective_version="release-utility-v1",
+        objective_version="configured-objective-v1",
     )
     context_digest = hpo.hpo_context_digest(context)
     context_filename = f"hpo_context-{context_digest}.json"
@@ -2762,6 +2762,155 @@ def test_contract_and_status_sidecars_round_trip(tmp_path):
         "candidate": "candidate-context",
         "full": "full-context",
     }
+
+
+def test_prior_contract_registry_bundle_is_readable_only_through_legacy_path(tmp_path):
+    evaluation_dir = tmp_path / "evaluation"
+    evaluation_dir.mkdir()
+    combined = _combined()
+    metric_column = ("synthcity", "utility", "stats.ks_test.marginal")
+    combined[metric_column] = [0.5]
+    combined.columns = pd.MultiIndex.from_tuples(combined.columns)
+    combined.to_csv(evaluation_dir / "combined_evaluation.csv")
+    added_contract_ids = {
+        "syntheval.auroc_macro_ovr_v3",
+        "syntheval.auroc_macro_ovr_v3.diagnostic",
+        "syntheval.statistical_parity_macro_ovr_v1",
+        "syntheval.statistical_parity_macro_ovr_v1.diagnostic",
+        "custom.equalized_odds_macro_ovr_v1",
+        "custom.equalized_odds_macro_ovr_v1.diagnostic",
+        "custom.equal_opportunity_macro_ovr_v1",
+        "custom.equal_opportunity_macro_ovr_v1.diagnostic",
+    }
+    prior_registry = MetricContractRegistry(
+        contract
+        for contract in DEFAULT_METRIC_CONTRACT_REGISTRY
+        if contract.contract_id not in added_contract_ids
+        and contract.contract_id.removesuffix(".binary_target") not in added_contract_ids
+    )
+    prior_manifest = prior_registry.manifest()
+    role_hashes = {"train": "train-hash", "tuning": "tuning-hash"}
+    validation = resolve_metric_observations(
+        registry=prior_registry,
+        model_name="model_a",
+        framework="synthcity",
+        expected_keys=[metric_column[2]],
+        observations=[
+            MetricObservation(
+                model_name="model_a",
+                framework="synthcity",
+                emitted_key=metric_column[2],
+                raw_value=0.5,
+                direction="maximize",
+                role_hashes=role_hashes,
+            )
+        ],
+        context=MetricEvaluationContext(role_hashes=role_hashes),
+        requested_use="audit",
+    )
+    persist_evaluation_artifacts(
+        evaluation_dir,
+        combined,
+        {},
+        native_syntheval_plot_dir=None,
+        synthcity_validation_results={"model_a": validation},
+        metric_contract_manifest=prior_manifest,
+    )
+
+    with pytest.raises(ValueError, match="current registry"):
+        validate_evaluation_bundle(evaluation_dir)
+    validate_evaluation_bundle(evaluation_dir, allow_legacy=True)
+    assert load_metric_contract_manifest(evaluation_dir)["digest"] == prior_registry.digest()
+
+
+def test_ovr_class_support_failure_remains_in_persisted_metric_status(tmp_path):
+    evaluation_dir = tmp_path / "evaluation"
+    evaluation_dir.mkdir()
+    combined = _combined()
+    combined.to_csv(evaluation_dir / "combined_evaluation.csv")
+    emitted_key = "auroc_income_class_0_ovr_v3"
+    validation = resolve_metric_observations(
+        registry=DEFAULT_METRIC_CONTRACT_REGISTRY,
+        model_name="model_a",
+        framework="syntheval",
+        expected_keys=[emitted_key],
+        observations=[
+            MetricObservation(
+                model_name="model_a",
+                framework="syntheval",
+                emitted_key=emitted_key,
+                raw_value=None,
+                error="ValueError: class support is insufficient",
+                role_hashes={"train": "train-hash", "tuning": "tuning-hash"},
+                support={"state": "insufficient", "synthetic_rows": 0, "reference_rows": 4},
+            )
+        ],
+        context=MetricEvaluationContext(
+            role_hashes={"train": "train-hash", "tuning": "tuning-hash"}
+        ),
+        requested_use="audit",
+    )
+    persist_evaluation_artifacts(
+        evaluation_dir,
+        combined,
+        {},
+        native_syntheval_plot_dir=None,
+        syntheval_validation_results={("syntheval", "main"): {"model_a": validation}},
+        metric_contract_manifest=DEFAULT_METRIC_CONTRACT_REGISTRY.manifest(),
+    )
+
+    record = load_syntheval_metric_status(evaluation_dir)["passes"]["syntheval:main"]["model_a"][
+        "records"
+    ][0]
+    assert record["expected_key"] == emitted_key
+    assert record["contract_id"] == "syntheval.auroc_macro_ovr_v3.diagnostic"
+    assert record["status"] == "failed"
+    assert record["error"] == "reason_code=metric_evaluation_failed; exception_type=ValueError"
+    assert record["support"] == {
+        "state": "insufficient",
+        "synthetic_rows": 0,
+        "reference_rows": 4,
+    }
+
+
+def test_metric_status_rejects_contract_owned_by_different_ovr_identity(tmp_path):
+    evaluation_dir = tmp_path / "evaluation"
+    evaluation_dir.mkdir()
+    combined = _combined()
+    combined.to_csv(evaluation_dir / "combined_evaluation.csv")
+    emitted_key = "auroc_macro_ovr_v3"
+    validation = resolve_metric_observations(
+        registry=DEFAULT_METRIC_CONTRACT_REGISTRY,
+        model_name="model_a",
+        framework="syntheval",
+        expected_keys=[emitted_key],
+        observations=[
+            MetricObservation(
+                model_name="model_a",
+                framework="syntheval",
+                emitted_key=emitted_key,
+                raw_value=0.25,
+                role_hashes={"train": "train-hash", "tuning": "tuning-hash"},
+            )
+        ],
+        context=MetricEvaluationContext(
+            role_hashes={"train": "train-hash", "tuning": "tuning-hash"}
+        ),
+        requested_use="audit",
+    )
+    payload = validation.to_dict()
+    payload["records"][0]["contract_id"] = "syntheval.auroc.diagnostic"
+    persist_evaluation_artifacts(
+        evaluation_dir,
+        combined,
+        {},
+        native_syntheval_plot_dir=None,
+        syntheval_validation_results={("syntheval", "main"): {"model_a": payload}},
+        metric_contract_manifest=DEFAULT_METRIC_CONTRACT_REGISTRY.manifest(),
+    )
+
+    with pytest.raises(ValueError, match="contract_id does not own"):
+        load_syntheval_metric_status(evaluation_dir)
 
 
 def test_metric_status_artifact_round_trips_provenance_fields(tmp_path):

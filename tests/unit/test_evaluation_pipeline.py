@@ -41,6 +41,33 @@ from synthdata.generation import pipeline as generation_pipeline
 pytestmark = pytest.mark.unit
 
 
+def test_release_age_bins_use_shared_half_open_boundaries():
+    release_bins = {
+        "Age": {
+            "intervals": [
+                {"label": "<18", "lower": None, "upper": 18},
+                {"label": "18-30", "lower": 18, "upper": 30},
+                {"label": "30-45", "lower": 30, "upper": 45},
+                {"label": "45-60", "lower": 45, "upper": 60},
+                {"label": "60+", "lower": 60, "upper": None},
+            ]
+        }
+    }
+    ages = [17, 18, 29, 30, 44, 45, 59, 60]
+    synthetic = pd.DataFrame({"Age": ages})
+    real_roles = {"train": pd.DataFrame({"Age": ages})}
+
+    released_synthetic, released_roles, _metadata = transform_release_roles(
+        synthetic,
+        real_roles,
+        release_bins,
+    )
+
+    expected = ["<18", "18-30", "18-30", "30-45", "30-45", "45-60", "45-60", "60+"]
+    assert released_synthetic["Age"].tolist() == expected
+    assert released_roles["train"]["Age"].tolist() == expected
+
+
 def _fail_test(message: str) -> NoReturn:
     raise AssertionError(message)
 
@@ -81,7 +108,6 @@ def test_run_evaluation_persists_partial_model_coverage(
     cfg.evaluation.synthcity.metrics = ["identifiability_score"]
     cfg.evaluation.syntheval.enabled = False
     cfg.evaluation.custom.enabled = False
-    cfg.evaluation.binary_target.enabled = False
     cfg.evaluation.save_per_model_syntheval_plots = False
     cfg.evaluation.generate_report = True
     cfg.evaluation.privacy_gate.enabled = False
@@ -1293,13 +1319,22 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     cfg = make_config()
     cfg.evaluation.synthcity.metrics = ["identifiability_score"]
     cfg.evaluation.syntheval.enabled = True
-    cfg.evaluation.custom.enabled = False
-    cfg.evaluation.binary_target.enabled = False
+    cfg.evaluation.custom.enabled = True
     cfg.evaluation.save_per_model_syntheval_plots = False
     cfg.evaluation.generate_report = False
     cfg.evaluation.privacy_gate.enabled = False
+    cfg.data.protected_columns = ["feature"]
+    cfg.data.protected_attribute_bins = [["<12", "12+"]]
 
     dataset = make_canonical_dataset()
+    dataset.release_generalization = {
+        "feature": {
+            "intervals": [
+                {"label": "dataset_lower", "lower": None, "upper": 8},
+                {"label": "dataset_upper", "lower": 8, "upper": None},
+            ]
+        }
+    }
     synthetic = dataset.role_frame("train", imputed=True).copy()
     synthcity_calls = []
     synthcity_fit_frames = []
@@ -1309,6 +1344,7 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     syntheval_fit_frames = []
     syntheval_released_datasets = []
     syntheval_released_references = []
+    release_evidence_generalizations = []
     synthcity_report = _dataframe(
         {"mean": [0.25] * 4, "direction": ["minimize"] * 4},
         index=[
@@ -1336,10 +1372,18 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     def fake_refit_selected_model(*args, **kwargs):
         return _fake_refit_metadata(synthetic, kwargs["output_dir"])
 
+    def fake_run_release_evidence(_selected, _dataset, **kwargs):
+        release_evidence_generalizations.append(kwargs["generalization"])
+        return {}
+
     monkeypatch.setattr(generation_pipeline, "refit_selected_model", fake_refit_selected_model)
 
     monkeypatch.setattr(synthcity_eval, "run_synthcity_evaluation", fake_run_synthcity_evaluation)
     monkeypatch.setattr(syntheval_eval, "run_syntheval_evaluation", fake_run_syntheval_evaluation)
+    monkeypatch.setattr(custom_eval, "run_log_disparity_evaluation", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        release_evidence_eval, "run_release_evidence_evaluation", fake_run_release_evidence
+    )
     monkeypatch.setattr(
         "synthdata.evaluation._select_policy_model", lambda _combined: ("model_a", None)
     )
@@ -1361,10 +1405,27 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     assert syntheval_released_datasets[0] is None
     assert syntheval_released_datasets[1] is not None
     assert syntheval_released_references[1] is not None
+    assert set(syntheval_released_datasets[1]["model_a"]["feature"]) <= {
+        "dataset_lower",
+        "dataset_upper",
+    }
+    assert set(syntheval_released_references[1]["feature"]) <= {
+        "dataset_lower",
+        "dataset_upper",
+    }
+    assert (
+        syntheval_released_datasets[1]["model_a"].attrs["release_provenance"]["generalization"]
+        == dataset.release_generalization
+    )
+    assert release_evidence_generalizations == [
+        dataset.release_generalization,
+        dataset.release_generalization,
+    ]
     assert "final_holdout_evidence" in extras
     evidence = artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)
     assert evidence["state"] == "failed"
     assert evidence["selected_model"] == "model_a"
+    assert evidence["provenance_inventory"]["intervals"] == dataset.release_generalization
     assert evidence["role_context"]["roles"].keys() == {
         "train",
         "tuning",
@@ -1387,7 +1448,6 @@ def test_run_evaluation_keeps_multi_model_selection_outside_final_holdout(
     cfg.evaluation.synthcity.metrics = ["identifiability_score"]
     cfg.evaluation.syntheval.enabled = False
     cfg.evaluation.custom.enabled = False
-    cfg.evaluation.binary_target.enabled = False
     cfg.evaluation.save_per_model_syntheval_plots = False
     cfg.evaluation.generate_report = False
     cfg.evaluation.privacy_gate.enabled = False
@@ -1475,7 +1535,6 @@ def test_run_evaluation_records_authoritative_final_task10_evidence(
     cfg.evaluation.synthcity.metrics = ["identifiability_score"]
     cfg.evaluation.syntheval.enabled = False
     cfg.evaluation.custom.enabled = True
-    cfg.evaluation.binary_target.enabled = False
     cfg.evaluation.save_per_model_syntheval_plots = False
     cfg.evaluation.generate_report = False
     cfg.evaluation.privacy_gate.enabled = False
@@ -1732,7 +1791,6 @@ def test_run_evaluation_blocks_legacy_before_candidate_ranking(
     cfg.evaluation.synthcity.metrics = ["identifiability_score"]
     cfg.evaluation.syntheval.enabled = False
     cfg.evaluation.custom.enabled = False
-    cfg.evaluation.binary_target.enabled = False
     cfg.evaluation.save_per_model_syntheval_plots = False
     cfg.evaluation.generate_report = True
     cfg.evaluation.privacy_gate.enabled = False
@@ -1773,7 +1831,6 @@ def test_run_evaluation_persists_failed_final_framework_evidence(
     cfg.evaluation.synthcity.metrics = ["identifiability_score"]
     cfg.evaluation.syntheval.enabled = False
     cfg.evaluation.custom.enabled = False
-    cfg.evaluation.binary_target.enabled = True
     cfg.evaluation.save_per_model_syntheval_plots = False
     cfg.evaluation.generate_report = False
     cfg.evaluation.privacy_gate.enabled = False
@@ -1842,7 +1899,7 @@ def test_run_evaluation_persists_failed_final_framework_evidence(
     assert disabled_syntheval_calls == []
     assert evidence["frameworks"]["syntheval"] == {
         "validation": {},
-        "execution": {"main": {}, "binary_target": {}},
+        "execution": {"main": {}},
     }
 
 
@@ -1854,7 +1911,6 @@ def test_run_evaluation_persists_failed_final_syntheval_worker(
     cfg.evaluation.synthcity.metrics = ["identifiability_score"]
     cfg.evaluation.syntheval.enabled = True
     cfg.evaluation.custom.enabled = False
-    cfg.evaluation.binary_target.enabled = False
     cfg.evaluation.save_per_model_syntheval_plots = False
     cfg.evaluation.generate_report = False
     cfg.evaluation.privacy_gate.enabled = False
@@ -1912,21 +1968,41 @@ def test_run_evaluation_persists_failed_final_syntheval_worker(
     assert extras["final_holdout_evidence"]["state"] == "failed"
 
 
-def test_run_evaluation_passes_real_fit_to_final_binary_evidence(
-    make_config, make_canonical_dataset, monkeypatch
+@pytest.mark.parametrize(
+    ("class_count", "expected_metric_names"),
+    [
+        (2, {"auroc_v2", "statistical_parity", "equalized_odds", "equal_opportunity"}),
+        (
+            3,
+            {
+                "auroc_macro_ovr_v3",
+                "statistical_parity_macro_ovr_v1",
+                "equalized_odds_macro_ovr_v1",
+                "equal_opportunity_macro_ovr_v1",
+            },
+        ),
+    ],
+)
+def test_run_evaluation_routes_native_metric_manifests_without_binary_pass(
+    make_config, make_canonical_dataset, monkeypatch, class_count, expected_metric_names
 ):
     cfg = make_config()
     cfg.evaluation.synthcity.metrics = ["identifiability_score"]
     cfg.evaluation.syntheval.enabled = True
+    cfg.evaluation.syntheval.metrics = [
+        "auroc_diff",
+        "statistical_parity",
+        "equalized_odds",
+        "equal_opportunity",
+    ]
     cfg.evaluation.custom.enabled = False
-    cfg.evaluation.binary_target.enabled = True
-    cfg.evaluation.binary_target.positive_classes = [1]
-    cfg.evaluation.binary_target.negative_classes = [0]
     cfg.evaluation.save_per_model_syntheval_plots = False
     cfg.evaluation.generate_report = False
     cfg.evaluation.privacy_gate.enabled = False
 
     dataset = make_canonical_dataset()
+    train_frame = dataset.role_frame("train", imputed=True)
+    train_frame.loc[:, "target"] = [index % class_count for index in range(len(train_frame))]
     synthetic = dataset.role_frame("train", imputed=True).copy()
     synthcity_report = _dataframe(
         {"mean": [0.25] * 4, "direction": ["minimize"] * 4},
@@ -1937,30 +2013,24 @@ def test_run_evaluation_passes_real_fit_to_final_binary_evidence(
             "privacy.identifiability_score.score_OC_entropy_weighted",
         ],
     )
-    binary_calls = []
-    main_calls = []
+    syntheval_calls = []
+    validation_expected_keys = []
 
     def fake_run_synthcity_evaluation(*args, **kwargs):
         return {"model_a": synthcity_report}
 
     def fake_run_syntheval_evaluation(*args, **kwargs):
-        if kwargs.get("evaluation_role") == "final_holdout":
-            main_calls.append(kwargs)
+        syntheval_calls.append(kwargs.get("evaluation_role", "tuning"))
         return None, None, {}
 
-    def fake_run_binary_target_syntheval_evaluation(*args, **kwargs):
-        fit_frame = kwargs.get("fit_frame")
-        binary_calls.append(
-            {
-                "evaluation_role": kwargs.get("evaluation_role", "tuning"),
-                "synthetic": args[0]["model_a"].copy(),
-                "fit_frame": fit_frame.copy() if fit_frame is not None else None,
-                "fit_roles": kwargs.get("fit_roles"),
-                "released_datasets": kwargs.get("released_synthetic_datasets"),
-                "released_reference": kwargs.get("released_final_holdout_frame"),
-            }
-        )
-        return None, None, {}
+    def fail_if_binary_syntheval_runs(*args, **kwargs):
+        raise AssertionError("new evaluation must not run a collapsed binary-target pass")
+
+    validate_syntheval_results = syntheval_eval.validate_syntheval_results
+
+    def capture_validation_expected_keys(results, ranks, expected_keys, *args, **kwargs):
+        validation_expected_keys.append(expected_keys)
+        return validate_syntheval_results(results, ranks, expected_keys, *args, **kwargs)
 
     def fake_refit_selected_model(*args, **kwargs):
         return _fake_refit_metadata(synthetic, kwargs["output_dir"])
@@ -1968,9 +2038,12 @@ def test_run_evaluation_passes_real_fit_to_final_binary_evidence(
     monkeypatch.setattr(synthcity_eval, "run_synthcity_evaluation", fake_run_synthcity_evaluation)
     monkeypatch.setattr(syntheval_eval, "run_syntheval_evaluation", fake_run_syntheval_evaluation)
     monkeypatch.setattr(
+        syntheval_eval, "validate_syntheval_results", capture_validation_expected_keys
+    )
+    monkeypatch.setattr(
         syntheval_eval,
         "run_binary_target_syntheval_evaluation",
-        fake_run_binary_target_syntheval_evaluation,
+        fail_if_binary_syntheval_runs,
     )
     monkeypatch.setattr(generation_pipeline, "refit_selected_model", fake_refit_selected_model)
     monkeypatch.setattr(
@@ -1979,104 +2052,13 @@ def test_run_evaluation_passes_real_fit_to_final_binary_evidence(
 
     _combined, extras = run_evaluation(cfg, dataset, {"model_a": synthetic})
 
-    expected_real_fit = pd.concat(
-        [dataset.role_frame("train", imputed=True), dataset.role_frame("tuning", imputed=True)],
-        ignore_index=True,
-    )
-    assert [call["evaluation_role"] for call in binary_calls] == ["tuning", "final_holdout"]
-    pd.testing.assert_frame_equal(binary_calls[1]["fit_frame"], expected_real_fit)
-    pd.testing.assert_frame_equal(binary_calls[1]["synthetic"], synthetic)
-    assert binary_calls[1]["fit_roles"] == ("train", "tuning")
-    assert main_calls[0]["released_synthetic_datasets"] is binary_calls[1]["released_datasets"]
-    assert main_calls[0]["released_final_holdout_frame"] is binary_calls[1]["released_reference"]
-    assert extras["final_holdout_evidence"]["state"] == "failed"
-    assert artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)[
-        "binary_target_mapping"
-    ] == {
-        "column": "target",
-        "positive_classes": [1],
-        "negative_classes": [0],
-        "encoding": {"positive": 1, "negative": 0},
-    }
-
-
-@pytest.mark.parametrize("exception_type", [ValueError, TypeError])
-def test_run_evaluation_persists_failed_final_binary_syntheval_worker(
-    make_config, make_canonical_dataset, monkeypatch, exception_type
-):
-    cfg = make_config()
-    cfg.evaluation.synthcity.metrics = ["identifiability_score"]
-    cfg.evaluation.syntheval.enabled = True
-    cfg.evaluation.binary_target.enabled = True
-    cfg.evaluation.binary_target.positive_classes = [1]
-    cfg.evaluation.binary_target.negative_classes = [0]
-    cfg.evaluation.custom.enabled = False
-    cfg.evaluation.save_per_model_syntheval_plots = False
-    cfg.evaluation.generate_report = False
-    cfg.evaluation.privacy_gate.enabled = False
-
-    dataset = make_canonical_dataset()
-    synthetic = dataset.role_frame("train", imputed=True).copy()
-    synthcity_report = _dataframe(
-        {"mean": [0.25] * 4, "direction": ["minimize"] * 4},
-        index=[
-            "privacy.identifiability_score.score",
-            "privacy.identifiability_score.score_OC",
-            "privacy.identifiability_score.score_entropy_weighted",
-            "privacy.identifiability_score.score_OC_entropy_weighted",
-        ],
-    )
-
-    monkeypatch.setattr(
-        synthcity_eval,
-        "run_synthcity_evaluation",
-        lambda *args, **kwargs: {"model_a": synthcity_report},
-    )
-    monkeypatch.setattr(
-        syntheval_eval, "run_syntheval_evaluation", lambda *args, **kwargs: (None, None, {})
-    )
-
-    def fail_binary(*args, **kwargs):
-        if kwargs.get("evaluation_role") == "final_holdout":
-            raise exception_type("binary failed; checkpoint=/candidate/model_a/status.json")
-        return None, None, {}
-
-    monkeypatch.setattr(syntheval_eval, "run_binary_target_syntheval_evaluation", fail_binary)
-    monkeypatch.setattr(
-        generation_pipeline,
-        "refit_selected_model",
-        lambda *args, **kwargs: _fake_refit_metadata(synthetic, kwargs["output_dir"]),
-    )
-    monkeypatch.setattr(
-        "synthdata.evaluation._select_policy_model", lambda _combined: ("model_a", None)
-    )
-
-    _combined, extras = run_evaluation(cfg, dataset, {"model_a": synthetic})
-
+    assert syntheval_calls == ["tuning", "final_holdout"]
+    assert len(validation_expected_keys) == 2
+    for expected_keys in validation_expected_keys:
+        manifested_metric_names = set(expected_keys["syntheval"]) | set(expected_keys["custom"])
+        assert expected_metric_names <= manifested_metric_names
     evidence = artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)
-    assert evidence["state"] == "failed"
-    binary_failures = [
-        reason
-        for reason in evidence["failure_reasons"]
-        if reason.get("execution_pass") == "binary_target" and reason.get("status") == "failed"
-    ]
-    assert binary_failures == [
-        {
-            "stage": "final_holdout",
-            "framework": "syntheval",
-            "execution_pass": "binary_target",
-            "model": "model_a",
-            "status": "failed",
-            "policy_eligible": False,
-            "error_type": "SynthEvalExecutionError",
-            "exception_type": exception_type.__name__,
-            "reason_code": "final_holdout_execution_failed",
-            "failure_reason": "Final-holdout SynthEval execution failed.",
-        }
-    ]
-    assert all("binary failed" not in str(reason) for reason in evidence["failure_reasons"])
-    assert all(
-        "/candidate/model_a/status.json" not in str(reason)
-        for reason in evidence["failure_reasons"]
-    )
-    assert extras["final_holdout_evidence"]["state"] == "failed"
+    assert evidence["frameworks"]["syntheval"]["execution"].keys() == {"main"}
+    assert "binary_target_mapping" not in evidence
+    assert all("binary_target" not in str(key) for key in extras["syntheval_validation"])
+    assert all(key != ("syntheval", "binary_target") for key in extras["syntheval_execution"])

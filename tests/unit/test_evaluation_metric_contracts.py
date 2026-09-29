@@ -555,18 +555,161 @@ class TestMetricContractRegistry:
     def test_duplicate_wildcard_matches_are_ambiguous(self):
         registry = MetricContractRegistry(
             [
-                _contract(key="test.*"),
-                _contract(key="test.m*", target_view="other"),
+                _contract(key="ab*cd"),
+                _contract(key="abc*d", target_view="other"),
             ]
         )
         with pytest.raises(AmbiguousMetricContractError):
-            registry.resolve(framework="test", emitted_key="test.metric")
+            registry.resolve(framework="test", emitted_key="abcd")
+
+    def test_more_specific_wildcard_contract_takes_precedence(self):
+        registry = MetricContractRegistry(
+            [
+                _contract(key="auroc_*"),
+                _contract(key="auroc_*_ovr_v3", target_view="versioned"),
+            ]
+        )
+
+        assert (
+            registry.resolve(framework="test", emitted_key="auroc_age_class_0_ovr_v3").target_view
+            == "versioned"
+        )
 
     def test_default_auroc_v2_contract_is_unambiguous(self):
         contract = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
             framework="syntheval", emitted_key="auroc_v2"
         )
         assert contract.contract_id == "syntheval.auroc_v2"
+
+    @pytest.mark.parametrize(
+        ("framework", "emitted_key", "contract_id"),
+        [
+            ("syntheval", "auroc_macro_ovr_v3", "syntheval.auroc_macro_ovr_v3"),
+            (
+                "syntheval",
+                "statistical_parity_macro_ovr_v1",
+                "syntheval.statistical_parity_macro_ovr_v1",
+            ),
+            (
+                "custom",
+                "equalized_odds_macro_ovr_v1",
+                "custom.equalized_odds_macro_ovr_v1",
+            ),
+            (
+                "custom",
+                "equal_opportunity_macro_ovr_v1",
+                "custom.equal_opportunity_macro_ovr_v1",
+            ),
+        ],
+    )
+    def test_versioned_ovr_aggregates_resolve_to_exact_contracts(
+        self, framework, emitted_key, contract_id
+    ):
+        contract = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
+            framework=framework, emitted_key=emitted_key
+        )
+
+        assert contract.contract_id == contract_id
+        assert contract.emitted_key_pattern == emitted_key
+        assert contract.metric_version in {"macro_ovr_v1", "macro_ovr_v3"}
+        assert contract.semantic_family == (
+            "utility" if emitted_key.startswith("auroc") else "fairness"
+        )
+        if emitted_key.startswith("auroc"):
+            assert contract.direction == "maximize"
+            assert contract.policy_transform == "one_minus_absolute"
+        else:
+            assert contract.direction == "minimize"
+            assert contract.policy_transform == "identity"
+
+    @pytest.mark.parametrize(
+        ("framework", "emitted_key", "contract_id"),
+        [
+            (
+                "syntheval",
+                "auroc_income_macro_ovr_v3",
+                "syntheval.auroc_macro_ovr_v3.diagnostic",
+            ),
+            (
+                "syntheval",
+                "auroc_income_class_0_ovr_v3",
+                "syntheval.auroc_macro_ovr_v3.diagnostic",
+            ),
+            (
+                "syntheval",
+                "sp_ovr_v1_income_positive_sex",
+                "syntheval.statistical_parity_macro_ovr_v1.diagnostic",
+            ),
+            (
+                "custom",
+                "eqo_ovr_v1_income_positive_sex",
+                "custom.equalized_odds_macro_ovr_v1.diagnostic",
+            ),
+            (
+                "custom",
+                "eo_ovr_v1_income_positive_sex",
+                "custom.equal_opportunity_macro_ovr_v1.diagnostic",
+            ),
+        ],
+    )
+    def test_ovr_class_diagnostics_resolve_to_diagnostic_owners(
+        self, framework, emitted_key, contract_id
+    ):
+        contract = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
+            framework=framework, emitted_key=emitted_key
+        )
+
+        assert contract.contract_id == contract_id
+        assert contract.value_role == "diagnostic"
+        assert contract.direction is None
+
+    @pytest.mark.parametrize(
+        ("framework", "emitted_key", "contract_id"),
+        [
+            ("syntheval", "auroc_macro_ovr_v3", "syntheval.auroc_macro_ovr_v3"),
+            (
+                "syntheval",
+                "auroc_income_class_0_ovr_v3",
+                "syntheval.auroc_macro_ovr_v3.diagnostic",
+            ),
+            (
+                "syntheval",
+                "statistical_parity_macro_ovr_v1",
+                "syntheval.statistical_parity_macro_ovr_v1",
+            ),
+            (
+                "custom",
+                "equalized_odds_macro_ovr_v1",
+                "custom.equalized_odds_macro_ovr_v1",
+            ),
+            (
+                "custom",
+                "equal_opportunity_macro_ovr_v1",
+                "custom.equal_opportunity_macro_ovr_v1",
+            ),
+        ],
+    )
+    def test_ovr_contracts_resolve_on_binary_target_pass(self, framework, emitted_key, contract_id):
+        contract = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
+            framework=framework,
+            emitted_key=emitted_key,
+            execution_pass="binary_target",
+        )
+
+        assert contract.contract_id == f"{contract_id}.binary_target"
+        assert contract.target_view == "binary_collapsed"
+
+    @pytest.mark.parametrize(
+        ("framework", "emitted_key"),
+        [
+            ("custom", "auroc_macro_ovr_v3"),
+            ("syntheval", "equalized_odds_macro_ovr_v1"),
+            ("syntheval", "equal_opportunity_macro_ovr_v1"),
+        ],
+    )
+    def test_versioned_ovr_aggregate_rejects_wrong_framework(self, framework, emitted_key):
+        with pytest.raises(UnknownMetricContractError):
+            DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(framework=framework, emitted_key=emitted_key)
 
     @pytest.mark.parametrize(
         ("emitted_key", "sample_size_field"),
