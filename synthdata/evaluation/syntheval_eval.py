@@ -381,11 +381,10 @@ def _preprocessing_failure(
     return payload
 
 
-def _candidate_role_frames(dataset: Dataset) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Resolve the fit, tuning, and final-holdout model frames by name."""
+def _candidate_role_frames(dataset: Dataset) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Resolve only train and tuning frames used during candidate evaluation."""
     fit_frame = dataset.role_frame("train", imputed=True)
     tuning_frame = dataset.role_frame("tuning", imputed=True)
-    final_holdout_frame = dataset.role_frame("final_holdout", imputed=True)
     if tuning_frame is None and dataset.legacy_two_role:
         raise RuntimeError(
             "SynthEval legacy two-role datasets cannot substitute final_holdout for tuning; "
@@ -396,7 +395,6 @@ def _candidate_role_frames(dataset: Dataset) -> tuple[pd.DataFrame, pd.DataFrame
         for role, frame in (
             ("train", fit_frame),
             ("tuning", tuning_frame),
-            ("final_holdout", final_holdout_frame),
         )
         if frame is None
     ]
@@ -406,8 +404,7 @@ def _candidate_role_frames(dataset: Dataset) -> tuple[pd.DataFrame, pd.DataFrame
         )
     assert fit_frame is not None
     assert tuning_frame is not None
-    assert final_holdout_frame is not None
-    return fit_frame, tuning_frame, final_holdout_frame
+    return fit_frame, tuning_frame
 
 
 def _evaluation_role_frames(
@@ -416,10 +413,22 @@ def _evaluation_role_frames(
     """Return the train fit frame and one explicitly named evidence frame."""
     if evaluation_role == "final_holdout":
         dataset.require_canonical_roles("final-holdout evaluation")
-    fit_frame, tuning_frame, final_holdout_frame = _candidate_role_frames(dataset)
     if evaluation_role == "tuning":
-        return fit_frame, tuning_frame
+        return _candidate_role_frames(dataset)
     if evaluation_role == "final_holdout":
+        fit_frame = dataset.role_frame("train", imputed=True)
+        final_holdout_frame = dataset.role_frame("final_holdout", imputed=True)
+        missing = [
+            role
+            for role, frame in (("train", fit_frame), ("final_holdout", final_holdout_frame))
+            if frame is None
+        ]
+        if missing:
+            raise RuntimeError(
+                "SynthEval requires populated imputed role frame(s): " + ", ".join(missing)
+            )
+        assert fit_frame is not None
+        assert final_holdout_frame is not None
         return fit_frame, final_holdout_frame
     raise ValueError(
         f"Unsupported SynthEval evaluation_role {evaluation_role!r}; "
@@ -433,6 +442,7 @@ def build_group_context(
     *,
     group_mode: str = "row",
     group_column: str | None = None,
+    include_final_holdout: bool = True,
 ) -> dict:
     """Resolve and validate the population context used by evaluation.
 
@@ -440,6 +450,8 @@ def build_group_context(
     never put the raw identifier in a model frame. Historical datasets may use
     raw frame identifiers, but only through the explicit legacy compatibility
     path. The returned context contains counts and fingerprints, never raw IDs.
+    Candidate evaluation sets ``include_final_holdout=False`` so this function
+    does not inspect final-holdout frames or group metadata before selection.
     """
     if group_mode == "row":
         return {
@@ -538,25 +550,26 @@ def build_group_context(
         train_metadata, train_identifiers = legacy_role_metadata(
             "train", dataset.role_frame("train", imputed=True)
         )
-        holdout_metadata, holdout_identifiers = legacy_role_metadata(
-            "holdout", dataset.role_frame("final_holdout", imputed=True)
-        )
-        overlap = train_identifiers & holdout_identifiers
-        if overlap:
-            raise ValueError(
-                f"Patient-group identifiers overlap between train and holdout for column "
-                f"{group_column!r} ({len(overlap)} group(s)); grouped evaluation requires disjoint "
-                "real-data roles"
-            )
         roles["train"] = train_metadata
-        roles["holdout"] = holdout_metadata
+        if include_final_holdout:
+            holdout_metadata, holdout_identifiers = legacy_role_metadata(
+                "holdout", dataset.role_frame("final_holdout", imputed=True)
+            )
+            overlap = train_identifiers & holdout_identifiers
+            if overlap:
+                raise ValueError(
+                    f"Patient-group identifiers overlap between train and holdout for column "
+                    f"{group_column!r} ({len(overlap)} group(s)); grouped evaluation requires disjoint "
+                    "real-data roles"
+                )
+            roles["holdout"] = holdout_metadata
     else:
-        fit_frame, tuning_frame, final_holdout_frame = _candidate_role_frames(dataset)
         role_frames = {
-            "train": fit_frame,
-            "tuning": tuning_frame,
-            "final_holdout": final_holdout_frame,
+            "train": dataset.role_frame("train", imputed=True),
+            "tuning": dataset.role_frame("tuning", imputed=True),
         }
+        if include_final_holdout:
+            role_frames["final_holdout"] = dataset.role_frame("final_holdout", imputed=True)
         role_identifiers = {}
         for role, frame in role_frames.items():
             roles[role], role_identifiers[role] = sidecar_role_metadata(role, frame)
@@ -2058,7 +2071,7 @@ def _evaluation_context_fingerprint(
 ) -> str:
     """Fingerprint inputs shared by every model in one evaluation pass."""
     if fit_frame is None or tuning_frame is None:
-        fit_frame, tuning_frame, _final_holdout_frame = _candidate_role_frames(dataset)
+        fit_frame, tuning_frame = _evaluation_role_frames(dataset, evaluation_role)
     role_context = _evaluation_role_context(
         dataset,
         fit_frame,
@@ -2174,10 +2187,10 @@ def _run_resumable_syntheval(
     expected_manifest_digest = expected_manifest_digest or _execution_manifest_digest(
         expected_output_manifest
     )
-    fit_frame, tuning_frame, _final_holdout_frame = (
-        (fit_frame, tuning_frame, None)
+    fit_frame, tuning_frame = (
+        (fit_frame, tuning_frame)
         if fit_frame is not None and tuning_frame is not None
-        else _candidate_role_frames(dataset)
+        else _evaluation_role_frames(dataset, evaluation_role)
     )
     context_fingerprint = _evaluation_context_fingerprint(
         dataset,
@@ -2969,17 +2982,9 @@ def run_binary_target_syntheval_evaluation(
         out[column] = build_binary_target_series(out[column], positive_classes, negative_classes)
         return out
 
-    canonical_fit_frame, tuning_frame, final_holdout_frame = _candidate_role_frames(dataset)
-    if evaluation_role == "tuning":
-        evidence_frame = tuning_frame
-    elif evaluation_role == "final_holdout":
-        dataset.require_canonical_roles("final-holdout binary evaluation")
-        evidence_frame = final_holdout_frame
-    else:
-        raise ValueError(
-            f"Unsupported SynthEval evaluation_role {evaluation_role!r}; "
-            "expected 'tuning' or 'final_holdout'"
-        )
+    canonical_fit_frame, evidence_frame = _evaluation_role_frames(dataset, evaluation_role)
+    tuning_frame = evidence_frame if evaluation_role == "tuning" else None
+    final_holdout_frame = evidence_frame if evaluation_role == "final_holdout" else None
     if released_synthetic_datasets is not None or released_final_holdout_frame is not None:
         if evaluation_role != "final_holdout":
             if released_final_holdout_frame is not None:
@@ -2999,8 +3004,10 @@ def run_binary_target_syntheval_evaluation(
         synthetic_datasets = released_synthetic_datasets
     fit_frame = canonical_fit_frame if fit_frame is None else fit_frame
     binary_fit_frame = _binarize(fit_frame)
-    binary_tuning_frame = _binarize(tuning_frame)
-    binary_final_holdout_frame = _binarize(final_holdout_frame)
+    binary_tuning_frame = _binarize(tuning_frame) if tuning_frame is not None else None
+    binary_final_holdout_frame = (
+        _binarize(final_holdout_frame) if final_holdout_frame is not None else None
+    )
     binary_evidence_frame = _binarize(evidence_frame)
     binary_synthetic_datasets: dict[str, pd.DataFrame] = {}
     binary_preprocessing_failures: dict[str, dict] = {}
@@ -3045,11 +3052,11 @@ def run_binary_target_syntheval_evaluation(
         **dataset.variable_schema,
         column: {**dataset.variable_schema.get(column, {}), "kind": "categorical"},
     }
-    binary_imputed_roles = {
-        "train": binary_fit_frame,
-        "tuning": binary_tuning_frame,
-        "final_holdout": binary_final_holdout_frame,
-    }
+    binary_imputed_roles = {"train": binary_fit_frame}
+    if binary_tuning_frame is not None:
+        binary_imputed_roles["tuning"] = binary_tuning_frame
+    if binary_final_holdout_frame is not None:
+        binary_imputed_roles["final_holdout"] = binary_final_holdout_frame
     binary_dataset = dataclasses.replace(
         dataset,
         target_column=column,

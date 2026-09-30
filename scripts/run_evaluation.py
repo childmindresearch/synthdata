@@ -231,7 +231,9 @@ def _run_evaluation_cli() -> None:
             "No validated candidate imputation found. Run `synthdata-impute --config <path>` first."
         )
 
-    logger.debug("event=evaluation.final_holdout.setup_start phase=final roles=train,final_holdout")
+    logger.debug(
+        "event=evaluation.final_holdout.setup_start phase=final roles=train,tuning,final_holdout"
+    )
     final_dataset = load_dataset(cfg)
     final_dataset = run_imputation(cfg, final_dataset, phase="final")
     final_dataset = load_imputed_splits(
@@ -239,29 +241,34 @@ def _run_evaluation_cli() -> None:
         expected_cache_key=_cache_key_record(cfg, final_dataset, phase="final")["cache_key"],
         phase="final",
     )
-    final_holdout = final_dataset.role_frame("final_holdout", imputed=True)
-    if final_holdout is None:
+    final_roles = {
+        role: final_dataset.role_frame(role, imputed=True)
+        for role in ("train", "tuning", "final_holdout")
+    }
+    if any(frame is None for frame in final_roles.values()):
         raise SystemExit(
-            "No validated final-phase imputation found; refusing to evaluate raw final_holdout."
+            "No complete validated final-phase imputation found; refusing final evaluation."
         )
+    final_train = final_roles["train"]
+    final_tuning = final_roles["tuning"]
+    final_holdout = final_roles["final_holdout"]
+    assert final_train is not None
+    assert final_tuning is not None
+    assert final_holdout is not None
     logger.debug(
         "event=evaluation.cache.validation_complete phase=final dataset=%s "
-        "dataset_version=%s final_holdout_shape=%s imputation=validated",
+        "dataset_version=%s train_shape=%s tuning_shape=%s final_holdout_shape=%s "
+        "imputation=validated",
         final_dataset.name,
         final_dataset.version,
+        final_train.shape,
+        final_tuning.shape,
         final_holdout.shape,
     )
     train = candidate_dataset.role_frame("train", imputed=True)
     tuning = candidate_dataset.role_frame("tuning", imputed=True)
     if train is None or tuning is None:
         raise SystemExit("Validated candidate imputation is incomplete; refusing evaluation.")
-    candidate_dataset.set_imputed_roles(
-        {
-            "train": train,
-            "tuning": tuning,
-            "final_holdout": final_holdout,
-        }
-    )
     dataset = candidate_dataset
 
     experiment = load_experiment(cfg, dataset=dataset, allow_final_holdout_handoff=True)
@@ -317,7 +324,13 @@ def _run_evaluation_cli() -> None:
         sorted(synthetic_datasets),
     )
     try:
-        combined, extras = run_evaluation(cfg, dataset, synthetic_datasets, experiment=experiment)
+        combined, extras = run_evaluation(
+            cfg,
+            dataset,
+            synthetic_datasets,
+            experiment=experiment,
+            final_dataset=final_dataset,
+        )
     except InsufficientSynthEvalResourcesError as exc:
         logger.error(
             "event=evaluation.pipeline.failed experiment_id=%s dataset=%s "

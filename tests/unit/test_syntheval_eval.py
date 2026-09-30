@@ -29,6 +29,7 @@ from synthdata.evaluation.syntheval_eval import (
     BINARY_ONLY_METRICS,
     InsufficientSynthEvalCPUError,
     _atomic_parquet,
+    _candidate_role_frames,
     _checkpoint_paths,
     _compute_cache_key,
     _evaluation_context_fingerprint,
@@ -577,6 +578,124 @@ class TestBuildPreset:
 
 
 class TestEvaluationRoleContext:
+    def test_candidate_role_resolution_never_reads_final_holdout(self, make_canonical_dataset):
+        dataset = make_canonical_dataset()
+
+        class HoldoutGuard:
+            legacy_two_role = False
+
+            def __init__(self):
+                self.roles_read = []
+
+            def role_frame(self, role, *, imputed):
+                self.roles_read.append(role)
+                if role == "final_holdout":
+                    raise AssertionError("candidate evaluation read final_holdout")
+                return dataset.role_frame(role, imputed=imputed)
+
+            def __getattr__(self, name):
+                return getattr(dataset, name)
+
+        guarded = HoldoutGuard()
+        fit_frame, tuning_frame = _candidate_role_frames(guarded)
+        assert fit_frame is dataset.role_frame("train", imputed=True)
+        assert tuning_frame is dataset.role_frame("tuning", imputed=True)
+
+        guarded.roles_read.clear()
+        _evaluation_context_fingerprint(guarded, {}, "main", False)
+
+        assert "final_holdout" not in guarded.roles_read
+        assert set(guarded.roles_read) == {"train", "tuning"}
+
+    def test_explicit_final_evaluation_reads_final_holdout(self, make_canonical_dataset):
+        dataset = make_canonical_dataset()
+
+        class RoleReadTracker:
+            legacy_two_role = False
+
+            def __init__(self):
+                self.roles_read = []
+
+            def role_frame(self, role, *, imputed):
+                self.roles_read.append(role)
+                return dataset.role_frame(role, imputed=imputed)
+
+            def __getattr__(self, name):
+                return getattr(dataset, name)
+
+        tracked = RoleReadTracker()
+        fit_frame, final_holdout_frame = _evaluation_role_frames(tracked, "final_holdout")
+
+        assert fit_frame is dataset.role_frame("train", imputed=True)
+        assert final_holdout_frame is dataset.role_frame("final_holdout", imputed=True)
+        assert tracked.roles_read == ["train", "final_holdout"]
+
+    def test_resumable_candidate_fallback_never_reads_final_holdout(
+        self, make_canonical_dataset, tmp_path, monkeypatch
+    ):
+        dataset = make_canonical_dataset()
+        original_role_frame = dataset.role_frame
+        roles_read = []
+
+        def guarded_role_frame(role, *, imputed):
+            roles_read.append(role)
+            if role == "final_holdout":
+                raise AssertionError("candidate fallback read final_holdout")
+            return original_role_frame(role, imputed=imputed)
+
+        def stop_after_frame_resolution(*_args, **_kwargs):
+            raise RuntimeError("stop after frame resolution")
+
+        monkeypatch.setattr(dataset, "role_frame", guarded_role_frame)
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval._evaluation_context_fingerprint",
+            stop_after_frame_resolution,
+        )
+
+        with pytest.raises(RuntimeError, match="stop after frame resolution"):
+            _run_resumable_syntheval(
+                {},
+                dataset,
+                {},
+                tmp_path / "preset.json",
+                tmp_path / "run",
+                "linear",
+                None,
+                "main",
+            )
+
+        assert "final_holdout" not in roles_read
+        assert set(roles_read) == {"train", "tuning"}
+
+    def test_binary_candidate_evaluation_never_reads_final_holdout(
+        self, make_canonical_dataset, tmp_path, monkeypatch
+    ):
+        dataset = make_canonical_dataset()
+        original_role_frame = dataset.role_frame
+        roles_read = []
+
+        def guarded_role_frame(role, *, imputed):
+            roles_read.append(role)
+            if role == "final_holdout":
+                raise AssertionError("binary candidate evaluation read final_holdout")
+            return original_role_frame(role, imputed=imputed)
+
+        monkeypatch.setattr(dataset, "role_frame", guarded_role_frame)
+        invalid_synthetic = original_role_frame("train", imputed=True).copy()
+        invalid_synthetic["target"] = 99
+
+        run_binary_target_syntheval_evaluation(
+            {"invalid_model": invalid_synthetic},
+            dataset,
+            FrameworkSelectionConfig(),
+            SimpleNamespace(column="target", positive_classes=[1], negative_classes=[0]),
+            preset_dir=tmp_path,
+            output_folder=tmp_path / "binary",
+        )
+
+        assert "final_holdout" not in roles_read
+        assert set(roles_read) == {"train", "tuning"}
+
     def test_binary_mixed_inventory_survives_fresh_and_cached_paths(
         self, make_canonical_dataset, tmp_path, monkeypatch
     ):
@@ -3023,6 +3142,30 @@ class TestGroupContext:
         assert context["roles"]["holdout"]["groups"] == 1
         assert len(context["roles"]["train"]["fingerprint"]) == 64
         assert context["models"]["model_a"]["groups"] == 2
+
+    def test_candidate_group_context_excludes_final_holdout_metadata(self, make_canonical_dataset):
+        dataset = make_canonical_dataset()
+        synthetic = dataset.role_frame("train", imputed=True).copy()
+        original_holdout_groups = dataset.role_groups["final_holdout"].copy()
+        dataset.role_groups["final_holdout"] = dataset.role_groups["train"].copy()
+
+        candidate_context = build_group_context(
+            dataset,
+            {"model_a": synthetic},
+            group_mode="patient_group",
+            group_column="patient_id",
+            include_final_holdout=False,
+        )
+
+        assert set(candidate_context["roles"]) == {"train", "tuning"}
+        dataset.role_groups["final_holdout"] = original_holdout_groups
+        final_context = build_group_context(
+            dataset,
+            {"model_a": synthetic},
+            group_mode="patient_group",
+            group_column="patient_id",
+        )
+        assert set(final_context["roles"]) == {"train", "tuning", "final_holdout"}
 
     def test_patient_group_context_rejects_missing_synthetic_identifier(self, make_dataset):
         dataset = self._dataset(make_dataset)

@@ -46,7 +46,9 @@ def test_candidate_imputation_lineage_rejects_stale_assignment_and_identity(
     record = _cache_key_record(cfg, dataset)
     record["assignment_fingerprint"] = "stale-assignment"
     record["identity_fingerprint"] = "stale-identity"
-    (dataset.data_dir / ".imputation_cache_key.json").write_text(json.dumps(record))
+    cache_path = dataset.imputation_paths("candidate")["cache_key"]
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(record))
 
     with pytest.raises(RuntimeError, match="rerun imputation before generation"):
         validate_imputation_cache_lineage(dataset, record, required=True)
@@ -60,10 +62,31 @@ def test_candidate_imputation_lineage_rejects_persisted_cache_key_mismatch(
     dataset = make_canonical_dataset()
     record = _cache_key_record(make_config(), dataset)
     persisted = dict(record, cache_key="old-lineage")
-    (dataset.data_dir / ".imputation_cache_key.json").write_text(json.dumps(persisted))
+    cache_path = dataset.imputation_paths("candidate")["cache_key"]
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(persisted))
 
     with pytest.raises(RuntimeError, match="cache key does not match"):
         validate_imputation_cache_lineage(dataset, record, required=True)
+
+
+def test_candidate_imputation_lineage_rejects_tampered_source_with_original_key(
+    make_config, make_canonical_dataset
+):
+    from synthdata.imputation.pipeline import _cache_key_record, run_imputation
+
+    cfg = make_config()
+    dataset = make_canonical_dataset()
+    run_imputation(cfg, dataset)
+    cache_path = dataset.imputation_paths("candidate")["cache_key"]
+    persisted = json.loads(cache_path.read_text())
+    persisted["source_fingerprint"] = "tampered-source"
+    cache_path.write_text(json.dumps(persisted))
+
+    with pytest.raises(RuntimeError, match="payload or digest"):
+        validate_imputation_cache_lineage(
+            dataset, _cache_key_record(cfg, dataset, phase="candidate"), required=True
+        )
 
 
 def test_candidate_imputation_lineage_accepts_current_cache(make_config, make_canonical_dataset):
@@ -72,8 +95,9 @@ def test_candidate_imputation_lineage_accepts_current_cache(make_config, make_ca
     dataset = make_canonical_dataset()
     record = _cache_key_record(make_config(), dataset)
     run_imputation(make_config(), dataset)
-    record = json.loads((dataset.data_dir / ".imputation_cache_key.json").read_text())
-    (dataset.data_dir / ".imputation_cache_key.json").write_text(json.dumps(record))
+    cache_path = dataset.imputation_paths("candidate")["cache_key"]
+    record = json.loads(cache_path.read_text())
+    cache_path.write_text(json.dumps(record))
     validate_imputation_cache_lineage(dataset, record, required=True)
 
 
@@ -82,7 +106,7 @@ def test_candidate_imputation_lineage_rejects_absent_fit_state(make_config, make
 
     dataset = make_canonical_dataset()
     run_imputation(make_config(), dataset)
-    path = dataset.data_dir / ".imputation_cache_key.json"
+    path = dataset.imputation_paths("candidate")["cache_key"]
     record = json.loads(path.read_text())
     del record["fit_state"]
     path.write_text(json.dumps(record))
@@ -98,7 +122,7 @@ def test_candidate_imputation_lineage_rejects_mismatched_fit_state(
 
     dataset = make_canonical_dataset()
     run_imputation(make_config(), dataset)
-    path = dataset.data_dir / ".imputation_cache_key.json"
+    path = dataset.imputation_paths("candidate")["cache_key"]
     record = json.loads(path.read_text())
     record["fit_state"]["fit_frame_fingerprint"] = "stale"
     path.write_text(json.dumps(record))
@@ -114,7 +138,7 @@ def test_candidate_imputation_lineage_rejects_old_fingerprint_contract(
 
     dataset = make_canonical_dataset()
     run_imputation(make_config(), dataset)
-    path = dataset.data_dir / ".imputation_cache_key.json"
+    path = dataset.imputation_paths("candidate")["cache_key"]
     record = json.loads(path.read_text())
     del record["fit_state"]["fit_frame_fingerprint_version"]
     record["fit_state"]["state_fingerprint"] = "stale"

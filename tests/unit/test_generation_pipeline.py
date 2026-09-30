@@ -14,10 +14,18 @@ import pytest
 import torch
 
 from synthdata.config import Config, GenerationConfig, SynthcityModelsConfig
-from synthdata.data import role_context_payload, semantic_context_payload
+from synthdata.data import (
+    dataframe_fingerprint,
+    load_imputed_splits,
+    role_context_payload,
+    semantic_context_payload,
+)
 from synthdata.experiment import start_experiment
 from synthdata.generation import hpo as hpo_mod
 from synthdata.generation import synthcity_backend as sc
+from synthdata.generation.pipeline import (
+    refit_candidate_model as _refit_candidate_model,
+)
 from synthdata.generation.pipeline import (
     refit_selected_model,
 )
@@ -29,13 +37,28 @@ from synthdata.plotting.generation_plots import save_generation_plots
 pytestmark = pytest.mark.unit
 
 
+def refit_candidate_model(cfg, dataset, model_name, output_dir=None):
+    """Exercise explicit candidate refit API with persisted candidate inputs."""
+    from synthdata.data import validate_imputation_cache_lineage
+    from synthdata.imputation.pipeline import _cache_key_record, run_imputation
+
+    if not dataset.imputation_paths("candidate")["cache_key"].exists():
+        run_imputation(cfg, dataset)
+    validate_imputation_cache_lineage(
+        dataset,
+        _cache_key_record(cfg, dataset, phase="candidate"),
+        required=True,
+    )
+    return _refit_candidate_model(cfg, dataset, model_name, output_dir=output_dir)
+
+
 def run_generation(cfg, dataset, *args, prepare_candidate_cache=True, **kwargs):
     """Create candidate lineage for canonical fixtures before generation tests."""
     if (
         prepare_candidate_cache
         and dataset.has_canonical_roles
         and dataset.role_frame("train", imputed=True) is not None
-        and not (dataset.data_dir / ".imputation_cache_key.json").exists()
+        and not dataset.imputation_paths("candidate")["cache_key"].exists()
     ):
         from synthdata.imputation.pipeline import run_imputation
 
@@ -117,7 +140,7 @@ def test_generation_does_not_execute_model_on_invalid_hyperimpute_fit_state(
     cfg.generation.tabpfn.data_variants = ["imputed"]
     dataset = make_canonical_dataset()
     run_imputation(cfg, dataset)
-    cache_path = dataset.data_dir / ".imputation_cache_key.json"
+    cache_path = dataset.imputation_paths("candidate")["cache_key"]
     record = json.loads(cache_path.read_text())
     del record["fit_state"]
     cache_path.write_text(json.dumps(record))
@@ -138,7 +161,7 @@ def test_generation_does_not_execute_model_when_candidate_sidecar_is_missing(
     from synthdata.imputation.pipeline import run_imputation
 
     run_imputation(cfg, dataset)
-    (dataset.data_dir / ".imputation_cache_key.json").unlink()
+    dataset.imputation_paths("candidate")["cache_key"].unlink()
     builder = mocker.patch("synthdata.generation.pipeline.tpfn.generate_tabpfn_custom")
 
     with pytest.raises(RuntimeError, match="lineage metadata is unavailable|unreadable"):
@@ -509,6 +532,9 @@ def test_tabpfgen_standard_preserves_nonfinal_target_schema_order(
     dataset.imputed_roles = {
         role: frame.loc[:, schema_columns] for role, frame in dataset.imputed_roles.items()
     }
+    dataset.role_fingerprints = {
+        role: dataframe_fingerprint(frame) for role, frame in dataset.roles.items()
+    }
 
     def generate_classification(_generator, X_train, y_train, n_samples, balance_classes):
         del X_train, y_train, balance_classes
@@ -547,6 +573,9 @@ def test_tabpfgen_custom_preserves_nonfinal_target_schema_order(
     dataset.roles = {role: frame.loc[:, schema_columns] for role, frame in dataset.roles.items()}
     dataset.imputed_roles = {
         role: frame.loc[:, schema_columns] for role, frame in dataset.imputed_roles.items()
+    }
+    dataset.role_fingerprints = {
+        role: dataframe_fingerprint(frame) for role, frame in dataset.roles.items()
     }
 
     def generate_classification(_generator, _features, _labels, n_samples, balance_classes):
@@ -743,7 +772,7 @@ def test_tabpfgen_hpo_cache_is_scoped_to_implementation_fingerprint(
     ]
 
     selected_model = f"tabpfgen_{variant}_hpo"
-    refit_selected_model(
+    refit_candidate_model(
         cfg,
         dataset,
         selected_model,
@@ -1286,13 +1315,13 @@ def test_non_private_final_refit_cache_requires_generator_metadata(
     )
     refit_dir = Path(cfg.evaluation.output_dir) / "final_refit"
 
-    _result, metadata = refit_selected_model(cfg, dataset, "ctgan", output_dir=refit_dir)
+    _result, metadata = refit_candidate_model(cfg, dataset, "ctgan", output_dir=refit_dir)
     cache_metadata = json.loads(Path(metadata["metadata_path"]).read_text())
     cache_metadata.pop("generator_metadata")
     Path(metadata["metadata_path"]).write_text(json.dumps(cache_metadata))
 
     fit_generate.reset_mock()
-    refit_selected_model(cfg, dataset, "ctgan", output_dir=refit_dir)
+    refit_candidate_model(cfg, dataset, "ctgan", output_dir=refit_dir)
 
     fit_generate.assert_called_once()
 
@@ -1348,14 +1377,14 @@ def test_final_refit_cache_rejects_mismatched_generator_metadata(
     )
     refit_dir = Path(cfg.evaluation.output_dir) / "final_refit"
 
-    _result, metadata = refit_selected_model(cfg, dataset, "ctgan", output_dir=refit_dir)
+    _result, metadata = refit_candidate_model(cfg, dataset, "ctgan", output_dir=refit_dir)
     metadata_path = Path(metadata["metadata_path"])
     cache_metadata = json.loads(metadata_path.read_text())
     cache_metadata["generator_metadata"]["random_state"] = cfg.seed + 1
     metadata_path.write_text(json.dumps(cache_metadata))
 
     fit_generate.reset_mock()
-    refit_selected_model(cfg, dataset, "ctgan", output_dir=refit_dir)
+    refit_candidate_model(cfg, dataset, "ctgan", output_dir=refit_dir)
 
     fit_generate.assert_called_once()
 
@@ -1408,9 +1437,9 @@ def test_final_refit_cache_rejects_changed_implementation_fingerprint(
     )
     refit_dir = Path(cfg.evaluation.output_dir) / "final_refit"
 
-    refit_selected_model(cfg, dataset, "ctgan", output_dir=refit_dir)
+    refit_candidate_model(cfg, dataset, "ctgan", output_dir=refit_dir)
     fit_generate.reset_mock()
-    refit_selected_model(cfg, dataset, "ctgan", output_dir=refit_dir)
+    refit_candidate_model(cfg, dataset, "ctgan", output_dir=refit_dir)
 
     assert fingerprint.call_count == 2
     fit_generate.assert_called_once()
@@ -1446,7 +1475,7 @@ def test_final_refit_uses_train_and_tuning_and_resumes_cache(
     mocker.patch("synthdata.generation.pipeline.sc.make_loader", side_effect=fake_make_loader)
 
     refit_dir = Path(cfg.evaluation.output_dir) / "final_refit"
-    result, metadata = refit_selected_model(cfg, dataset, "ctgan", output_dir=refit_dir)
+    result, metadata = refit_candidate_model(cfg, dataset, "ctgan", output_dir=refit_dir)
 
     expected_fit = pd.concat(
         [dataset.role_frame("train", imputed=True), dataset.role_frame("tuning", imputed=True)],
@@ -1464,7 +1493,7 @@ def test_final_refit_uses_train_and_tuning_and_resumes_cache(
     )
     fake_fit_generate.reset_mock()
 
-    cached_result, cached_metadata = refit_selected_model(
+    cached_result, cached_metadata = refit_candidate_model(
         cfg, dataset, "ctgan", output_dir=refit_dir
     )
 
@@ -1475,13 +1504,200 @@ def test_final_refit_uses_train_and_tuning_and_resumes_cache(
     cached_result.loc[0, "feature"] = -999.0
     cached_result.to_csv(cached_metadata["path"], index=False)
 
-    regenerated_result, regenerated_metadata = refit_selected_model(
+    regenerated_result, regenerated_metadata = refit_candidate_model(
         cfg, dataset, "ctgan", output_dir=refit_dir
     )
 
     pd.testing.assert_frame_equal(regenerated_result, synthetic)
     assert regenerated_metadata["cache_state"] == "generated"
     assert fake_fit_generate.call_count == 1
+
+
+def test_final_refit_uses_final_phase_imputation_and_excludes_holdout(
+    make_config, make_canonical_dataset, mocker
+):
+    from synthdata.data import validate_imputation_cache_lineage
+    from synthdata.imputation.hyperimpute_backend import metadata_fingerprint
+    from synthdata.imputation.pipeline import _cache_key_record, run_imputation
+
+    cfg = make_config()
+    cfg.generation.synthcity.names = ["ctgan"]
+    cfg.generation.tabpfn.enabled = False
+    cfg.generation.tabpfgen.enabled = False
+    cfg.generation.hpo.enabled = False
+    cfg.generation.n_samples = 4
+    candidate_dataset = make_canonical_dataset()
+    run_imputation(cfg, candidate_dataset)
+    validate_imputation_cache_lineage(
+        candidate_dataset,
+        _cache_key_record(cfg, candidate_dataset, phase="candidate"),
+        required=True,
+    )
+    final_dataset = make_canonical_dataset()
+    final_roles = {role: frame.copy() for role, frame in final_dataset.roles.items()}
+    final_roles["train"].loc[:, "feature"] = 101
+    final_roles["tuning"].loc[:, "feature"] = 102
+    final_roles["final_holdout"].loc[:, "feature"] = 99999
+    final_dataset.set_imputed_roles(final_roles)
+
+    paths = final_dataset.imputation_paths("final")
+    paths["train_tuning_imputed"].parent.mkdir(parents=True, exist_ok=True)
+    expected_fit = pd.concat(
+        [
+            final_dataset.role_frame("train", imputed=True),
+            final_dataset.role_frame("tuning", imputed=True),
+        ],
+        ignore_index=True,
+    )
+    expected_fit.to_csv(paths["train_tuning_imputed"], index=False)
+    final_dataset.role_frame("final_holdout", imputed=True).to_csv(
+        paths["final_holdout_imputed"], index=False
+    )
+    final_dataset.full_imputed_df.to_csv(paths["full_final_imputed"], index=False)
+    cache_record = _cache_key_record(cfg, final_dataset, phase="final")
+    fit_state = {
+        "status": "disabled",
+        "backend": "hyperimpute",
+        "fit_roles": ["train", "tuning"],
+        "transform_roles": ["train", "tuning", "final_holdout"],
+        "fit_frame_fingerprint": cache_record["fit_frame_fingerprint"],
+        "fit_frame_fingerprint_version": "dataframe_fingerprint_v1",
+        "feature_columns": list(final_dataset.feature_columns),
+        "categorical_columns": list(final_dataset.categorical_columns),
+        "continuous_plugin": cache_record["continuous_plugin"],
+        "categorical_plugin": "most_frequent",
+    }
+    fit_state["state_fingerprint"] = metadata_fingerprint(fit_state)
+    artifact_paths = {
+        "train_tuning": paths["train_tuning_imputed"],
+        "final_holdout": paths["final_holdout_imputed"],
+        "full_final": paths["full_final_imputed"],
+    }
+    cache_record.update(
+        {
+            "phase": "final",
+            "fit_roles": ["train", "tuning"],
+            "fit_state": fit_state,
+            "fit_frame_fingerprint": dataframe_fingerprint(
+                pd.concat([final_dataset.roles["train"], final_dataset.roles["tuning"]], axis=0)
+            ),
+            "imputed_row_counts": {
+                name: len(pd.read_csv(path, low_memory=False))
+                for name, path in artifact_paths.items()
+            },
+            "imputed_frame_fingerprints": {
+                name: dataframe_fingerprint(pd.read_csv(path, low_memory=False))
+                for name, path in artifact_paths.items()
+            },
+        }
+    )
+    paths["cache_key"].write_text(json.dumps(cache_record))
+    final_dataset = load_imputed_splits(
+        final_dataset, expected_cache_key=cache_record["cache_key"], phase="final"
+    )
+    expected_fit = pd.concat(
+        [
+            final_dataset.role_frame("train", imputed=True),
+            final_dataset.role_frame("tuning", imputed=True),
+        ],
+        ignore_index=True,
+    )
+
+    captured = {}
+    synthetic = expected_fit.head(cfg.generation.n_samples).copy()
+    mocker.patch("synthdata.generation.pipeline.sc.fit_generate", return_value=synthetic)
+
+    def capture_loader(frame, *args, **kwargs):
+        captured["fit_frame"] = frame.copy()
+        return object()
+
+    mocker.patch("synthdata.generation.pipeline.sc.make_loader", side_effect=capture_loader)
+
+    _result, metadata = refit_selected_model(
+        cfg,
+        final_dataset,
+        "ctgan",
+        output_dir=Path(cfg.evaluation.output_dir) / "final_refit",
+        imputation_phase="final",
+        candidate_dataset=candidate_dataset,
+    )
+
+    pd.testing.assert_frame_equal(captured["fit_frame"], expected_fit)
+    assert 101 not in set(candidate_dataset.role_frame("train", imputed=True)["feature"])
+    assert 99999 not in set(captured["fit_frame"]["feature"])
+    assert metadata["fit_frame_fingerprint"] == dataframe_fingerprint(expected_fit)
+    assert metadata["fit_frame_fingerprints"]["imputed"] == dataframe_fingerprint(expected_fit)
+    assert metadata["imputation_phase"] == "final"
+    assert metadata["imputation_lineage"]["phase"] == "final"
+    assert metadata["imputation_lineage"]["cache_key"] == cache_record["cache_key"]
+
+    raw_holdout = final_dataset.roles["final_holdout"].copy()
+    final_dataset.roles["final_holdout"].loc[0, "feature"] = -998
+    with pytest.raises(RuntimeError, match="Final Dataset raw role fingerprints"):
+        refit_selected_model(
+            cfg,
+            final_dataset,
+            "ctgan",
+            output_dir=Path(cfg.evaluation.output_dir) / "final_refit",
+            imputation_phase="final",
+            candidate_dataset=candidate_dataset,
+        )
+    final_dataset.roles["final_holdout"] = raw_holdout
+
+    final_dataset.imputed_roles["final_holdout"].loc[0, "feature"] = -999
+    with pytest.raises(RuntimeError, match="In-memory final imputed role fingerprint"):
+        refit_selected_model(
+            cfg,
+            final_dataset,
+            "ctgan",
+            output_dir=Path(cfg.evaluation.output_dir) / "final_refit",
+            imputation_phase="final",
+            candidate_dataset=candidate_dataset,
+        )
+
+
+def test_selected_refit_rejects_candidate_phase(make_config, make_canonical_dataset):
+    cfg = make_config()
+    dataset = make_canonical_dataset()
+
+    with pytest.raises(ValueError, match="requires imputation_phase='final'"):
+        refit_selected_model(
+            cfg,
+            dataset,
+            "ctgan",
+            imputation_phase="candidate",
+            candidate_dataset=dataset,
+        )
+
+
+def test_selected_refit_rejects_missing_final_cache_proof(make_config, make_canonical_dataset):
+    from synthdata.data import validate_imputation_cache_lineage
+    from synthdata.imputation.pipeline import _cache_key_record, run_imputation
+
+    cfg = make_config()
+    candidate = make_canonical_dataset()
+    final = make_canonical_dataset()
+    run_imputation(cfg, candidate)
+    validate_imputation_cache_lineage(
+        candidate,
+        _cache_key_record(cfg, candidate, phase="candidate"),
+        required=True,
+    )
+
+    with pytest.raises(RuntimeError, match="validated final-imputation cache proof"):
+        refit_selected_model(cfg, final, "ctgan", candidate_dataset=candidate)
+
+
+def test_selected_refit_rejects_candidate_final_dataset_identity_mismatch(
+    make_config, make_canonical_dataset
+):
+    cfg = make_config()
+    candidate = make_canonical_dataset()
+    final = make_canonical_dataset()
+    final.version = "unrelated-version"
+
+    with pytest.raises(ValueError, match="Candidate and final Dataset lineage differs"):
+        refit_selected_model(cfg, final, "ctgan", candidate_dataset=candidate)
 
 
 def test_pategan_generation_cache_persists_and_requires_accounting_metadata(
@@ -1575,7 +1791,7 @@ def test_pategan_generator_metadata_rejects_unfitted_or_mismatched_accounting():
     assert not sc.generator_metadata_is_valid(mismatched, expected_context)
 
 
-def test_final_refit_cache_ignores_final_holdout_changes(
+def test_candidate_refit_rejects_final_holdout_changes_after_proof(
     make_config, make_canonical_dataset, mocker
 ):
     cfg = make_config()
@@ -1598,19 +1814,18 @@ def test_final_refit_cache_ignores_final_holdout_changes(
     )
     refit_dir = Path(cfg.evaluation.output_dir) / "final_refit"
 
-    _result, first_metadata = refit_selected_model(cfg, dataset, "ctgan", output_dir=refit_dir)
+    _result, first_metadata = refit_candidate_model(cfg, dataset, "ctgan", output_dir=refit_dir)
     dataset.imputed_roles["final_holdout"] = dataset.imputed_roles["final_holdout"].copy()
     dataset.imputed_roles["final_holdout"].loc[:, "feature"] += 1000
     dataset.roles["final_holdout"] = dataset.roles["final_holdout"].copy()
     dataset.roles["final_holdout"].loc[:, "feature"] += 2000
 
-    _cached_result, second_metadata = refit_selected_model(
-        cfg, dataset, "ctgan", output_dir=refit_dir
-    )
+    fit_generate.reset_mock()
+    with pytest.raises(RuntimeError, match="Candidate Dataset raw role fingerprints"):
+        refit_candidate_model(cfg, dataset, "ctgan", output_dir=refit_dir)
 
-    assert first_metadata["cache_key"] == second_metadata["cache_key"]
-    assert second_metadata["cache_state"] == "hit"
-    fit_generate.assert_called_once()
+    assert first_metadata["cache_key"]
+    fit_generate.assert_not_called()
 
 
 def test_synthcity_params_forward_and_invalidate_cache(make_config, make_canonical_dataset, mocker):
@@ -1692,7 +1907,7 @@ def test_final_refit_hpo_requires_canonical_context_before_cache_lookup(
     )
 
     with pytest.raises(RuntimeError, match="complete canonical hpo_context"):
-        refit_selected_model(cfg, dataset, "ctgan_hpo")
+        refit_candidate_model(cfg, dataset, "ctgan_hpo")
 
 
 def test_hpo_generated_cache_rejects_changed_objective_context(
@@ -2283,7 +2498,7 @@ def test_best_params_cache_context_identity_preserves_complete_provenance(
     assert cache.has("synthcity", cache_name)
     assert not cache.has("synthcity", "ctgan")
 
-    refit_selected_model(
+    refit_candidate_model(
         cfg,
         dataset,
         "ctgan_hpo",

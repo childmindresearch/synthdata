@@ -64,9 +64,37 @@ def _validate_phase(phase: str) -> None:
         raise ValueError(f"Invalid imputation phase {phase!r}; expected 'candidate' or 'final'")
 
 
-def _persist_decoded_imputed_splits(dataset: Dataset) -> None:
+def _persist_decoded_imputed_splits(dataset: Dataset, phase: str = "candidate") -> None:
     """Persist label-preserving views alongside numeric model-space caches."""
     dataset.attach_decoded_imputed_splits()
+    if dataset.has_canonical_roles:
+        paths = dataset.imputation_paths(phase)
+        if phase == "candidate":
+            decoded_frames = {
+                "train_imputed_decoded": dataset.decoded_roles.get("train"),
+                "tuning_imputed_decoded": dataset.decoded_roles.get("tuning"),
+                "full_candidate_partial_imputed_decoded": dataset.full_imputed_decoded_df,
+            }
+        else:
+            decoded_frames = {
+                "train_tuning_imputed_decoded": pd.concat(
+                    [dataset.decoded_roles["train"], dataset.decoded_roles["tuning"]],
+                    ignore_index=True,
+                ),
+                "final_holdout_imputed_decoded": dataset.decoded_roles.get("final_holdout"),
+                "full_final_imputed_decoded": dataset.full_imputed_decoded_df,
+            }
+        for name, frame in decoded_frames.items():
+            if frame is None:
+                raise RuntimeError(
+                    f"Cannot persist decoded imputed artifact {name!r}: frame missing"
+                )
+            frame.to_csv(paths[name], index=False)
+        logger.info(
+            "Wrote %s-phase decoded imputation artifacts under %s", phase, paths[name].parent
+        )
+        return
+
     decoded_frames = {"full_imputed_decoded": dataset.full_imputed_decoded_df}
     decoded_frames.update(
         {f"{role}_imputed_decoded": dataset.decoded_roles.get(role) for role in dataset.roles}
@@ -166,7 +194,7 @@ def _impute_canonical_roles(
         state_metadata = hyper_state_metadata(
             None,
             status="not_required",
-            transform_roles=(["train", "tuning"] if phase == "candidate" else ["final_holdout"]),
+            transform_roles=(["train", "tuning"] if phase == "candidate" else list(ROLE_NAMES)),
             fit_roles=["train"] if phase == "candidate" else ["train", "tuning"],
             fit_frame_fingerprint=dataframe_fingerprint(fit_frame),
             feature_columns=dataset.feature_columns,
@@ -198,9 +226,8 @@ def _impute_canonical_roles(
         transformed["final_holdout"] = role_frames["final_holdout"].copy()
         roles = ["train", "tuning"]
     else:
-        transformed = {role: role_frames[role].copy() for role in ("train", "tuning")}
-        transformed["final_holdout"] = transform_dataframe(state, role_frames["final_holdout"])
-        roles = ["final_holdout"]
+        transformed = {role: transform_dataframe(state, role_frames[role]) for role in ROLE_NAMES}
+        roles = list(ROLE_NAMES)
     return transformed, hyper_state_metadata(state, transform_roles=roles)
 
 
@@ -296,6 +323,7 @@ def _cache_key_payload(cfg: Config, dataset: Dataset, phase: str = "candidate") 
         "round_to_int_default": imp_cfg.round_to_int_default,
         "continuous_plugin": imp_cfg.continuous_plugin,
         "categorical_plugin": "most_frequent",
+        "dataset_name": dataset.name,
         "dataset_version": dataset.version,
         "variable_schema_fingerprint": dataset.variable_schema_fingerprint,
         "source_fingerprint": dataset.source_fingerprint,
@@ -304,7 +332,7 @@ def _cache_key_payload(cfg: Config, dataset: Dataset, phase: str = "candidate") 
     if dataset.has_canonical_roles:
         payload.update(
             {
-                "cache_contract": "canonical_roles_v1",
+                "cache_contract": "canonical_roles_v2",
                 "role_names": list(ROLE_NAMES),
                 "role_fingerprints": dataset.role_fingerprints,
                 "assignment_fingerprint": dataset.assignment_fingerprint,
@@ -317,7 +345,7 @@ def _cache_key_payload(cfg: Config, dataset: Dataset, phase: str = "candidate") 
                 "fit_roles": ["train"] if phase == "candidate" else ["train", "tuning"],
                 "transform_roles": ["train", "tuning"]
                 if phase == "candidate"
-                else ["final_holdout"],
+                else list(ROLE_NAMES),
                 "fit_frame_fingerprint": dataframe_fingerprint(
                     dataset.roles["train"]
                     if phase == "candidate"
@@ -404,7 +432,7 @@ def _canonical_hyperimpute_state_is_valid(
     if state.get("status") not in {"fitted", "not_required", "disabled"}:
         return False
     expected_fit_roles = ["train"] if phase == "candidate" else ["train", "tuning"]
-    expected_transform_roles = ["train", "tuning"] if phase == "candidate" else ["final_holdout"]
+    expected_transform_roles = ["train", "tuning"] if phase == "candidate" else list(ROLE_NAMES)
     if state.get("backend") != "hyperimpute" or state.get("fit_roles") != expected_fit_roles:
         return False
     if state.get("transform_roles") != expected_transform_roles:
@@ -456,55 +484,71 @@ def run_imputation(cfg: Config, dataset: Dataset, phase: str = "candidate") -> D
             "Use canonical method='hyperimpute'."
         )
     paths = dataset.paths()
-    cache_dir = (
-        dataset.data_dir / "imputation_final"
-        if (dataset.has_canonical_roles and phase == "final")
-        else dataset.data_dir
-    )
-    cache_key_path = cache_dir / _CACHE_KEY_FILENAME
-    if dataset.has_canonical_roles and phase == "final":
-        paths = {
-            **paths,
-            **{f"{role}_imputed": cache_dir / f"{role}_imputed.csv" for role in ROLE_NAMES},
+    if dataset.has_canonical_roles:
+        phase_paths = dataset.imputation_paths(phase)
+        cache_dir = phase_paths["cache_key"].parent
+        if phase == "candidate":
+            cached_frame_paths = {
+                "train": phase_paths["train_imputed"],
+                "tuning": phase_paths["tuning_imputed"],
+                "full_candidate_partial": phase_paths["full_candidate_partial_imputed"],
+            }
+        else:
+            cached_frame_paths = {
+                "train_tuning": phase_paths["train_tuning_imputed"],
+                "final_holdout": phase_paths["final_holdout_imputed"],
+                "full_final": phase_paths["full_final_imputed"],
+            }
+    else:
+        phase_paths = {}
+        cache_dir = dataset.data_dir
+        cached_frame_paths = {
+            "full": paths["full_imputed"],
+            "train": paths["train_imputed"],
+            "test": paths["test_imputed"],
         }
+    cache_key_path = cache_dir / _CACHE_KEY_FILENAME
     cache_record = _cache_key_record(cfg, dataset, phase)
     current_key = cache_record["cache_key"]
     cached_record = _load_cache_record(cache_key_path)
     cached_key = cached_record.get("cache_key") if cached_record is not None else None
 
-    cached_frame_paths = (
-        {role: paths[f"{role}_imputed"] for role in ROLE_NAMES}
-        if dataset.has_canonical_roles
-        else {
-            "full": paths["full_imputed"],
-            "train": paths["train_imputed"],
-            "test": paths["test_imputed"],
-        }
-    )
     cached_paths = list(cached_frame_paths.values())
     cached_csvs_exist = all(path.exists() for path in cached_paths)
 
     if cfg.imputation.cache and cached_csvs_exist and cached_key == current_key:
         if _canonical_hyperimpute_state_is_valid(cfg, dataset, cached_record, phase):
-            dataset = load_imputed_splits(dataset, expected_cache_key=current_key, phase=phase)
+            if dataset.has_canonical_roles:
+                dataset.full_imputed_df = None
+                dataset.imputed_roles = {}
+                dataset.full_imputed_decoded_df = None
+                dataset.decoded_roles = {}
+            dataset = load_imputed_splits(
+                dataset,
+                expected_cache_key=current_key,
+                phase=phase,
+                expected_cache_payload={
+                    field: value for field, value in cache_record.items() if field != "cache_key"
+                },
+            )
             if dataset.full_imputed_df is not None:
-                _persist_decoded_imputed_splits(dataset)
+                _persist_decoded_imputed_splits(dataset, phase)
                 logger.info(
                     "Using cached imputed data at %s (cache_key=%s)",
-                    dataset.data_dir,
+                    cache_dir,
                     current_key[:16],
                 )
                 return dataset
             logger.warning(
                 "Imputation cache key matched at %s, but cached frames failed provenance/shape "
                 "validation; retraining",
-                dataset.data_dir,
+                cache_dir,
             )
         else:
             logger.warning(
                 "Canonical HyperImpute cache at %s lacks valid phase-fitted state provenance; "
                 "retraining",
-                dataset.data_dir,
+                cache_dir,
             )
 
     if cfg.imputation.cache and cached_csvs_exist and cached_key != current_key:
@@ -512,7 +556,7 @@ def run_imputation(cfg: Config, dataset: Dataset, phase: str = "candidate") -> D
             "Imputation-relevant config changed since the cached imputed data at %s was "
             "produced (cached cache_key=%s, current=%s) -- retraining instead of reusing "
             "the stale cache",
-            dataset.data_dir,
+            cache_dir,
             cached_key[:16] if cached_key else None,
             current_key[:16],
         )
@@ -548,7 +592,7 @@ def run_imputation(cfg: Config, dataset: Dataset, phase: str = "candidate") -> D
                 feature_columns=dataset.feature_columns,
                 categorical_columns=dataset.categorical_columns,
                 continuous_plugin=cfg.imputation.continuous_plugin,
-                transform_roles=["train", "tuning"] if phase == "candidate" else ["final_holdout"],
+                transform_roles=(["train", "tuning"] if phase == "candidate" else list(ROLE_NAMES)),
             )
     elif not cfg.imputation.enabled:
         logger.info("Imputation disabled; using rows with complete cases only")
@@ -571,12 +615,17 @@ def run_imputation(cfg: Config, dataset: Dataset, phase: str = "candidate") -> D
         )
         if dataset.has_canonical_roles:
             role_imputed, fit_state_metadata = _impute_canonical_roles(cfg, dataset, device, phase)
+            rounding_roles = ("train", "tuning") if phase == "candidate" else ROLE_NAMES
             role_imputed = {
-                role: apply_rounding(
-                    frame,
-                    dataset.feature_columns,
-                    cfg.imputation.round_rules,
-                    cfg.imputation.round_to_int_default,
+                role: (
+                    apply_rounding(
+                        frame,
+                        dataset.feature_columns,
+                        cfg.imputation.round_rules,
+                        cfg.imputation.round_to_int_default,
+                    )
+                    if role in rounding_roles
+                    else frame
                 )
                 for role, frame in role_imputed.items()
             }
@@ -595,22 +644,36 @@ def run_imputation(cfg: Config, dataset: Dataset, phase: str = "candidate") -> D
         raise RuntimeError("Imputation did not produce a full model-space frame")
 
     ensure_dir(cache_dir)
-    full_imputed.to_csv(paths["full_imputed"], index=False)
-
     if dataset.has_canonical_roles:
-        for role in ROLE_NAMES:
-            dataset.imputed_roles[role].to_csv(paths[f"{role}_imputed"], index=False)
+        if phase == "candidate":
+            persisted_frames = {
+                "train": dataset.imputed_roles["train"],
+                "tuning": dataset.imputed_roles["tuning"],
+                "full_candidate_partial": full_imputed,
+            }
+        else:
+            persisted_frames = {
+                "train_tuning": pd.concat(
+                    [dataset.imputed_roles["train"], dataset.imputed_roles["tuning"]],
+                    ignore_index=True,
+                ),
+                "final_holdout": dataset.imputed_roles["final_holdout"],
+                "full_final": full_imputed,
+            }
+        for name, frame in persisted_frames.items():
+            frame.to_csv(cached_frame_paths[name], index=False)
         if cfg.imputation.method == "hyperimpute":
             if fit_state_metadata is None:
                 raise RuntimeError(
                     "Canonical HyperImpute imputation completed without fitted-state provenance"
                 )
             cache_record["fit_state"] = fit_state_metadata
+        cache_record["role_row_counts"] = {role: len(dataset.roles[role]) for role in ROLE_NAMES}
         cache_record["imputed_row_counts"] = {
-            "full": len(full_imputed),
-            **{role: len(dataset.imputed_roles[role]) for role in ROLE_NAMES},
+            name: len(frame) for name, frame in persisted_frames.items()
         }
     else:
+        full_imputed.to_csv(paths["full_imputed"], index=False)
         # When imputation is disabled, full_imputed is a complete-case subset of
         # full_df (dropna()), so its index may no longer contain every train/test
         # row -- intersect rather than assume a full match (still a strict subset
@@ -659,7 +722,7 @@ def run_imputation(cfg: Config, dataset: Dataset, phase: str = "candidate") -> D
             "train": train_imputed,
             "final_holdout": test_imputed,
         }
-    _persist_decoded_imputed_splits(dataset)
+    _persist_decoded_imputed_splits(dataset, phase)
     return dataset
 
 

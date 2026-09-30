@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+from copy import deepcopy
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
@@ -13,7 +14,7 @@ import pandas as pd
 import pytest
 
 import scripts.run_evaluation as evaluation_cli
-from synthdata.data import dataframe_fingerprint
+from synthdata.data import dataframe_fingerprint, load_imputed_splits
 from synthdata.evaluation import (
     _final_holdout_state_dimensions,
     _generation_metadata,
@@ -70,6 +71,69 @@ def test_release_age_bins_use_shared_half_open_boundaries():
 
 def _fail_test(message: str) -> NoReturn:
     raise AssertionError(message)
+
+
+def _same_phase_final_dataset(cfg, dataset):
+    """Build a Dataset loaded through a fully fingerprinted final cache."""
+    from synthdata.data import validate_imputation_cache_lineage
+    from synthdata.imputation.hyperimpute_backend import metadata_fingerprint
+    from synthdata.imputation.pipeline import _cache_key_record, run_imputation
+
+    for entry in dataset.variable_schema.values():
+        entry.setdefault("ordinal_order", None)
+    generated_candidate_cache = False
+    if not dataset.imputation_paths("candidate")["cache_key"].exists():
+        run_imputation(cfg, dataset)
+        generated_candidate_cache = True
+    if generated_candidate_cache or dataset.candidate_imputation_lineage is not None:
+        validate_imputation_cache_lineage(
+            dataset,
+            _cache_key_record(cfg, dataset, phase="candidate"),
+            required=True,
+        )
+
+    final = deepcopy(dataset)
+    final.set_imputed_roles({role: frame.copy() for role, frame in final.imputed_roles.items()})
+    paths = final.imputation_paths("final")
+    paths["cache_key"].parent.mkdir(parents=True, exist_ok=True)
+    output_frames = {
+        "train_tuning": pd.concat(
+            [final.imputed_roles["train"], final.imputed_roles["tuning"]], ignore_index=True
+        ),
+        "final_holdout": final.imputed_roles["final_holdout"],
+        "full_final": final.full_imputed_df,
+    }
+    artifact_paths = {
+        "train_tuning": "train_tuning_imputed",
+        "final_holdout": "final_holdout_imputed",
+        "full_final": "full_final_imputed",
+    }
+    for name, frame in output_frames.items():
+        frame.to_csv(paths[artifact_paths[name]], index=False)
+    record = _cache_key_record(cfg, final, phase="final")
+    state = {
+        "status": "disabled",
+        "backend": "hyperimpute",
+        "fit_roles": ["train", "tuning"],
+        "transform_roles": ["train", "tuning", "final_holdout"],
+        "fit_frame_fingerprint": record["fit_frame_fingerprint"],
+        "fit_frame_fingerprint_version": "dataframe_fingerprint_v1",
+        "feature_columns": list(final.feature_columns),
+        "categorical_columns": list(final.categorical_columns),
+        "continuous_plugin": record["continuous_plugin"],
+        "categorical_plugin": "most_frequent",
+    }
+    state["state_fingerprint"] = metadata_fingerprint(state)
+    record["fit_state"] = state
+    record["imputed_row_counts"] = {name: len(frame) for name, frame in output_frames.items()}
+    record["imputed_frame_fingerprints"] = {
+        name: dataframe_fingerprint(pd.read_csv(paths[artifact_paths[name]], low_memory=False))
+        for name in output_frames
+    }
+    paths["cache_key"].write_text(json.dumps(record))
+    final = load_imputed_splits(final, expected_cache_key=record["cache_key"], phase="final")
+    assert final.final_imputation_lineage is not None
+    return final
 
 
 def test_select_models_fails_closed_before_evaluation_for_missing_requested_model(
@@ -138,7 +202,13 @@ def test_run_evaluation_persists_partial_model_coverage(
     )
     monkeypatch.setattr(custom_eval, "run_log_disparity_evaluation", lambda *args, **kwargs: {})
 
-    combined, extras = run_evaluation(cfg, dataset, {"model_a": synthetic}, experiment=experiment)
+    combined, extras = run_evaluation(
+        cfg,
+        dataset,
+        {"model_a": synthetic},
+        experiment=experiment,
+        final_dataset=_same_phase_final_dataset(cfg, dataset),
+    )
 
     assert list(combined.index) == ["model_a"]
     assert "stage_a_failed" not in combined.index
@@ -186,9 +256,130 @@ def test_run_evaluation_missing_requested_model_stops_before_downstream_stages(
     )
 
     with pytest.raises(ValueError, match="missing_model"):
-        run_evaluation(cfg, dataset, synthetic)
+        run_evaluation(
+            cfg,
+            dataset,
+            synthetic,
+            final_dataset=_same_phase_final_dataset(cfg, dataset),
+        )
 
     assert calls == []
+
+
+def test_canonical_evaluation_requires_final_phase_dataset(make_config, make_canonical_dataset):
+    cfg = make_config()
+    dataset = make_canonical_dataset()
+    synthetic = dataset.role_frame("train", imputed=True).copy()
+
+    with pytest.raises(ValueError, match="requires a separately imputed final_dataset"):
+        run_evaluation(cfg, dataset, {"model_a": synthetic})
+
+
+def test_canonical_evaluation_rejects_final_dataset_without_cache_proof(
+    make_config, make_canonical_dataset
+):
+    from synthdata.data import validate_imputation_cache_lineage
+    from synthdata.imputation.pipeline import _cache_key_record, run_imputation
+
+    cfg = make_config()
+    candidate = make_canonical_dataset()
+    run_imputation(cfg, candidate)
+    validate_imputation_cache_lineage(
+        candidate,
+        _cache_key_record(cfg, candidate, phase="candidate"),
+        required=True,
+    )
+    final = deepcopy(candidate)
+    final.set_imputed_roles({role: frame.copy() for role, frame in final.imputed_roles.items()})
+
+    with pytest.raises(RuntimeError, match="validated final-imputation cache proof"):
+        run_evaluation(cfg, candidate, {}, final_dataset=final)
+
+
+def test_canonical_evaluation_rejects_missing_candidate_cache_proof(
+    make_config, make_canonical_dataset
+):
+    cfg = make_config()
+    candidate = make_canonical_dataset()
+    final = _same_phase_final_dataset(cfg, deepcopy(candidate))
+
+    with pytest.raises(RuntimeError, match="Candidate imputation cache proof is missing"):
+        run_evaluation(cfg, candidate, {}, final_dataset=final)
+
+
+def test_canonical_evaluation_rejects_mixed_candidate_role_frames(
+    make_config, make_canonical_dataset
+):
+    cfg = make_config()
+    candidate = make_canonical_dataset()
+    final = _same_phase_final_dataset(cfg, candidate)
+    mixed_roles = {role: frame.copy() for role, frame in candidate.imputed_roles.items()}
+    mixed_roles["train"].loc[:, "feature"] = -999
+    candidate.set_imputed_roles(mixed_roles)
+
+    with pytest.raises(RuntimeError, match="Candidate imputation cache proof is missing"):
+        run_evaluation(cfg, candidate, {}, final_dataset=final)
+
+
+def test_canonical_evaluation_rejects_candidate_frame_changed_after_validation(
+    make_config, make_canonical_dataset
+):
+    cfg = make_config()
+    candidate = make_canonical_dataset()
+    final = _same_phase_final_dataset(cfg, candidate)
+    candidate.imputed_roles["train"].loc[:, "feature"] = -999
+
+    with pytest.raises(RuntimeError, match="In-memory candidate imputed role differs"):
+        run_evaluation(cfg, candidate, {}, final_dataset=final)
+
+
+def test_canonical_evaluation_rejects_raw_candidate_tuning_changed_after_proof(
+    make_config, make_canonical_dataset
+):
+    cfg = make_config()
+    candidate = make_canonical_dataset()
+    final = _same_phase_final_dataset(cfg, candidate)
+    candidate.roles["tuning"].loc[:, "feature"] = -999
+
+    with pytest.raises(RuntimeError, match="Candidate Dataset raw role fingerprints"):
+        run_evaluation(cfg, candidate, {}, final_dataset=final)
+
+
+def test_canonical_evaluation_rejects_raw_final_holdout_changed_after_proof(
+    make_config, make_canonical_dataset
+):
+    cfg = make_config()
+    candidate = make_canonical_dataset()
+    final = _same_phase_final_dataset(cfg, candidate)
+    final.roles["final_holdout"].loc[:, "feature"] = -999
+
+    with pytest.raises(RuntimeError, match="Final Dataset raw role fingerprints"):
+        run_evaluation(cfg, candidate, {}, final_dataset=final)
+
+
+def test_canonical_evaluation_rejects_changed_final_cache_record(
+    make_config, make_canonical_dataset
+):
+    cfg = make_config()
+    candidate = make_canonical_dataset()
+    final = _same_phase_final_dataset(cfg, candidate)
+    cache_path = final.imputation_paths("final")["cache_key"]
+    record = json.loads(cache_path.read_text())
+    record["cache_key"] = "mismatched-cache-key"
+    cache_path.write_text(json.dumps(record))
+
+    with pytest.raises(RuntimeError, match="cache record differs from validated Dataset lineage"):
+        run_evaluation(cfg, candidate, {}, final_dataset=final)
+
+
+def test_canonical_evaluation_rejects_modified_final_holdout(make_config, make_canonical_dataset):
+    cfg = make_config()
+    candidate = make_canonical_dataset()
+    final = _same_phase_final_dataset(cfg, candidate)
+    final.imputed_roles["final_holdout"].loc[0, "feature"] = -999
+
+    with pytest.raises(RuntimeError, match="In-memory final imputed role fingerprint"):
+        run_evaluation(cfg, candidate, {}, final_dataset=final)
 
 
 def _dataframe(
@@ -271,6 +462,8 @@ def test_evaluation_cli_hands_candidate_and_final_phase_roles_to_evaluator(
     )
     candidate.set_imputed_roles(candidate_roles)
     final_roles = {role: frame.copy() for role, frame in final.roles.items()}
+    final_roles["train"].loc[:, "feature"] = 21
+    final_roles["tuning"].loc[:, "feature"] = 22
     final_roles["final_holdout"].loc[:, "feature"] = -3
     final.set_imputed_roles(final_roles)
 
@@ -362,8 +555,9 @@ def test_evaluation_cli_hands_candidate_and_final_phase_roles_to_evaluator(
         ),
     )
 
-    def fake_run_evaluation(_cfg, dataset, _synthetic, experiment=None):
+    def fake_run_evaluation(_cfg, dataset, _synthetic, experiment=None, final_dataset=None):
         evaluated["dataset"] = dataset
+        evaluated["final_dataset"] = final_dataset
         return pd.DataFrame(), {"artifact_manifest": "manifest.json"}
 
     monkeypatch.setattr(evaluation_cli, "run_evaluation", fake_run_evaluation)
@@ -376,7 +570,12 @@ def test_evaluation_cli_hands_candidate_and_final_phase_roles_to_evaluator(
     handed_off = evaluated["dataset"]
     assert handed_off.role_frame("train", imputed=True)["feature"].eq(-1).all()
     assert handed_off.role_frame("tuning", imputed=True)["feature"].eq(-2).all()
-    assert handed_off.role_frame("final_holdout", imputed=True)["feature"].eq(-3).all()
+    assert not handed_off.role_frame("final_holdout", imputed=True)["feature"].eq(-3).all()
+    final_handoff = evaluated["final_dataset"]
+    assert final_handoff is final
+    assert final_handoff.role_frame("train", imputed=True)["feature"].eq(21).all()
+    assert final_handoff.role_frame("tuning", imputed=True)["feature"].eq(22).all()
+    assert final_handoff.role_frame("final_holdout", imputed=True)["feature"].eq(-3).all()
     assert preflight_calls == [inventory]
     assert len(lineage_calls) == 1
     assert lineage_calls[0][1] == {"cache_key": "candidate"}
@@ -717,7 +916,7 @@ def test_evaluation_cli_rejects_invalid_candidate_fit_state_before_evaluator(
     candidate = make_canonical_dataset()
     final = make_canonical_dataset()
     evaluation_cli.run_imputation(cfg, candidate)
-    cache_path = candidate.data_dir / ".imputation_cache_key.json"
+    cache_path = candidate.imputation_paths("candidate")["cache_key"]
     cache_record = json.loads(cache_path.read_text())
     del cache_record["fit_state"]
     cache_path.write_text(json.dumps(cache_record))
@@ -805,7 +1004,7 @@ def test_evaluation_cli_rejects_unvalidated_final_holdout(
     )
     monkeypatch.setattr("sys.argv", ["run_evaluation", "--config", "config.yaml"])
 
-    with pytest.raises(SystemExit, match="refusing to evaluate raw final_holdout"):
+    with pytest.raises(SystemExit, match="No complete validated final-phase imputation"):
         evaluation_cli.main()
 
 
@@ -874,7 +1073,9 @@ def test_run_evaluation_validates_ranks_and_persists_status(
         lambda *args, **kwargs: _fake_refit_metadata(synthetic, kwargs["output_dir"]),
     )
 
-    combined, extras = run_evaluation(cfg, dataset, {"model_a": synthetic})
+    combined, extras = run_evaluation(
+        cfg, dataset, {"model_a": synthetic}, final_dataset=_same_phase_final_dataset(cfg, dataset)
+    )
 
     assert received_feature_types == {
         column: "categorical" if column == "target" else "continuous"
@@ -999,7 +1200,9 @@ def test_run_evaluation_persists_generator_metadata_sidecars(
         lambda *args, **kwargs: _fake_refit_metadata(synthetic, kwargs["output_dir"]),
     )
 
-    _combined, extras = run_evaluation(cfg, dataset, {"model_a": synthetic})
+    _combined, extras = run_evaluation(
+        cfg, dataset, {"model_a": synthetic}, final_dataset=_same_phase_final_dataset(cfg, dataset)
+    )
 
     assert extras["generator_metadata"]["model_a"]["state"] == "legacy"
     assert extras["generator_metadata"]["model_a"]["metadata"] == generator_metadata
@@ -1097,7 +1300,9 @@ def test_selection_failure_persists_auditable_blocked_final_evidence(
         "synthdata.evaluation.combine.build_combined_table", lambda *args, **kwargs: combined
     )
     monkeypatch.setattr(custom_eval, "run_log_disparity_evaluation", lambda *args, **kwargs: {})
-    _result, extras = run_evaluation(cfg, dataset, {"model_a": synthetic})
+    _result, extras = run_evaluation(
+        cfg, dataset, {"model_a": synthetic}, final_dataset=_same_phase_final_dataset(cfg, dataset)
+    )
 
     evidence = artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)
     assert extras["final_holdout_evidence"]["state"] == "blocked"
@@ -1243,7 +1448,7 @@ def test_run_evaluation_rejects_conflicting_synthcity_qi_override(
     cfg.evaluation.synthcity.quasi_identifier_columns = ["protected"]
 
     with pytest.raises(ValueError, match="must match the Dataset declaration"):
-        run_evaluation(cfg, dataset, {})
+        run_evaluation(cfg, dataset, {}, final_dataset=_same_phase_final_dataset(cfg, dataset))
 
 
 def test_run_evaluation_propagates_patient_group_context(
@@ -1263,6 +1468,12 @@ def test_run_evaluation_propagates_patient_group_context(
         column: {"kind": "categorical" if column == "target" else "continuous"}
         for column in dataset.full_df.columns
     }
+    final_dataset = _same_phase_final_dataset(cfg, dataset)
+    dataset.role_groups["final_holdout"] = (
+        dataset.role_groups["train"]
+        .iloc[: len(dataset.role_groups["final_holdout"])]
+        .reset_index(drop=True)
+    )
     synthetic = dataset.role_frame("train", imputed=True).copy()
     synthcity_report = _dataframe(
         {"mean": [0.25], "direction": ["minimize"]},
@@ -1303,7 +1514,9 @@ def test_run_evaluation_propagates_patient_group_context(
         lambda *args, **kwargs: None,
     )
 
-    _combined, extras = run_evaluation(cfg, dataset, {"model_a": synthetic})
+    _combined, extras = run_evaluation(
+        cfg, dataset, {"model_a": synthetic}, final_dataset=final_dataset
+    )
 
     context = received_context["value"]
     assert context.group_mode == "patient_group"
@@ -1311,11 +1524,15 @@ def test_run_evaluation_propagates_patient_group_context(
     assert context.resolved_configuration["group_context"]["group_column"] == "group"
     assert extras["group_context"]["group_column"] == "group"
     assert extras["population_unit"] == "patient_group"
+    assert set(extras["group_context"]["roles"]) == {"train", "tuning"}
 
 
 def test_run_evaluation_records_post_selection_final_holdout_evidence(
     make_config, make_canonical_dataset, monkeypatch
 ):
+    from synthdata.data import validate_imputation_cache_lineage
+    from synthdata.imputation.pipeline import _cache_key_record, run_imputation
+
     cfg = make_config()
     cfg.evaluation.synthcity.metrics = ["identifiability_score"]
     cfg.evaluation.syntheval.enabled = True
@@ -1327,6 +1544,13 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     cfg.data.protected_attribute_bins = [["<12", "12+"]]
 
     dataset = make_canonical_dataset()
+    final_dataset = make_canonical_dataset()
+    run_imputation(cfg, dataset)
+    validate_imputation_cache_lineage(
+        dataset,
+        _cache_key_record(cfg, dataset, phase="candidate"),
+        required=True,
+    )
     dataset.release_generalization = {
         "feature": {
             "intervals": [
@@ -1335,6 +1559,13 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
             ]
         }
     }
+    final_dataset.release_generalization = dataset.release_generalization
+    final_roles = {role: frame.copy() for role, frame in final_dataset.roles.items()}
+    final_roles["train"].loc[:, "feature"] = 101
+    final_roles["tuning"].loc[:, "feature"] = 102
+    final_roles["final_holdout"].loc[:, "feature"] = 103
+    final_dataset.set_imputed_roles(final_roles)
+    final_dataset = _same_phase_final_dataset(cfg, final_dataset)
     synthetic = dataset.role_frame("train", imputed=True).copy()
     synthcity_calls = []
     synthcity_fit_frames = []
@@ -1345,6 +1576,9 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     syntheval_released_datasets = []
     syntheval_released_references = []
     release_evidence_generalizations = []
+    release_evidence_holdouts = []
+    tstr_holdouts = []
+    refit_inputs = []
     synthcity_report = _dataframe(
         {"mean": [0.25] * 4, "direction": ["minimize"] * 4},
         index=[
@@ -1370,11 +1604,20 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
         return None, None, {}
 
     def fake_refit_selected_model(*args, **kwargs):
+        refit_inputs.append(
+            (args[1], kwargs.get("candidate_dataset"), kwargs.get("imputation_phase"))
+        )
         return _fake_refit_metadata(synthetic, kwargs["output_dir"])
 
     def fake_run_release_evidence(_selected, _dataset, **kwargs):
         release_evidence_generalizations.append(kwargs["generalization"])
+        if "release_form_inputs" in kwargs:
+            release_evidence_holdouts.append(kwargs["release_form_inputs"][1]["final_holdout"])
         return {}
+
+    def fake_run_tstr(_synthetic, real_data, **_kwargs):
+        tstr_holdouts.append(real_data.copy())
+        return SimpleNamespace(envelope={"state": "blocked"})
 
     monkeypatch.setattr(generation_pipeline, "refit_selected_model", fake_refit_selected_model)
 
@@ -1384,27 +1627,67 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     monkeypatch.setattr(
         release_evidence_eval, "run_release_evidence_evaluation", fake_run_release_evidence
     )
+    monkeypatch.setattr("synthdata.evaluation.run_tstr_evaluation", fake_run_tstr)
     monkeypatch.setattr(
         "synthdata.evaluation._select_policy_model", lambda _combined: ("model_a", None)
     )
 
-    combined, extras = run_evaluation(cfg, dataset, {"model_a": synthetic})
+    combined, extras = run_evaluation(
+        cfg, dataset, {"model_a": synthetic}, final_dataset=final_dataset
+    )
 
     assert synthcity_calls == ["tuning", "final_holdout"]
     expected_real_fit = pd.concat(
+        [
+            final_dataset.role_frame("train", imputed=True),
+            final_dataset.role_frame("tuning", imputed=True),
+        ],
+        ignore_index=True,
+    )
+    expected_candidate_fit = pd.concat(
         [dataset.role_frame("train", imputed=True), dataset.role_frame("tuning", imputed=True)],
         ignore_index=True,
     )
+    pd.testing.assert_frame_equal(
+        synthcity_fit_frames[0], dataset.role_frame("train", imputed=True)
+    )
+    assert 101 not in set(synthcity_fit_frames[0]["feature"])
+    pd.testing.assert_frame_equal(
+        synthcity_evidence_frames[0], dataset.role_frame("tuning", imputed=True)
+    )
+    assert 103 not in set(synthcity_evidence_frames[0]["feature"])
     pd.testing.assert_frame_equal(synthcity_fit_frames[1], expected_real_fit)
     pd.testing.assert_frame_equal(
-        synthcity_evidence_frames[1], dataset.role_frame("final_holdout", imputed=True)
+        synthcity_evidence_frames[1], final_dataset.role_frame("final_holdout", imputed=True)
     )
+    assert refit_inputs == [(final_dataset, dataset, "final")]
+    assert not expected_candidate_fit["feature"].isin(expected_real_fit["feature"]).all()
     assert syntheval_calls == ["tuning", "final_holdout"]
     assert syntheval_fit_roles == [None, ("train", "tuning")]
     pd.testing.assert_frame_equal(syntheval_fit_frames[1], expected_real_fit)
     assert syntheval_released_datasets[0] is None
     assert syntheval_released_datasets[1] is not None
     assert syntheval_released_references[1] is not None
+    _raw_released_synthetic, expected_raw_released_roles, _raw_release_meta = (
+        transform_release_roles(
+            synthetic,
+            {"final_holdout": final_dataset.role_frame("final_holdout", imputed=False)},
+            final_dataset.release_generalization,
+        )
+    )
+    _imputed_released_synthetic, expected_imputed_released_roles, _imputed_release_meta = (
+        transform_release_roles(
+            synthetic,
+            {"final_holdout": final_dataset.role_frame("final_holdout", imputed=True)},
+            final_dataset.release_generalization,
+        )
+    )
+    pd.testing.assert_frame_equal(
+        tstr_holdouts[0], expected_imputed_released_roles["final_holdout"]
+    )
+    pd.testing.assert_frame_equal(
+        release_evidence_holdouts[0], expected_raw_released_roles["final_holdout"]
+    )
     assert set(syntheval_released_datasets[1]["model_a"]["feature"]) <= {
         "dataset_lower",
         "dataset_upper",
@@ -1415,17 +1698,17 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     }
     assert (
         syntheval_released_datasets[1]["model_a"].attrs["release_provenance"]["generalization"]
-        == dataset.release_generalization
+        == final_dataset.release_generalization
     )
     assert release_evidence_generalizations == [
         dataset.release_generalization,
-        dataset.release_generalization,
+        final_dataset.release_generalization,
     ]
     assert "final_holdout_evidence" in extras
     evidence = artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)
     assert evidence["state"] == "failed"
     assert evidence["selected_model"] == "model_a"
-    assert evidence["provenance_inventory"]["intervals"] == dataset.release_generalization
+    assert evidence["provenance_inventory"]["intervals"] == final_dataset.release_generalization
     assert evidence["role_context"]["roles"].keys() == {
         "train",
         "tuning",
@@ -1512,6 +1795,7 @@ def test_run_evaluation_keeps_multi_model_selection_outside_final_holdout(
         cfg,
         dataset,
         {"model_a": synthetic.copy(), "model_b": synthetic.copy()},
+        final_dataset=_same_phase_final_dataset(cfg, dataset),
     )
 
     assert selected_models == [("tuning", {"model_a", "model_b"}), ("final_holdout", {"model_a"})]
@@ -1745,7 +2029,9 @@ def test_run_evaluation_records_authoritative_final_task10_evidence(
             },
         )
 
-    combined, extras = run_evaluation(cfg, dataset, {"model_a": synthetic})
+    combined, extras = run_evaluation(
+        cfg, dataset, {"model_a": synthetic}, final_dataset=_same_phase_final_dataset(cfg, dataset)
+    )
 
     evidence = artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)
     expected_state = "succeeded" if finite_final_score else "failed"
@@ -1871,7 +2157,9 @@ def test_run_evaluation_persists_failed_final_framework_evidence(
         "synthdata.evaluation._select_policy_model", lambda _combined: ("model_a", None)
     )
 
-    _combined, extras = run_evaluation(cfg, dataset, {"model_a": synthetic})
+    _combined, extras = run_evaluation(
+        cfg, dataset, {"model_a": synthetic}, final_dataset=_same_phase_final_dataset(cfg, dataset)
+    )
 
     evidence = extras["final_holdout_evidence"]
     assert evidence["state"] == "failed"
@@ -1946,7 +2234,9 @@ def test_run_evaluation_persists_failed_final_syntheval_worker(
         "synthdata.evaluation._select_policy_model", lambda _combined: ("model_a", None)
     )
 
-    _combined, extras = run_evaluation(cfg, dataset, {"model_a": synthetic})
+    _combined, extras = run_evaluation(
+        cfg, dataset, {"model_a": synthetic}, final_dataset=_same_phase_final_dataset(cfg, dataset)
+    )
 
     evidence = artifacts.load_final_holdout_evidence(cfg.evaluation.output_dir)
     assert evidence["state"] == "failed"
@@ -2002,7 +2292,13 @@ def test_run_evaluation_routes_native_metric_manifests_without_binary_pass(
 
     dataset = make_canonical_dataset()
     train_frame = dataset.role_frame("train", imputed=True)
+    dataset.role_frame("train", imputed=False).loc[:, "target"] = [
+        index % class_count for index in range(len(train_frame))
+    ]
     train_frame.loc[:, "target"] = [index % class_count for index in range(len(train_frame))]
+    dataset.role_fingerprints = {
+        role: dataframe_fingerprint(frame) for role, frame in dataset.roles.items()
+    }
     synthetic = dataset.role_frame("train", imputed=True).copy()
     synthcity_report = _dataframe(
         {"mean": [0.25] * 4, "direction": ["minimize"] * 4},
@@ -2050,7 +2346,9 @@ def test_run_evaluation_routes_native_metric_manifests_without_binary_pass(
         "synthdata.evaluation._select_policy_model", lambda _combined: ("model_a", None)
     )
 
-    _combined, extras = run_evaluation(cfg, dataset, {"model_a": synthetic})
+    _combined, extras = run_evaluation(
+        cfg, dataset, {"model_a": synthetic}, final_dataset=_same_phase_final_dataset(cfg, dataset)
+    )
 
     assert syntheval_calls == ["tuning", "final_holdout"]
     assert len(validation_expected_keys) == 2

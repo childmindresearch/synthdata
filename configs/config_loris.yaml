@@ -7,13 +7,13 @@ device: auto
 
 experiment:
   tag: refactored_loris_v2
-  id: "1.8"
+  id: "1.9"
 
 data:
   # Source and schema
   source: csv
   path: data/loris/loris_v2_664_features_us_id.csv # Input file.
-  version: "2.0"
+  version: "2.01"
   variable_schema_path: data/loris/loris_v2_variable_schema_us.csv
 
   # Modeling columns
@@ -53,11 +53,9 @@ data:
     train_fraction: 0.60
     tuning_fraction: 0.20
     final_holdout_fraction: 0.20
-    candidate_count: 32
 
   # Local derived-data storage
   data_dir: data/loris
-  raw_cache_subdir: raw
 
 imputation:
   enabled: true
@@ -115,8 +113,8 @@ generation:
         n_iter: 10
   tabpfn:
     enabled: true
-    variants: [standard, custom]
-    data_variants: [raw, imputed]
+    variants: [standard]
+    data_variants: [raw]
 
   tabpfgen:
     enabled: true

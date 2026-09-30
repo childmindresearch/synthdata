@@ -18,6 +18,8 @@ from synthdata.data import (
     role_context_payload,
     semantic_context_digest,
     semantic_context_payload,
+    validate_final_imputation_lineage,
+    validate_imputation_cache_lineage,
 )
 from synthdata.evaluation import (
     artifacts,
@@ -130,8 +132,8 @@ def _candidate_role_frames(
     dataset: Dataset,
     *,
     audit_only_legacy_adapter: bool = False,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Return fit, tuning, and final-holdout frames for evaluation context.
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return candidate fit and tuning frames without reading final_holdout.
 
     Legacy two-role data has no tuning role. Substituting its final holdout is
     unsafe for candidate evaluation and is allowed only for an explicitly
@@ -139,22 +141,15 @@ def _candidate_role_frames(
     """
     train_frame = dataset.role_frame("train", imputed=True)
     tuning_frame = dataset.role_frame("tuning", imputed=True)
-    final_holdout_frame = dataset.role_frame("final_holdout", imputed=True)
     if tuning_frame is None and dataset.legacy_two_role and audit_only_legacy_adapter:
-        tuning_frame = final_holdout_frame
+        tuning_frame = dataset.role_frame("final_holdout", imputed=True)
     elif tuning_frame is None and dataset.legacy_two_role:
         raise RuntimeError(
             "Legacy two-role datasets cannot substitute final_holdout for tuning; "
             "request the explicit audit-only legacy adapter"
         )
     missing = [
-        role
-        for role, frame in (
-            ("train", train_frame),
-            ("tuning", tuning_frame),
-            ("final_holdout", final_holdout_frame),
-        )
-        if frame is None
+        role for role, frame in (("train", train_frame), ("tuning", tuning_frame)) if frame is None
     ]
     if missing:
         raise RuntimeError(
@@ -162,8 +157,59 @@ def _candidate_role_frames(
         )
     assert train_frame is not None
     assert tuning_frame is not None
-    assert final_holdout_frame is not None
-    return train_frame, tuning_frame, final_holdout_frame
+    return train_frame, tuning_frame
+
+
+def _validate_phase_dataset_pair(candidate: Dataset, final: Dataset, cfg: Config) -> None:
+    """Ensure final-phase roles belong to same canonical source/split as candidates."""
+    if candidate is final:
+        raise ValueError("Candidate and final imputation phases require separate Dataset objects")
+    candidate.require_canonical_roles("candidate evaluation")
+    final.require_canonical_roles("final-phase evaluation")
+    if candidate.final_imputation_lineage is not None:
+        raise ValueError("Candidate Dataset cannot carry final-phase imputation outputs")
+    if final.candidate_imputation_lineage is not None:
+        raise ValueError("Final Dataset cannot carry candidate-phase imputation outputs")
+    from synthdata.imputation.pipeline import _cache_key_record
+
+    validate_imputation_cache_lineage(
+        candidate,
+        _cache_key_record(cfg, candidate, phase="candidate"),
+        required=True,
+        require_attached_proof=True,
+    )
+
+    expected_final_cache_key = _cache_key_record(cfg, final, phase="final")["cache_key"]
+    validate_final_imputation_lineage(final, expected_final_cache_key)
+    identity_fields = (
+        "name",
+        "version",
+        "source_fingerprint",
+        "full_fingerprint",
+        "assignment_fingerprint",
+        "assignment_policy_fingerprint",
+        "identity_fingerprint",
+        "variable_schema_fingerprint",
+        "semantic_fingerprint",
+        "role_fingerprints",
+    )
+    mismatches = {
+        field: (getattr(candidate, field), getattr(final, field))
+        for field in identity_fields
+        if getattr(candidate, field) != getattr(final, field)
+    }
+    if mismatches:
+        raise ValueError(f"Candidate and final Dataset lineage differs: {mismatches}")
+    missing = [
+        role
+        for role in ("train", "tuning", "final_holdout")
+        if final.role_frame(role, imputed=True) is None
+    ]
+    if missing:
+        raise RuntimeError(
+            "Final-phase evaluation requires imputed train, tuning, and final_holdout roles; "
+            f"missing={missing}"
+        )
 
 
 def _syntheval_target_type_flags(dataset: Dataset, train_frame: pd.DataFrame) -> tuple[bool, bool]:
@@ -548,6 +594,7 @@ def _final_holdout_state_dimensions(
 def _run_final_holdout_evidence(
     cfg: Config,
     dataset: Dataset,
+    candidate_dataset: Dataset,
     selected_datasets: dict[str, pd.DataFrame],
     combined: pd.DataFrame,
     group_context: dict,
@@ -556,7 +603,7 @@ def _run_final_holdout_evidence(
     role_context: dict,
     role_context_fingerprints: dict[str, str],
 ) -> dict:
-    """Evaluate only the selected candidate against the untouched final role."""
+    """Evaluate only selected candidate against final-phase imputed holdout."""
     base_evidence = {
         "evaluation_role": "final_holdout",
         "role_context": role_context["full"],
@@ -617,7 +664,7 @@ def _run_final_holdout_evidence(
 
     eval_cfg = cfg.evaluation
     output_dir = ensure_dir(eval_cfg.output_dir)
-    synthcity_semantics = _synthcity_semantic_context(dataset, eval_cfg.synthcity)
+    synthcity_semantics = _synthcity_semantic_context(candidate_dataset, eval_cfg.synthcity)
     base_evidence["semantic_context"] = synthcity_semantics
     base_evidence["semantic_context_fingerprint"] = semantic_context_digest(synthcity_semantics)
     train_frame = dataset.role_frame("train", imputed=True)
@@ -636,6 +683,8 @@ def _run_final_holdout_evidence(
         dataset,
         selected_model,
         output_dir=output_dir / "final_refit",
+        imputation_phase="final",
+        candidate_dataset=candidate_dataset,
     )
     selected_dataset = {selected_model: refit_frame}
     final_group_context = syntheval_eval.build_group_context(
@@ -670,7 +719,18 @@ def _run_final_holdout_evidence(
             dataset.release_generalization,
         )
     )
-    released_final_dataset = {selected_model: released_final_synthetic}
+    released_metric_synthetic, released_imputed_roles, metric_release_metadata = (
+        transform_release_roles(
+            refit_frame,
+            {"final_holdout": final_holdout_frame},
+            dataset.release_generalization,
+        )
+    )
+    if not released_final_synthetic.equals(released_metric_synthetic):
+        raise RuntimeError("Final synthetic release differs across holdout representations")
+    released_imputed_final_holdout = released_imputed_roles["final_holdout"]
+    released_final_dataset = {selected_model: released_metric_synthetic}
+    released_raw_final_dataset = {selected_model: released_final_synthetic}
     # All final evidence consumers share this exact release-form object.  Do not
     # let individual metric adapters transform or normalize independent copies.
     selected_dataset = released_final_dataset
@@ -679,12 +739,12 @@ def _run_final_holdout_evidence(
         for model_name in selected_dataset:
             authoritative_tstr_results[model_name] = run_tstr_evaluation(
                 released_final_dataset[model_name],
-                released_final_roles["final_holdout"],
+                released_imputed_final_holdout,
                 target_column=dataset.target_column,
                 evaluation_role="final_holdout",
                 seed=cfg.seed,
                 protected_columns=list(dataset.protected_columns),
-                role_hashes=final_custom_role_hashes,
+                role_hashes=final_role_hashes,
             ).envelope
     group_configuration = {
         "group_context": final_group_context,
@@ -718,7 +778,7 @@ def _run_final_holdout_evidence(
         group_mode=group_mode,
         evaluation_role="final_holdout",
         released_synthetic_datasets=released_final_dataset,
-        released_reference_frame=released_final_roles["final_holdout"],
+        released_reference_frame=released_imputed_final_holdout,
     )
     final_synthcity_metric_config = synthcity_eval.resolve_metric_config(eval_cfg.synthcity)
     final_synthcity_validations = synthcity_eval.validate_synthcity_results(
@@ -757,7 +817,7 @@ def _run_final_holdout_evidence(
                 evaluation_role="final_holdout",
                 fit_frame=real_fit_frame,
                 fit_roles=("train", "tuning"),
-                released_final_holdout_frame=released_final_roles["final_holdout"],
+                released_final_holdout_frame=released_imputed_final_holdout,
                 released_synthetic_datasets=released_final_dataset,
             )
         except Exception as exc:  # noqa: BLE001 - preserve process-control exceptions
@@ -838,7 +898,7 @@ def _run_final_holdout_evidence(
         eval_cfg.log_disparity,
         eval_cfg.custom,
         evaluation_role="final_holdout",
-        reference_frame=released_final_roles.get("final_holdout"),
+        reference_frame=released_imputed_final_holdout,
     )
     final_custom_validations = (
         custom_eval.validate_log_disparity_results(
@@ -855,7 +915,7 @@ def _run_final_holdout_evidence(
         else {}
     )
     final_release_evidence_observations = release_evidence_eval.run_release_evidence_evaluation(
-        selected_dataset,
+        released_raw_final_dataset,
         dataset,
         evaluation_role="final_holdout",
         generalization=dataset.release_generalization,
@@ -967,6 +1027,9 @@ def _run_final_holdout_evidence(
             "attack_protocol": {
                 "evaluation_role": "final_holdout",
                 "privacy": "release-form final audit",
+                "imputed_evaluation_release_transform_digest": metric_release_metadata[
+                    "common_protocol_digest"
+                ],
             },
             "seeds": {"evaluation": cfg.seed},
             "supports": {
@@ -1081,6 +1144,7 @@ def _run_blocked_legacy_evaluation(
     final_holdout_evidence = _run_final_holdout_evidence(
         cfg,
         dataset,
+        dataset,
         {},
         combined,
         group_context,
@@ -1151,6 +1215,7 @@ def run_evaluation(
     dataset: Dataset,
     synthetic_datasets: dict[str, pd.DataFrame],
     experiment=None,
+    final_dataset: Dataset | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """Run the full evaluation stage.
 
@@ -1169,6 +1234,12 @@ def run_evaluation(
     """
     if dataset.legacy_two_role:
         return _run_blocked_legacy_evaluation(cfg, dataset, synthetic_datasets, experiment)
+    if final_dataset is None:
+        raise ValueError(
+            "Canonical evaluation requires a separately imputed final_dataset; "
+            "candidate-phase fallback is not supported"
+        )
+    _validate_phase_dataset_pair(dataset, final_dataset, cfg)
 
     eval_cfg = cfg.evaluation
     output_dir, attempt_metadata = artifacts.select_evaluation_attempt(
@@ -1208,12 +1279,13 @@ def run_evaluation(
             evaluation_coverage["failed_outputs"],
         )
     logger.info("Evaluating %d models: %s", len(model_names), model_names)
-    train_frame, tuning_frame, final_holdout_frame = _candidate_role_frames(dataset)
+    train_frame, tuning_frame = _candidate_role_frames(dataset)
     group_context = syntheval_eval.build_group_context(
         dataset,
         selected_datasets,
         group_mode=eval_cfg.group_mode,
         group_column=eval_cfg.group_column,
+        include_final_holdout=False,
     )
     population_unit = group_context["population_unit"]
     group_mode = group_context["group_mode"]
@@ -1255,7 +1327,6 @@ def run_evaluation(
     }
     role_hashes = {
         **candidate_role_hashes,
-        "final_holdout": dataframe_fingerprint(final_holdout_frame),
     }
     if dataset.legacy_two_role:
         role_hashes["test"] = role_hashes["tuning"]
@@ -1472,18 +1543,15 @@ def run_evaluation(
     context_roles = (
         ("train", "tuning") if dataset.has_canonical_roles else ("train", "final_holdout")
     )
-    full_context_roles = (
-        ("train", "tuning", "final_holdout")
-        if dataset.has_canonical_roles
-        else ("train", "final_holdout")
-    )
+    resolved_final_dataset = final_dataset
+    full_context_roles = ("train", "tuning", "final_holdout")
     role_context = {
         "candidate": role_context_payload(dataset, context_roles),
-        "full": role_context_payload(dataset, full_context_roles),
+        "full": role_context_payload(resolved_final_dataset, full_context_roles),
     }
     role_context_fingerprints = {
         "candidate": role_context_fingerprint(dataset, context_roles),
-        "full": role_context_fingerprint(dataset, full_context_roles),
+        "full": role_context_fingerprint(resolved_final_dataset, full_context_roles),
     }
     source_provenance = artifacts.collect_source_provenance(
         config_path=cfg.config_path,
@@ -1491,6 +1559,7 @@ def run_evaluation(
     )
     final_holdout_evidence = _run_final_holdout_evidence(
         cfg,
+        resolved_final_dataset,
         dataset,
         selected_datasets,
         combined,

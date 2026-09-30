@@ -8,7 +8,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from synthdata.data import dataframe_fingerprint, load_imputed_splits
+from synthdata.data import (
+    dataframe_fingerprint,
+    load_imputed_splits,
+    validate_final_imputation_lineage,
+)
 from synthdata.imputation import pipeline as imputation_pipeline
 from synthdata.imputation.hyperimpute_backend import (
     FIT_FRAME_FINGERPRINT_VERSION,
@@ -74,7 +78,7 @@ def test_fitted_hyperimpute_state_uses_canonical_frame_fingerprint():
     assert metadata["fit_frame_fingerprint_version"] == FIT_FRAME_FINGERPRINT_VERSION
 
 
-def test_final_phase_fits_train_and_tuning_and_transforms_holdout_only(
+def test_final_phase_fits_train_and_tuning_and_transforms_all_roles(
     make_config, make_canonical_dataset, mocker
 ):
     cfg = make_config()
@@ -100,8 +104,11 @@ def test_final_phase_fits_train_and_tuning_and_transforms_holdout_only(
     pd.testing.assert_frame_equal(
         fit.call_args.args[0], pd.concat([dataset.roles["train"], dataset.roles["tuning"]])
     )
-    assert transform.call_count == 1
-    pd.testing.assert_frame_equal(transform.call_args.args[1], dataset.roles["final_holdout"])
+    assert transform.call_count == 3
+    for call, role in zip(
+        transform.call_args_list, ("train", "tuning", "final_holdout"), strict=True
+    ):
+        pd.testing.assert_frame_equal(call.args[1], dataset.roles[role])
 
 
 def test_final_phase_noop_metadata_uses_concat_fit_fingerprint(make_config, make_canonical_dataset):
@@ -112,7 +119,7 @@ def test_final_phase_noop_metadata_uses_concat_fit_fingerprint(make_config, make
     fit_frame = pd.concat([dataset.roles["train"], dataset.roles["tuning"]])
     assert metadata is not None
     assert metadata["fit_roles"] == ["train", "tuning"]
-    assert metadata["transform_roles"] == ["final_holdout"]
+    assert metadata["transform_roles"] == ["train", "tuning", "final_holdout"]
     assert metadata["fit_frame_fingerprint"] == dataframe_fingerprint(fit_frame)
     from synthdata.imputation.hyperimpute_backend import metadata_fingerprint
 
@@ -358,7 +365,7 @@ class TestCacheKeyPayload:
         assert candidate["cache_key"] != final["cache_key"]
         assert candidate["cache_key"] != mean["cache_key"]
         assert final["fit_roles"] == ["train", "tuning"]
-        assert final["transform_roles"] == ["final_holdout"]
+        assert final["transform_roles"] == ["train", "tuning", "final_holdout"]
 
     @pytest.mark.parametrize("builder", [_cache_key_payload, _cache_key_record])
     def test_cache_key_builders_reject_invalid_phase(self, make_config, make_dataset, builder):
@@ -406,19 +413,63 @@ class TestRunImputationCaching:
         dataset = make_canonical_dataset()
 
         run_imputation(cfg, dataset)
-        record = json.loads((dataset.data_dir / _CACHE_KEY_FILENAME).read_text())
+        record = json.loads(dataset.imputation_paths("candidate")["cache_key"].read_text())
         fresh = make_canonical_dataset()
         fresh.data_dir = dataset.data_dir
 
         assert record["cache_key"] == _cache_key_record(cfg, fresh)["cache_key"]
         load_imputed_splits(fresh, expected_cache_key=record["cache_key"])
         assert fresh.full_imputed_df is not None
-        assert record["imputed_frame_fingerprints"] == {
+        candidate_paths = dataset.imputation_paths("candidate")
+        expected_fingerprints = {
             role: dataframe_fingerprint(
-                pd.read_csv(dataset.paths()[f"{role}_imputed"], low_memory=False)
+                pd.read_csv(candidate_paths[f"{role}_imputed"], low_memory=False)
             )
-            for role in dataset.roles
+            for role in ("train", "tuning")
         }
+        expected_fingerprints["full_candidate_partial"] = dataframe_fingerprint(
+            pd.read_csv(candidate_paths["full_candidate_partial_imputed"], low_memory=False)
+        )
+        assert record["imputed_frame_fingerprints"] == expected_fingerprints
+
+    def test_candidate_cache_hit_reloads_decoded_artifacts_and_values(
+        self, make_config, make_canonical_dataset, mocker
+    ):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+        dataset.ordinal_columns = ["feature"]
+        dataset.variable_schema["feature"] = {
+            "kind": "categorical",
+            "ordinal_order": [f"level-{value}" for value in range(24)],
+        }
+
+        run_imputation(cfg, dataset, phase="candidate")
+        expected_roles = {role: dataset.decoded_roles[role].copy() for role in ("train", "tuning")}
+        expected_aggregate = dataset.full_imputed_decoded_df.copy()
+        fresh = make_canonical_dataset()
+        fresh.data_dir = dataset.data_dir
+        fresh.ordinal_columns = ["feature"]
+        fresh.variable_schema["feature"] = dataset.variable_schema["feature"].copy()
+        impute = mocker.patch(
+            "synthdata.imputation.pipeline._impute_canonical_roles",
+            wraps=imputation_pipeline._impute_canonical_roles,
+        )
+
+        run_imputation(cfg, fresh, phase="candidate")
+
+        impute.assert_not_called()
+        paths = fresh.imputation_paths("candidate")
+        for role in ("train", "tuning"):
+            pd.testing.assert_frame_equal(fresh.decoded_roles[role], expected_roles[role])
+            pd.testing.assert_frame_equal(
+                pd.read_csv(paths[f"{role}_imputed_decoded"]), expected_roles[role]
+            )
+            assert fresh.decoded_roles[role]["feature"].str.startswith("level-").all()
+        pd.testing.assert_frame_equal(fresh.full_imputed_decoded_df, expected_aggregate)
+        pd.testing.assert_frame_equal(
+            pd.read_csv(paths["full_candidate_partial_imputed_decoded"]), expected_aggregate
+        )
 
     @pytest.mark.parametrize("drift", ["content", "dtype"])
     def test_canonical_role_cache_drift_forces_reimputation(
@@ -429,7 +480,7 @@ class TestRunImputationCaching:
         dataset = make_canonical_dataset()
         run_imputation(cfg, dataset)
 
-        train_path = dataset.paths()["train_imputed"]
+        train_path = dataset.imputation_paths("candidate")["train_imputed"]
         cached_train = pd.read_csv(train_path, low_memory=False)
         if drift == "content":
             cached_train.loc[0, "feature"] += 1.0
@@ -460,7 +511,7 @@ class TestRunImputationCaching:
         dataset = make_canonical_dataset()
         run_imputation(cfg, dataset)
 
-        train_path = dataset.paths()["train_imputed"]
+        train_path = dataset.imputation_paths("candidate")["train_imputed"]
         cached_train = dataset.imputed_roles["train"].copy()
         mixed_values = [17, "A"] * (len(cached_train) // 2)
         if len(cached_train) % 2:
@@ -468,9 +519,18 @@ class TestRunImputationCaching:
         cached_train["protected"] = pd.Series(mixed_values, dtype=object).to_numpy()
         cached_train.to_csv(train_path, index=False)
         expected_train = pd.read_csv(train_path, low_memory=False)
-        provenance_path = dataset.data_dir / _CACHE_KEY_FILENAME
+        candidate_paths = dataset.imputation_paths("candidate")
+        aggregate_path = candidate_paths["full_candidate_partial_imputed"]
+        aggregate = pd.read_csv(aggregate_path, low_memory=False)
+        train_row_keys = dataset.assignment.loc[dataset.assignment["role"] == "train", "row_key"]
+        aggregate.loc[train_row_keys, :] = expected_train.to_numpy()
+        aggregate.to_csv(aggregate_path, index=False)
+        provenance_path = dataset.imputation_paths("candidate")["cache_key"]
         provenance = json.loads(provenance_path.read_text())
         provenance["imputed_frame_fingerprints"]["train"] = dataframe_fingerprint(expected_train)
+        provenance["imputed_frame_fingerprints"]["full_candidate_partial"] = dataframe_fingerprint(
+            pd.read_csv(aggregate_path, low_memory=False)
+        )
         provenance_path.write_text(json.dumps(provenance))
 
         read_options = []
@@ -501,7 +561,7 @@ class TestRunImputationCaching:
         dataset = make_canonical_dataset()
 
         run_imputation(cfg, dataset)
-        record = json.loads((dataset.data_dir / _CACHE_KEY_FILENAME).read_text())
+        record = json.loads(dataset.imputation_paths("candidate")["cache_key"].read_text())
 
         assert record["phase"] == "candidate"
         assert record["fit_roles"] == ["train"]
@@ -516,13 +576,12 @@ class TestRunImputationCaching:
         dataset = make_canonical_dataset()
 
         run_imputation(cfg, dataset)
-        candidate_record = json.loads((dataset.data_dir / _CACHE_KEY_FILENAME).read_text())
+        candidate_key_path = dataset.imputation_paths("candidate")["cache_key"]
+        candidate_record = json.loads(candidate_key_path.read_text())
         run_imputation(cfg, dataset, phase="final")
 
-        assert json.loads((dataset.data_dir / _CACHE_KEY_FILENAME).read_text()) == candidate_record
-        final_record = json.loads(
-            (dataset.data_dir / "imputation_final" / _CACHE_KEY_FILENAME).read_text()
-        )
+        assert json.loads(candidate_key_path.read_text()) == candidate_record
+        final_record = json.loads(dataset.imputation_paths("final")["cache_key"].read_text())
         assert final_record["phase"] == "final"
 
     def test_canonical_final_cache_writes_and_reloads_phase_metadata(
@@ -533,9 +592,7 @@ class TestRunImputationCaching:
         dataset = make_canonical_dataset()
 
         run_imputation(cfg, dataset, phase="final")
-        record = json.loads(
-            (dataset.data_dir / "imputation_final" / _CACHE_KEY_FILENAME).read_text()
-        )
+        record = json.loads(dataset.imputation_paths("final")["cache_key"].read_text())
         fresh = make_canonical_dataset()
         fresh.data_dir = dataset.data_dir
 
@@ -543,9 +600,282 @@ class TestRunImputationCaching:
         fit_frame = pd.concat([fresh.roles["train"], fresh.roles["tuning"]], axis=0)
         assert record["phase"] == "final"
         assert record["fit_roles"] == ["train", "tuning"]
-        assert record["transform_roles"] == ["final_holdout"]
+        assert record["transform_roles"] == ["train", "tuning", "final_holdout"]
         assert record["fit_frame_fingerprint"] == dataframe_fingerprint(fit_frame)
         assert fresh.full_imputed_df is not None
+
+    def test_canonical_phase_layouts_write_exact_artifacts_and_ordered_views(
+        self, make_config, make_canonical_dataset
+    ):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+        dataset.nominal_columns = ["protected"]
+        dataset.ordinal_columns = ["feature"]
+        dataset.variable_schema["feature"] = {
+            "kind": "categorical",
+            "ordinal_order": [f"level-{value}" for value in range(24)],
+        }
+        for role in ("train", "tuning", "final_holdout"):
+            frame = dataset.roles[role].copy()
+            frame.loc[frame.index[0], "feature"] = np.nan
+            dataset.roles[role] = frame
+
+        run_imputation(cfg, dataset, phase="candidate")
+        initial_paths = dataset.imputation_paths("candidate")
+        assert {path.name for path in initial_paths["cache_key"].parent.iterdir()} == {
+            "train_imputed.csv",
+            "tuning_imputed.csv",
+            "train_imputed_decoded.csv",
+            "tuning_imputed_decoded.csv",
+            "full_candidate_partial_imputed.csv",
+            "full_candidate_partial_imputed_decoded.csv",
+            _CACHE_KEY_FILENAME,
+        }
+        assert not (initial_paths["cache_key"].parent / "final_holdout_imputed.csv").exists()
+        candidate_aggregate = pd.read_csv(
+            initial_paths["full_candidate_partial_imputed"], low_memory=False
+        )
+        expected_candidate = dataset.full_df.copy()
+        for role in ("train", "tuning", "final_holdout"):
+            expected_candidate.loc[
+                dataset.assignment.loc[dataset.assignment["role"] == role, "row_key"],
+                :,
+            ] = dataset.roles[role].to_numpy()
+        for role in ("train", "tuning"):
+            expected_candidate.loc[
+                dataset.assignment.loc[dataset.assignment["role"] == role, "row_key"],
+                :,
+            ] = dataset.imputed_roles[role].to_numpy()
+        pd.testing.assert_frame_equal(
+            candidate_aggregate, expected_candidate.reset_index(drop=True), check_dtype=False
+        )
+        pd.testing.assert_frame_equal(
+            pd.read_csv(initial_paths["full_candidate_partial_imputed_decoded"]),
+            dataset.decode_ordinal_frame(candidate_aggregate),
+            check_dtype=False,
+        )
+        pd.testing.assert_frame_equal(
+            dataset.imputed_roles["final_holdout"], dataset.roles["final_holdout"]
+        )
+        assert (
+            pd.read_csv(initial_paths["train_imputed_decoded"])["feature"]
+            .str.startswith("level-")
+            .all()
+        )
+
+        run_imputation(cfg, dataset, phase="final")
+        final_paths = dataset.imputation_paths("final")
+        assert {path.name for path in final_paths["cache_key"].parent.iterdir()} == {
+            "train_tuning_imputed.csv",
+            "final_holdout_imputed.csv",
+            "train_tuning_imputed_decoded.csv",
+            "final_holdout_imputed_decoded.csv",
+            "full_final_imputed.csv",
+            "full_final_imputed_decoded.csv",
+            _CACHE_KEY_FILENAME,
+        }
+        final_aggregate = pd.read_csv(final_paths["full_final_imputed"], low_memory=False)
+        pd.testing.assert_frame_equal(final_aggregate, dataset.full_imputed_df, check_dtype=False)
+        assert all(
+            not dataset.imputed_roles[role]["feature"].isna().any()
+            for role in ("train", "tuning", "final_holdout")
+        )
+        final_record = json.loads(final_paths["cache_key"].read_text())
+        final_fit_frame = pd.concat([dataset.roles["train"], dataset.roles["tuning"]])
+        assert final_record["cache_contract"] == "canonical_roles_v2"
+        assert final_record["fit_roles"] == ["train", "tuning"]
+        assert final_record["transform_roles"] == ["train", "tuning", "final_holdout"]
+        assert final_record["fit_frame_fingerprint"] == dataframe_fingerprint(final_fit_frame)
+        assert final_record["fit_state"]["fit_frame_fingerprint"] == dataframe_fingerprint(
+            final_fit_frame
+        )
+        assert final_record["role_row_counts"] == {
+            role: len(dataset.roles[role]) for role in ("train", "tuning", "final_holdout")
+        }
+        assert final_record["imputed_row_counts"] == {
+            "train_tuning": len(dataset.roles["train"]) + len(dataset.roles["tuning"]),
+            "final_holdout": len(dataset.roles["final_holdout"]),
+            "full_final": len(dataset.full_df),
+        }
+        combined_train_tuning = pd.read_csv(final_paths["train_tuning_imputed"], low_memory=False)
+        pd.testing.assert_frame_equal(
+            combined_train_tuning,
+            pd.concat(
+                [dataset.imputed_roles["train"], dataset.imputed_roles["tuning"]],
+                ignore_index=True,
+            ),
+            check_dtype=False,
+        )
+        pd.testing.assert_frame_equal(
+            pd.read_csv(final_paths["full_final_imputed_decoded"]),
+            dataset.decode_ordinal_frame(final_aggregate),
+            check_dtype=False,
+        )
+        assert (
+            pd.read_csv(final_paths["train_tuning_imputed_decoded"])["feature"]
+            .str.startswith("level-")
+            .all()
+        )
+        assert dataset.roles["final_holdout"].index.equals(
+            make_canonical_dataset().roles["final_holdout"].index
+        )
+
+    def test_final_cache_hit_reloads_all_final_role_frames(
+        self, make_config, make_canonical_dataset, mocker
+    ):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+        dataset.ordinal_columns = ["feature"]
+        dataset.variable_schema["feature"] = {
+            "kind": "categorical",
+            "ordinal_order": [f"level-{value}" for value in range(24)],
+        }
+        run_imputation(cfg, dataset, phase="final")
+        expected_roles = {role: frame.copy() for role, frame in dataset.imputed_roles.items()}
+        expected_decoded_roles = {
+            role: frame.copy() for role, frame in dataset.decoded_roles.items()
+        }
+        expected_aggregate = dataset.full_imputed_decoded_df.copy()
+        fresh = make_canonical_dataset()
+        fresh.data_dir = dataset.data_dir
+        fresh.ordinal_columns = ["feature"]
+        fresh.variable_schema["feature"] = dataset.variable_schema["feature"].copy()
+        impute = mocker.patch(
+            "synthdata.imputation.pipeline._impute_canonical_roles",
+            wraps=imputation_pipeline._impute_canonical_roles,
+        )
+
+        run_imputation(cfg, fresh, phase="final")
+
+        impute.assert_not_called()
+        for role in expected_roles:
+            pd.testing.assert_frame_equal(
+                fresh.imputed_roles[role], expected_roles[role], check_dtype=False
+            )
+            pd.testing.assert_frame_equal(fresh.decoded_roles[role], expected_decoded_roles[role])
+            assert fresh.decoded_roles[role]["feature"].str.startswith("level-").all()
+
+        paths = fresh.imputation_paths("final")
+        pd.testing.assert_frame_equal(
+            pd.read_csv(paths["train_tuning_imputed_decoded"]),
+            pd.concat(
+                [expected_decoded_roles["train"], expected_decoded_roles["tuning"]],
+                ignore_index=True,
+            ),
+        )
+        pd.testing.assert_frame_equal(
+            pd.read_csv(paths["final_holdout_imputed_decoded"]),
+            expected_decoded_roles["final_holdout"],
+        )
+        pd.testing.assert_frame_equal(fresh.full_imputed_decoded_df, expected_aggregate)
+        pd.testing.assert_frame_equal(
+            pd.read_csv(paths["full_final_imputed_decoded"]), expected_aggregate
+        )
+
+        cache_path = dataset.imputation_paths("final")["cache_key"]
+        old_layout_record = json.loads(cache_path.read_text())
+        old_layout_record["cache_contract"] = "canonical_roles_v1"
+        cache_path.write_text(json.dumps(old_layout_record))
+        stale = make_canonical_dataset()
+        stale.data_dir = dataset.data_dir
+        retrain = mocker.patch(
+            "synthdata.imputation.pipeline._impute_canonical_roles",
+            wraps=imputation_pipeline._impute_canonical_roles,
+        )
+
+        run_imputation(cfg, stale, phase="final")
+
+        retrain.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("field", "tampered_value"),
+        [
+            ("dataset_name", "another-dataset"),
+            ("dataset_version", "another-version"),
+            ("assignment_policy_fingerprint", "another-policy"),
+            ("identity_fingerprint", "another-identity"),
+            ("variable_schema_fingerprint", "another-schema"),
+        ],
+    )
+    def test_final_cache_loader_rejects_tampered_payload_with_original_key(
+        self, make_config, make_canonical_dataset, field, tampered_value
+    ):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+        run_imputation(cfg, dataset, phase="final")
+        cache_path = dataset.imputation_paths("final")["cache_key"]
+        record = json.loads(cache_path.read_text())
+        original_key = record["cache_key"]
+        record[field] = tampered_value
+        cache_path.write_text(json.dumps(record))
+
+        fresh = make_canonical_dataset()
+        fresh.data_dir = dataset.data_dir
+        expected = _cache_key_record(cfg, fresh, phase="final")
+        load_imputed_splits(
+            fresh,
+            expected_cache_key=original_key,
+            phase="final",
+            expected_cache_payload={
+                name: value for name, value in expected.items() if name != "cache_key"
+            },
+        )
+
+        assert fresh.full_imputed_df is None
+        assert fresh.final_imputation_lineage is None
+
+    def test_final_lineage_validation_recomputes_sidecar_payload_digest(
+        self, make_config, make_canonical_dataset
+    ):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+        run_imputation(cfg, dataset, phase="final")
+        record = json.loads(dataset.imputation_paths("final")["cache_key"].read_text())
+        fresh = make_canonical_dataset()
+        fresh.data_dir = dataset.data_dir
+        load_imputed_splits(fresh, expected_cache_key=record["cache_key"], phase="final")
+        assert fresh.final_imputation_lineage is not None
+
+        record["assignment_policy_fingerprint"] = "tampered-policy"
+        dataset.imputation_paths("final")["cache_key"].write_text(json.dumps(record))
+
+        with pytest.raises(RuntimeError, match="payload digest"):
+            validate_final_imputation_lineage(fresh, record["cache_key"])
+
+    def test_old_root_canonical_cache_is_untouched_and_never_reused(
+        self, make_config, make_canonical_dataset, mocker
+    ):
+        cfg = make_config()
+        cfg.imputation.method = "hyperimpute"
+        dataset = make_canonical_dataset()
+        legacy_key = dataset.data_dir / _CACHE_KEY_FILENAME
+        legacy_record = _cache_key_record(cfg, dataset)
+        legacy_key.write_text(json.dumps(legacy_record))
+        old_artifacts = {
+            f"{role}_imputed.csv": dataset.roles[role]
+            for role in ("train", "tuning", "final_holdout")
+        }
+        old_artifacts["full_imputed.csv"] = dataset.full_df
+        preserved = {}
+        for filename, frame in old_artifacts.items():
+            artifact_path = dataset.data_dir / filename
+            frame.to_csv(artifact_path, index=False)
+            preserved[artifact_path] = artifact_path.read_bytes()
+        impute = mocker.patch(
+            "synthdata.imputation.pipeline._impute_canonical_roles",
+            wraps=imputation_pipeline._impute_canonical_roles,
+        )
+
+        run_imputation(cfg, dataset, phase="candidate")
+
+        impute.assert_called_once()
+        assert json.loads(legacy_key.read_text()) == legacy_record
+        assert all(path.read_bytes() == contents for path, contents in preserved.items())
+        assert dataset.imputation_paths("candidate")["cache_key"].exists()
 
     @pytest.mark.parametrize(
         "change",
@@ -573,7 +903,7 @@ class TestRunImputationCaching:
         cfg.imputation.method = "hyperimpute"
         dataset = make_canonical_dataset()
         run_imputation(cfg, dataset)
-        cache_path = dataset.data_dir / _CACHE_KEY_FILENAME
+        cache_path = dataset.imputation_paths("candidate")["cache_key"]
         record = json.loads(cache_path.read_text())
         change(record)
         cache_path.write_text(json.dumps(record))
@@ -595,7 +925,7 @@ class TestRunImputationCaching:
 
         run_imputation(cfg, dataset)
 
-        record = json.loads((dataset.data_dir / _CACHE_KEY_FILENAME).read_text())
+        record = json.loads(dataset.imputation_paths("candidate")["cache_key"].read_text())
         fit_state = record["fit_state"]
         assert fit_state["backend"] == "hyperimpute"
         assert fit_state["fit_roles"] == ["train"]
@@ -613,7 +943,7 @@ class TestRunImputationCaching:
         dataset = make_canonical_dataset()
         run_imputation(cfg, dataset)
 
-        cache_path = dataset.data_dir / _CACHE_KEY_FILENAME
+        cache_path = dataset.imputation_paths("candidate")["cache_key"]
         record = json.loads(cache_path.read_text())
         record["fit_state"]["categorical_columns"] = ["feature", "protected"]
         record["fit_state"]["state_fingerprint"] = metadata_fingerprint(record["fit_state"])
@@ -635,7 +965,7 @@ class TestRunImputationCaching:
         dataset = make_canonical_dataset()
         run_imputation(cfg, dataset)
 
-        cache_path = dataset.data_dir / _CACHE_KEY_FILENAME
+        cache_path = dataset.imputation_paths("candidate")["cache_key"]
         record = json.loads(cache_path.read_text())
         del record["fit_state"]
         cache_path.write_text(json.dumps(record))
@@ -659,7 +989,7 @@ class TestRunImputationCaching:
         dataset = make_canonical_dataset()
         run_imputation(cfg, dataset)
 
-        cache_path = dataset.data_dir / _CACHE_KEY_FILENAME
+        cache_path = dataset.imputation_paths("candidate")["cache_key"]
         record = json.loads(cache_path.read_text())
         if version is None:
             record["fit_state"].pop("fit_frame_fingerprint_version")

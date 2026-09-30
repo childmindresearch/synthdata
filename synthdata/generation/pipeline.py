@@ -26,6 +26,7 @@ from synthdata.data import (
     role_context_payload,
     semantic_context_digest,
     semantic_context_payload,
+    validate_final_imputation_lineage,
     validate_imputation_cache_lineage,
 )
 from synthdata.evaluation.metric_contracts import DEFAULT_METRIC_CONTRACT_REGISTRY
@@ -53,7 +54,7 @@ from synthdata.utils import (
 logger = get_logger(__name__)
 
 GENERATION_CACHE_SCHEMA_VERSION = "generation-cache-v3"
-FINAL_REFIT_CACHE_SCHEMA_VERSION = "final-refit-v2"
+FINAL_REFIT_CACHE_SCHEMA_VERSION = "final-refit-v3"
 
 
 def _structured_generator_metadata(value) -> dict | None:
@@ -357,23 +358,209 @@ def _file_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _final_imputation_lineage(cfg: Config, dataset: Dataset, fit_frame: pd.DataFrame) -> dict:
+    """Validate and describe final-phase imputation inputs for refit provenance."""
+    if not dataset.has_canonical_roles:
+        return {"phase": "legacy_two_role", "cache_key": None}
+
+    paths = dataset.imputation_paths("final")
+    cache_path = paths["cache_key"]
+    artifact_path = paths["train_tuning_imputed"]
+    try:
+        cache_record = load_json(cache_path)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"Final refit requires readable final-imputation lineage at {cache_path}"
+        ) from exc
+    expected_cache_key = _cache_key_record(cfg, dataset, phase="final")["cache_key"]
+    validated_lineage = validate_final_imputation_lineage(dataset, expected_cache_key)
+    if not isinstance(cache_record, dict) or cache_record.get("cache_key") != expected_cache_key:
+        raise RuntimeError(
+            "Final refit imputation cache key does not match current dataset/config lineage"
+        )
+    if (
+        cache_record.get("phase") != "final"
+        or cache_record.get("fit_roles")
+        != [
+            "train",
+            "tuning",
+        ]
+        or cache_record.get("transform_roles") != ["train", "tuning", "final_holdout"]
+    ):
+        raise RuntimeError(
+            "Final refit imputation cache does not describe a final train+tuning fit"
+        )
+    if cache_record.get("fit_frame_fingerprint") != dataframe_fingerprint(
+        pd.concat([dataset.roles["train"], dataset.roles["tuning"]], axis=0)
+    ):
+        raise RuntimeError("Final refit imputation cache fit-frame fingerprint is stale")
+    try:
+        persisted_fit = pd.read_csv(artifact_path, low_memory=False)
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
+        raise RuntimeError(
+            f"Final refit train+tuning imputation artifact is unreadable at {artifact_path}"
+        ) from exc
+    persisted_fingerprint = dataframe_fingerprint(persisted_fit)
+    recorded_fingerprints = cache_record.get("imputed_frame_fingerprints")
+    if not isinstance(recorded_fingerprints, dict):
+        raise RuntimeError("Final refit imputation cache lacks artifact fingerprints")
+    if recorded_fingerprints.get("train_tuning") != persisted_fingerprint:
+        raise RuntimeError("Final refit train+tuning imputation artifact fingerprint is stale")
+    if validated_lineage["output_fingerprints"].get("train_tuning") != persisted_fingerprint:
+        raise RuntimeError("Final refit fit artifact differs from validated cache lineage")
+    try:
+        pd.testing.assert_frame_equal(
+            persisted_fit.reset_index(drop=True),
+            fit_frame.reset_index(drop=True),
+            check_dtype=False,
+        )
+    except AssertionError as exc:
+        raise RuntimeError(
+            "Final refit frame differs from the persisted final train+tuning imputation artifact"
+        ) from exc
+    return {
+        "phase": "final",
+        "cache_key": expected_cache_key,
+        "cache_path": str(cache_path),
+        "train_tuning_artifact": str(artifact_path),
+        "train_tuning_fingerprint": persisted_fingerprint,
+        "final_holdout_fingerprint": validated_lineage["output_fingerprints"]["final_holdout"],
+    }
+
+
+def _validate_candidate_final_refit_pair(
+    cfg: Config, candidate_dataset: Dataset, final_dataset: Dataset
+) -> tuple[dict, dict]:
+    """Validate candidate HPO context and final refit Dataset share source lineage."""
+    if candidate_dataset is final_dataset:
+        raise ValueError("Candidate and final imputation phases require separate Dataset objects")
+    candidate_dataset.require_canonical_roles("final model refit candidate context")
+    final_dataset.require_canonical_roles("final model refit")
+    if candidate_dataset.final_imputation_lineage is not None:
+        raise ValueError("Candidate Dataset cannot carry final-phase imputation outputs")
+    if final_dataset.candidate_imputation_lineage is not None:
+        raise ValueError("Final Dataset cannot carry candidate-phase imputation outputs")
+    identity_fields = (
+        "name",
+        "version",
+        "source_fingerprint",
+        "full_fingerprint",
+        "assignment_fingerprint",
+        "assignment_policy_fingerprint",
+        "identity_fingerprint",
+        "variable_schema_fingerprint",
+        "semantic_fingerprint",
+        "role_fingerprints",
+    )
+    mismatches = {
+        field: (getattr(candidate_dataset, field), getattr(final_dataset, field))
+        for field in identity_fields
+        if getattr(candidate_dataset, field) != getattr(final_dataset, field)
+    }
+    if mismatches:
+        raise ValueError(f"Candidate and final Dataset lineage differs: {mismatches}")
+
+    candidate_record = _cache_key_record(cfg, candidate_dataset, phase="candidate")
+    validate_imputation_cache_lineage(
+        candidate_dataset,
+        candidate_record,
+        required=True,
+        require_attached_proof=True,
+    )
+    final_record = _cache_key_record(cfg, final_dataset, phase="final")
+    final_lineage = validate_final_imputation_lineage(final_dataset, final_record["cache_key"])
+    candidate_lineage = candidate_dataset.candidate_imputation_lineage
+    if not isinstance(candidate_lineage, dict):
+        raise RuntimeError("Selected-model refit requires validated candidate imputation proof")
+    return candidate_lineage, final_lineage
+
+
 def refit_selected_model(
     cfg: Config,
     dataset: Dataset,
     model_name: str,
     output_dir: str | Path | None = None,
+    *,
+    imputation_phase: str = "final",
+    candidate_dataset: Dataset | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """Refit the selected model using validated final-imputed train+tuning roles."""
+    if imputation_phase != "final":
+        raise ValueError(
+            "refit_selected_model requires imputation_phase='final'; "
+            "use refit_candidate_model for explicit candidate-phase refits"
+        )
+    candidate = candidate_dataset
+    if candidate is None:
+        raise ValueError("Selected-model refit requires its candidate_dataset HPO context")
+    candidate_lineage, _ = _validate_candidate_final_refit_pair(cfg, candidate, dataset)
+    return _refit_model(
+        cfg,
+        dataset,
+        model_name,
+        output_dir,
+        imputation_phase="final",
+        candidate_dataset=candidate,
+        candidate_lineage=candidate_lineage,
+    )
+
+
+def refit_candidate_model(
+    cfg: Config,
+    dataset: Dataset,
+    model_name: str,
+    output_dir: str | Path | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """Explicitly refit a candidate-phase model for non-release workflows."""
+    dataset.require_canonical_roles("candidate model refit")
+    validate_imputation_cache_lineage(
+        dataset,
+        _cache_key_record(cfg, dataset, phase="candidate"),
+        required=True,
+        require_attached_proof=True,
+    )
+    candidate_lineage = dataset.candidate_imputation_lineage
+    if not isinstance(candidate_lineage, dict):
+        raise RuntimeError("Candidate model refit requires validated candidate imputation proof")
+    return _refit_model(
+        cfg,
+        dataset,
+        model_name,
+        output_dir,
+        imputation_phase="candidate",
+        candidate_dataset=dataset,
+        candidate_lineage=candidate_lineage,
+    )
+
+
+def _refit_model(
+    cfg: Config,
+    dataset: Dataset,
+    model_name: str,
+    output_dir: str | Path | None = None,
+    *,
+    imputation_phase: str,
+    candidate_dataset: Dataset,
+    candidate_lineage: dict,
 ) -> tuple[pd.DataFrame, dict]:
     """Refit one selected candidate using only canonical train and tuning roles.
 
     The returned metadata is persisted beside the synthetic CSV and is suitable
-    for inclusion in post-selection evidence. No final-holdout frame is read by
-    this function, so the refit cache key cannot depend on final-holdout values.
+    for inclusion in post-selection evidence. Final-holdout lineage is validated,
+    but the holdout frame is never included in the generator fit.
     """
     dataset.require_canonical_roles("final model refit")
+    if imputation_phase not in {"candidate", "final"}:
+        raise ValueError(f"Unsupported refit imputation phase: {imputation_phase!r}")
+    candidate_dataset.require_canonical_roles("final model refit candidate context")
     gen_cfg = cfg.generation
     output_root = ensure_dir(output_dir or Path(gen_cfg.output_dir) / "final_refit")
-    candidate_context = role_context_payload(dataset, ("train", "tuning"))
-    candidate_context_digest = role_context_fingerprint(dataset, ("train", "tuning"))
+    candidate_context = role_context_payload(candidate_dataset, ("train", "tuning"))
+    candidate_context_digest = role_context_fingerprint(candidate_dataset, ("train", "tuning"))
+    candidate_semantic_context = semantic_context_payload(
+        candidate_dataset,
+        classification_score=cfg.evaluation.synthcity.classification_score,
+    )
     refit_semantic_context = semantic_context_payload(
         dataset,
         classification_score=cfg.evaluation.synthcity.classification_score,
@@ -387,18 +574,18 @@ def refit_selected_model(
     imputed_fit_frame = _combine_canonical_roles(dataset, imputed=True)
     stage_a_contract = _build_stage_a_contract(
         cfg,
-        dataset,
-        _role_frame(dataset, "train", imputed=True),
+        candidate_dataset,
+        _role_frame(candidate_dataset, "train", imputed=True),
     )
     hpo_context = _build_hpo_context(
         cfg,
-        dataset,
+        candidate_dataset,
         task_type=task_type,
         role_context=candidate_context,
         role_context_digest=candidate_context_digest,
         stage_a_contract=stage_a_contract,
         device=device,
-        semantic_context=refit_semantic_context,
+        semantic_context=candidate_semantic_context,
     )
     raw_role_hashes = {
         role: dataframe_fingerprint(_required_role_frame(dataset, role, imputed=False))
@@ -408,6 +595,11 @@ def refit_selected_model(
         role: dataframe_fingerprint(_required_role_frame(dataset, role, imputed=True))
         for role in ("train", "tuning")
     }
+    final_imputation_lineage = (
+        _final_imputation_lineage(cfg, dataset, imputed_fit_frame)
+        if imputation_phase == "final"
+        else {"phase": "candidate", "cache_key": None}
+    )
 
     backend = None
     fit_frame = imputed_fit_frame
@@ -459,7 +651,9 @@ def refit_selected_model(
             )
         tpfn.validate_tabpfn_target(dataset.target_column, dataset.target_is_categorical)
         backend = "tabpfn"
-        fit_frame = imputed_fit_frame if use_imputed else raw_fit_frame
+        # Final refit always uses the post-selection imputed train+tuning frame,
+        # including candidates whose search variant used raw training values.
+        fit_frame = imputed_fit_frame
         if variant == "standard":
 
             def build_final_model():
@@ -620,6 +814,9 @@ def refit_selected_model(
         "backend": backend,
         "columns": expected_columns,
         "fit_roles": ["train", "tuning"],
+        "imputation_phase": imputation_phase,
+        "imputation_lineage": final_imputation_lineage,
+        "candidate_imputation_lineage": candidate_lineage,
         "fit_frame_fingerprint": fit_frame_fingerprint,
         "fit_frame_fingerprints": {
             "raw": dataframe_fingerprint(raw_fit_frame),

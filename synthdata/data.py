@@ -58,6 +58,42 @@ def dataframe_fingerprint(df: pd.DataFrame) -> str:
     return digest.hexdigest()
 
 
+def _current_canonical_role_fingerprints(dataset, phase: str) -> dict[str, str]:
+    """Fingerprint live raw roles and reject drift from captured Dataset lineage."""
+    if set(dataset.roles) != set(ROLE_NAMES):
+        raise RuntimeError(
+            f"{phase} Dataset raw role keys do not match canonical roles "
+            f"(actual={list(dataset.roles)}, expected={list(ROLE_NAMES)})"
+        )
+    current = {role: dataframe_fingerprint(dataset.roles[role]) for role in ROLE_NAMES}
+    if dataset.role_fingerprints != current:
+        raise RuntimeError(f"{phase} Dataset raw role fingerprints differ from captured lineage")
+    return current
+
+
+_IMPUTATION_CACHE_METADATA_FIELDS = {
+    "cache_key",
+    "fit_state",
+    "imputed_row_counts",
+    "imputed_frame_fingerprints",
+}
+
+
+def _imputation_cache_payload(record: Mapping[str, object]) -> dict[str, object]:
+    """Return the cache-key payload, excluding fields added after key creation."""
+    return {
+        field: value
+        for field, value in record.items()
+        if field not in _IMPUTATION_CACHE_METADATA_FIELDS
+    }
+
+
+def _imputation_cache_payload_digest(payload: Mapping[str, object]) -> str:
+    """Hash cache payload using the canonical imputation cache-key encoding."""
+    encoded = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
 def file_fingerprint(path: str | Path) -> str:
     """Return the SHA-256 fingerprint of a source file's exact bytes."""
     digest = hashlib.sha256()
@@ -141,6 +177,7 @@ def validate_imputation_cache_lineage(
     cache_record: Mapping[str, object] | None,
     *,
     required: bool = False,
+    require_attached_proof: bool = False,
 ) -> None:
     """Fail closed when candidate imputation metadata is stale or incomplete.
 
@@ -155,9 +192,15 @@ def validate_imputation_cache_lineage(
                 "Candidate imputation lineage is unavailable; rerun imputation before generation."
             )
         return
-    if not dataset.has_canonical_roles:
+    if dataset.legacy_two_role:
         return
-    persisted_path = dataset.data_dir / IMPUTATION_CACHE_KEY_FILENAME
+    live_role_fingerprints = _current_canonical_role_fingerprints(dataset, "Candidate")
+    if require_attached_proof and not isinstance(dataset.candidate_imputation_lineage, dict):
+        raise RuntimeError(
+            "Candidate imputation cache proof is missing or unvalidated; "
+            "load or validate candidate imputation before this operation"
+        )
+    persisted_path = dataset.imputation_paths("candidate")["cache_key"]
     try:
         with persisted_path.open() as cache_file:
             persisted_record = json.load(cache_file)
@@ -176,8 +219,20 @@ def validate_imputation_cache_lineage(
             "Candidate imputation cache key does not match current dataset lineage; "
             "rerun imputation before generation."
         )
+    expected_payload = _imputation_cache_payload(cache_record)
+    persisted_payload = _imputation_cache_payload(persisted_record)
+    if (
+        _imputation_cache_payload_digest(persisted_payload) != expected_cache_key
+        or persisted_payload != expected_payload
+    ):
+        raise RuntimeError(
+            "Candidate imputation cache payload or digest does not match current dataset lineage; "
+            "rerun imputation before generation."
+        )
     expected = {
+        "dataset_name": dataset.name,
         "dataset_version": dataset.version,
+        "source_fingerprint": dataset.source_fingerprint,
         "variable_schema_fingerprint": dataset.variable_schema_fingerprint,
         "assignment_fingerprint": dataset.assignment_fingerprint,
         "assignment_policy_fingerprint": dataset.assignment_policy_fingerprint,
@@ -185,7 +240,7 @@ def validate_imputation_cache_lineage(
             "identity_fingerprint"
         ),
         "semantic_fingerprint": dataset.semantic_fingerprint,
-        "role_fingerprints": dataset.role_fingerprints,
+        "role_fingerprints": live_role_fingerprints,
     }
     mismatches = {
         field: (persisted_record.get(field), value)
@@ -198,7 +253,14 @@ def validate_imputation_cache_lineage(
             f"rerun imputation before generation (mismatches={mismatches})."
         )
     if (
-        persisted_record.get("cache_contract") == "canonical_roles_v1"
+        persisted_record.get("phase") != "candidate"
+        or persisted_record.get("fit_roles") != ["train"]
+        or persisted_record.get("transform_roles") != ["train", "tuning"]
+        or persisted_record.get("role_names") != list(ROLE_NAMES)
+    ):
+        raise RuntimeError("Candidate imputation cache does not describe candidate train-only fit")
+    if (
+        persisted_record.get("cache_contract") == "canonical_roles_v2"
         and persisted_record.get("imputation_method") == "hyperimpute"
         and not _canonical_candidate_fit_state_is_valid(dataset, persisted_record)
     ):
@@ -206,6 +268,86 @@ def validate_imputation_cache_lineage(
             "Candidate HyperImpute fit state is missing or invalid; "
             "rerun imputation before generation."
         )
+
+    artifacts = dataset.imputation_paths("candidate")
+    artifact_paths = {
+        "train": artifacts["train_imputed"],
+        "tuning": artifacts["tuning_imputed"],
+        "full_candidate_partial": artifacts["full_candidate_partial_imputed"],
+    }
+    expected_rows = {
+        "train": len(dataset.roles["train"]),
+        "tuning": len(dataset.roles["tuning"]),
+        "full_candidate_partial": len(dataset.full_df),
+    }
+    expected_role_rows = {role: len(dataset.roles[role]) for role in ROLE_NAMES}
+    if persisted_record.get("role_row_counts") != expected_role_rows:
+        raise RuntimeError("Candidate imputation cache role counts do not match live raw roles")
+    recorded_rows = persisted_record.get("imputed_row_counts")
+    recorded_fingerprints = persisted_record.get("imputed_frame_fingerprints")
+    if not isinstance(recorded_rows, dict) or not isinstance(recorded_fingerprints, dict):
+        raise RuntimeError("Candidate imputation cache lacks role artifact fingerprints")
+    actual_fingerprints: dict[str, str] = {}
+    artifact_frames: dict[str, pd.DataFrame] = {}
+    try:
+        for name, path in artifact_paths.items():
+            frame = pd.read_csv(path, low_memory=False)
+            artifact_frames[name] = frame
+            actual_fingerprints[name] = dataframe_fingerprint(frame)
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
+        raise RuntimeError("Candidate imputation role artifact is unreadable") from exc
+    invalid = {
+        name: (len(artifact_frames[name]), expected_rows[name])
+        for name in artifact_paths
+        if len(artifact_frames[name]) != expected_rows[name]
+        or artifact_frames[name].columns.tolist() != dataset.full_df.columns.tolist()
+    }
+    if invalid or recorded_rows != expected_rows or recorded_fingerprints != actual_fingerprints:
+        raise RuntimeError(
+            "Candidate imputation role artifact fingerprints do not match validated cache "
+            f"(invalid={invalid})"
+        )
+
+    if set(dataset.imputed_roles) != set(dataset.roles):
+        raise RuntimeError("Candidate imputed role keys do not match canonical raw roles")
+    live_role_fingerprints: dict[str, str] = {}
+    try:
+        for role in ("train", "tuning"):
+            live_frame = dataset.role_frame(role, imputed=True)
+            if live_frame is None:
+                raise RuntimeError(f"Candidate imputation requires populated {role} role")
+            pd.testing.assert_frame_equal(
+                artifact_frames[role].reset_index(drop=True),
+                live_frame.reset_index(drop=True),
+                check_dtype=False,
+            )
+            live_role_fingerprints[role] = dataframe_fingerprint(live_frame)
+    except AssertionError as exc:
+        raise RuntimeError(
+            "In-memory candidate imputed role differs from raw/cache phase contract"
+        ) from exc
+
+    record_fingerprint = hashlib.sha256(
+        json.dumps(persisted_record, sort_keys=True, default=str, separators=(",", ":")).encode()
+    ).hexdigest()
+    current_proof = dataset.candidate_imputation_lineage
+    if isinstance(current_proof, dict) and (
+        current_proof.get("phase") != "candidate"
+        or current_proof.get("cache_key") != expected_cache_key
+        or current_proof.get("cache_path") != str(persisted_path)
+        or current_proof.get("cache_record_fingerprint") != record_fingerprint
+        or current_proof.get("role_output_fingerprints") != live_role_fingerprints
+    ):
+        raise RuntimeError(
+            "Candidate imputation proof differs from current cache or in-memory roles"
+        )
+    dataset.candidate_imputation_lineage = {
+        "phase": "candidate",
+        "cache_key": expected_cache_key,
+        "cache_path": str(persisted_path),
+        "cache_record_fingerprint": record_fingerprint,
+        "role_output_fingerprints": live_role_fingerprints,
+    }
 
 
 def _canonical_candidate_fit_state_is_valid(dataset, cache_record: Mapping[str, object]) -> bool:
@@ -631,6 +773,10 @@ class Dataset:
     identity_fingerprint: str | None = None
     release_generalization: dict = dataclasses.field(default_factory=dict)
     role_context_fingerprint: str | None = None
+    #: Validated provenance for the currently attached final-phase cache.
+    final_imputation_lineage: dict | None = None
+    #: Validated provenance for the currently attached candidate-phase cache.
+    candidate_imputation_lineage: dict | None = None
 
     #: Numeric model-space frames populated once imputation has run
     #: (see synthdata.imputation).
@@ -725,6 +871,8 @@ class Dataset:
 
     def set_imputed_roles(self, frames: dict[str, pd.DataFrame]) -> None:
         """Attach role-specific imputed frames and derived compatibility views."""
+        self.final_imputation_lineage = None
+        self.candidate_imputation_lineage = None
         if set(frames) != set(self.roles):
             raise ValueError(
                 f"Imputed role keys {list(frames)} do not match raw role keys {list(self.roles)}"
@@ -835,6 +983,50 @@ class Dataset:
                 }
             )
         return paths
+
+    def imputation_paths(self, phase: str) -> dict[str, Path]:
+        """Return phase-scoped canonical imputation artifact paths.
+
+        Legacy two-role datasets retain their historical root-level layout.
+        Canonical artifact paths intentionally omit obsolete root-level cache
+        files so those files can never be mistaken for the phase cache.
+        """
+        if phase not in {"candidate", "final"}:
+            raise ValueError(f"Unsupported imputation cache phase: {phase!r}")
+        if not self.has_canonical_roles:
+            paths = self.paths()
+            return {
+                "full_imputed": paths["full_imputed"],
+                "train_imputed": paths["train_imputed"],
+                "test_imputed": paths["test_imputed"],
+                "cache_key": self.data_dir / IMPUTATION_CACHE_KEY_FILENAME,
+            }
+
+        phase_dir = self.data_dir / (
+            "imputation_initial" if phase == "candidate" else "imputation_final"
+        )
+        if phase == "candidate":
+            artifact_names = (
+                "train_imputed",
+                "tuning_imputed",
+                "train_imputed_decoded",
+                "tuning_imputed_decoded",
+                "full_candidate_partial_imputed",
+                "full_candidate_partial_imputed_decoded",
+            )
+        else:
+            artifact_names = (
+                "train_tuning_imputed",
+                "final_holdout_imputed",
+                "train_tuning_imputed_decoded",
+                "final_holdout_imputed_decoded",
+                "full_final_imputed",
+                "full_final_imputed_decoded",
+            )
+        return {
+            **{name: phase_dir / f"{name}.csv" for name in artifact_names},
+            "cache_key": phase_dir / IMPUTATION_CACHE_KEY_FILENAME,
+        }
 
     def attach_decoded_imputed_splits(self) -> None:
         """Attach decoded user-facing views for any loaded imputed roles."""
@@ -2334,10 +2526,423 @@ def load_dataset(cfg: Config) -> Dataset:
     return dataset
 
 
+def _load_canonical_imputed_splits(
+    dataset: Dataset,
+    expected_cache_key: str | None,
+    phase: str,
+    expected_cache_payload: Mapping[str, object] | None = None,
+) -> Dataset:
+    """Load one validated phase-specific canonical cache, if present."""
+    _current_canonical_role_fingerprints(dataset, phase.title())
+    # A Dataset can hold only one imputation phase at a time. Clear prior
+    # outputs before attempting another load; a cache miss must never leave
+    # stale phase data available under a newly requested phase.
+    dataset.final_imputation_lineage = None
+    dataset.imputed_roles = {}
+    dataset.full_imputed_df = None
+    dataset.full_imputed_decoded_df = None
+    dataset.decoded_roles = {}
+    dataset.train_imputed_df = None
+    dataset.test_imputed_df = None
+    artifacts = dataset.imputation_paths(phase)
+    if phase == "candidate":
+        paths = {
+            "train": artifacts["train_imputed"],
+            "tuning": artifacts["tuning_imputed"],
+            "full_candidate_partial": artifacts["full_candidate_partial_imputed"],
+        }
+        expected_rows = {
+            "train": len(dataset.roles["train"]),
+            "tuning": len(dataset.roles["tuning"]),
+            "full_candidate_partial": len(dataset.full_df),
+        }
+        fit_roles = ["train"]
+        transform_roles = ["train", "tuning"]
+        fit_frame = dataset.roles["train"]
+    else:
+        paths = {
+            "train_tuning": artifacts["train_tuning_imputed"],
+            "final_holdout": artifacts["final_holdout_imputed"],
+            "full_final": artifacts["full_final_imputed"],
+        }
+        expected_rows = {
+            "train_tuning": len(dataset.roles["train"]) + len(dataset.roles["tuning"]),
+            "final_holdout": len(dataset.roles["final_holdout"]),
+            "full_final": len(dataset.full_df),
+        }
+        fit_roles = ["train", "tuning"]
+        transform_roles = ["train", "tuning", "final_holdout"]
+        fit_frame = pd.concat([dataset.roles["train"], dataset.roles["tuning"]], axis=0)
+
+    provenance_path = artifacts["cache_key"]
+    if not all(path.exists() for path in paths.values()) or not provenance_path.exists():
+        return dataset
+    try:
+        with provenance_path.open() as source:
+            provenance = json.load(source)
+        frames = {name: pd.read_csv(path, low_memory=False) for name, path in paths.items()}
+    except (OSError, json.JSONDecodeError, pd.errors.ParserError) as exc:
+        logger.warning(
+            "Ignoring canonical imputation cache under %s because it could not be read (%s: %s)",
+            provenance_path.parent,
+            type(exc).__name__,
+            exc,
+        )
+        return dataset
+    if not isinstance(provenance, dict):
+        return dataset
+
+    fit_fingerprint = dataframe_fingerprint(fit_frame)
+    expected_provenance = {
+        "cache_contract": "canonical_roles_v2",
+        "dataset_name": dataset.name,
+        "dataset_version": dataset.version,
+        "source_fingerprint": dataset.source_fingerprint,
+        "full_fingerprint": dataframe_fingerprint(dataset.full_df),
+        "role_names": list(ROLE_NAMES),
+        "role_fingerprints": dataset.role_fingerprints,
+        "assignment_fingerprint": dataset.assignment_fingerprint,
+        "assignment_policy_fingerprint": dataset.assignment_policy_fingerprint,
+        "identity_fingerprint": dataset.role_metadata.get("identity", {}).get(
+            "identity_fingerprint"
+        ),
+        "variable_schema_fingerprint": dataset.variable_schema_fingerprint,
+        "semantic_fingerprint": dataset.semantic_fingerprint,
+        "phase": phase,
+        "fit_roles": fit_roles,
+        "transform_roles": transform_roles,
+        "fit_frame_fingerprint": fit_fingerprint,
+        "role_row_counts": {role: len(dataset.roles[role]) for role in ROLE_NAMES},
+    }
+    state = provenance.get("fit_state")
+    expected_state = {
+        "status": {"fitted", "not_required", "disabled"},
+        "backend": "hyperimpute",
+        "fit_roles": fit_roles,
+        "transform_roles": transform_roles,
+        "fit_frame_fingerprint": fit_fingerprint,
+        "fit_frame_fingerprint_version": "dataframe_fingerprint_v1",
+        "feature_columns": list(dataset.feature_columns),
+        "categorical_columns": list(dataset.categorical_columns),
+    }
+    mismatches: dict[str, tuple[object, object]] = {
+        field: (provenance.get(field), value)
+        for field, value in expected_provenance.items()
+        if provenance.get(field) != value
+    }
+    payload = _imputation_cache_payload(provenance)
+    stored_cache_key = provenance.get("cache_key")
+    if (
+        not isinstance(stored_cache_key, str)
+        or _imputation_cache_payload_digest(payload) != stored_cache_key
+    ):
+        mismatches["cache_key_digest"] = (
+            stored_cache_key,
+            _imputation_cache_payload_digest(payload),
+        )
+    if expected_cache_payload is not None and payload != dict(expected_cache_payload):
+        mismatches["cache_payload"] = (payload, dict(expected_cache_payload))
+    if expected_cache_key is not None and provenance.get("cache_key") != expected_cache_key:
+        mismatches["cache_key"] = (provenance.get("cache_key"), expected_cache_key)
+    if not isinstance(state, dict):
+        mismatches["fit_state"] = (state, expected_state)
+    else:
+        mismatches.update(
+            {
+                f"fit_state.{field}": (state.get(field), value)
+                for field, value in expected_state.items()
+                if (
+                    state.get(field) not in value
+                    if field == "status"
+                    else state.get(field) != value
+                )
+            }
+        )
+        from synthdata.imputation.hyperimpute_backend import metadata_fingerprint
+
+        if state.get("state_fingerprint") != metadata_fingerprint(state):
+            mismatches["fit_state.state_fingerprint"] = (
+                state.get("state_fingerprint"),
+                metadata_fingerprint(state),
+            )
+    if mismatches:
+        logger.warning(
+            "Ignoring stale canonical imputation cache under %s: %s",
+            provenance_path.parent,
+            mismatches,
+        )
+        return dataset
+
+    recorded_rows = provenance.get("imputed_row_counts")
+    recorded_fingerprints = provenance.get("imputed_frame_fingerprints")
+    invalid_frames = {
+        name: {"rows": len(frame), "expected_rows": expected_rows[name]}
+        for name, frame in frames.items()
+        if len(frame) != expected_rows[name]
+        or frame.columns.tolist() != dataset.full_df.columns.tolist()
+    }
+    if invalid_frames or recorded_rows != expected_rows:
+        logger.warning(
+            "Ignoring canonical imputation cache under %s because row counts/columns are stale: "
+            "frames=%s, recorded=%s, expected=%s",
+            provenance_path.parent,
+            invalid_frames,
+            recorded_rows,
+            expected_rows,
+        )
+        return dataset
+    actual_fingerprints = {name: dataframe_fingerprint(frame) for name, frame in frames.items()}
+    if recorded_fingerprints != actual_fingerprints:
+        logger.warning(
+            "Ignoring canonical imputation cache under %s because artifact fingerprints differ",
+            provenance_path.parent,
+        )
+        return dataset
+
+    if phase == "candidate":
+        role_frames = {
+            "train": frames["train"],
+            "tuning": frames["tuning"],
+            "final_holdout": dataset.roles["final_holdout"].copy(),
+        }
+        aggregate = frames["full_candidate_partial"]
+    else:
+        combined = frames["train_tuning"]
+        n_train = len(dataset.roles["train"])
+        role_frames = {
+            "train": combined.iloc[:n_train].reset_index(drop=True),
+            "tuning": combined.iloc[n_train:].reset_index(drop=True),
+            "final_holdout": frames["final_holdout"],
+        }
+        aggregate = frames["full_final"]
+    dataset.set_imputed_roles(role_frames)
+    constructed_aggregate = dataset.full_imputed_df
+    if constructed_aggregate is None:
+        raise RuntimeError("Canonical imputation role attachment did not build a full aggregate")
+    try:
+        pd.testing.assert_frame_equal(
+            aggregate.reset_index(drop=True),
+            constructed_aggregate.reset_index(drop=True),
+            check_dtype=False,
+        )
+    except AssertionError as exc:
+        logger.warning(
+            "Ignoring canonical imputation cache under %s because aggregate order/content differs: %s",
+            provenance_path.parent,
+            exc,
+        )
+        dataset.imputed_roles = {}
+        dataset.full_imputed_df = None
+        dataset.full_imputed_decoded_df = None
+        dataset.decoded_roles = {}
+        return dataset
+    dataset.full_imputed_df = aggregate
+    dataset.attach_decoded_imputed_splits()
+    if phase == "final":
+        dataset.final_imputation_lineage = {
+            "phase": "final",
+            "cache_key": provenance["cache_key"],
+            "cache_path": str(provenance_path),
+            "cache_record_fingerprint": hashlib.sha256(
+                json.dumps(provenance, sort_keys=True, default=str, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "cache_payload": payload,
+            "role_fingerprints": dict(dataset.role_fingerprints),
+            "assignment_fingerprint": dataset.assignment_fingerprint,
+            "source_fingerprint": dataset.source_fingerprint,
+            "full_fingerprint": dataframe_fingerprint(dataset.full_df),
+            "output_fingerprints": actual_fingerprints,
+            "role_output_fingerprints": {
+                role: dataframe_fingerprint(dataset.imputed_roles[role]) for role in ROLE_NAMES
+            },
+        }
+    else:
+        dataset.candidate_imputation_lineage = {
+            "phase": "candidate",
+            "cache_key": provenance["cache_key"],
+            "cache_path": str(provenance_path),
+            "cache_record_fingerprint": hashlib.sha256(
+                json.dumps(provenance, sort_keys=True, default=str, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "role_output_fingerprints": {
+                role: dataframe_fingerprint(dataset.imputed_roles[role])
+                for role in ("train", "tuning")
+            },
+        }
+    return dataset
+
+
+def validate_final_imputation_lineage(
+    dataset: Dataset, expected_cache_key: str | None = None
+) -> dict:
+    """Validate attached final-phase cache proof against artifacts and live frames.
+
+    The cache loader creates the proof only after validating cache metadata and
+    all persisted outputs. This boundary check then detects stale sidecars,
+    altered in-memory roles, or a Dataset whose raw role lineage changed.
+    """
+    dataset.require_canonical_roles("final-phase imputation lineage")
+    live_role_fingerprints = _current_canonical_role_fingerprints(dataset, "Final")
+    proof = dataset.final_imputation_lineage
+    if not isinstance(proof, dict) or proof.get("phase") != "final":
+        raise RuntimeError(
+            "Canonical final-phase operation requires a validated final-imputation cache proof"
+        )
+
+    artifacts = dataset.imputation_paths("final")
+    cache_path = artifacts["cache_key"]
+    if proof.get("cache_path") != str(cache_path):
+        raise RuntimeError("Final imputation lineage cache path does not match Dataset phase")
+    try:
+        with cache_path.open() as cache_file:
+            record = json.load(cache_file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Final imputation lineage is unreadable at {cache_path}") from exc
+    if not isinstance(record, dict):
+        raise RuntimeError("Final imputation cache record must be a JSON object")
+    cache_payload = _imputation_cache_payload(record)
+    computed_cache_key = _imputation_cache_payload_digest(cache_payload)
+    record_cache_key = record.get("cache_key")
+    if not isinstance(record_cache_key, str) or record_cache_key != computed_cache_key:
+        raise RuntimeError(
+            "Final imputation cache record differs from validated Dataset lineage: "
+            "payload digest does not match stored cache key"
+        )
+    record_fingerprint = hashlib.sha256(
+        json.dumps(record, sort_keys=True, default=str, separators=(",", ":")).encode()
+    ).hexdigest()
+    if proof.get("cache_record_fingerprint") != record_fingerprint:
+        raise RuntimeError("Final imputation cache record differs from validated Dataset lineage")
+
+    cache_key = proof.get("cache_key")
+    if (
+        not isinstance(cache_key, str)
+        or record.get("cache_key") != cache_key
+        or (expected_cache_key is not None and cache_key != expected_cache_key)
+    ):
+        raise RuntimeError(
+            "Final imputation cache payload digest/key does not match validated Dataset lineage"
+        )
+    if proof.get("cache_payload") != cache_payload:
+        raise RuntimeError("Final imputation cache payload differs from validated Dataset lineage")
+    if (
+        record.get("phase") != "final"
+        or record.get("fit_roles") != ["train", "tuning"]
+        or record.get("transform_roles") != list(ROLE_NAMES)
+    ):
+        raise RuntimeError("Final imputation cache does not describe final train+tuning lineage")
+
+    current_fit = pd.concat([dataset.roles["train"], dataset.roles["tuning"]], axis=0)
+    expected_record_fields = {
+        "cache_contract": "canonical_roles_v2",
+        "dataset_name": dataset.name,
+        "dataset_version": dataset.version,
+        "source_fingerprint": dataset.source_fingerprint,
+        "full_fingerprint": dataframe_fingerprint(dataset.full_df),
+        "role_names": list(ROLE_NAMES),
+        "role_fingerprints": live_role_fingerprints,
+        "role_row_counts": {role: len(dataset.roles[role]) for role in ROLE_NAMES},
+        "assignment_fingerprint": dataset.assignment_fingerprint,
+        "assignment_policy_fingerprint": dataset.assignment_policy_fingerprint,
+        "identity_fingerprint": dataset.role_metadata.get("identity", {}).get(
+            "identity_fingerprint"
+        ),
+        "variable_schema_fingerprint": dataset.variable_schema_fingerprint,
+        "semantic_fingerprint": dataset.semantic_fingerprint,
+        "fit_frame_fingerprint": dataframe_fingerprint(current_fit),
+    }
+    mismatches = {
+        field: (record.get(field), expected)
+        for field, expected in expected_record_fields.items()
+        if record.get(field) != expected
+    }
+    if mismatches:
+        raise RuntimeError(f"Final imputation raw-role lineage is stale: {mismatches}")
+    if (
+        proof.get("role_fingerprints") != live_role_fingerprints
+        or proof.get("assignment_fingerprint") != dataset.assignment_fingerprint
+        or proof.get("source_fingerprint") != dataset.source_fingerprint
+        or proof.get("full_fingerprint") != dataframe_fingerprint(dataset.full_df)
+    ):
+        raise RuntimeError("Final imputation proof no longer matches Dataset raw-role lineage")
+
+    recorded_outputs = record.get("imputed_frame_fingerprints")
+    expected_output_rows = {
+        "train_tuning": len(dataset.roles["train"]) + len(dataset.roles["tuning"]),
+        "final_holdout": len(dataset.roles["final_holdout"]),
+        "full_final": len(dataset.full_df),
+    }
+    if (
+        not isinstance(recorded_outputs, dict)
+        or proof.get("output_fingerprints") != recorded_outputs
+        or set(recorded_outputs) != {"train_tuning", "final_holdout", "full_final"}
+        or record.get("imputed_row_counts") != expected_output_rows
+    ):
+        raise RuntimeError("Final imputation output fingerprints are missing or mismatched")
+    artifact_names = {
+        "train_tuning": "train_tuning_imputed",
+        "final_holdout": "final_holdout_imputed",
+        "full_final": "full_final_imputed",
+    }
+    artifact_frames: dict[str, pd.DataFrame] = {}
+    for name, path_key in artifact_names.items():
+        artifact_path = artifacts[path_key]
+        try:
+            frame = pd.read_csv(artifact_path, low_memory=False)
+        except (OSError, pd.errors.ParserError) as exc:
+            raise RuntimeError(
+                f"Final imputation artifact {name!r} is unreadable at {artifact_path}"
+            ) from exc
+        if (
+            len(frame) != expected_output_rows[name]
+            or frame.columns.tolist() != dataset.full_df.columns.tolist()
+            or dataframe_fingerprint(frame) != recorded_outputs[name]
+        ):
+            raise RuntimeError(f"Final imputation artifact fingerprint is stale for {name!r}")
+        artifact_frames[name] = frame
+
+    role_output_fingerprints = proof.get("role_output_fingerprints")
+    if (
+        not isinstance(role_output_fingerprints, dict)
+        or set(dataset.imputed_roles) != set(dataset.roles)
+        or set(role_output_fingerprints) != set(ROLE_NAMES)
+    ):
+        raise RuntimeError("Final imputation proof lacks role output fingerprints")
+    current_role_fingerprints = {
+        role: dataframe_fingerprint(dataset.imputed_roles.get(role, pd.DataFrame()))
+        for role in ROLE_NAMES
+    }
+    if role_output_fingerprints != current_role_fingerprints:
+        raise RuntimeError("In-memory final imputed role fingerprint differs from validated cache")
+
+    current_combined = pd.concat(
+        [dataset.imputed_roles["train"], dataset.imputed_roles["tuning"]], ignore_index=True
+    )
+    for role, artifact_name, current in (
+        ("train+tuning", "train_tuning", current_combined),
+        ("final_holdout", "final_holdout", dataset.imputed_roles["final_holdout"]),
+        ("full_final", "full_final", dataset.full_imputed_df),
+    ):
+        if current is None:
+            raise RuntimeError(f"Final imputation is missing in-memory {role} output")
+        try:
+            pd.testing.assert_frame_equal(
+                current.reset_index(drop=True),
+                artifact_frames[artifact_name].reset_index(drop=True),
+                check_dtype=False,
+            )
+        except AssertionError as exc:
+            raise RuntimeError(
+                f"In-memory final imputation {role} differs from its validated cache artifact"
+            ) from exc
+    return proof
+
+
 def load_imputed_splits(
     dataset: Dataset,
     expected_cache_key: str | None = None,
     phase: str = "candidate",
+    expected_cache_payload: Mapping[str, object] | None = None,
 ) -> Dataset:
     """Attach imputed role CSVs only when their provenance still matches.
 
@@ -2347,6 +2952,10 @@ def load_imputed_splits(
     """
     if phase not in {"candidate", "final"}:
         raise ValueError(f"Unsupported imputation cache phase: {phase!r}")
+    if dataset.has_canonical_roles:
+        return _load_canonical_imputed_splits(
+            dataset, expected_cache_key, phase, expected_cache_payload
+        )
     paths = dataset.paths()
     if dataset.has_canonical_roles and phase == "final":
         # Final refit artifacts must coexist with candidate artifacts. Keeping
