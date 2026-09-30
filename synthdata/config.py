@@ -11,6 +11,7 @@ or pass absolute paths).
 """
 
 import dataclasses
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -448,29 +449,61 @@ class LogDisparityConfig:
     protected_bins: list | None = None
 
 
-@dataclasses.dataclass
-class PrivacyPolicyConfig:
-    """Fixed release privacy thresholds and support requirements."""
+def _removed_setting_error(prefix: str, name: str) -> ValueError:
+    return ValueError(
+        f"{prefix}.{name} is no longer supported; remove this setting. "
+        "It was not consumed by evaluation; there is no replacement control."
+    )
 
-    k_required: int = 5
-    l_required: int = 2
+
+class _MigrationConfigMeta(type):
+    _config_prefix: str
+    _removed_fields: tuple[str, ...]
+
+    def __call__(cls, *args: Any, **kwargs: Any) -> Any:
+        for name in cls._removed_fields:
+            if name in kwargs:
+                raise _removed_setting_error(cls._config_prefix, name)
+        return super().__call__(*args, **kwargs)
+
+
+class _MigrationConfig(metaclass=_MigrationConfigMeta):
+    _config_prefix = ""
+    _removed_fields: tuple[str, ...] = ()
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in self._removed_fields:
+            raise _removed_setting_error(self._config_prefix, name)
+        super().__setattr__(name, value)
+
+
+@dataclasses.dataclass
+class PrivacyPolicyConfig(_MigrationConfig):
+    """Support requirements for release privacy screens, not formal guarantees."""
+
+    _config_prefix = "evaluation.privacy_policy"
+    _removed_fields = (
+        "k_required",
+        "l_required",
+        "mia_epsilon_repetitions",
+        "epsilon_excess_anchor",
+        "mia_advantage_anchor",
+        "attribute_disclosure_anchor",
+    )
+
     role_population_floor: int = 20
-    protected_slice_floor: int = 5
-    mia_epsilon_repetitions: int = 10
-    epsilon_excess_anchor: float = 0.10
-    mia_advantage_anchor: float = 0.10
-    attribute_disclosure_anchor: float = 0.20
+    protected_slice_floor: int = 1
 
 
 @dataclasses.dataclass
-class ScoringPolicyConfig:
-    """Fixed fairness/scoring anchors and validity thresholds."""
+class ScoringPolicyConfig(_MigrationConfig):
+    """Fairness anchors retained by evaluation scoring."""
+
+    _config_prefix = "evaluation.scoring_policy"
+    _removed_fields = ("bh_alpha", "practical_log_disparity_floor", "valid_comparison_fraction")
 
     equalized_odds_gap_anchor: float = 0.10
     worst_absolute_log_disparity_anchor: float = 0.69314718056
-    bh_alpha: float = 0.05
-    practical_log_disparity_floor: float = 0.22314355131
-    valid_comparison_fraction: float = 0.80
 
 
 @dataclasses.dataclass
@@ -543,7 +576,10 @@ class SynthEvalExecutionConfig:
 
 
 @dataclasses.dataclass
-class EvaluationConfig:
+class EvaluationConfig(_MigrationConfig):
+    _config_prefix = "evaluation"
+    _removed_fields = ("rank_weights",)
+
     #: Base artifact root. Runtime stage paths are versioned under
     #: ``<output_dir>/<data.version or 'unversioned'>/<experiment-id>/``.
     output_dir: str = "output/dataset/evaluation"
@@ -572,17 +608,6 @@ class EvaluationConfig:
         default_factory=SynthEvalExecutionConfig
     )
 
-    #: Per-"type" (utility/privacy/fairness) weight applied when rolling up
-    #: type-level ranks into the overall rank (see
-    #: synthdata.evaluation.combine.build_combined_table). Keys must be
-    #: exactly {"utility","privacy","fairness"}; values must be non-negative.
-    #: Default is equal weight -- ``privacy_gate`` (pass/fail) below is this
-    #: project's primary safeguard for sensitive data, not this weight; raise
-    #: "privacy" here too if you also want privacy to influence relative
-    #: ranking among gate-passing models.
-    rank_weights: dict = dataclasses.field(
-        default_factory=lambda: {"utility": 1.0, "privacy": 1.0, "fairness": 1.0}
-    )
     privacy_gate: PrivacyGateConfig = dataclasses.field(default_factory=PrivacyGateConfig)
     privacy_policy: PrivacyPolicyConfig = dataclasses.field(default_factory=PrivacyPolicyConfig)
     scoring_policy: ScoringPolicyConfig = dataclasses.field(default_factory=ScoringPolicyConfig)
@@ -685,6 +710,8 @@ def _from_dict(cls, data: dict | None):
     field_types = {f.name: f.type for f in dataclasses.fields(cls)}
     kwargs = {}
     for key, value in data.items():
+        if issubclass(cls, _MigrationConfig) and key in cls._removed_fields:
+            raise _removed_setting_error(cls._config_prefix, key)
         if key not in field_types:
             raise ValueError(
                 f"Unknown config key '{key}' for {cls.__name__}. Valid keys: {sorted(field_types)}"
@@ -796,6 +823,20 @@ def _validate_policy_config(cfg: Any) -> None:
     """Validate canonical policy values and named release transformations."""
     privacy = cfg.evaluation.privacy_policy
     scoring = cfg.evaluation.scoring_policy
+    for owner, expected_cls in (
+        (cfg.evaluation, EvaluationConfig),
+        (privacy, PrivacyPolicyConfig),
+        (scoring, ScoringPolicyConfig),
+    ):
+        if isinstance(owner, dict):
+            for name in expected_cls._removed_fields:
+                if name in owner:
+                    raise _removed_setting_error(expected_cls._config_prefix, name)
+        if not isinstance(owner, expected_cls):
+            raise ValueError(f"{expected_cls._config_prefix} must be {expected_cls.__name__}")
+        for name in expected_cls._removed_fields:
+            if hasattr(owner, name):
+                raise _removed_setting_error(expected_cls._config_prefix, name)
     if cfg.data.canonical:
         provided = getattr(cfg, "_provided_paths", None)
         if provided is None:
@@ -814,14 +855,8 @@ def _validate_policy_config(cfg: Any) -> None:
             required.update(
                 f"evaluation.privacy_policy.{name}"
                 for name in (
-                    "k_required",
-                    "l_required",
                     "role_population_floor",
                     "protected_slice_floor",
-                    "mia_epsilon_repetitions",
-                    "epsilon_excess_anchor",
-                    "mia_advantage_anchor",
-                    "attribute_disclosure_anchor",
                 )
             )
             required.update(
@@ -829,9 +864,6 @@ def _validate_policy_config(cfg: Any) -> None:
                 for name in (
                     "equalized_odds_gap_anchor",
                     "worst_absolute_log_disparity_anchor",
-                    "bh_alpha",
-                    "practical_log_disparity_floor",
-                    "valid_comparison_fraction",
                 )
             )
             missing = sorted(path for path in required if path not in (provided or set()))
@@ -845,36 +877,24 @@ def _validate_policy_config(cfg: Any) -> None:
             "declare named column-based data.protected_attribute_bins instead"
         )
     for name in (
-        "k_required",
-        "l_required",
         "role_population_floor",
         "protected_slice_floor",
-        "mia_epsilon_repetitions",
     ):
         value = getattr(privacy, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"evaluation.privacy_policy.{name} must be a positive integer")
     for name in (
-        "epsilon_excess_anchor",
-        "mia_advantage_anchor",
-        "attribute_disclosure_anchor",
         "equalized_odds_gap_anchor",
         "worst_absolute_log_disparity_anchor",
-        "practical_log_disparity_floor",
     ):
-        value = getattr(privacy, name, None)
-        if value is None:
-            value = getattr(scoring, name, None)
-        if not isinstance(value, (int, float)) or value < 0:
-            owner = "privacy_policy" if hasattr(privacy, name) else "scoring_policy"
-            raise ValueError(f"evaluation.{owner}.{name} must be a non-negative number")
-    if not isinstance(scoring.bh_alpha, (int, float)) or not 0 < scoring.bh_alpha <= 1:
-        raise ValueError("evaluation.scoring_policy.bh_alpha must be in (0, 1]")
-    if (
-        not isinstance(scoring.valid_comparison_fraction, (int, float))
-        or not 0 < scoring.valid_comparison_fraction <= 1
-    ):
-        raise ValueError("evaluation.scoring_policy.valid_comparison_fraction must be in (0, 1]")
+        value = getattr(scoring, name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or value <= 0
+            or (isinstance(value, float) and not math.isfinite(value))
+        ):
+            raise ValueError(f"evaluation.scoring_policy.{name} must be a finite positive number")
     if cfg.data.canonical and cfg.generation.hpo.metric_config != {
         "canonical_objectives": ["tstr_macro_f1.v1"]
     }:
@@ -1492,21 +1512,6 @@ def _validate(cfg: Config) -> None:
         raise ValueError(
             "evaluation.synthcity.structural_min_rows_per_cluster must be a positive integer, "
             f"got {structural.structural_min_rows_per_cluster!r}"
-        )
-    rank_weight_keys = set(cfg.evaluation.rank_weights)
-    if rank_weight_keys != {"utility", "privacy", "fairness"}:
-        raise ValueError(
-            "evaluation.rank_weights must have exactly keys {'utility', 'privacy', 'fairness'}, "
-            f"got {sorted(rank_weight_keys)}"
-        )
-    negative_weights = {
-        k: v
-        for k, v in cfg.evaluation.rank_weights.items()
-        if not isinstance(v, (int, float)) or v < 0
-    }
-    if negative_weights:
-        raise ValueError(
-            f"evaluation.rank_weights values must be non-negative numbers, got {negative_weights}"
         )
     for metric, spec in cfg.evaluation.privacy_gate.thresholds.items():
         if not isinstance(spec, dict) or "bound" not in spec or "value" not in spec:

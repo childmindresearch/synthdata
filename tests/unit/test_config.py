@@ -19,7 +19,9 @@ from synthdata.config import (
     HPOConfig,
     ImputationConfig,
     PrivacyGateConfig,
+    PrivacyPolicyConfig,
     RefiDiffConfig,
+    ScoringPolicyConfig,
     StageAScreenConfig,
     SynthEvalExecutionConfig,
     _from_dict,
@@ -32,6 +34,94 @@ from synthdata.evaluation.release import transform_release_roles
 from synthdata.evaluation.syntheval_eval import resolve_model_workers
 
 pytestmark = pytest.mark.unit
+
+REMOVED_POLICY_SETTINGS = [
+    (EvaluationConfig, "", "rank_weights", {"utility": 1.0, "privacy": 1.0, "fairness": 1.0}),
+    (PrivacyPolicyConfig, "privacy_policy", "k_required", 5),
+    (PrivacyPolicyConfig, "privacy_policy", "l_required", 2),
+    (PrivacyPolicyConfig, "privacy_policy", "mia_epsilon_repetitions", 10),
+    (PrivacyPolicyConfig, "privacy_policy", "epsilon_excess_anchor", 0.10),
+    (PrivacyPolicyConfig, "privacy_policy", "mia_advantage_anchor", 0.10),
+    (PrivacyPolicyConfig, "privacy_policy", "attribute_disclosure_anchor", 0.20),
+    (ScoringPolicyConfig, "scoring_policy", "bh_alpha", 0.05),
+    (ScoringPolicyConfig, "scoring_policy", "practical_log_disparity_floor", 0.22314355131),
+    (ScoringPolicyConfig, "scoring_policy", "valid_comparison_fraction", 0.80),
+]
+
+
+@pytest.mark.parametrize("cls,block,field,value", REMOVED_POLICY_SETTINGS)
+@pytest.mark.parametrize(
+    "route", ["mapping", "yaml", "constructor", "assignment", "injected", "replacement"]
+)
+def test_removed_policy_settings_fail_with_migration_path(
+    tmp_path, cls, block, field, value, route
+):
+    path = ".".join(part for part in ("evaluation", block, field) if part)
+    settings = {field: value}
+    raw = {"data": {"source": "csv", "path": "x.csv"}, "evaluation": {}}
+    raw["evaluation"] = {block: settings} if block else settings
+    with pytest.raises(ValueError, match=path.replace(".", r"\.") + ".*remove"):
+        if route == "mapping":
+            _from_dict(Config, raw)
+        elif route == "yaml":
+            yaml_path = tmp_path / "removed.yaml"
+            yaml_path.write_text(yaml.safe_dump(raw))
+            load_config(yaml_path)
+        elif route == "constructor":
+            cls(**settings)
+        else:
+            cfg = Config(data=DataConfig(source="csv", path="x.csv"))
+            owner = getattr(cfg.evaluation, block) if block else cfg.evaluation
+            if route == "assignment":
+                setattr(owner, field, value)
+            elif route == "replacement" and block:
+                setattr(cfg.evaluation, block, settings)
+                _validate(cfg)
+            else:
+                owner.__dict__[field] = value
+                _validate(cfg)
+
+
+@pytest.mark.parametrize("cls,block,field,value", REMOVED_POLICY_SETTINGS)
+def test_removed_policy_settings_are_absent_from_schema(cls, block, field, value):
+    assert field not in {entry.name for entry in dataclasses.fields(cls)}
+    assert not hasattr(cls(), field)
+
+
+@pytest.mark.parametrize("field", ["role_population_floor", "protected_slice_floor"])
+@pytest.mark.parametrize("value", [True, False, None, 0, -1, 1.5, float("nan"), float("inf"), "2"])
+def test_retained_support_floors_reject_invalid_values(field, value):
+    cfg = Config(data=DataConfig(source="csv", path="x.csv"))
+    setattr(cfg.evaluation.privacy_policy, field, value)
+    with pytest.raises(ValueError, match=f"evaluation.privacy_policy.{field}"):
+        _validate(cfg)
+
+
+@pytest.mark.parametrize(
+    "field", ["equalized_odds_gap_anchor", "worst_absolute_log_disparity_anchor"]
+)
+@pytest.mark.parametrize(
+    "value", [True, False, None, 0, -1, float("nan"), float("inf"), -float("inf"), "2"]
+)
+def test_retained_fairness_anchors_reject_invalid_values(field, value):
+    cfg = Config(data=DataConfig(source="csv", path="x.csv"))
+    setattr(cfg.evaluation.scoring_policy, field, value)
+    with pytest.raises(ValueError, match=f"evaluation.scoring_policy.{field}"):
+        _validate(cfg)
+
+
+def test_retained_policy_nondefaults_load_and_validate(tmp_path):
+    raw = TestLoadConfig._canonical_yaml_data()
+    raw["evaluation"]["privacy_policy"] = {"role_population_floor": 30, "protected_slice_floor": 3}
+    raw["evaluation"]["scoring_policy"] = {
+        "equalized_odds_gap_anchor": 0.25,
+        "worst_absolute_log_disparity_anchor": 2,
+    }
+    path = tmp_path / "retained.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    cfg = load_config(path)
+    assert dataclasses.asdict(cfg.evaluation.privacy_policy) == raw["evaluation"]["privacy_policy"]
+    assert dataclasses.asdict(cfg.evaluation.scoring_policy) == raw["evaluation"]["scoring_policy"]
 
 
 @pytest.fixture
@@ -704,37 +794,21 @@ class TestValidate:
         with pytest.raises(AttributeError, match="binary_target"):
             evaluation.binary_target = {"enabled": True}
 
-    def test_rank_weights_default_passes(self):
-        cfg = self._base_valid()
-        _validate(cfg)  # should not raise
-
-    def test_rank_weights_missing_key_raises(self):
-        cfg = self._base_valid()
-        cfg.evaluation.rank_weights = {"utility": 1.0, "privacy": 1.0}
-        with pytest.raises(ValueError, match="rank_weights"):
-            _validate(cfg)
-
-    def test_rank_weights_extra_key_raises(self):
-        cfg = self._base_valid()
-        cfg.evaluation.rank_weights = {
-            "utility": 1.0,
-            "privacy": 1.0,
-            "fairness": 1.0,
-            "bogus": 1.0,
-        }
-        with pytest.raises(ValueError, match="rank_weights"):
-            _validate(cfg)
-
-    def test_rank_weights_negative_value_raises(self):
-        cfg = self._base_valid()
-        cfg.evaluation.rank_weights = {"utility": 1.0, "privacy": -0.5, "fairness": 1.0}
-        with pytest.raises(ValueError, match="rank_weights"):
-            _validate(cfg)
-
-    def test_rank_weights_zero_is_allowed(self):
-        cfg = self._base_valid()
-        cfg.evaluation.rank_weights = {"utility": 1.0, "privacy": 0.0, "fairness": 1.0}
-        _validate(cfg)  # should not raise
+    @pytest.mark.parametrize(
+        "weights",
+        [
+            {"utility": 1.0, "privacy": 1.0, "fairness": 1.0},
+            {"utility": 1.0, "privacy": 1.0},
+            {"utility": 1.0, "privacy": 1.0, "fairness": 1.0, "bogus": 1.0},
+            {"utility": 1.0, "privacy": -0.5, "fairness": 1.0},
+            {"utility": 1.0, "privacy": 0.0, "fairness": 1.0},
+            {},
+            None,
+        ],
+    )
+    def test_removed_rank_weights_are_rejected(self, weights):
+        with pytest.raises(ValueError, match=r"evaluation\.rank_weights.*remove"):
+            _from_dict(Config, {"evaluation": {"rank_weights": weights}})
 
     def test_privacy_gate_default_thresholds_pass(self):
         cfg = self._base_valid()
@@ -795,8 +869,8 @@ class TestLoadConfig:
     def test_canonical_policy_settings_are_populated(self):
         cfg = self._canonical_fixture()
         assert cfg.data.patient_id_column == "patient_id"
-        assert cfg.evaluation.privacy_policy.k_required == 5
-        assert cfg.evaluation.privacy_policy.mia_epsilon_repetitions == 10
+        assert cfg.evaluation.privacy_policy.role_population_floor == 20
+        assert cfg.evaluation.privacy_policy.protected_slice_floor == 1
         assert cfg.data.split is not None
         assert cfg.data.split.patient_id_column is None
 
@@ -910,14 +984,14 @@ class TestLoadConfig:
 
     def test_canonical_invalid_support_setting_is_rejected(self):
         cfg = self._canonical_fixture()
-        cfg.evaluation.privacy_policy.k_required = 0
-        with pytest.raises(ValueError, match="k_required"):
+        cfg.evaluation.privacy_policy.role_population_floor = 0
+        with pytest.raises(ValueError, match="role_population_floor"):
             _validate(cfg)
 
     def test_canonical_missing_anchor_is_rejected(self):
         cfg = self._canonical_fixture()
-        cfg.evaluation.scoring_policy.bh_alpha = cast(float, None)
-        with pytest.raises(ValueError, match="bh_alpha"):
+        cfg.evaluation.scoring_policy.equalized_odds_gap_anchor = cast(float, None)
+        with pytest.raises(ValueError, match="equalized_odds_gap_anchor"):
             _validate(cfg)
 
     def test_legacy_profile_cannot_declare_canonical_patient_id(self):
@@ -984,19 +1058,10 @@ class TestLoadConfig:
     @pytest.mark.parametrize(
         "block, field",
         [
-            ("privacy_policy", "k_required"),
-            ("privacy_policy", "l_required"),
             ("privacy_policy", "role_population_floor"),
             ("privacy_policy", "protected_slice_floor"),
-            ("privacy_policy", "mia_epsilon_repetitions"),
-            ("privacy_policy", "epsilon_excess_anchor"),
-            ("privacy_policy", "mia_advantage_anchor"),
-            ("privacy_policy", "attribute_disclosure_anchor"),
             ("scoring_policy", "equalized_odds_gap_anchor"),
             ("scoring_policy", "worst_absolute_log_disparity_anchor"),
-            ("scoring_policy", "bh_alpha"),
-            ("scoring_policy", "practical_log_disparity_floor"),
-            ("scoring_policy", "valid_comparison_fraction"),
         ],
     )
     def test_canonical_omitted_policy_value_fails_closed(self, tmp_path, block, field):

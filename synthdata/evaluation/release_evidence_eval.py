@@ -73,6 +73,9 @@ _SAFE_SUPPORT_KEYS = frozenset(
         "slices",
         "target_classes",
         "protected_domains",
+        "role_population_floor",
+        "protected_slice_floor",
+        "protected_slices",
     }
 )
 
@@ -147,8 +150,23 @@ def _sanitize_blocked_metadata(metadata: Mapping[str, object]) -> dict[str, obje
                             support_key == "state"
                             and support_value in _NON_SUCCESS_STATUSES | {"succeeded"}
                         )
+                        or (
+                            support_key in {"role_population_floor", "protected_slice_floor"}
+                            and isinstance(support_value, int)
+                            and not isinstance(support_value, bool)
+                            and 1 <= support_value <= 1_000_000_000
+                        )
                     ):
                         support[support_key] = support_value
+                    elif support_key == "protected_slices" and isinstance(support_value, Mapping):
+                        floor = support_value.get("floor")
+                        if (
+                            support_value.get("state") == "not_applicable"
+                            and isinstance(floor, int)
+                            and not isinstance(floor, bool)
+                            and 1 <= floor <= 1_000_000_000
+                        ):
+                            support[support_key] = {"state": "not_applicable", "floor": floor}
                 sanitized[key] = support
         elif key in {"protocol_version", "producer_protocol_version"}:
             if isinstance(value, str) and value in _SAFE_PROTOCOL_VERSIONS:
@@ -203,6 +221,7 @@ def _release_evidence_record(
     )
     if key == "equalized_odds.final.v1" and details.get("support_slices"):
         support = {
+            **dict(support),
             "state": details.get("support_state", "indeterminate"),
             "slices": details["support_slices"],
             "target_classes": details.get("target_classes", ()),
@@ -277,6 +296,8 @@ def run_release_evidence_evaluation(
     role_hashes: Mapping[str, str],
     k_required: int = 5,
     l_required: int = 2,
+    role_population_floor: int = 20,
+    protected_slice_floor: int = 1,
     tstr_results: Mapping[str, object] | None = None,
     seed: int = 0,
     release_form_inputs: tuple[pd.DataFrame, Mapping[str, pd.DataFrame], Mapping[str, object]]
@@ -287,6 +308,10 @@ def run_release_evidence_evaluation(
     Missing release artifacts remain explicit blocked observations. Candidate
     callers use ``tuning``; final callers use ``final_holdout``. Equalized odds
     is never emitted outside ``final_audit``.
+    Population support is checked on both synthetic and reference rows.
+    Protected-slice support is not applicable to privacy (no protected
+    population assessed); final TSTR owns the minimum total, actual-positive,
+    and actual-negative rows per protected group/OVR class view.
     """
     if release_form_inputs is not None and evaluation_role == "final_holdout":
         _, released_roles, _ = release_form_inputs
@@ -307,6 +332,14 @@ def run_release_evidence_evaluation(
     results: dict[str, list[MetricObservation]] = {}
     for name, frame in synthetic_datasets.items():
         observations: list[MetricObservation] = []
+        floor_support = {
+            "role_population_floor": role_population_floor,
+            "protected_slice_floor": protected_slice_floor,
+        }
+        privacy_support = {
+            **floor_support,
+            "protected_slices": {"state": "not_applicable", "floor": protected_slice_floor},
+        }
         try:
             if release_form_inputs is None:
                 released_synthetic, released, _metadata = transform_release_roles(
@@ -327,11 +360,14 @@ def run_release_evidence_evaluation(
                 k_required=k_required,
                 l_required=l_required,
                 seed=seed,
+                role_population_floor=role_population_floor,
+                protected_slice_floor=protected_slice_floor,
             )
             release_status = release.get("status", "indeterminate")
             release_value = release.get("value")
             common_metadata = {
                 "support": {
+                    **floor_support,
                     "support_contract": "declared_support_v1",
                     "synthetic": len(released_synthetic),
                     "reference": len(released[evaluation_role]),
@@ -350,7 +386,11 @@ def run_release_evidence_evaluation(
                         if release.get("invalid_reasons")
                         else None
                     ),
-                    metadata={**release, **common_metadata},
+                    metadata={
+                        **release,
+                        **common_metadata,
+                        "support": {**common_metadata["support"], **privacy_support},
+                    },
                 )
             )
             representation = custom_eval.run_log_disparity_evaluation(
@@ -415,13 +455,19 @@ def run_release_evidence_evaluation(
                         evaluation_role=evaluation_role,
                         status="blocked",
                         reason="release_evidence_release_or_representation_error",
-                        metadata=_safe_exception_metadata(
-                            exc, "release_evidence_release_or_representation_error"
-                        ),
+                        metadata={
+                            **_safe_exception_metadata(
+                                exc, "release_evidence_release_or_representation_error"
+                            ),
+                            "support": privacy_support
+                            if key == "release_privacy.v1"
+                            else floor_support,
+                        },
                     )
                 )
         if evaluation_role == "final_holdout":
             tstr = (tstr_results or {}).get(name)
+            fairness_support = dict(floor_support)
             try:
                 if tstr is None:
                     raise ValueError("authoritative final TSTR result is unavailable")
@@ -453,6 +499,8 @@ def run_release_evidence_evaluation(
                 fairness = (
                     tstr_report.get("equalized_odds") if isinstance(tstr_report, Mapping) else None
                 )
+                if isinstance(fairness, Mapping) and isinstance(fairness.get("support"), Mapping):
+                    fairness_support.update(fairness["support"])
                 value = (
                     fairness.get("macro_valid_slice_score")
                     if isinstance(fairness, Mapping) and fairness.get("state") == "complete"
@@ -490,9 +538,10 @@ def run_release_evidence_evaluation(
                         metadata={
                             "tstr_report": tstr_report,
                             "prediction_artifact": prediction_artifact,
-                            "support": tstr_report.get("class_supports", {})
-                            if isinstance(tstr_report, Mapping)
-                            else {},
+                            "support": fairness_support,
+                            "support_policy": tstr_report["result_metadata"].get(
+                                "support_policy", {}
+                            ),
                             "support_state": fairness.get("state")
                             if isinstance(fairness, Mapping)
                             else "indeterminate",
@@ -555,6 +604,7 @@ def run_release_evidence_evaluation(
                                 "protected_population_identity"
                             ),
                             "fit_roles": tstr_report["result_metadata"].get("fit_roles"),
+                            "role_hashes": tstr_report["result_metadata"].get("role_hashes"),
                         },
                     )
                 )
@@ -568,9 +618,12 @@ def run_release_evidence_evaluation(
                         evaluation_role=evaluation_role,
                         status="blocked",
                         reason="release_evidence_final_fairness_error",
-                        metadata=_safe_exception_metadata(
-                            exc, "release_evidence_final_fairness_error"
-                        ),
+                        metadata={
+                            **_safe_exception_metadata(
+                                exc, "release_evidence_final_fairness_error"
+                            ),
+                            "support": fairness_support,
+                        },
                     )
                 )
         else:
@@ -583,7 +636,7 @@ def run_release_evidence_evaluation(
                     evaluation_role=evaluation_role,
                     status="blocked",
                     reason="Equalized odds requires evaluation_role=final_holdout",
-                    metadata={"execution_pass": "final_audit"},
+                    metadata={"execution_pass": "final_audit", "support": floor_support},
                 )
             )
         results[name] = observations

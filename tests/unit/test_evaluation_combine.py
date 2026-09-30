@@ -697,7 +697,7 @@ class TestBuildCombinedTable:
         assert combined.loc["model_a", ("__all__", "utility", "rank")] == pytest.approx(1.0)
         assert combined.loc["model_b", ("__all__", "utility", "rank")] == pytest.approx(0.0)
 
-    def test_incomplete_fixed_utility_is_indeterminate_regardless_of_rank_weights(self):
+    def test_incomplete_fixed_utility_is_indeterminate(self):
         synthcity_results = {
             "model_a": _dataframe(
                 {"mean": [1.0], "direction": ["maximize"]}, index=["privacy.identifiability_score"]
@@ -712,35 +712,27 @@ class TestBuildCombinedTable:
             None,
             {},
             model_names=["model_a", "model_b"],
-            rank_weights={"utility": 1.0, "privacy": 0.0, "fairness": 1.0},
         )
         assert combined[("__all__", "overall", "rank")].isna().all()
 
-    def test_rank_weights_asymmetric_changes_sort_order(self):
-        synthcity_results = {
-            "model_a": _dataframe(
-                {"mean": [1.0, 0.0], "direction": ["maximize", "maximize"]},
-                index=["stats.utility_metric", "privacy.identifiability_score"],
-            ),
-            "model_b": _dataframe(
-                {"mean": [0.0, 1.0], "direction": ["maximize", "maximize"]},
-                index=["stats.utility_metric", "privacy.identifiability_score"],
-            ),
-        }
-        combined = build_combined_table(
-            synthcity_results,
-            None,
-            None,
+    @pytest.mark.parametrize(
+        "weights",
+        [
+            {"utility": 1.0, "privacy": 1.0, "fairness": 1.0},
+            {"utility": 5.0, "privacy": 0.1, "fairness": 1.0},
             {},
-            model_names=["model_a", "model_b"],
-            rank_weights={"utility": 5.0, "privacy": 0.1, "fairness": 1.0},
-        )
-        # model_a wins on utility (weighted heavily); model_b wins on privacy
-        # (weighted lightly) -- utility-heavy weighting should make model_a
-        # rank first overall.
-        assert combined.index[0] == "model_a"
+            {"invalid": -1},
+        ],
+    )
+    def test_rank_weights_rejected_before_evaluation_work(self, weights, monkeypatch):
+        def unexpected_work(*args, **kwargs):
+            pytest.fail("Evaluation work started before rank_weights rejection")
 
-    def test_default_rank_weights_used_when_none_passed(self):
+        monkeypatch.setattr("synthdata.evaluation.combine._synthcity_frames", unexpected_work)
+        with pytest.raises(ValueError, match=r"evaluation\.rank_weights.*remove"):
+            build_combined_table({}, None, None, {}, model_names=[], rank_weights=weights)
+
+    def test_none_rank_weights_preserves_unweighted_behavior(self):
         synthcity_results = {
             "model_a": _dataframe(
                 {"mean": [0.9], "direction": ["maximize"]}, index=["stats.ks_test"]
@@ -750,6 +742,10 @@ class TestBuildCombinedTable:
             ),
         }
         combined = build_combined_table(
-            synthcity_results, None, None, {}, model_names=["model_a", "model_b"]
+            synthcity_results, None, None, {}, model_names=["model_a", "model_b"], rank_weights=None
         )
         assert combined.index[0] == "model_a"
+        omitted = build_combined_table(
+            synthcity_results, None, None, {}, model_names=["model_a", "model_b"]
+        )
+        pd.testing.assert_frame_equal(combined, omitted)

@@ -78,6 +78,8 @@ class TestResolveMetricConfig:
         stream = StringIO()
         monkeypatch.setattr(synthcity_eval.logger, "handlers", [logging.StreamHandler(stream)])
         monkeypatch.setattr(synthcity_eval.logger, "level", logging.DEBUG)
+        # setLevel invalidates cached isEnabledFor decisions from earlier tests.
+        synthcity_eval.logger.setLevel(logging.DEBUG)
         monkeypatch.setattr(synthcity_eval.logger, "propagate", False)
         with pytest.raises(ValueError):
             run_synthcity_metrics(
@@ -107,6 +109,7 @@ class TestResolveMetricConfig:
         stream = StringIO()
         monkeypatch.setattr(synthcity_eval.logger, "handlers", [logging.StreamHandler(stream)])
         monkeypatch.setattr(synthcity_eval.logger, "level", logging.DEBUG)
+        synthcity_eval.logger.setLevel(logging.DEBUG)
         monkeypatch.setattr(synthcity_eval.logger, "propagate", False)
 
         result = run_synthcity_metrics(
@@ -952,6 +955,41 @@ class TestResolveMetricConfig:
                 feature_types={"age": feature_type},
             )
 
+        assert workspaces[0] != workspaces[1]
+
+    @pytest.mark.parametrize("evaluation_role", ["tuning", "final_holdout"])
+    @pytest.mark.parametrize("sensitive", [["secret"], []])
+    def test_sensitive_roles_reach_native_loaders_and_cache_identity(
+        self, monkeypatch, tmp_path, evaluation_role, sensitive
+    ):
+        from synthcity.metrics import Metrics
+
+        workspaces = []
+        loader_roles = []
+
+        def fake_evaluate(*args, **kwargs):
+            workspaces.append(kwargs["workspace"])
+            loader_roles.append([list(loader.sensitive_features) for loader in args[:5]])
+            return pd.DataFrame()
+
+        monkeypatch.setattr(Metrics, "evaluate", staticmethod(fake_evaluate))
+        frame = pd.DataFrame(
+            {"protected": [0, 1, 0, 1], "secret": [1, 2, 3, 4], "target": [0, 1, 0, 1]}
+        )
+        for declaration in (sensitive, ["protected"]):
+            run_synthcity_metrics(
+                frame,
+                frame,
+                frame,
+                n_samples=4,
+                target_column="target",
+                sensitive_features=declaration,
+                metrics={},
+                workspace=tmp_path,
+                evaluation_role=evaluation_role,
+            )
+        assert loader_roles[0] == [sensitive] * 5
+        assert loader_roles[1] == [["protected"]] * 5
         assert workspaces[0] != workspaces[1]
 
     def test_run_metrics_retains_jensen_shannon_aggregation_metadata(self, tmp_path):

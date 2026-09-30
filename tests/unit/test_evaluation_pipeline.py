@@ -1315,6 +1315,13 @@ def test_selection_failure_persists_auditable_blocked_final_evidence(
     assert evidence["selected_model"] is None
     assert evidence["provenance_inventory"]["invalid_reasons"]
     assert evidence["provenance_inventory"]["selected_model_provenance"]["status"] == "not_selected"
+    policy = evidence["provenance_inventory"]["integration_policy"]
+    assert policy["version"] == "evaluation-integration-v1"
+    assert evidence["provenance_inventory"]["supports"]["effective"] == policy["support_floors"]
+    manifest = json.loads(Path(extras["artifact_manifest"]).read_text())
+    assert manifest["evaluation_attempt"]["integration_policy"] == policy
+    normalized_inventory = artifacts._normalize_final_provenance_inventory(evidence)
+    assert normalized_inventory["anchors"]["integration_policy"] == policy
 
 
 def test_multi_model_selection_does_not_rerank_on_final_holdout_evidence():
@@ -1336,7 +1343,8 @@ def test_multi_model_selection_does_not_rerank_on_final_holdout_evidence():
     assert selected == "model_a"
 
 
-def test_release_score_adapter_maps_successful_task12_aggregate_records():
+@pytest.mark.parametrize("legacy_metadata", [False, True])
+def test_release_score_adapter_maps_successful_task12_aggregate_records(legacy_metadata):
     role_hashes = {"train": "train", "tuning": "tuning", "final_holdout": "holdout"}
     common = {
         "producer": "task12-test",
@@ -1370,7 +1378,19 @@ def test_release_score_adapter_maps_successful_task12_aggregate_records():
             0.87,
             role_hashes=role_hashes,
             evaluation_role="final_holdout",
-            metadata={**common, "summary_stats": {"worst_abs_log_disparity": 0.12}},
+            metadata={
+                **common,
+                **(
+                    {
+                        "summary_stats": {
+                            "representation_safety": 0.13,
+                            "worst_abs_log_disparity": 0.12,
+                        }
+                    }
+                    if legacy_metadata
+                    else {"representation_safety": 0.13, "worst_abs_log_disparity": 0.12}
+                ),
+            },
         ),
         release_evidence_eval._release_evidence_record(
             "model_a",
@@ -1416,9 +1436,9 @@ def test_release_score_adapter_maps_successful_task12_aggregate_records():
         "S_attribute": 0.46,
     }
     assert {name: item["value"] for name, item in fairness.items()} == {
-        "S_representation": 0.87,
-        "S_worst_log_disparity": 0.12,
-        "S_EO": 0.78,
+        "S_representation": 0.13,
+        "worst_log_disparity": 0.12,
+        "eo": 0.78,
     }
     assert privacy["S_k"]["evidence"]["metadata"]["common_protocol_digest"] == "common-protocol"
     assert privacy["S_k"]["evidence"]["record"]["model_name"] == "model_a"
@@ -1434,9 +1454,172 @@ def test_release_score_adapter_maps_successful_task12_aggregate_records():
         (0.64 * 0.55 * 0.46) ** (1 / 3)
     )
     assert release_score["dimensions"]["fairness"]["score"] == pytest.approx(
-        0.4 * 0.87 + 0.4 * 0.78 + 0.2 * 0.12
+        0.4 * 0.13 + 0.4 * 0.0 + 0.2 * (1 - 0.12 / 0.69314718056)
     )
     assert release_score["score"] is not None
+    changed = compute_release_score(
+        utility={"S_TSTR": 0.8, "S_MMD": 0.7, "S_JSD": 0.6},
+        privacy=privacy,
+        fairness=fairness,
+        anchors={"equalized_odds_gap": 1.0, "worst_absolute_log_disparity": 0.5},
+    )
+    assert changed["dimensions"]["fairness"]["score"] == pytest.approx(
+        0.4 * 0.13 + 0.4 * (1 - 0.78) + 0.2 * (1 - 0.12 / 0.5)
+    )
+    assert fairness["eo"]["value"] == 0.78
+    assert fairness["worst_log_disparity"]["value"] == 0.12
+    assert privacy["S_k"]["score"] == 0.91
+    for status, raw, safety in (
+        ("failed", 0.87, 0.13),
+        ("succeeded", None, None),
+        ("succeeded", 0.87, float("nan")),
+    ):
+        incomplete = replace(
+            validations,
+            records=tuple(
+                replace(
+                    record,
+                    status=status,
+                    raw_value=raw,
+                    result_metadata={"representation_safety": safety},
+                )
+                if "representation_evidence" in record.expected_key
+                else record
+                for record in validations.records
+            ),
+        )
+        _, p, f = _release_score_inputs({"model_a": incomplete})
+        score = compute_release_score(
+            utility={"S_TSTR": 0.8, "S_MMD": 0.7, "S_JSD": 0.6}, privacy=p, fairness=f
+        )
+        assert score["status"] == "indeterminate"
+        assert score["score"] is None
+
+
+@pytest.mark.parametrize("worst_evidence", ["flat", "legacy", "missing", "failed"])
+@pytest.mark.parametrize(
+    "summary_key",
+    [None, "log_disparity_mean_abs", "log_disparity_median_abs", "log_disparity_share_significant"],
+)
+def test_release_score_worst_gap_uses_explicit_evidence_after_custom_summaries(
+    worst_evidence, summary_key
+):
+    role_hashes = {"train": "a" * 64, "tuning": "b" * 64, "final_holdout": "c" * 64}
+    summary_values = {
+        "log_disparity_mean_abs": 0.2,
+        "log_disparity_median_abs": 0.3,
+        "log_disparity_share_significant": 0.4,
+    }
+    report = {
+        "state": "succeeded",
+        **{table: pd.DataFrame() for table in custom_eval._LOG_REPORT_TABLES},
+        "summary_stats": {
+            "mean_abs_log_disparity": 0.2,
+            "median_abs_log_disparity": 0.3,
+            "share_significant_bh": 0.4,
+        },
+    }
+    custom_validations = custom_eval.validate_log_disparity_results(
+        {"model_a": report},
+        ["model_a"],
+        role_hashes=role_hashes,
+        evaluation_role="final_holdout",
+        requested_use="audit",
+    )
+    assert all(record.status == "succeeded" for record in custom_validations["model_a"].records)
+    if summary_key is not None:
+        custom_validations["model_a"] = replace(
+            custom_validations["model_a"],
+            records=tuple(
+                record
+                for record in custom_validations["model_a"].records
+                if record.expected_key == summary_key
+            ),
+        )
+    stats = {"representation_safety": 0.6}
+    if worst_evidence != "missing":
+        stats["worst_abs_log_disparity"] = 0.8
+    observation = release_evidence_eval._release_evidence_record(
+        "model_a",
+        "representation_evidence.v1",
+        0.4,
+        role_hashes=role_hashes,
+        evaluation_role="final_holdout",
+        metadata={
+            "producer": "release_evidence_representation",
+            "protocol_version": release_evidence_eval.RELEASE_EVIDENCE_PROTOCOL_VERSION,
+            "seed": 7,
+            "release_transform_digest": "d" * 64,
+            "common_protocol_digest": "e" * 64,
+            "role_hashes": role_hashes,
+            "fit_roles": ["train", "tuning"],
+            "support": {
+                "roles": {
+                    "synthetic": {"population": 20, "population_floor": 20, "role_hash": "f" * 64},
+                    "reference": {
+                        "population": 20,
+                        "population_floor": 20,
+                        "role_hash": role_hashes["final_holdout"],
+                    },
+                },
+                "protected_slices": {"state": "valid", "floor": 1},
+            },
+            **({"summary_stats": stats} if worst_evidence == "legacy" else stats),
+        },
+    )
+    if worst_evidence == "failed":
+        observation = replace(observation, error="representation evaluator failed")
+    release_validations = release_evidence_eval.validate_release_evidence_results(
+        {"model_a": [observation]}, role_hashes=role_hashes, evaluation_role="final_holdout"
+    )
+    representation_record = next(
+        record
+        for record in release_validations["model_a"].records
+        if record.expected_key == "representation_evidence.v1"
+    )
+    assert representation_record.status == ("failed" if worst_evidence == "failed" else "succeeded")
+    validations = {
+        ("synthcity", "main"): synthcity_eval.validate_synthcity_results(
+            {"model_a": pd.DataFrame()}, {}, role_hashes=role_hashes
+        ),
+        ("custom", "log_disparity"): custom_validations,
+        ("custom", "release_evidence"): release_validations,
+    }
+    original_payloads = deepcopy(
+        [
+            record.to_dict()
+            for result in validations.values()
+            for record in result["model_a"].records
+        ]
+    )
+    _, _, fairness = _release_score_inputs(validations)
+    score = compute_release_score(
+        utility={"S_TSTR": 0.8, "S_MMD": 0.7, "S_JSD": 0.6},
+        privacy={
+            name: 0.9 for name in ("S_k", "S_l", "S_DCR", "S_epsilon", "S_MIA", "S_attribute")
+        },
+        fairness={"S_representation": 0.6, "eo": 0.1, **fairness},
+        anchors={"equalized_odds_gap": 0.5, "worst_absolute_log_disparity": 2.0},
+    )
+    component = score["dimensions"]["fairness"]["components"]["worst_log_disparity"]
+    if worst_evidence in {"flat", "legacy"}:
+        assert fairness["worst_log_disparity"]["value"] == 0.8
+        assert "score" not in fairness["worst_log_disparity"]
+        assert fairness["worst_log_disparity"]["adapter"].endswith(".worst_abs_log_disparity")
+        assert component["score"] == pytest.approx(1 - 0.8 / 2.0)
+        assert score["status"] == "succeeded"
+    else:
+        assert "worst_log_disparity" not in fairness
+        assert component["status"] == "indeterminate"
+        assert score["status"] == "indeterminate"
+        assert score["score"] is None
+    assert [
+        record.to_dict() for result in validations.values() for record in result["model_a"].records
+    ] == original_payloads
+    assert all(
+        record.raw_value == summary_values[record.expected_key]
+        for record in custom_validations["model_a"].records
+    )
 
 
 def test_run_evaluation_rejects_conflicting_synthcity_qi_override(
@@ -1527,8 +1710,9 @@ def test_run_evaluation_propagates_patient_group_context(
     assert set(extras["group_context"]["roles"]) == {"train", "tuning"}
 
 
+@pytest.mark.parametrize("sensitive_columns", [["feature"], []])
 def test_run_evaluation_records_post_selection_final_holdout_evidence(
-    make_config, make_canonical_dataset, monkeypatch
+    make_config, make_canonical_dataset, monkeypatch, sensitive_columns
 ):
     from synthdata.data import validate_imputation_cache_lineage
     from synthdata.imputation.pipeline import _cache_key_record, run_imputation
@@ -1540,11 +1724,19 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     cfg.evaluation.save_per_model_syntheval_plots = False
     cfg.evaluation.generate_report = False
     cfg.evaluation.privacy_gate.enabled = False
-    cfg.data.protected_columns = ["feature"]
-    cfg.data.protected_attribute_bins = [["<12", "12+"]]
+    cfg.evaluation.privacy_policy.role_population_floor = 3
+    cfg.evaluation.privacy_policy.protected_slice_floor = 2
+    cfg.evaluation.scoring_policy.equalized_odds_gap_anchor = 0.25
+    cfg.evaluation.scoring_policy.worst_absolute_log_disparity_anchor = 0.5
+    cfg.data.protected_columns = ["protected"]
+    cfg.data.sensitive_columns = sensitive_columns
+    cfg.data.quasi_identifier_columns = ["protected"]
 
     dataset = make_canonical_dataset()
     final_dataset = make_canonical_dataset()
+    for phase_dataset in (dataset, final_dataset):
+        phase_dataset.sensitive_columns = sensitive_columns
+        phase_dataset.quasi_identifier_columns = ["protected"]
     run_imputation(cfg, dataset)
     validate_imputation_cache_lineage(
         dataset,
@@ -1568,6 +1760,10 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     final_dataset = _same_phase_final_dataset(cfg, final_dataset)
     synthetic = dataset.role_frame("train", imputed=True).copy()
     synthcity_calls = []
+    synthcity_sensitive = []
+    release_floors = []
+    tstr_floors = []
+    score_anchors = []
     synthcity_fit_frames = []
     synthcity_evidence_frames = []
     syntheval_calls = []
@@ -1591,6 +1787,11 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
 
     def fake_run_synthcity_evaluation(*args, **kwargs):
         synthcity_calls.append(kwargs.get("evaluation_role", "tuning"))
+        synthcity_sensitive.append(
+            kwargs.get("sensitive_features", args[4] if len(args) > 4 else None)
+        )
+        assert kwargs["semantic_context"]["protected_columns"] == ["protected"]
+        assert kwargs["quasi_identifier_columns"] == ["protected"]
         synthcity_fit_frames.append(args[1])
         synthcity_evidence_frames.append(args[2])
         return {"model_a": synthcity_report}
@@ -1610,12 +1811,16 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
         return _fake_refit_metadata(synthetic, kwargs["output_dir"])
 
     def fake_run_release_evidence(_selected, _dataset, **kwargs):
+        release_floors.append(
+            (kwargs.get("role_population_floor"), kwargs.get("protected_slice_floor"))
+        )
         release_evidence_generalizations.append(kwargs["generalization"])
         if "release_form_inputs" in kwargs:
             release_evidence_holdouts.append(kwargs["release_form_inputs"][1]["final_holdout"])
         return {}
 
-    def fake_run_tstr(_synthetic, real_data, **_kwargs):
+    def fake_run_tstr(_synthetic, real_data, **kwargs):
+        tstr_floors.append(kwargs.get("protected_slice_floor"))
         tstr_holdouts.append(real_data.copy())
         return SimpleNamespace(envelope={"state": "blocked"})
 
@@ -1628,6 +1833,12 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
         release_evidence_eval, "run_release_evidence_evaluation", fake_run_release_evidence
     )
     monkeypatch.setattr("synthdata.evaluation.run_tstr_evaluation", fake_run_tstr)
+
+    def capture_score(**kwargs):
+        score_anchors.append(kwargs.get("anchors"))
+        return compute_release_score(**kwargs)
+
+    monkeypatch.setattr("synthdata.evaluation.compute_release_score", capture_score)
     monkeypatch.setattr(
         "synthdata.evaluation._select_policy_model", lambda _combined: ("model_a", None)
     )
@@ -1637,6 +1848,10 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     )
 
     assert synthcity_calls == ["tuning", "final_holdout"]
+    assert synthcity_sensitive == [sensitive_columns, sensitive_columns]
+    assert release_floors == [(3, 2), (3, 2)]
+    assert tstr_floors == [2]
+    assert score_anchors == [{"equalized_odds_gap": 0.25, "worst_absolute_log_disparity": 0.5}]
     expected_real_fit = pd.concat(
         [
             final_dataset.role_frame("train", imputed=True),
@@ -1721,6 +1936,15 @@ def test_run_evaluation_records_post_selection_final_holdout_evidence(
     ]
     assert final_configuration["fit_frame_fingerprint"] != "0" * 64
     assert final_configuration["refit_fit_frame_fingerprint"] == "0" * 64
+    policy = final_configuration["integration_policy"]
+    assert policy["version"] == "evaluation-integration-v1"
+    assert policy["support_floors"] == {"role_population_floor": 3, "protected_slice_floor": 2}
+    assert (
+        artifacts._normalize_final_provenance_inventory(evidence)["anchors"]["integration_policy"]
+        == policy
+    )
+    assert evidence["provenance_inventory"]["anchors"]["effective"] == score_anchors[0]
+    assert evidence["provenance_inventory"]["supports"]["effective"] == policy["support_floors"]
     assert list(combined.index) == ["model_a"]
 
 

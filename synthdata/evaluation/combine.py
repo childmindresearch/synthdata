@@ -699,9 +699,7 @@ def _minmax_scale(col: pd.Series) -> pd.Series:
 #: but not for correctness (weighted sum is order-independent).
 _TYPES = ("utility", "privacy", "fairness")
 
-#: Equal weighting used when the caller doesn't pass ``rank_weights`` (e.g.
-#: existing direct callers/tests predating evaluation.rank_weights) --
-#: mirrors the pre-existing implicit behavior before per-type weights existed.
+#: Historical compatibility constant; not consumed by current ranking calculations.
 DEFAULT_RANK_WEIGHTS = {"utility": 1.0, "privacy": 1.0, "fairness": 1.0}
 
 
@@ -725,8 +723,15 @@ def build_combined_table(
     ``(__all__, overall, rank)`` remains for backward-compatible consumers,
     but equals complete canonical ``U_tuning`` only. Incomplete evidence stays
     indeterminate; no candidate-relative ranking or reweighting occurs.
-    ``rank_weights`` is accepted for API compatibility and ignored.
+    ``rank_weights`` must be omitted or ``None``; supplied weights are rejected
+    because evaluation never consumed them.
     """
+
+    if rank_weights is not None:
+        raise ValueError(
+            "evaluation.rank_weights is no longer supported; remove this argument. "
+            "Ranking calculations do not consume configurable weights."
+        )
 
     legacy_validation_argument = task12_validations is not None
     if release_evidence_validations is not None and task12_validations is not None:

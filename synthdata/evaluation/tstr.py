@@ -126,12 +126,22 @@ def run_tstr_evaluation(
     seed: int = 17,
     protected_columns: Sequence[str] = (),
     role_hashes: Mapping[str, str] | None = None,
+    protected_slice_floor: int = 1,
 ) -> TSTRResult:
     """Fit only release synthetic rows and evaluate one model on real rows.
 
     ``evaluation_role`` is ``tuning`` or ``final_holdout``. No validation split
     is requested from XGBoost, so every synthetic release row is used for fit.
+    ``protected_slice_floor`` is the minimum total, actual-positive, and
+    actual-negative row count per protected group and OVR class view. The
+    provisional default of 1 is a support gate, not a statistical reliability claim.
     """
+    if (
+        not isinstance(protected_slice_floor, int)
+        or isinstance(protected_slice_floor, bool)
+        or protected_slice_floor < 1
+    ):
+        raise ValueError("protected_slice_floor must be a positive integer")
     if evaluation_role not in {"tuning", "final_holdout"}:
         raise ValueError("evaluation_role must be tuning or final_holdout")
     _require_release(synthetic_release)
@@ -162,6 +172,11 @@ def run_tstr_evaluation(
         "source_role": "synthetic",
         "release_form": True,
         "seed": seed,
+        "support_policy": {
+            "version": "tstr-support-v1",
+            "protected_slice_floor": protected_slice_floor,
+            "counts": "minimum total, actual-positive, actual-negative rows per protected group/OVR class",
+        },
         "common_protocol_digest": synthetic_provenance["common_protocol_digest"],
         "target_column": target_column,
         "protected_columns": list(protected_columns),
@@ -281,7 +296,14 @@ def run_tstr_evaluation(
             target_classes=classes,
             protected_columns=protected_columns,
             prediction_artifact=prediction_artifact,
+            min_support=protected_slice_floor,
         )
+        fairness["support"] = {
+            "support_contract": "all_target_protected_cells",
+            "protected_slice_floor": protected_slice_floor,
+            "state": fairness["state"],
+        }
+        fairness["support_policy"] = dict(metadata["support_policy"])
         report["equalized_odds"] = fairness
         report["prediction_artifact"] = prediction_artifact
     envelope = {

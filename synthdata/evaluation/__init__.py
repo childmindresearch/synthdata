@@ -48,6 +48,21 @@ from synthdata.utils import ensure_dir, get_logger
 logger = get_logger(__name__)
 
 
+def _integration_policy(cfg: Config) -> dict:
+    """Record effective adapter policy separately from raw metric evidence."""
+    return {
+        "version": "evaluation-integration-v1",
+        "support_floors": {
+            "role_population_floor": cfg.evaluation.privacy_policy.role_population_floor,
+            "protected_slice_floor": cfg.evaluation.privacy_policy.protected_slice_floor,
+        },
+        "fairness_anchors": {
+            "equalized_odds_gap": cfg.evaluation.scoring_policy.equalized_odds_gap_anchor,
+            "worst_absolute_log_disparity": cfg.evaluation.scoring_policy.worst_absolute_log_disparity_anchor,
+        },
+    }
+
+
 def _authoritative_tstr_results(
     executions: dict,
     *,
@@ -500,19 +515,35 @@ def _release_score_inputs(validations: dict) -> tuple[dict, dict, dict]:
                         normalized=True,
                     )
             elif "representation_evidence.v1" in key:
-                add(fairness, "S_representation", raw, evidence, key, normalized=True)
                 stats = metadata.get("summary_stats", {})
+                # Current producer emits flat metadata; historical adapters used
+                # summary_stats. Raw representation evidence is risk, not safety.
+                safety = metadata.get("representation_safety")
+                # Mean/median/significance summaries must never substitute for
+                # missing explicit worst-gap evidence, regardless of record order.
+                worst = metadata.get("worst_abs_log_disparity")
                 if isinstance(stats, dict):
-                    add(
-                        fairness,
-                        "S_worst_log_disparity",
-                        stats.get("worst_abs_log_disparity"),
-                        evidence,
-                        f"{key}.summary_stats.worst_abs_log_disparity",
-                        normalized=True,
-                    )
+                    if "representation_safety" not in metadata:
+                        safety = stats.get("representation_safety")
+                    if "worst_abs_log_disparity" not in metadata:
+                        worst = stats.get("worst_abs_log_disparity")
+                add(
+                    fairness,
+                    "S_representation",
+                    safety,
+                    evidence,
+                    f"{key}.representation_safety",
+                    normalized=True,
+                )
+                add(
+                    fairness,
+                    "worst_log_disparity",
+                    worst,
+                    evidence,
+                    f"{key}.worst_abs_log_disparity",
+                )
             elif "equalized_odds.final.v1" in key:
-                add(fairness, "S_EO", raw, evidence, key, normalized=True)
+                add(fairness, "eo", raw, evidence, key)
             elif any(name in key for name in ("tstr", "macro_f1")):
                 add(utility, "tstr", raw, evidence, key)
             elif "mmd" in key:
@@ -527,8 +558,6 @@ def _release_score_inputs(validations: dict) -> tuple[dict, dict, dict]:
                 add(privacy, "mia", raw, evidence, key)
             elif "attribute" in key:
                 add(privacy, "attribute", raw, evidence, key)
-            elif "log_disparity" in key:
-                add(fairness, "worst_log_disparity", raw, evidence, key)
     return utility, privacy, fairness
 
 
@@ -604,6 +633,7 @@ def _run_final_holdout_evidence(
     role_context_fingerprints: dict[str, str],
 ) -> dict:
     """Evaluate only selected candidate against final-phase imputed holdout."""
+    integration_policy = _integration_policy(cfg)
     base_evidence = {
         "evaluation_role": "final_holdout",
         "role_context": role_context["full"],
@@ -637,6 +667,12 @@ def _run_final_holdout_evidence(
                 )
             }
             | {
+                "integration_policy": integration_policy,
+                "anchors": {
+                    "effective": integration_policy["fairness_anchors"],
+                    "integration_policy": integration_policy,
+                },
+                "supports": {"effective": integration_policy["support_floors"]},
                 "invalid_reasons": {"final_holdout": reason},
                 "selected_model_provenance": {
                     "model": None,
@@ -744,9 +780,11 @@ def _run_final_holdout_evidence(
                 evaluation_role="final_holdout",
                 seed=cfg.seed,
                 protected_columns=list(dataset.protected_columns),
+                protected_slice_floor=cfg.evaluation.privacy_policy.protected_slice_floor,
                 role_hashes=final_role_hashes,
             ).envelope
     group_configuration = {
+        "integration_policy": integration_policy,
         "group_context": final_group_context,
         "fit_roles": ["train", "tuning"],
         "fit_frame_fingerprint": real_fit_frame_fingerprint,
@@ -760,8 +798,8 @@ def _run_final_holdout_evidence(
         real_fit_frame,
         final_holdout_frame,
         dataset.target_column,
-        synthcity_semantics["protected_columns"],
-        eval_cfg.synthcity,
+        sensitive_features=synthcity_semantics["sensitive_columns"],
+        selection_cfg=eval_cfg.synthcity,
         n_samples=cfg.generation.n_samples,
         seed=cfg.seed,
         workspace=str(output_dir / "synthcity_final_holdout_workspace"),
@@ -930,6 +968,7 @@ def _run_final_holdout_evidence(
             released_final_roles,
             release_transform_metadata,
         ),
+        **integration_policy["support_floors"],
     )
     final_release_evidence_validations = release_evidence_eval.validate_release_evidence_results(
         final_release_evidence_observations,
@@ -982,6 +1021,7 @@ def _run_final_holdout_evidence(
         utility=utility_evidence,
         privacy=privacy_evidence,
         fairness=fairness_evidence,
+        anchors=integration_policy["fairness_anchors"],
         provenance={"model": selected_model, "evaluation_role": "final_holdout"},
     )
     (
@@ -1001,6 +1041,7 @@ def _run_final_holdout_evidence(
         "score_completeness_state": score_completeness_state,
         "audit_outcome_state": audit_outcome_state,
         "provenance_inventory": {
+            "integration_policy": integration_policy,
             "raw_values": {
                 "frameworks": {
                     str(key): {model: validation.to_dict() for model, validation in value.items()}
@@ -1015,6 +1056,8 @@ def _run_final_holdout_evidence(
                 "R_final": "0.45*U + 0.30*P + 0.25*F",
             },
             "anchors": {
+                "effective": integration_policy["fairness_anchors"],
+                "integration_policy": integration_policy,
                 "source": "metric contract and release-score configuration",
                 "release_score_status": release_score.get("status"),
                 "required_components": release_score.get("required_components", []),
@@ -1033,6 +1076,7 @@ def _run_final_holdout_evidence(
             },
             "seeds": {"evaluation": cfg.seed},
             "supports": {
+                "effective": integration_policy["support_floors"],
                 "synthetic_rows": len(released_final_synthetic),
                 "final_holdout_rows": len(released_final_roles["final_holdout"]),
                 "release_transform": release_transform_metadata,
@@ -1090,6 +1134,7 @@ def _run_blocked_legacy_evaluation(
     output_dir = ensure_dir(output_dir)
     eval_cfg.output_dir = str(output_dir)
     attempt_metadata["source_generation_root"] = str(cfg.generation.output_dir)
+    attempt_metadata["integration_policy"] = _integration_policy(cfg)
     if experiment is not None:
         experiment.evaluation_dir = output_dir
         experiment.plots_dir = output_dir / "plots"
@@ -1248,6 +1293,7 @@ def run_evaluation(
     output_dir = ensure_dir(output_dir)
     eval_cfg.output_dir = str(output_dir)
     attempt_metadata["source_generation_root"] = str(cfg.generation.output_dir)
+    attempt_metadata["integration_policy"] = _integration_policy(cfg)
     if experiment is not None:
         experiment.evaluation_dir = output_dir
         experiment.plots_dir = output_dir / "plots"
@@ -1289,15 +1335,18 @@ def run_evaluation(
     )
     population_unit = group_context["population_unit"]
     group_mode = group_context["group_mode"]
-    group_configuration = {"group_context": group_context}
+    group_configuration = {
+        "group_context": group_context,
+        "integration_policy": _integration_policy(cfg),
+    }
 
     synthcity_results = synthcity_eval.run_synthcity_evaluation(
         selected_datasets,
         train_frame,
         tuning_frame,
         dataset.target_column,
-        synthcity_semantics["protected_columns"],
-        eval_cfg.synthcity,
+        sensitive_features=synthcity_semantics["sensitive_columns"],
+        selection_cfg=eval_cfg.synthcity,
         n_samples=cfg.generation.n_samples,
         seed=cfg.seed,
         workspace=str(output_dir / "synthcity_workspace"),
@@ -1473,6 +1522,7 @@ def run_evaluation(
             protected_columns=list(dataset.protected_columns),
             role_hashes=dict(raw_candidate_role_hashes),
             seed=cfg.seed,
+            **group_configuration["integration_policy"]["support_floors"],
         )
     candidate_release_digest = None
     if release_evidence_observations:
@@ -1512,7 +1562,6 @@ def run_evaluation(
         benchmark_ranks,
         log_disparity_reports,
         model_names,
-        rank_weights=eval_cfg.rank_weights,
         synthcity_validations=synthcity_validation_results,
         syntheval_validations=syntheval_validations,
         metric_execution_passes=metric_execution_passes,

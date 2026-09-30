@@ -1,5 +1,6 @@
 from hashlib import sha256
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -37,6 +38,7 @@ def test_missing_class_preserves_real_support():
     result = run_tstr_evaluation(synthetic, real, target_column="y")
     assert result.report["state"] == "indeterminate"
     assert result.report["class_supports"] == {"0": 1, "1": 1}
+    assert result.report["result_metadata"]["support_policy"]["protected_slice_floor"] == 1
 
 
 def test_unexpected_classes_are_stably_ordered():
@@ -280,6 +282,7 @@ def test_run_sanitizes_forbidden_release_category_feature_names(monkeypatch):
     result = run_tstr_evaluation(synthetic, real, target_column="y", protected_columns=["group"])
 
     assert result.report["state"] == "complete"
+
     assert seen[0] == seen[1]
     assert all(not any(char in name for char in "[]<") for name in seen[0])
     assert "category_plain" in seen[0]
@@ -304,6 +307,8 @@ def test_final_holdout_eo_uses_raw_non_numeric_labels():
         protected_columns=["group"],
     )
     assert result.report["state"] == "complete"
+    assert result.report["result_metadata"]["support_policy"]["protected_slice_floor"] == 1
+    assert result.report["equalized_odds"]["support"]["protected_slice_floor"] == 1
 
 
 def test_tuning_does_not_compute_equalized_odds():
@@ -312,5 +317,95 @@ def test_tuning_does_not_compute_equalized_odds():
         {"tuning": pd.DataFrame([{"x": 0, "group": "a", "y": 0}, {"x": 1, "group": "b", "y": 1}])},
     )
     real = roles["tuning"]
-    result = run_tstr_evaluation(synthetic, real, target_column="y", protected_columns=["group"])
+    result = run_tstr_evaluation(
+        synthetic, real, target_column="y", protected_columns=["group"], protected_slice_floor=3
+    )
+    assert "equalized_odds" not in result.report
+    assert result.report["result_metadata"]["support_policy"]["protected_slice_floor"] == 3
+
+
+@pytest.mark.parametrize(
+    ("targets", "groups", "floor", "state", "valid_groups"),
+    [
+        ([0, 1, 0, 1], ["a", "a", "b", "b"], 1, "complete", 2),
+        ([0, 1, 0, 1], ["a", "a", "b", "b"], 2, "indeterminate", 0),
+        ([0, 0, 1, 1] * 2, ["a"] * 4 + ["b"] * 4, 2, "complete", 2),
+        ([0, 1, 0, 0], ["a", "a", "b", "b"], 1, "indeterminate", 1),
+        ([0, 1], ["a", "a"], 1, "indeterminate", 1),
+    ],
+)
+def test_final_tstr_support_floor_uses_actual_labels(
+    monkeypatch, targets, groups, floor, state, valid_groups
+):
+    frame = pd.DataFrame({"x": range(len(targets)), "y": targets, "group": groups})
+    synthetic, roles, _ = transform_release_roles(frame, {"final_holdout": frame})
+
+    class Model:
+        def fit(self, x, y):
+            return self
+
+        def predict(self, x):
+            # No predicted positives for class 1: support must still use actual labels.
+            return np.zeros(len(x), dtype=int)
+
+        def predict_proba(self, x):
+            return np.tile([0.75, 0.25], (len(x), 1))
+
+    monkeypatch.setattr("synthdata.evaluation.tstr._xgb", lambda seed, classes: Model())
+    result = run_tstr_evaluation(
+        synthetic,
+        roles["final_holdout"],
+        target_column="y",
+        evaluation_role="final_holdout",
+        protected_columns=["group"],
+        protected_slice_floor=floor,
+    )
+    fairness = result.report["equalized_odds"]
+    artifact = dict(result.report["prediction_artifact"])
+    artifact["prediction_length"] += 1
+    with pytest.raises(ValueError, match="immutable content binding"):
+        compute_equalized_odds(
+            roles["final_holdout"]["y"],
+            result.predictions,
+            roles["final_holdout"][["group"]],
+            prediction_artifact=artifact,
+        )
+    assert fairness["state"] == state
+    assert fairness["support"]["protected_slice_floor"] == floor
+    assert result.report["result_metadata"]["support_policy"]["protected_slice_floor"] == floor
+    assert all(item["valid_group_count"] == valid_groups for item in fairness["slices"])
+    if state == "complete":
+        assert fairness["macro_valid_slice_score"] == 0.0
+        assert all(
+            rate["positive_support"] >= floor and rate["negative_support"] >= floor
+            for item in fairness["slices"]
+            for rate in item["group_rates"]
+        )
+    else:
+        assert fairness["macro_valid_slice_score"] is None
+        assert all(item["reason"] == "fewer_than_two_valid_groups" for item in fairness["slices"])
+
+
+@pytest.mark.parametrize("floor", [True, False, 0, -1, 1.5, "2", None])
+def test_tstr_rejects_non_positive_integer_support_floor(floor):
+    with pytest.raises(ValueError, match="protected_slice_floor must be a positive integer"):
+        run_tstr_evaluation(
+            pd.DataFrame(), pd.DataFrame(), target_column="y", protected_slice_floor=floor
+        )
+
+
+def test_indeterminate_tstr_records_floor_without_eo():
+    synthetic, roles, _ = transform_release_roles(
+        pd.DataFrame({"x": [0], "y": [0]}),
+        {"final_holdout": pd.DataFrame({"x": [0, 1], "y": [0, 1]})},
+    )
+    result = run_tstr_evaluation(
+        synthetic,
+        roles["final_holdout"],
+        target_column="y",
+        evaluation_role="final_holdout",
+        protected_slice_floor=4,
+    )
+    assert result.report["state"] == "indeterminate"
+    assert result.report["result_metadata"]["support_policy"]["protected_slice_floor"] == 4
     assert "equalized_odds" not in result.report

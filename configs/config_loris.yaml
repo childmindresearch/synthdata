@@ -168,27 +168,22 @@ evaluation:
     protected_map: [null, null, null]
     protected_bins: null
 
-  # Formal release thresholds; privacy stage; invalid values fail closed.
+  # Evidence support only, not formal privacy guarantees; invalid values fail closed.
   # Unsupported synthetic categorical values are never coerced: affected
   # evidence is failed or indeterminate, never succeeded. Succeeded requires
   # all required tables; only succeeded evidence supplies metrics/plots/ranking.
   privacy_policy:
-    k_required: 5 # Equivalence-class rows; release privacy; lower values fail closed.
-    l_required: 2 # Distinct sensitive values; release privacy; lower values fail closed.
-    role_population_floor: 20 # Rows per role; support validation; undersized roles fail closed.
-    protected_slice_floor: 5 # Rows per protected slice; fairness/privacy; undersized slices fail closed.
-    mia_epsilon_repetitions: 10 # Fixed repetitions; privacy attack; fewer repetitions fail closed.
-    epsilon_excess_anchor: 0.10 # Excess-risk anchor; [0,1]; final scoring; invalid values fail closed.
-    mia_advantage_anchor: 0.10 # MIA advantage anchor; [0,1]; final scoring; invalid values fail closed.
-    attribute_disclosure_anchor: 0.20 # Disclosure-risk anchor; [0,1]; final scoring; invalid values fail closed.
+    role_population_floor: 20 # Synthetic/reference rows for release-privacy evidence only.
+    # Final TSTR EO: minimum total, actual-positive and actual-negative rows per
+    # protected group and one-vs-rest class; at least two valid groups required.
+    # Provisional 1 implies at least two rows per group, not statistical confidence.
+    protected_slice_floor: 1
 
-  # Fixed fairness anchors; final scoring stage; invalid values fail closed.
+  # Existing final-audit score normalization only; raw metrics/selection unchanged.
+  # Both anchors must be finite and positive; metric reconciliation is deferred.
   scoring_policy:
-    equalized_odds_gap_anchor: 0.10 # Gap anchor; [0,1]; final scoring; invalid values fail closed.
-    worst_absolute_log_disparity_anchor: 0.69314718056 # Log-gap anchor; non-negative; final scoring; invalid values fail closed.
-    bh_alpha: 0.05 # BH familywise threshold; (0,1]; representation stage; invalid values fail closed.
-    practical_log_disparity_floor: 0.22314355131 # Material log-gap floor; non-negative; representation stage; invalid values fail closed.
-    valid_comparison_fraction: 0.80 # Required valid-leaf fraction; (0,1]; representation stage; invalid values fail closed.
+    equalized_odds_gap_anchor: 0.10
+    worst_absolute_log_disparity_anchor: 0.69314718056
 
   # Resource cap for resumable per-model SynthEval processes.
   syntheval_execution:
@@ -198,7 +193,6 @@ evaluation:
     memory_reserve_gib: 16
     memory_per_model_gib: 14
 
-  rank_weights: { utility: 1.0, privacy: 1.0, fairness: 1.0 }
   privacy_gate:
     # Calibration-only starting thresholds; enable only with reviewed
     # operational contract IDs after privacy calibration.

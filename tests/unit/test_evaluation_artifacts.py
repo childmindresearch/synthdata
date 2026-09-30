@@ -1859,6 +1859,21 @@ def test_current_final_refit_envelope_round_trips_strictly(tmp_path):
     assert evidence["final_refit"]["cache_metadata"]["fit_roles"] == ["train", "tuning"]
 
 
+def test_pre_integration_policy_bundle_stays_readable_and_new_attempt_is_append_only(tmp_path):
+    evaluation_dir, _refit = _persist_current_final_refit_bundle(tmp_path)
+    evidence_path = artifact_bundle_dir(evaluation_dir) / "final_holdout_evidence.json"
+    historical_bytes = evidence_path.read_bytes()
+    historical = load_final_holdout_evidence(evaluation_dir)
+    assert "integration_policy" not in historical["provenance_inventory"]
+
+    attempt, metadata = select_evaluation_attempt(evaluation_dir)
+    next_attempt, _ = select_evaluation_attempt(evaluation_dir)
+    assert attempt != next_attempt
+    assert metadata["prior_attempt"] == str(evaluation_dir)
+    assert load_final_holdout_evidence(evaluation_dir) == historical
+    assert evidence_path.read_bytes() == historical_bytes
+
+
 def test_legacy_final_holdout_marker_migrates_to_complete_shape(tmp_path):
     evaluation_dir, _refit = _persist_current_final_refit_bundle(tmp_path)
     evidence_path = artifact_bundle_dir(evaluation_dir) / "final_holdout_evidence.json"

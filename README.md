@@ -69,7 +69,21 @@ Declare each role explicitly in the config file; the pipeline does not guess one
 - `target` is the outcome used to evaluate utility and fairness,
 - `quasi-identifiers (QIs)` are explicitly selected columns an attacker could use to link records to people,
 - `sensitive attributes` are columns whose disclosure is measured by privacy attacks,
-- `protected attributes` identify groups used to check fairness. Checks include representation , equal opportunity, equalized odds, and log-disparity evidence. May overlap with QIs and sensitive attributes.
+- `protected attributes` identify groups used to check fairness. Checks include representation, equal opportunity, equalized odds, and log-disparity evidence. May overlap with QIs and sensitive attributes when explicitly declared.
+
+Use `data.sensitive_columns` for disclosure/attribute-inference targets and `data.protected_columns` for fairness groups; neither role substitutes for the other. Canonical profiles require independent declarations. The deferred Hepatitis example retains historical sensitive roles and explicit `evaluation.log_disparity.protected_columns`; legacy aliases are not guidance for choosing protected attributes in a new profile.
+
+### Evaluation configuration migration (0.10.0)
+
+Version **0.10.0** rejects previously accepted but unused controls, even when set to their former defaults. Remove these keys from configurations; errors name the unsupported dotted path. There are no replacement controls:
+
+- `evaluation.rank_weights`;
+- under `evaluation.privacy_policy`: `k_required`, `l_required`, `mia_epsilon_repetitions`, `epsilon_excess_anchor`, `mia_advantage_anchor`, `attribute_disclosure_anchor`;
+- under `evaluation.scoring_policy`: `bh_alpha`, `practical_log_disparity_floor`, `valid_comparison_fraction`.
+
+The supported `privacy_policy` controls are positive-integer support floors. `role_population_floor` (default **20**) applies only to synthetic/reference population support for release-privacy evidence, not every metric. `protected_slice_floor` (provisional default **1**) applies to final TSTR equalized-odds (EO) evidence: each protected group and one-vs-rest class view needs at least that many total, actual-positive, and actual-negative rows, with at least two valid groups for comparison. A floor of 1 therefore requires at least two rows per group, not statistical confidence. Privacy evidence does not use this protected-slice floor. Privacy thresholds and this provisional support policy require later review.
+
+The supported `scoring_policy` controls are `equalized_odds_gap_anchor` (default **0.10**) and `worst_absolute_log_disparity_anchor` (default **0.69314718056**), both finite and positive. They normalize existing final-audit fairness scores only; raw metrics and candidate selection are unaffected. This repair leaves existing k/l calculations, attack repetitions, privacy/representation/scoring formulas, and fixed aggregate selection/scoring unchanged pending reconciliation with established metric implementations. It does not endorse a universal objective, make missing metric producers complete, establish scientific readiness, or provide a formal privacy guarantee. Historical result bundles remain readable; preserve raw evidence, statuses, and saved configurations rather than rewriting earlier results.
 
 ## Pipeline behavior
 
