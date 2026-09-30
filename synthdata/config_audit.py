@@ -28,7 +28,8 @@ def audit_config(path: str | Path) -> ConfigAuditResult:
 
     Dataset loading uses the normal project loader, including its established
     cleanup, declaration, schema, and split checks. This function does not run
-    imputation, generation, evaluation, plotting, or hosted inference.
+    imputation, generation, evaluation, plotting, or model inference. An uncached
+    UCI source can still trigger a dataset download.
     """
     config_path = Path(path).expanduser().resolve()
     logger.info("[config-audit] validating config=%s", config_path)

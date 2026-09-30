@@ -30,17 +30,17 @@ from synthdata.utils import ensure_dir
 
 
 def _selected_repository_root() -> Path:
-    """Find nearest marked SynthData checkout containing this conftest."""
+    """Find the nearest SynthData source checkout containing this conftest."""
     conftest_path = Path(__file__).resolve()
     for candidate in conftest_path.parents:
         resolved_candidate = candidate.resolve()
-        if (resolved_candidate / "AGENTS.md").is_file() and (
+        if (resolved_candidate / "synthdata" / "__init__.py").is_file() and (
             resolved_candidate / "pyproject.toml"
         ).is_file():
             return resolved_candidate
     raise RuntimeError(
         "Unable to locate SynthData repository root from tests/conftest.py: "
-        "required AGENTS.md and pyproject.toml markers are absent"
+        "required synthdata/__init__.py and pyproject.toml markers are absent"
     )
 
 

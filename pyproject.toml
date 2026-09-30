@@ -1,6 +1,6 @@
 [project]
 name = "synthdata"
-version = "0.9.0"
+version = "0.9.2"
 description = "Sandbox for synthetic data generation and evaluation"
 authors = [
     {name = "Alp Erkent", email = "alp.erkent@childmind.org"},
@@ -185,7 +185,7 @@ markers = [
     "cache: tests exercising file/SQLite caching and resumability logic",
     "integration: multi-module orchestration tests (may use tmp_path, mocks)",
     "slow: exercises real model training (synthcity/tabpfgen/tabpfn); not run by default in CI",
-    "network: requires a live external/hosted API (e.g. hosted TabPFN); skipped in CI",
+    "network: requires live network access (e.g. dataset/model downloads); excluded in CI",
 ]
 
 [build-system]

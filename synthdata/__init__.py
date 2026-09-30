@@ -20,14 +20,22 @@ import os
 import platform
 from pathlib import Path
 
+# Sensitive-data runs must never send TabPFN usage telemetry. Force the library's
+# opt-out before dependency imports; setdefault would permit an inherited "0".
+# load_dotenv() does not override this value, and child workers inherit it.
+os.environ["TABPFN_DISABLE_TELEMETRY"] = "1"
+
 # Load .env (TABPFN_TOKEN, HF_TOKEN, PYTORCH_CUDA_ALLOC_CONF, ...) into the
 # process environment as early as possible: variables like
 # PYTORCH_CUDA_ALLOC_CONF only take effect if set *before* the CUDA context is
 # initialized (i.e. before anything imports torch), and merely having them in
 # .env does nothing on its own -- nothing else in this package reads that file.
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # noqa: E402 - privacy opt-out precedes dependencies
 
-from synthdata.config import Config, load_config
+from synthdata.config import (  # noqa: E402 - privacy opt-out precedes dependencies
+    Config,
+    load_config,
+)
 
 load_dotenv()
 

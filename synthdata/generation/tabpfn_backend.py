@@ -1,6 +1,8 @@
 """TabPFN-based synthetic data generation (two variants).
 
-Both variants use TabPFN's unsupervised-experiment API (``tabpfn_extensions``).
+Both variants use local TabPFN models through the in-process unsupervised-experiment
+API (``tabpfn_extensions``), not a hosted inference service. SynthData disables
+usage telemetry at package startup; missing weights can still trigger downloads.
 TabPFN's foundation model handles missing values natively, so the caller may
 pass either the original (pre-imputation) train split or the imputed one --
 see ``generation.tabpfn.data_variants`` in the pipeline config, which drives

@@ -2,6 +2,11 @@
 
 SynthData is a config-driven pipeline for tabular-data imputation, synthetic data generation, evaluation, and plots. It is designed to run on **your own local CSV or Parquet data**.
 
+**Model fitting, inference, HPO, and evaluation run locally**. SynthData forces TabPFN usage telemetry off, including in child workers. Local inference is not automatically offline: missing model weights can trigger downloads/license checks, and an uncached UCI source downloads data. For offline runs, provision the required weights and licenses and cache input data before disconnecting; telemetry opt-out alone does not block network access.
+
+> [!WARNING]
+> This pipeline is experimental. Evaluation still needs validation; no end-to-end readiness or formal privacy guarantee is claimed.
+
 ## Quick start
 
 Clone the repository, download its linked libraries (submodules), and install the packages needed to run the pipeline:
@@ -23,7 +28,7 @@ uv run synthdata-plot     --config path/to/your-config.yaml
 ```
 
 > [!NOTE]
-> This repository includes config files for UCI ML Repo's Hepatitis and HBN's LORIS data only as local development test data and examples. Treat these configs as templates, not ready-to-use settings for your data. Review each project's dataset paths, column roles, target, version, generation methods, and evaluation settings.
+> This repository includes config files for UCI ML Repo's Hepatitis and HBN's LORIS data as development examples. The Hepatitis config uses `source: uci` and downloads the public data if its local cache is incomplete; the LORIS example uses a local CSV. Treat these configs as templates, not ready-to-use settings for your data. Review each project's dataset paths, column roles, target, version, generation methods, and evaluation settings.
 
 ### Audit a configuration
 
@@ -53,7 +58,7 @@ Dataset profiles must define the standard `data.split` roles `train`, `tuning`, 
 
 Age interval labels use explicit `<N`, `N-M`, and `N+` syntax. They derive lower-inclusive, upper-exclusive bounds `[lower, upper)`; `<N` and `N+` are open-ended. Use one shared Age scheme wherever Age is binned: `[−∞,18)`, `[18,30)`, `[30,45)`, `[45,60)`, `[60,+∞)`, labeled `<18`, `18-30`, `30-45`, `45-60`, `60+`. Thus age 18 belongs in `18-30`, while age 30 belongs in `30-45`. When Age is a stratification variable, `data.stratification_bins` labels must match `data.protected_attribute_bins` labels in order; do not maintain separate Age cuts or labels. The bins also define protected-attribute slices for release evaluation; they do not collapse or remap the target, which remains evaluated in its native categories.
 
-Shipped profiles configure HPO with TSTR macro-F1 (`tstr_macro_f1.v1`) as its sole objective on `tuning`. HPO does not create a separate binary-target evaluation pass or a positive/negative target mapping.
+The LORIS example currently configures HPO with TSTR macro-F1 (`tstr_macro_f1.v1`) as its sole objective on `tuning`. This example is not a universal HPO policy; review the configured screening checks, utility metrics, and supported runtime options for your dataset. HPO does not create a separate binary-target evaluation pass or a positive/negative target mapping.
 
 For patient-group splitting, the pipeline creates and reuses a local secret key (`.patient_id_hmac_key`) in the data folder by default. To use an external key, set `SYNTHDATA_PATIENT_ID_HMAC_KEY`; the pipeline uses that key instead. The pipeline uses it to create consistent patient-ID tokens in split and assignment files, reducing raw-ID exposure if those files are shared.
 
@@ -115,7 +120,7 @@ The pipeline above is the supported way to run new work. The following older or 
 
 - [`notebooks/ydata-test.py`](notebooks/ydata-test.py): experiments with ydata-synthetic; requires `uv sync --extra ydata`.
 - [`notebooks/ctgan_hpo_hepatitis.ipynb`](notebooks/ctgan_hpo_hepatitis.ipynb) and [`notebooks/test_hepatitis_data.ipynb`](notebooks/test_hepatitis_data.ipynb): earlier Hepatitis-focused synthesis, imputation, HPO, and evaluation work.
-- [`notebooks/tabpfn_demo.ipynb`](notebooks/tabpfn_demo.ipynb): experiments with TabPFN classification and data synthesis. When the API is needed, set `TABPFN_TOKEN` (and, optionally, `HF_TOKEN`) in `.env`.
+- [`notebooks/tabpfn_demo.ipynb`](notebooks/tabpfn_demo.ipynb): experiments with local TabPFN classification and data synthesis. Standalone notebooks do not import SynthData's telemetry safeguard: set `TABPFN_DISABLE_TELEMETRY=1` before importing TabPFN. `TABPFN_TOKEN`/`HF_TOKEN` may be needed for gated weight downloads/license acceptance, not hosted inference.
 
 ### Scripts
 
