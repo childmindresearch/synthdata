@@ -166,6 +166,12 @@ def _load_synthetic_datasets(cfg, dataset=None, *, generation_inventory=None) ->
 
 
 def main() -> None:
+    # TEMPORARY HARD BLOCK: the evaluator rejects hpo-context-v3 caches that the
+    # generator writes (artifacts._HPO_CONTEXT_SCHEMA_VERSIONS only has v1/v2).
+    # Remove this guard once that mismatch is fixed.
+    raise SystemExit(
+        "Evaluation is temporarily disabled."
+    )
     with _evaluation_debug_logging():
         _run_evaluation_cli()
 

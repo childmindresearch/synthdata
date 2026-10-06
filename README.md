@@ -2,10 +2,11 @@
 
 SynthData is a config-driven pipeline for tabular-data imputation, synthetic data generation, evaluation, and plots. It is designed to run on **your own local CSV or Parquet data**.
 
-**Model fitting, inference, HPO, and evaluation run locally**. SynthData forces TabPFN usage telemetry off, including in child workers. Local inference is not automatically offline: missing model weights can trigger downloads/license checks, and an uncached UCI source downloads data. For offline runs, provision the required weights and licenses and cache input data before disconnecting; telemetry opt-out alone does not block network access.
+> [!IMPORTANT]
+> **Model fitting, inference, HPO, and evaluation run locally**. SynthData forces TabPFN usage telemetry off, including in child workers. Local inference is not automatically offline: missing model weights can trigger downloads/license checks, and an uncached UCI source downloads data. For offline runs, provision the required weights and licenses and cache input data before disconnecting; telemetry opt-out alone does not block network access.
 
 > [!WARNING]
-> This pipeline is experimental. Evaluation still needs validation; no end-to-end readiness or formal privacy guarantee is claimed.
+> This pipeline is experimental. Evaluation still needs validation and has been temporarily disabled; no end-to-end readiness or formal privacy guarantee is claimed yet.
 
 ## Quick start
 
@@ -54,12 +55,6 @@ target,categorical,
 
 Dataset profiles must define the standard `data.split` roles `train`, `tuning`, and `final_holdout`. The roles are patient-disjoint: each patient can appear in only one role, even if they have multiple encounters. `train` is used to fit candidate models, `tuning` is used for hyperparameter optimization (HPO) and candidate selection, and `final_holdout` is kept separate until after selection to provide final evidence. Set `data.patient_id_column` to the patient ID column. The pipeline uses it to keep each patient's records in one role, then removes it from the data given to models.
 
-`data.stratification_variables` lists columns used to balance the split, and `data.stratification_bins` gives one entry per variable in the same order. The lists must have equal length. A `null` bin entry uses that column's observed values directly; a list of labels requests the corresponding categories or configured numeric intervals. Configured variables are combined for joint stratification, so the pipeline attempts to preserve their joint distribution across roles. `data.protected_attribute_bins` is also positional: it has one entry per `data.protected_columns` value, with `null` for unbinned columns and one label list for each binned numeric column. For example, `[Sex, Age, Ethnicity]` aligns with `[null, ["<18", "18-30", "30-45", "45-60", "60+"], null]`.
-
-Age interval labels use explicit `<N`, `N-M`, and `N+` syntax. They derive lower-inclusive, upper-exclusive bounds `[lower, upper)`; `<N` and `N+` are open-ended. Use one shared Age scheme wherever Age is binned: `[−∞,18)`, `[18,30)`, `[30,45)`, `[45,60)`, `[60,+∞)`, labeled `<18`, `18-30`, `30-45`, `45-60`, `60+`. Thus age 18 belongs in `18-30`, while age 30 belongs in `30-45`. When Age is a stratification variable, `data.stratification_bins` labels must match `data.protected_attribute_bins` labels in order; do not maintain separate Age cuts or labels. The bins also define protected-attribute slices for release evaluation; they do not collapse or remap the target, which remains evaluated in its native categories.
-
-The LORIS example currently configures HPO with TSTR macro-F1 (`tstr_macro_f1.v1`) as its sole objective on `tuning`. This example is not a universal HPO policy; review the configured screening checks, utility metrics, and supported runtime options for your dataset. HPO does not create a separate binary-target evaluation pass or a positive/negative target mapping.
-
 For patient-group splitting, the pipeline creates and reuses a local secret key (`.patient_id_hmac_key`) in the data folder by default. To use an external key, set `SYNTHDATA_PATIENT_ID_HMAC_KEY`; the pipeline uses that key instead. The pipeline uses it to create consistent patient-ID tokens in split and assignment files, reducing raw-ID exposure if those files are shared.
 
 ### Role overlap and threat-model boundaries
@@ -73,18 +68,6 @@ Declare each role explicitly in the config file; the pipeline does not guess one
 
 Use `data.sensitive_columns` for disclosure/attribute-inference targets and `data.protected_columns` for fairness groups; neither role substitutes for the other. Canonical profiles require independent declarations. The deferred Hepatitis example retains historical sensitive roles and explicit `evaluation.log_disparity.protected_columns`; legacy aliases are not guidance for choosing protected attributes in a new profile.
 
-### Evaluation configuration migration (0.10.0)
-
-Version **0.10.0** rejects previously accepted but unused controls, even when set to their former defaults. Remove these keys from configurations; errors name the unsupported dotted path. There are no replacement controls:
-
-- `evaluation.rank_weights`;
-- under `evaluation.privacy_policy`: `k_required`, `l_required`, `mia_epsilon_repetitions`, `epsilon_excess_anchor`, `mia_advantage_anchor`, `attribute_disclosure_anchor`;
-- under `evaluation.scoring_policy`: `bh_alpha`, `practical_log_disparity_floor`, `valid_comparison_fraction`.
-
-The supported `privacy_policy` controls are positive-integer support floors. `role_population_floor` (default **20**) applies only to synthetic/reference population support for release-privacy evidence, not every metric. `protected_slice_floor` (provisional default **1**) applies to final TSTR equalized-odds (EO) evidence: each protected group and one-vs-rest class view needs at least that many total, actual-positive, and actual-negative rows, with at least two valid groups for comparison. A floor of 1 therefore requires at least two rows per group, not statistical confidence. Privacy evidence does not use this protected-slice floor. Privacy thresholds and this provisional support policy require later review.
-
-The supported `scoring_policy` controls are `equalized_odds_gap_anchor` (default **0.10**) and `worst_absolute_log_disparity_anchor` (default **0.69314718056**), both finite and positive. They normalize existing final-audit fairness scores only; raw metrics and candidate selection are unaffected. This repair leaves existing k/l calculations, attack repetitions, privacy/representation/scoring formulas, and fixed aggregate selection/scoring unchanged pending reconciliation with established metric implementations. It does not endorse a universal objective, make missing metric producers complete, establish scientific readiness, or provide a formal privacy guarantee. Historical result bundles remain readable; preserve raw evidence, statuses, and saved configurations rather than rewriting earlier results.
-
 ## Pipeline behavior
 
 These four commands form the pipeline and run in this order:
@@ -95,15 +78,6 @@ These four commands form the pipeline and run in this order:
 4. **Plot** saves data quality, generation, HPO, and evaluation results without running earlier steps again.
 
 Files (artifacts) produced by the pipeline are organized by dataset name, dataset version, and experiment ID. Folder names show both versions, for example, `data_v_1.2/exp_v_0.4/`. Generation creates a new experiment by default. Evaluation and plotting use the latest experiment or accept `--experiment-id` to open an earlier run. This keeps cached inputs, model outputs, HPO state, metrics, and figures separate across dataset revisions.
-
-### Imputation artifacts
-
-For canonical `train`/`tuning`/`final_holdout` datasets, version **0.9.0** stores phase-specific imputation artifacts under the configured dataset `data_dir`:
-
-- `imputation_initial/` writes and uses these seven candidate-phase artifacts in the current layout: `train_imputed.csv`, `tuning_imputed.csv`, `train_imputed_decoded.csv`, `tuning_imputed_decoded.csv`, `full_candidate_partial_imputed.csv`, `full_candidate_partial_imputed_decoded.csv`, and `.imputation_cache_key.json`. The role files hold candidate-imputed `train` and `tuning`; the decoded files are label-preserving views. The `full_candidate_partial` aggregates cover all original rows in original row order: candidate-imputed `train` and `tuning`, plus raw, unchanged `final_holdout`. There is no separate candidate-imputed holdout file.
-- `imputation_final/` writes and uses these seven final-phase artifacts in the current layout: `train_tuning_imputed.csv`, `final_holdout_imputed.csv`, `train_tuning_imputed_decoded.csv`, `final_holdout_imputed_decoded.csv`, `full_final_imputed.csv`, `full_final_imputed_decoded.csv`, and `.imputation_cache_key.json`. The two role files contain combined final-imputed `train`+`tuning` and final-imputed `final_holdout`; decoded files are label-preserving views. The `full_final` aggregates cover every original row in original row order, with every role transformed by the same final imputer fit on raw `train`+`tuning`. These are current-layout artifacts, not an exclusive folder listing; older files from prior layouts, such as `train_imputed.csv` and `tuning_imputed.csv`, may remain in `imputation_final/`.
-
-Each phase's cache-key file is scoped to that phase's imputation inputs and lineage. Raw `full.csv`, raw role CSVs (`train.csv`, `tuning.csv`, and `final_holdout.csv`), and role assignment files/manifests under the dataset-root `assignments/` directory remain at the dataset root; phase-specific imputed artifacts do not replace them. Legacy two-role datasets retain the historical root-level imputation artifact layout and do not use these phase directories.
 
 > [!TIP]
 > See [`synthdata/config.py`](synthdata/config.py) for settings for cached data, computing devices, models, HPO, parallel evaluation, saved files, experiments, metrics, rankings, privacy gates, and plots.
