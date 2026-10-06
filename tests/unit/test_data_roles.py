@@ -72,12 +72,22 @@ def test_mapping_sidecar_identity_is_removed_from_model_frames(make_canonical_da
     )
 
 
-def test_one_row_per_patient_cannot_create_row_index_identity():
-    frame = pd.DataFrame({"feature": [1, 2, 3], "target": [0, 1, 0]})
+def test_one_row_per_patient_makes_each_row_its_own_population_group():
+    frame = pd.DataFrame({"feature": [1, 1, 3], "target": [0, 0, 0]})
     split = DataSplitConfig(mode="patient_group", one_row_per_patient=True)
 
-    with pytest.raises(ValueError, match="not a leakage-safe identity source"):
-        resolve_population_identity(frame, split)
+    identity = resolve_population_identity(frame, split)
+    repeated = resolve_population_identity(frame, split)
+
+    assert identity.groups is not None
+    assert identity.groups.nunique() == len(frame)
+    assert identity.groups.tolist() == repeated.groups.tolist()
+    assert identity.model_frame.equals(frame)
+    assert identity.identity_sidecar is None
+    assert identity.metadata["identity_source"] == "one_row_per_patient"
+    assert identity.metadata["population_unit"] == "patient_group"
+    assert identity.metadata["n_population_groups"] == len(frame)
+    assert identity.metadata["raw_identifier_persisted"] is False
 
 
 def test_candidate_role_context_ignores_final_holdout_changes(make_canonical_dataset):

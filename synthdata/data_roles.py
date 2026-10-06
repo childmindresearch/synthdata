@@ -294,16 +294,40 @@ def resolve_population_identity(
     if split.mode != "patient_group":
         raise ValueError(f"Unsupported data.split.mode: {split.mode!r}")
 
-    if split.one_row_per_patient:
-        raise ValueError(
-            "one_row_per_patient is not a leakage-safe identity source; configure "
-            "patient_id_column or an approved identity mapping sidecar"
-        )
-
     token_secret, key_fingerprint = _required_token_secret(
         token_key_path,
         expected_fingerprint=expected_key_fingerprint,
     )
+    tokenization_metadata = {
+        "raw_identifier_persisted": False,
+        "tokenization_algorithm": TOKENIZATION_ALGORITHM,
+        "tokenization_version": TOKENIZATION_VERSION,
+        "tokenization_scope_fingerprint": hashlib.sha256(token_scope.encode()).hexdigest(),
+        "hmac_key_fingerprint": key_fingerprint,
+    }
+
+    if split.one_row_per_patient:
+        # The config asserts each source row is a distinct patient, so every row
+        # is its own population group and a group split is a patient split.
+        normalized = row_keys.map(
+            lambda key: _opaque_group_token(f"row:{key}", token_scope, token_secret=token_secret)
+        )
+        return PopulationIdentity(
+            groups=normalized.rename("population_group"),
+            model_frame=df.copy(),
+            row_keys=row_keys,
+            source="one_row_per_patient",
+            metadata={
+                "mode": "patient_group",
+                "population_unit": "patient_group",
+                "identity_source": "one_row_per_patient",
+                "identity_column": None,
+                "identity_fingerprint": _series_fingerprint(normalized),
+                "n_population_groups": int(normalized.nunique()),
+                **tokenization_metadata,
+            },
+            identity_sidecar=None,
+        )
 
     if split.patient_id_column is not None:
         column = split.patient_id_column
@@ -325,11 +349,7 @@ def resolve_population_identity(
             "identity_column": column,
             "identity_fingerprint": _series_fingerprint(normalized),
             "n_population_groups": int(normalized.nunique()),
-            "raw_identifier_persisted": False,
-            "tokenization_algorithm": TOKENIZATION_ALGORITHM,
-            "tokenization_version": TOKENIZATION_VERSION,
-            "tokenization_scope_fingerprint": hashlib.sha256(token_scope.encode()).hexdigest(),
-            "hmac_key_fingerprint": key_fingerprint,
+            **tokenization_metadata,
         }
         return PopulationIdentity(
             groups=normalized.rename("population_group"),
@@ -433,11 +453,7 @@ def resolve_population_identity(
         "identity_columns_removed": identity_columns,
         "identity_fingerprint": _series_fingerprint(safe_groups),
         "n_population_groups": int(safe_groups.nunique()),
-        "raw_identifier_persisted": False,
-        "tokenization_algorithm": TOKENIZATION_ALGORITHM,
-        "tokenization_version": TOKENIZATION_VERSION,
-        "tokenization_scope_fingerprint": hashlib.sha256(token_scope.encode()).hexdigest(),
-        "hmac_key_fingerprint": key_fingerprint,
+        **tokenization_metadata,
     }
     return PopulationIdentity(
         groups=safe_groups.rename("population_group"),

@@ -43,7 +43,9 @@ class DataSplitConfig:
     target_balance_tolerance: float = 0.20
 
     #: Direct source-column identity, a validated local mapping, or an explicit
-    #: assertion for data whose rows are already one distinct patient each.
+    #: assertion for data whose rows are already one distinct patient each. The
+    #: assertion makes every row its own population group, so a group split is a
+    #: patient split; it is only as correct as the source documentation behind it.
     patient_id_column: str | None = None
     identity_mapping_path: str | None = None
     mapping_row_key_column: str | None = None
@@ -79,7 +81,8 @@ class DataConfig:
     uci_id: int | None = None
     #: Path to a local CSV or Parquet file (only used when source == "csv"/"parquet").
     path: str | None = None
-    #: Direct source-column patient identity required for canonical evaluation.
+    #: Direct source-column patient identity. Canonical profiles declare this or
+    #: ``data.split.one_row_per_patient`` for sources with one row per patient.
     patient_id_column: str | None = None
     #: Marks profile as subject to canonical leakage-safe policy validation.
     canonical: bool = False
@@ -442,7 +445,7 @@ class FrameworkSelectionConfig:
 
 @dataclasses.dataclass
 class LogDisparityConfig:
-    #: Defaults to data.sensitive_columns if left empty.
+    #: Defaults to data.protected_columns if left empty.
     protected_columns: list = dataclasses.field(default_factory=list)
     target_map: dict | None = None
     protected_map: list | None = None
@@ -1161,14 +1164,6 @@ def _validate(cfg: Config) -> None:
         )
     _validate_data_split_config(cfg.data)
     if cfg.data.canonical:
-        if (
-            not isinstance(cfg.data.patient_id_column, str)
-            or not cfg.data.patient_id_column.strip()
-        ):
-            raise ValueError(
-                "Canonical evaluation requires data.patient_id_column as a direct source column; "
-                "mapping sidecars and one_row_per_patient are not accepted"
-            )
         if cfg.data.split is None:
             raise ValueError("Canonical evaluation requires data.split with patient_group mode")
         if cfg.data.split.mode != "patient_group":
@@ -1177,16 +1172,24 @@ def _validate(cfg: Config) -> None:
                 "use patient_group"
             )
         split_identity = cfg.data.split
+        has_patient_id = isinstance(cfg.data.patient_id_column, str) and bool(
+            cfg.data.patient_id_column.strip()
+        )
+        if has_patient_id == split_identity.one_row_per_patient:
+            raise ValueError(
+                "Canonical evaluation requires exactly one patient identity: "
+                "data.patient_id_column as a direct source column, or "
+                "data.split.one_row_per_patient=true for sources with one row per patient"
+            )
         if (
             split_identity.identity_mapping_path is not None
-            or split_identity.one_row_per_patient
             or split_identity.patient_id_column is not None
             or split_identity.mapping_row_key_column is not None
             or split_identity.mapping_patient_key_column is not None
         ):
             raise ValueError(
-                "Canonical evaluation rejects nested split identity, mapping sidecars, and "
-                "one_row_per_patient; use direct data.patient_id_column"
+                "Canonical evaluation rejects nested split identity and mapping sidecars; "
+                "use data.patient_id_column or data.split.one_row_per_patient"
             )
         if cfg.evaluation.group_mode != "row" or cfg.evaluation.group_column is not None:
             raise ValueError(

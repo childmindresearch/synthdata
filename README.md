@@ -53,7 +53,7 @@ Severity,categorical,"[0, 1, 2, 3]"
 target,categorical,
 ```
 
-Dataset profiles must define the standard `data.split` roles `train`, `tuning`, and `final_holdout`. The roles are patient-disjoint: each patient can appear in only one role, even if they have multiple encounters. `train` is used to fit candidate models, `tuning` is used for hyperparameter optimization (HPO) and candidate selection, and `final_holdout` is kept separate until after selection to provide final evidence. Set `data.patient_id_column` to the patient ID column. The pipeline uses it to keep each patient's records in one role, then removes it from the data given to models.
+Dataset profiles must define the standard `data.split` roles `train`, `tuning`, and `final_holdout`. The roles are patient-disjoint: each patient can appear in only one role, even if they have multiple encounters. `train` is used to fit candidate models, `tuning` is used for hyperparameter optimization (HPO) and candidate selection, and `final_holdout` is kept separate until after selection to provide final evidence. Set `data.patient_id_column` to the patient ID column. The pipeline uses it to keep each patient's records in one role, then removes it from the data given to models. If the source has exactly one row per patient and no ID column, set `data.split.one_row_per_patient: true` instead; each row is then treated as its own patient. Only use this when the source documentation confirms it, because the pipeline cannot check it.
 
 For patient-group splitting, the pipeline creates and reuses a local secret key (`.patient_id_hmac_key`) in the data folder by default. To use an external key, set `SYNTHDATA_PATIENT_ID_HMAC_KEY`; the pipeline uses that key instead. The pipeline uses it to create consistent patient-ID tokens in split and assignment files, reducing raw-ID exposure if those files are shared.
 
@@ -66,7 +66,7 @@ Declare each role explicitly in the config file; the pipeline does not guess one
 - `sensitive attributes` are columns whose disclosure is measured by privacy attacks,
 - `protected attributes` identify groups used to check fairness. Checks include representation, equal opportunity, equalized odds, and log-disparity evidence. May overlap with QIs and sensitive attributes when explicitly declared.
 
-Use `data.sensitive_columns` for disclosure/attribute-inference targets and `data.protected_columns` for fairness groups; neither role substitutes for the other. Canonical profiles require independent declarations. The deferred Hepatitis example retains historical sensitive roles and explicit `evaluation.log_disparity.protected_columns`; legacy aliases are not guidance for choosing protected attributes in a new profile.
+Use `data.sensitive_columns` for disclosure/attribute-inference targets and `data.protected_columns` for fairness groups; neither role substitutes for the other. Canonical profiles require independent declarations.
 
 ## Pipeline behavior
 

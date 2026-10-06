@@ -1,42 +1,51 @@
-# Hepatitis example. All paths are relative to the repository root.
+# Hepatitis example (UCI id 46). All paths are relative to the repository root.
 
 name: hepatitis
 seed: 42
 device: auto
 
 experiment:
-  tag: test
-  id: 0.1 # Set to resume or extend a specific experiment.
+  tag: hepatitis
+  id: "0.1" # Set to resume or extend a specific experiment.
 
 data:
   # Source and schema
-  canonical: false # Deferred legacy profile; canonical validation fails closed until direct patient identity/policy are defined.
   source: uci # Downloads public data on a cache miss; use csv/parquet for local-only input.
   uci_id: 46
   path: null # Required for csv/parquet sources.
-  version: "1.0" # Use a new value when the source data changes.
+  version: "1.1" # Use a new value when the source data changes.
   variable_schema_path: data/hepatitis/hepatitis_variable_schema.csv
 
   # Modeling columns
   target_column: target
-  stratification_variables: [target]
-  stratification_bins: [null]
   raw_target_column: CLASS
-  sensitive_columns: [AGE, SEX] # Historical disclosure targets, not an implicit fairness declaration.
-  drop_columns: []
+  stratification_variables: [target, SEX]
+  stratification_bins: [null, null]
+  canonical: true # Enables strict leakage-safe policy; validation failures abort loading.
+  # QIs are attacker-observable predictors and release equivalence-class fields;
+  # they must not overlap sensitive fields or the target. They may overlap
+  # protected fields. Attribute inference uses QIs as predictors.
+  quasi_identifier_columns: [AGE, SEX]
+  sensitive_columns: [HISTOLOGY, ANTIVIRALS] # Disclosure/attribute-inference targets.
+  # Protected fields define fairness groups. The sample has 155 patients, so age
+  # uses coarse bins; finer bins leave single-row groups.
+  protected_columns: [SEX, AGE]
+  protected_attribute_bins: [null, ["<30", "30-45", "45-60", ">60"]]
   drop_rows_missing_target: false
+  drop_columns: []
 
   # Source normalization and canonical population roles
   uppercase_columns: true
   remap_binary_one_two: true
   outlier_zscore_threshold: null
   outlier_columns: []
-  # The UCI table has one row per patient and no exported identity column.
   split:
     mode: patient_group
     train_fraction: 0.60
     tuning_fraction: 0.20
     final_holdout_fraction: 0.20
+    # The UCI table has one row per patient and no identity column, so each
+    # row is its own patient group.
     one_row_per_patient: true
     candidate_count: 32
 
@@ -46,23 +55,14 @@ data:
 
 imputation:
   enabled: true
-  method: refidiff
+  method: hyperimpute # Canonical imputation backend.
   device: auto
   cache: true
   validation_margin: 0.2
   round_to_int_default: true
   round_rules: { BILIRUBIN: 2, ALBUMIN: 1 }
-
-  # Used only by method: refidiff.
-  refidiff:
-    hidden_dim: 32
-    epochs: 10001
-    early_stopping_patience: 500
-    batch_size: 8192
-    num_steps: 50
-    num_trials: 10
-    denoiser: auto
-    checkpoint_every: 1000
+  benchmark:
+    enabled: false
 
 generation:
   output_dir: output/hepatitis/synthetic_data
@@ -118,33 +118,51 @@ evaluation:
     categories: null
     metrics: null
     classification_score: balanced_accuracy
+    # Attribute inference: QIs are predictors and sensitive fields are targets;
+    # membership/re-identification/structural screens retain distinct threats.
     structural_n_clusters: [2, 5, 10, 15]
     structural_min_rows_per_cluster: 10
   syntheval: { enabled: true, categories: null, metrics: null }
   custom: { enabled: true, categories: null, metrics: null }
 
   log_disparity:
-    # Explicit legacy fairness attributes; independent of sensitive disclosure targets.
-    protected_columns: [SEX, AGE]
     target_map: { 0: died, 1: survived }
-    protected_map: [{ 0: male, 1: female }, null]
-    protected_bins: [null, [7, 18, 30, 45, 60, 78]]
+    protected_map: [{ 0: male, 1: female }, null] # Aligned with data.protected_columns.
+    protected_bins: null
 
-  syntheval_execution:
-    model_workers: auto
-    max_model_workers: 8
-    cores_per_model: 4
-    memory_reserve_gib: 16
-    memory_per_model_gib: null
-
-  # Support settings do not make this deferred legacy profile release-ready.
+  # Evidence support only, not formal privacy guarantees; invalid values fail closed.
+  # Unsupported synthetic categorical values are never coerced: affected
+  # evidence is failed or indeterminate, never succeeded. Succeeded requires
+  # all required tables; only succeeded evidence supplies metrics/plots/ranking.
   privacy_policy:
     role_population_floor: 20 # Synthetic/reference rows for release-privacy evidence only.
-    protected_slice_floor: 1 # Provisional final TSTR EO total/actual-positive/actual-negative row minimum.
+    # Final TSTR EO: minimum total, actual-positive and actual-negative rows per
+    # protected group and one-vs-rest class; at least two valid groups required.
+    # Provisional 1 implies at least two rows per group, not statistical confidence.
+    protected_slice_floor: 1
 
-  # Calibration-only starting thresholds. Keep the gate disabled until reviewed
-  # operational contract IDs and thresholds are defined; no formal privacy guarantee.
+  # Existing final-audit score normalization only; raw metrics/selection unchanged.
+  # Both anchors must be finite and positive; metric reconciliation is deferred.
+  scoring_policy:
+    equalized_odds_gap_anchor: 0.10
+    worst_absolute_log_disparity_anchor: 0.69314718056
+
+  # Resource cap for resumable per-model SynthEval processes. The dataset has
+  # 20 columns, so each model needs far less memory than the automatic estimate.
+  syntheval_execution:
+    model_workers: auto
+    max_model_workers: 4
+    cores_per_model: 2
+    memory_reserve_gib: 4
+    memory_per_model_gib: 2
+    # Largest share of holdout rows with categories absent from train that
+    # cls_acc/auroc_diff/mia/att_discl resolve by mapping to the train mode;
+    # above it those metrics are blocked as a material shift. 0 always blocks.
+    max_holdout_unknown_row_fraction: 0.05
+
   privacy_gate:
+    # Calibration-only starting thresholds; enable only with reviewed
+    # operational contract IDs after privacy calibration.
     enabled: false
     thresholds:
       mia_recall: { bound: max, value: 0.6 }

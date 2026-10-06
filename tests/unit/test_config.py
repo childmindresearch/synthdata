@@ -935,9 +935,9 @@ class TestLoadConfig:
         assert evaluation.generation.force_retrain is False
         assert generation.generation.force_retrain is True
 
-    def test_canonical_requires_direct_patient_id(self):
+    def test_canonical_requires_patient_group_split(self):
         cfg = Config(data=DataConfig(source="csv", path="x.csv", canonical=True))
-        with pytest.raises(ValueError, match="patient_id_column"):
+        with pytest.raises(ValueError, match="requires data.split with patient_group mode"):
             _validate(cfg)
 
     @pytest.mark.parametrize("overlap", ["sensitive", "target", "patient"])
@@ -1031,6 +1031,20 @@ class TestLoadConfig:
         cfg = self._canonical_fixture()
         mutator(cfg)
         with pytest.raises(ValueError, match=message):
+            _validate(cfg)
+
+    def test_canonical_accepts_one_row_per_patient_without_patient_id_column(self):
+        cfg = self._canonical_fixture()
+        cfg.data.patient_id_column = None
+        assert cfg.data.split is not None
+        cfg.data.split.one_row_per_patient = True
+
+        _validate(cfg)
+
+    def test_canonical_requires_a_patient_identity(self):
+        cfg = self._canonical_fixture()
+        cfg.data.patient_id_column = None
+        with pytest.raises(ValueError, match="exactly one patient identity"):
             _validate(cfg)
 
     def test_canonical_nested_identity_is_rejected_at_load(self, tmp_path):
