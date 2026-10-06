@@ -5,7 +5,7 @@ import yaml
 
 from scripts import run_test
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("machine_resources")]
 
 
 def _write_valid_audit_files(tmp_path):
@@ -53,6 +53,7 @@ def test_cli_returns_zero_and_reports_valid_config(tmp_path, monkeypatch, capsys
     assert status == 0
     assert "audit passed" in captured.out
     assert "dataset=custom-audit-data" in captured.out
+    assert "syntheval_workers=4" in captured.out
     assert captured.err == ""
 
 

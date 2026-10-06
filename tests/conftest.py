@@ -195,6 +195,20 @@ def patient_id_hmac_secret(monkeypatch, tmp_path: Path):
 
 
 @pytest.fixture
+def machine_resources(monkeypatch):
+    """Fake the host CPU count and available memory read by SynthEval worker sizing."""
+
+    def _set(*, cpus: int = 16, available_gib: float = 200.0) -> None:
+        monkeypatch.setattr("synthdata.evaluation.syntheval_eval.os.cpu_count", lambda: cpus)
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval._available_memory_gib", lambda: available_gib
+        )
+
+    _set()
+    return _set
+
+
+@pytest.fixture
 def sample_mixed_df() -> pd.DataFrame:
     """A small (30-row) DataFrame mixing numeric, string-categorical, a {1,2}
     binary quirk column, and injected missingness -- for synthdata.data's

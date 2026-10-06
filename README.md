@@ -39,7 +39,7 @@ Run `synthdata-test` to check a configuration before running any pipeline steps:
 uv run synthdata-test --config path/to/your-config.yaml
 ```
 
-The audit checks that the configuration and its rules make sense, then loads the configured dataset and variable schema by default. It checks the data, schema, declared column roles, and data split using the same loader as the pipeline. The check may write processed data, split files, and related metadata under the configured data directory. If the config points to a remote source such as UCI and the data is not already cached locally, the audit may download and cache it.
+The audit checks that the configuration and its rules make sense, then loads the configured dataset and variable schema by default. It checks the data, schema, declared column roles, and data split using the same loader as the pipeline. When SynthEval evaluation is enabled, it also checks that `evaluation.syntheval_execution` fits this machine's available CPUs and memory, and reports how many SynthEval worker processes it would use. The check may write processed data, split files, and related metadata under the configured data directory. If the config points to a remote source such as UCI and the data is not already cached locally, the audit may download and cache it.
 
 ## Dataset configuration
 

@@ -4,8 +4,9 @@ import pytest
 import yaml
 
 from synthdata.config_audit import audit_config
+from synthdata.evaluation.syntheval_eval import InsufficientSynthEvalMemoryError
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("machine_resources")]
 
 
 def _write_valid_audit_files(tmp_path):
@@ -50,6 +51,28 @@ def test_audit_config_loads_supplied_config_and_schema(tmp_path):
     assert result.feature_columns == ("age",)
     assert result.target_column == "outcome"
     assert result.schema_columns == ("age", "outcome")
+    # Default budget on the faked 16-CPU, 200 GiB machine: 16 // 4 cores.
+    assert result.syntheval_model_workers == 4
+
+
+def test_audit_config_rejects_resource_budget_that_cannot_fit_one_model(
+    tmp_path, machine_resources
+):
+    config_path = _write_valid_audit_files(tmp_path)
+    machine_resources(available_gib=8.0)
+
+    with pytest.raises(InsufficientSynthEvalMemoryError, match="cannot fit one model"):
+        audit_config(config_path)
+
+
+def test_audit_config_skips_resource_check_when_syntheval_is_disabled(tmp_path, machine_resources):
+    config_path = _write_valid_audit_files(tmp_path)
+    raw = yaml.safe_load(config_path.read_text())
+    raw["evaluation"] = {"syntheval": {"enabled": False}}
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    machine_resources(available_gib=8.0)
+
+    assert audit_config(config_path).syntheval_model_workers is None
 
 
 def test_audit_config_applies_canonical_policy_checks_to_supplied_config(tmp_path):

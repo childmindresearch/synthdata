@@ -5,6 +5,7 @@ from pathlib import Path
 
 from synthdata.config import load_config
 from synthdata.data import load_dataset
+from synthdata.evaluation.syntheval_eval import resolve_model_workers
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -21,6 +22,9 @@ class ConfigAuditResult:
     feature_columns: tuple[str, ...]
     target_column: str
     schema_columns: tuple[str, ...]
+    #: Concurrent SynthEval model processes this machine can run now; None when
+    #: SynthEval evaluation is disabled.
+    syntheval_model_workers: int | None
 
 
 def audit_config(path: str | Path) -> ConfigAuditResult:
@@ -30,6 +34,10 @@ def audit_config(path: str | Path) -> ConfigAuditResult:
     cleanup, declaration, schema, and split checks. This function does not run
     imputation, generation, evaluation, plotting, or model inference. An uncached
     UCI source can still trigger a dataset download.
+
+    SynthEval worker sizing is checked against this machine's live CPU and
+    memory, so a resource budget that cannot fit one model process fails here
+    instead of partway through evaluation.
     """
     config_path = Path(path).expanduser().resolve()
     logger.info("[config-audit] validating config=%s", config_path)
@@ -41,6 +49,14 @@ def audit_config(path: str | Path) -> ConfigAuditResult:
         cfg.data.version or "unversioned",
     )
     dataset = load_dataset(cfg)
+    syntheval_model_workers = None
+    if cfg.evaluation.syntheval.enabled:
+        execution = cfg.evaluation.syntheval_execution
+        syntheval_model_workers = resolve_model_workers(
+            execution,
+            n_models=execution.max_model_workers,
+            n_columns=len(dataset.full_df.columns),
+        )
     result = ConfigAuditResult(
         config_path=config_path,
         dataset_name=dataset.name,
@@ -49,14 +65,17 @@ def audit_config(path: str | Path) -> ConfigAuditResult:
         feature_columns=tuple(dataset.feature_columns),
         target_column=dataset.target_column,
         schema_columns=tuple(dataset.variable_schema),
+        syntheval_model_workers=syntheval_model_workers,
     )
     logger.info(
-        "[config-audit] passed config=%s dataset=%s version=%s rows=%d features=%d schema_columns=%d",
+        "[config-audit] passed config=%s dataset=%s version=%s rows=%d features=%d "
+        "schema_columns=%d syntheval_workers=%s",
         result.config_path,
         result.dataset_name,
         result.dataset_version or "unversioned",
         result.row_count,
         len(result.feature_columns),
         len(result.schema_columns),
+        "disabled" if result.syntheval_model_workers is None else result.syntheval_model_workers,
     )
     return result

@@ -39,11 +39,13 @@ def main() -> int:
         )
         return 1
 
+    workers = result.syntheval_model_workers
     print(
         "synthdata-test: audit passed: "
         f"config={result.config_path} dataset={result.dataset_name} "
         f"version={result.dataset_version or 'unversioned'} rows={result.row_count} "
-        f"features={len(result.feature_columns)} schema_columns={len(result.schema_columns)}"
+        f"features={len(result.feature_columns)} schema_columns={len(result.schema_columns)} "
+        f"syntheval_workers={'disabled' if workers is None else workers}"
     )
     return 0
 

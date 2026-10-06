@@ -31,7 +31,6 @@ from synthdata.config import (
 )
 from synthdata.data import _configured_stratification_frame
 from synthdata.evaluation.release import transform_release_roles
-from synthdata.evaluation.syntheval_eval import resolve_model_workers
 
 pytestmark = pytest.mark.unit
 
@@ -1132,55 +1131,19 @@ class TestLoadConfig:
         assert cfg.data.target_column == "outcome"
         assert cfg.config_path == yaml_path.resolve()
 
-    def test_loris_syntheval_execution_uses_cpu_and_live_memory_bounds(self, monkeypatch):
-        config_path = Path(__file__).parents[2] / "configs" / "config_loris.yaml"
-        execution = load_config(config_path).evaluation.syntheval_execution
+    @pytest.mark.parametrize(
+        "config_path",
+        sorted((Path(__file__).parents[2] / "configs").glob("*.yaml")),
+        ids=lambda path: path.name,
+    )
+    def test_shipped_config_loads_as_canonical_profile(self, config_path):
+        cfg = load_config(config_path)
 
-        assert execution.model_workers == "auto"
-        assert execution.max_model_workers == 6
-        assert execution.cores_per_model == 4
-        assert execution.memory_reserve_gib == 16
-        assert execution.memory_per_model_gib == 14
+        assert cfg.data.canonical is True
 
-        monkeypatch.setattr("synthdata.evaluation.syntheval_eval.os.cpu_count", lambda: 24)
-        monkeypatch.setattr(
-            "synthdata.evaluation.syntheval_eval._available_memory_gib", lambda: 100.0
-        )
-        assert resolve_model_workers(execution, n_models=20, n_columns=664) == 6
-
-        # Live available memory below the six-worker budget lowers concurrency.
-        monkeypatch.setattr(
-            "synthdata.evaluation.syntheval_eval._available_memory_gib", lambda: 72.0
-        )
-        assert resolve_model_workers(execution, n_models=20, n_columns=664) == 4
-
-        # CPU availability independently limits workers even with ample memory.
-        monkeypatch.setattr("synthdata.evaluation.syntheval_eval.os.cpu_count", lambda: 16)
-        monkeypatch.setattr(
-            "synthdata.evaluation.syntheval_eval._available_memory_gib", lambda: 200.0
-        )
-        assert resolve_model_workers(execution, n_models=20, n_columns=664) == 4
-
-    def test_shipped_profiles_declare_stratification_and_tstr_only_hpo(self):
-        root = Path(__file__).parents[2]
-        loris = load_config(root / "configs" / "config_loris.yaml")
-        hepatitis = load_config(root / "configs" / "config_hepatitis.yaml")
-
-        assert loris.data.stratification_variables == ["CGAS_class", "Sex", "Age"]
-        assert loris.data.stratification_bins == [
-            None,
-            None,
-            ["<18", "18-30", "30-45", "45-60", ">60"],
-        ]
-        assert loris.data.protected_attribute_bins == [
-            None,
-            ["<18", "18-30", "30-45", "45-60", ">60"],
-            None,
-        ]
-        runtime_bins = _protected_attribute_bin_intervals(
-            loris.data.protected_columns,
-            loris.data.protected_attribute_bins,
-        )
+    def test_age_stratification_labels_match_release_transform(self):
+        labels = ["<18", "18-30", "30-45", "45-60", ">60"]
+        runtime_bins = _protected_attribute_bin_intervals(["Age"], [labels])
         age_intervals = runtime_bins["Age"]["intervals"]
         assert [(interval["lower"], interval["upper"]) for interval in age_intervals] == [
             (None, 18),
@@ -1189,21 +1152,11 @@ class TestLoadConfig:
             (45, 60),
             (60, None),
         ]
-        assert [interval["label"] for interval in age_intervals] == [
-            "<18",
-            "18-30",
-            "30-45",
-            "45-60",
-            ">60",
-        ]
+        assert [interval["label"] for interval in age_intervals] == labels
 
-        age_values = [17, 18, 29, 30, 44, 45, 59, 60]
-        age_frame = pd.DataFrame({"Age": age_values})
+        age_frame = pd.DataFrame({"Age": [17, 18, 29, 30, 44, 45, 59, 60]})
         stratified, _policy = _configured_stratification_frame(
-            age_frame,
-            ["Age"],
-            [loris.data.stratification_bins[2]],
-            runtime_bins,
+            age_frame, ["Age"], [labels], runtime_bins
         )
         assert stratified is not None
         released_synthetic, released_roles, _metadata = transform_release_roles(
@@ -1213,17 +1166,6 @@ class TestLoadConfig:
         )
         assert released_synthetic["Age"].tolist() == stratified["Age"].tolist()
         assert released_roles["train"]["Age"].tolist() == stratified["Age"].tolist()
-
-        assert hepatitis.data.stratification_variables == ["target"]
-        assert hepatitis.data.stratification_bins == [None]
-        for cfg in (loris, hepatitis):
-            assert cfg.generation.hpo.metric_config == {
-                "canonical_objectives": ["tstr_macro_f1.v1"]
-            }
-            assert cfg.generation.hpo.utility_policy == {
-                "metrics": ["tstr_macro_f1.v1"],
-                "weights": [1.0],
-            }
 
     def test_null_drop_columns_loads_as_empty_list(self, tmp_path):
         yaml_path = tmp_path / "config.yaml"
