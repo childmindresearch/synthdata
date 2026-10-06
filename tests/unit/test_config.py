@@ -609,6 +609,19 @@ class TestValidate:
         cfg.evaluation.syntheval_execution.model_workers = 3
         _validate(cfg)
 
+    @pytest.mark.parametrize("fraction", [-0.01, 1.5, True, "0.05", None])
+    def test_invalid_holdout_unknown_row_fraction_raises(self, fraction):
+        cfg = self._base_valid()
+        cfg.evaluation.syntheval_execution.max_holdout_unknown_row_fraction = fraction
+        with pytest.raises(ValueError, match="max_holdout_unknown_row_fraction"):
+            _validate(cfg)
+
+    @pytest.mark.parametrize("fraction", [0, 0.05, 1])
+    def test_valid_holdout_unknown_row_fraction_passes(self, fraction):
+        cfg = self._base_valid()
+        cfg.evaluation.syntheval_execution.max_holdout_unknown_row_fraction = fraction
+        _validate(cfg)
+
     @pytest.mark.parametrize("field", ["max_model_workers", "cores_per_model"])
     def test_non_positive_syntheval_integer_bounds_raise(self, field):
         cfg = self._base_valid()

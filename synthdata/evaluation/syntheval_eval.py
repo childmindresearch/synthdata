@@ -51,7 +51,7 @@ logger = get_logger(__name__)
 
 _RANK_COLUMNS = {"rank", "u_rank", "p_rank", "f_rank"}
 _CHECKPOINT_SCHEMA_VERSION = 1
-_PREPROCESSING_CONTRACT = "syntheval-fit-role-v4-real-holdout-unknown-nominal"
+_PREPROCESSING_CONTRACT = "syntheval-fit-role-v5-real-holdout-unknown-train-mode"
 
 
 def _model_artifact_id(model_name: str) -> str:
@@ -1517,6 +1517,7 @@ def _model_worker(
     group_context: dict | None = None,
     role_context: dict | None = None,
     semantic_context: Mapping[str, Any] | None = None,
+    max_holdout_unknown_row_fraction: float = 0.05,
     progress_queue=None,
 ) -> None:
     """Run exactly one model in a disposable child process and checkpoint it."""
@@ -1590,6 +1591,7 @@ def _model_worker(
             enable_plots=plot_dir is not None,
             console="off",
             show_warnings=False,
+            max_holdout_unknown_row_fraction=max_holdout_unknown_row_fraction,
         )
 
         def report_method_progress(event: dict) -> None:
@@ -1660,6 +1662,17 @@ def _model_worker(
                 )
         else:
             expected_holdout_block = False
+        unknown_metadata = execution.preprocessing_metadata or {}
+        if unknown_metadata.get("real_holdout_unknown_policy") == "train_mode":
+            logger.info(
+                "[syntheval] model=%s real holdout unknown categories remapped to train mode; "
+                "rows=%d row_fraction=%.4f columns=%d metric(s)=%s",
+                model_name,
+                unknown_metadata.get("real_holdout_unknown_row_count", 0),
+                unknown_metadata.get("real_holdout_unknown_row_fraction", 0.0),
+                len(unknown_metadata.get("real_holdout_unknown_categories", {})),
+                ", ".join(unknown_metadata.get("real_holdout_unknown_remapped_metrics", [])),
+            )
         plot_files = (
             sorted(
                 str(path.relative_to(plot_dir)) for path in plot_dir.rglob("*") if path.is_file()
@@ -2055,6 +2068,15 @@ def build_preset(
     return preset
 
 
+def _holdout_unknown_max_row_fraction(execution_cfg) -> float:
+    """Return the configured holdout unknown-category cap, defaulting when unset."""
+    if execution_cfg is None:
+        from synthdata.config import SynthEvalExecutionConfig
+
+        execution_cfg = SynthEvalExecutionConfig()
+    return float(execution_cfg.max_holdout_unknown_row_fraction)
+
+
 def _evaluation_context_fingerprint(
     dataset: Dataset,
     preset: dict,
@@ -2068,6 +2090,7 @@ def _evaluation_context_fingerprint(
     fit_roles: tuple[str, ...] = ("train",),
     target_view_context: Mapping[str, Any] | None = None,
     semantic_context: Mapping[str, Any] | None = None,
+    holdout_unknown_max_row_fraction: float | None = None,
 ) -> str:
     """Fingerprint inputs shared by every model in one evaluation pass."""
     if fit_frame is None or tuning_frame is None:
@@ -2097,6 +2120,11 @@ def _evaluation_context_fingerprint(
         "group_context": group_context,
         "registry_digest": DEFAULT_METRIC_CONTRACT_REGISTRY.digest(),
         "preprocessing_contract": _PREPROCESSING_CONTRACT,
+        "holdout_unknown_max_row_fraction": (
+            _holdout_unknown_max_row_fraction(None)
+            if holdout_unknown_max_row_fraction is None
+            else float(holdout_unknown_max_row_fraction)
+        ),
         "target_view_context": dict(target_view_context or {}),
         "semantic_context": dict(semantic_context) if semantic_context is not None else None,
         "semantic_context_digest": (
@@ -2205,6 +2233,7 @@ def _run_resumable_syntheval(
         fit_roles=fit_roles,
         target_view_context=target_view_context,
         semantic_context=semantic_context,
+        holdout_unknown_max_row_fraction=_holdout_unknown_max_row_fraction(execution_cfg),
     )
     role_context = _evaluation_role_context(
         dataset,
@@ -2436,6 +2465,7 @@ def _run_resumable_syntheval(
                                 group_context,
                                 role_context,
                                 semantic_context,
+                                _holdout_unknown_max_row_fraction(execution_cfg),
                                 progress_queue,
                             ),
                             name=f"syntheval-{pass_name}-{model_name}",
@@ -2748,6 +2778,7 @@ def run_syntheval_evaluation(
         evaluation_role=evaluation_role,
         fit_roles=fit_roles,
         semantic_context=semantic_context,
+        holdout_unknown_max_row_fraction=_holdout_unknown_max_row_fraction(execution_cfg),
     )
     role_context = _evaluation_role_context(
         dataset,
@@ -3096,6 +3127,7 @@ def run_binary_target_syntheval_evaluation(
         fit_roles=fit_roles,
         target_view_context=binary_target_context,
         semantic_context=binary_semantic_context,
+        holdout_unknown_max_row_fraction=_holdout_unknown_max_row_fraction(execution_cfg),
     )
     role_context = _evaluation_role_context(
         binary_dataset,

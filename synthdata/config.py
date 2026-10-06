@@ -573,6 +573,11 @@ class SynthEvalExecutionConfig:
     memory_reserve_gib: float = 16.0
     #: Optional fixed estimate; automatic mode derives one from feature width when None.
     memory_per_model_gib: float | None = None
+    #: Largest share of real holdout rows with categories absent from train that
+    #: classifier-based holdout metrics (cls_acc, auroc_diff, mia, att_discl)
+    #: resolve by mapping to the train mode. Above it those metrics are blocked
+    #: as a material distribution shift; 0 always blocks.
+    max_holdout_unknown_row_fraction: float = 0.05
 
 
 @dataclasses.dataclass
@@ -1453,6 +1458,16 @@ def _validate(cfg: Config) -> None:
                 f"evaluation.syntheval_execution.{field_name} must be a positive number or None, "
                 f"got {value!r}"
             )
+    unknown_fraction = execution.max_holdout_unknown_row_fraction
+    if (
+        isinstance(unknown_fraction, bool)
+        or not isinstance(unknown_fraction, (int, float))
+        or not 0.0 <= unknown_fraction <= 1.0
+    ):
+        raise ValueError(
+            "evaluation.syntheval_execution.max_holdout_unknown_row_fraction must be a number "
+            f"in [0, 1], got {unknown_fraction!r}"
+        )
     bad_data_variants = set(cfg.generation.tabpfn.data_variants) - {"raw", "imputed"}
     if bad_data_variants:
         raise ValueError(
