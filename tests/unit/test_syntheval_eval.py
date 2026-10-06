@@ -838,6 +838,9 @@ class TestEvaluationRoleContext:
             preset_dir=tmp_path,
             output_folder=tmp_path / "binary",
             return_execution=True,
+            execution_cfg=SynthEvalExecutionConfig(
+                model_workers=1, max_model_workers=1, cores_per_model=1
+            ),
         )
 
         assert worker_inputs == [{"valid_model"}]
@@ -896,6 +899,9 @@ class TestEvaluationRoleContext:
             preset_dir=tmp_path,
             output_folder=tmp_path / "binary",
             return_execution=True,
+            execution_cfg=SynthEvalExecutionConfig(
+                model_workers=1, max_model_workers=1, cores_per_model=1
+            ),
         )
 
         pd.testing.assert_frame_equal(first_results, second_results, check_dtype=False)
@@ -1094,6 +1100,9 @@ class TestEvaluationRoleContext:
             preset_dir=tmp_path,
             output_folder=tmp_path / "binary",
             return_execution=True,
+            execution_cfg=SynthEvalExecutionConfig(
+                model_workers=1, max_model_workers=1, cores_per_model=1
+            ),
         )
         model_dir, _status_path, _result_path = _checkpoint_paths(
             tmp_path / "binary", "binary_target", "valid_model"
@@ -1113,6 +1122,9 @@ class TestEvaluationRoleContext:
             preset_dir=tmp_path,
             output_folder=tmp_path / "binary",
             return_execution=True,
+            execution_cfg=SynthEvalExecutionConfig(
+                model_workers=1, max_model_workers=1, cores_per_model=1
+            ),
         )
         pd.testing.assert_frame_equal(first[0], second[0], check_dtype=False)
         pd.testing.assert_frame_equal(first[1], second[1], check_dtype=False)
@@ -1313,6 +1325,9 @@ class TestEvaluationRoleContext:
             preset_dir=tmp_path,
             output_folder=tmp_path / "main",
             return_execution=True,
+            execution_cfg=SynthEvalExecutionConfig(
+                model_workers=1, max_model_workers=1, cores_per_model=1
+            ),
         )
         sidecar_path = _checkpoint_paths(tmp_path / "main", "main", "model_a")[0] / "execution.json"
         first_sidecar = json.loads(sidecar_path.read_text())
@@ -1328,6 +1343,9 @@ class TestEvaluationRoleContext:
             preset_dir=tmp_path,
             output_folder=tmp_path / "main",
             return_execution=True,
+            execution_cfg=SynthEvalExecutionConfig(
+                model_workers=1, max_model_workers=1, cores_per_model=1
+            ),
         )
         second_sidecar = json.loads(sidecar_path.read_text())
 

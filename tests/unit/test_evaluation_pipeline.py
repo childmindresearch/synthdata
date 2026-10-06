@@ -1285,6 +1285,7 @@ def test_selection_failure_persists_auditable_blocked_final_evidence(
 ):
     cfg = make_config()
     cfg.evaluation.generate_report = False
+    cfg.evaluation.syntheval_execution.model_workers = 1
     dataset = make_canonical_dataset()
     synthetic = dataset.role_frame("train", imputed=True).copy()
     combined = _dataframe(
