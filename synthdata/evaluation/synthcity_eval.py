@@ -473,10 +473,6 @@ def build_canonical_synthcity_observations(
     return model_name, observations
 
 
-# Deprecated compatibility alias for historical callers.
-build_task12_synthcity_observations = build_canonical_synthcity_observations
-
-
 def validate_synthcity_report(
     model_name: str,
     report: pd.DataFrame,

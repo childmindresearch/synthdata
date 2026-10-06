@@ -605,7 +605,6 @@ class MetricObservation:
 
 
 _SHA256_DIGEST = re.compile(r"^[0-9a-f]{64}$")
-LEGACY_TSTR_PRODUCER = "task10_tstr"
 
 
 def is_verified_authoritative_tstr(
@@ -662,7 +661,7 @@ def is_verified_authoritative_tstr(
     ):
         return False
     return (
-        metadata.get("producer") in {"authoritative_tstr", LEGACY_TSTR_PRODUCER}
+        metadata.get("producer") == "authoritative_tstr"
         and metadata.get("protocol_version") == "tstr-v1"
         and isinstance(metadata.get("seed"), int)
         and not isinstance(metadata.get("seed"), bool)
@@ -673,7 +672,7 @@ def is_verified_authoritative_tstr(
         and isinstance(metadata.get("release_transform_digest"), str)
         and tuple(metadata.get("fit_roles", ())) == ("train", "tuning")
         and isinstance(artifact, Mapping)
-        and artifact.get("producer") in {"authoritative_tstr", LEGACY_TSTR_PRODUCER}
+        and artifact.get("producer") == "authoritative_tstr"
         and artifact.get("protocol_version") == "tstr-v1"
         and isinstance(artifact.get("seed"), int)
         and not isinstance(artifact.get("seed"), bool)
@@ -703,10 +702,6 @@ def _tstr_artifact_digest(artifact: Mapping[str, object]) -> str:
     return hashlib.sha256(
         repr(sorted(payload.items(), key=lambda item: item[0])).encode("utf-8")
     ).hexdigest()
-
-
-# Deprecated compatibility alias for historical callers.
-is_verified_task10_tstr = is_verified_authoritative_tstr
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1271,7 +1266,7 @@ def _validate_observation(
             observation.source_metadata.get("release_transform_digest"),
         ),
     )
-    if contract.protocol_version in {"release-evidence-v2", "task12-evaluation-v1"} and (
+    if contract.protocol_version == "release-evidence-v2" and (
         not isinstance(observed_release_digest, str)
         or _SHA256_DIGEST.fullmatch(observed_release_digest) is None
     ):
@@ -1304,7 +1299,7 @@ def _validate_observation(
     ):
         observed = metadata_value(field)
         requires_observed = expected is not None and (
-            field == "seed" or expected in {"release-evidence-v2", "task12-evaluation-v1"}
+            field == "seed" or expected == "release-evidence-v2"
         )
         if requires_observed and (observed is None or observed != expected):
             return "wrong_role", f"Observation {field} does not match contract", None, None

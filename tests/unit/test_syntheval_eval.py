@@ -2579,7 +2579,7 @@ class TestSynthEvalMetricValidation:
         assert validation.expected_records[0].status == "blocked"
         assert validation.expected_records[0].lifecycle_state == "operational"
 
-    def test_canonical_tstr_requires_task10_producer_metadata(self):
+    def test_canonical_tstr_requires_complete_producer_metadata(self):
         executions = {
             "model_a": {
                 "pass_id": "main",
@@ -2620,7 +2620,7 @@ class TestSynthEvalMetricValidation:
                                     "metric": "tstr_macro_f1.v1",
                                     "val": 0.8,
                                     "n_val": 0.8,
-                                    "result_metadata": {"producer": "task10_tstr"},
+                                    "result_metadata": {"producer": "authoritative_tstr"},
                                 }
                             ],
                         }

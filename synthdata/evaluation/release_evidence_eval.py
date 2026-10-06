@@ -24,7 +24,6 @@ CANONICAL_RELEASE_EVIDENCE_KEYS = (
     "equalized_odds.final.v1",
 )
 RELEASE_EVIDENCE_PROTOCOL_VERSION = "release-evidence-v2"
-LEGACY_TASK12_PROTOCOL_VERSION = "task12-evaluation-v1"
 _RELEASE_EVIDENCE_REASON_CODES = frozenset(
     {
         "release_evidence_release_or_representation_error",
@@ -58,9 +57,7 @@ _SAFE_ERROR_TYPES = frozenset(
     {"AttributeError", "KeyError", "RuntimeError", "TypeError", "ValueError"}
 )
 _NON_SUCCESS_STATUSES = frozenset({"blocked", "indeterminate"})
-_SAFE_PROTOCOL_VERSIONS = frozenset(
-    {RELEASE_EVIDENCE_PROTOCOL_VERSION, LEGACY_TASK12_PROTOCOL_VERSION}
-)
+_SAFE_PROTOCOL_VERSIONS = frozenset({RELEASE_EVIDENCE_PROTOCOL_VERSION})
 _SAFE_EXECUTION_PASSES = frozenset({"main", "final_audit"})
 _SAFE_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ROLE_NAMES = frozenset({"train", "tuning", "final_holdout"})

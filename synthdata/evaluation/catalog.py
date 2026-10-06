@@ -76,18 +76,6 @@ def canonical_manifest_for_framework(framework: str) -> tuple[str, ...]:
         raise ValueError(f"Unknown canonical framework: {framework!r}") from exc
 
 
-# Deprecated read/import aliases. New producers must use semantic names above.
-TASK12_METRIC_MANIFEST = CANONICAL_METRIC_MANIFEST
-TASK12_EXPECTED_MANIFEST = CANONICAL_EXPECTED_MANIFEST
-TASK12_HPO_ALLOWLIST = CANONICAL_HPO_ALLOWLIST
-SYNTHCITY_TASK12_MANIFEST = SYNTHCITY_CANONICAL_MANIFEST
-SYNTHEVAL_TASK12_MANIFEST = SYNTHEVAL_CANONICAL_MANIFEST
-CUSTOM_TASK12_MANIFEST = CUSTOM_CANONICAL_MANIFEST
-TASK12_MANIFEST_BY_FRAMEWORK = CANONICAL_MANIFEST_BY_FRAMEWORK
-task12_expected_manifest = canonical_expected_manifest
-task12_manifest_for_framework = canonical_manifest_for_framework
-
-
 # ---------------------------------------------------------------------------
 # synthcity
 # ---------------------------------------------------------------------------

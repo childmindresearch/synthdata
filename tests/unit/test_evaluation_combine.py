@@ -492,7 +492,7 @@ class TestBuildCombinedTable:
                 expected_key=metric,
                 framework="custom",
                 status="succeeded",
-                contract_id="test.task12",
+                contract_id="test.release_evidence",
                 raw_value=0.5,
                 policy_value=policy_value,
                 allowed_uses=frozenset({"audit", "policy_rank"}),
@@ -530,14 +530,14 @@ class TestBuildCombinedTable:
         assert pd.isna(combined.loc["model_a", ("__all__", "utility", "U_tuning")])
         assert pd.isna(combined.loc["model_a", ("__all__", "overall", "rank")])
 
-    def test_valid_task12_policy_values_remain_rank_eligible(self):
+    def test_valid_release_evidence_policy_values_remain_rank_eligible(self):
         records = tuple(
             MetricStatusRecord(
                 model_name="model_a",
                 expected_key=metric,
                 framework="custom",
                 status="succeeded",
-                contract_id="test.task12",
+                contract_id="test.release_evidence",
                 raw_value=0.5,
                 policy_value=0.5,
                 allowed_uses=frozenset({"audit", "policy_rank"}),

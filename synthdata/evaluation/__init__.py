@@ -91,7 +91,6 @@ def _authoritative_tstr_results(
         for candidate in (
             payload.get("authoritative_tstr"),
             payload.get("tstr_result"),
-            payload.get("task10_tstr"),
         ):
             if isinstance(candidate, dict):
                 if verified(candidate):

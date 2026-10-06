@@ -115,12 +115,112 @@ _GENERATOR_METADATA_REQUIRED_FIELDS = (
     "random_state",
     "privacy_accounting",
 )
-_SOURCE_PROVENANCE_SCHEMA_VERSION = "source-provenance-v3"
-_LEGACY_SOURCE_PROVENANCE_SCHEMA_VERSIONS = frozenset({"source-provenance-v2"})
-_PLAN02_GOVERNANCE_RELATIVE_PATH = Path(
-    "docs/internal/evaluation refactor plans/evaluation-modernization-02-governance.json"
+_SOURCE_PROVENANCE_SCHEMA_VERSION = "source-provenance-v4"
+_LEGACY_SOURCE_PROVENANCE_SCHEMA_VERSIONS = frozenset(
+    {"source-provenance-v2", "source-provenance-v3"}
 )
-_PLAN02_GOVERNANCE_SCHEMA_VERSION = "evaluation-modernization-02-governance-v1"
+#: SynthCity commit the editable fork's repairs are applied on top of.
+_SYNTHCITY_BASELINE_REVISION = "0ef2950c8b9991c2742c90bed849a3c3b647f61c"
+_SYNTHCITY_BASELINE_SOURCE = "pre_repair_fork_commit"
+#: Why each editable fork diverges from its baseline. Recorded in evaluation
+#: manifests so a bundle states which patched behavior produced its metrics.
+_SYNTHCITY_FORK_REPAIRS = (
+    {
+        "id": "SC-GROUPS",
+        "scope": "group-aware tabular loaders, generated namespaces, and grouped internal boundaries",
+        "rationale": (
+            "Patient-group evaluation requires aligned, disjoint group metadata and explicit "
+            "blocking where SynthCity internals lack validated group-aware behavior."
+        ),
+    },
+    {
+        "id": "SC-DETECTION",
+        "scope": "detector raw/effective identities and GMM operational exclusion",
+        "rationale": (
+            "Raw detector AUC must remain auditable while policy-facing distinguishability is "
+            "inversion-aware; the GMM component probability is not a labelled binary detector."
+        ),
+    },
+    {
+        "id": "SC-FEATURE-RANK",
+        "scope": "feature-importance rank direction and typed failure handling",
+        "rationale": (
+            "Agreement correlation is better when larger, and model or SHAP failures must not "
+            "become finite random-looking policy values."
+        ),
+    },
+    {
+        "id": "SC-SCHEMA-JSD",
+        "scope": "pre-coercion schema mismatch and shared-support statistical outputs",
+        "rationale": (
+            "Schema compatibility must be measured before dtype alignment, and JSD variable rows "
+            "need common support and source-table metadata for aggregation."
+        ),
+    },
+    {
+        "id": "SC-ATTRIBUTE-INFERENCE",
+        "scope": "explicit QIs, target typing, score policy, uncertainty, and worst-target aggregation",
+        "rationale": (
+            "Attribute inference requires a declared threat protocol, target-appropriate scoring, "
+            "and per-target evidence rather than an all-feature or exact-equality shortcut."
+        ),
+    },
+    {
+        "id": "SC-PRIVACY-DIAGNOSTICS",
+        "scope": "identifiability variants, structural proxy labels, DOMIAS raw/effective values",
+        "rationale": (
+            "Legacy formulas must remain readable, new weighted or proxy meanings must be named, "
+            "and raw DOMIAS values must not be treated as calibrated release risk."
+        ),
+    },
+    {
+        "id": "SC-PATE",
+        "scope": "PATE-GAN parameter forwarding, accounting, and generator metadata",
+        "rationale": (
+            "Requested and effective privacy accounting must be visible at the generator boundary "
+            "so caches, HPO checkpoints, and evaluation artifacts can reconstruct the claim."
+        ),
+    },
+    {
+        "id": "SC-FAILURE-OBSERVABILITY",
+        "scope": "metric and benchmark failure preservation",
+        "rationale": (
+            "An empty or failed evaluator result must remain a typed, testcase-specific failure "
+            "rather than disappearing from a partial aggregate."
+        ),
+    },
+)
+_SYNTHEVAL_FORK_REPAIRS = (
+    {
+        "id": "SE-STRUCTURED-EXECUTION",
+        "scope": "structured execution and normalized v2 outputs",
+        "rationale": (
+            "The root adapter needs per-method status, expected identities, and failure evidence."
+        ),
+    },
+    {
+        "id": "SE-METRIC-SEMANTICS",
+        "scope": "metric semantics and metadata propagation",
+        "rationale": (
+            "Root metric contracts require stable emitted keys, uncertainty, and support metadata."
+        ),
+    },
+    {
+        "id": "SE-FIT-ROLE-PREPROCESSING",
+        "scope": "fit-role preprocessing behavior",
+        "rationale": (
+            "Evaluation artifacts must identify the role used to fit preprocessing state."
+        ),
+    },
+    {
+        "id": "SE-HOLDOUT-UNKNOWN-CATEGORIES",
+        "scope": "real holdout categories absent from train",
+        "rationale": (
+            "Classifier-based holdout metrics map unseen holdout categories to the train mode "
+            "below a materiality cap instead of blocking on a few rare rows."
+        ),
+    },
+)
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _GIT_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _GENERATION_CACHE_SCHEMA_VERSION = "generation-cache-v3"
@@ -831,78 +931,6 @@ def _string_mapping(value: Any, label: str) -> dict[str, str]:
     return value
 
 
-def _validate_plan02_governance(payload: Any, path: Path) -> None:
-    if not isinstance(payload, Mapping):
-        raise ValueError(f"Plan 02 governance ledger must be an object at {path}")
-    if payload.get("schema_version") != _PLAN02_GOVERNANCE_SCHEMA_VERSION:
-        raise ValueError(
-            f"Unsupported Plan 02 governance schema at {path}: {payload.get('schema_version')!r}"
-        )
-
-    plan = payload.get("plan")
-    if not isinstance(plan, Mapping):
-        raise ValueError(f"Plan 02 governance ledger plan must be an object at {path}")
-    if plan.get("id") != "evaluation-modernization-02":
-        raise ValueError(f"Plan 02 governance ledger has an invalid plan id at {path}")
-    _non_empty_string(plan.get("revision"), "Plan 02 governance plan revision")
-
-    baseline = payload.get("baseline")
-    if not isinstance(baseline, Mapping):
-        raise ValueError(f"Plan 02 governance baseline must be an object at {path}")
-    baseline_revision = _non_empty_string(
-        baseline.get("revision"), "Plan 02 governance baseline revision"
-    )
-    if _GIT_REVISION_PATTERN.fullmatch(baseline_revision) is None:
-        raise ValueError(f"Plan 02 governance baseline revision is not a full Git SHA at {path}")
-    _non_empty_string(baseline.get("package_version"), "Plan 02 governance package version")
-    _non_empty_string(baseline.get("source"), "Plan 02 governance baseline source")
-
-    repairs = payload.get("fork_repairs")
-    if not isinstance(repairs, list) or not repairs:
-        raise ValueError(f"Plan 02 governance fork_repairs must be a non-empty list at {path}")
-    for index, repair in enumerate(repairs):
-        label = f"Plan 02 governance fork_repairs[{index}]"
-        if not isinstance(repair, Mapping):
-            raise ValueError(f"{label} must be an object at {path}")
-        for field in ("id", "scope", "rationale_type", "rationale", "tracking_reference"):
-            _non_empty_string(repair.get(field), f"{label}.{field}")
-        rationale_type = repair["rationale_type"]
-        if rationale_type not in {"fork_only", "upstream_reference"}:
-            raise ValueError(f"{label}.rationale_type is unsupported: {rationale_type!r}")
-        if rationale_type == "upstream_reference":
-            _non_empty_string(repair.get("upstream_issue_or_pr"), f"{label}.upstream_issue_or_pr")
-
-    fixture_matrix = payload.get("fixture_matrix")
-    if not isinstance(fixture_matrix, Mapping) or not isinstance(
-        fixture_matrix.get("entries"), list
-    ):
-        raise ValueError(f"Plan 02 governance fixture_matrix is incomplete at {path}")
-    handoff = payload.get("handoff")
-    if not isinstance(handoff, Mapping) or not isinstance(
-        handoff.get("required_sequence_after_acceptance"), list
-    ):
-        raise ValueError(f"Plan 02 governance handoff is incomplete at {path}")
-
-
-def _load_plan02_governance(
-    repository_root: Path,
-    governance_path: str | Path | None = None,
-) -> tuple[dict[str, Any], Path, str]:
-    path = (
-        Path(governance_path)
-        if governance_path is not None
-        else repository_root / _PLAN02_GOVERNANCE_RELATIVE_PATH
-    )
-    if not path.is_file():
-        raise FileNotFoundError(f"Plan 02 governance ledger is missing at {path}")
-    try:
-        payload = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("Plan 02 governance ledger is unreadable") from exc
-    _validate_plan02_governance(payload, path)
-    return dict(payload), path, _file_digest(path)
-
-
 def _validate_source_provenance(
     payload: Any,
     *,
@@ -923,31 +951,14 @@ def _validate_source_provenance(
         label = f" at {path}" if path is not None else ""
         raise ValueError(f"Unsupported source provenance schema {schema_version!r}{label}")
 
-    governance = payload.get("plan02_governance")
-    if not isinstance(governance, Mapping):
-        raise ValueError("Source provenance v3 requires plan02_governance")
-    for field in (
-        "path",
-        "sha256",
-        "schema_version",
-        "plan_id",
-        "plan_revision",
-        "baseline_revision",
-        "fixture_matrix_status",
-    ):
-        _non_empty_string(governance.get(field), f"Source provenance plan02_governance.{field}")
-    if governance["schema_version"] != _PLAN02_GOVERNANCE_SCHEMA_VERSION:
-        raise ValueError("Source provenance governance schema does not match the ledger schema")
-    if _SHA256_PATTERN.fullmatch(governance["sha256"]) is None:
-        raise ValueError("Source provenance governance digest must be a SHA-256 value")
-    if _GIT_REVISION_PATTERN.fullmatch(governance["baseline_revision"]) is None:
-        raise ValueError("Source provenance governance baseline revision must be a full Git SHA")
-
     synthcity = payload.get("synthcity")
     if not isinstance(synthcity, Mapping):
-        raise ValueError("Source provenance v3 requires SynthCity provenance")
-    if synthcity.get("baseline_revision") != governance["baseline_revision"]:
-        raise ValueError("Source provenance SynthCity baseline does not match governance")
+        raise ValueError("Source provenance requires SynthCity provenance")
+    baseline_revision = _non_empty_string(
+        synthcity.get("baseline_revision"), "Source provenance SynthCity baseline revision"
+    )
+    if _GIT_REVISION_PATTERN.fullmatch(baseline_revision) is None:
+        raise ValueError("Source provenance SynthCity baseline revision must be a full Git SHA")
     _non_empty_string(
         synthcity.get("baseline_source"), "Source provenance SynthCity baseline source"
     )
@@ -2315,7 +2326,7 @@ def _metric_status_record_from_payload(
                 requires_observed = (
                     record.status == "succeeded"
                     and expected is not None
-                    and (metadata_name == "seed" or expected == "task12-evaluation-v1")
+                    and (metadata_name == "seed" or expected == "release-evidence-v2")
                 )
                 if requires_observed and (
                     metadata_name not in record.provenance
@@ -3076,7 +3087,7 @@ def _fork_attribution(path: Path, distribution: str) -> dict[str, Any]:
 def _fork_provenance(
     path: Path,
     distribution: str,
-    fork_repairs: list[dict[str, Any]],
+    fork_repairs: tuple[Mapping[str, str], ...],
     *,
     baseline_revision: str | None = None,
     baseline_source: str = "not_recorded",
@@ -3091,7 +3102,7 @@ def _fork_provenance(
             "package_name": distribution,
             "package_version": _package_version(distribution),
             "attribution": _fork_attribution(path, distribution),
-            "fork_repairs": fork_repairs,
+            "fork_repairs": [dict(repair) for repair in fork_repairs],
         }
     )
     return provenance
@@ -3101,62 +3112,18 @@ def collect_source_provenance(
     *,
     config_path: str | Path | None = None,
     metric_contract_digest: str | None = None,
-    governance_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Collect root and editable-fork identities for an evaluation manifest."""
     repository_root = Path(__file__).resolve().parents[2]
-    governance, resolved_governance_path, governance_digest = _load_plan02_governance(
-        repository_root,
-        governance_path,
-    )
     config_digest = None
     if config_path is not None:
         config_path = Path(config_path)
         if not config_path.exists():
             raise FileNotFoundError(f"Configured evaluation config is missing at {config_path}")
         config_digest = _file_digest(config_path)
-    try:
-        governance_reference = str(resolved_governance_path.relative_to(repository_root))
-    except ValueError:
-        governance_reference = str(resolved_governance_path)
-    baseline = governance["baseline"]
-    syntheval_repairs = [
-        {
-            "scope": "structured execution and normalized v2 outputs",
-            "rationale": "The root adapter needs per-method status, expected identities, and failure evidence.",
-            "upstream_issue_or_pr": None,
-            "tracking_reference": "Evaluation Modernization Plan 01 P01-06/P01-B2",
-        },
-        {
-            "scope": "metric semantics and metadata propagation",
-            "rationale": "Root metric contracts require stable emitted keys, uncertainty, and support metadata.",
-            "upstream_issue_or_pr": None,
-            "tracking_reference": "Evaluation Modernization Plan 01 P01-02/P01-B4",
-        },
-        {
-            "scope": "fit-role preprocessing behavior",
-            "rationale": "Evaluation artifacts must identify the role used to fit preprocessing state.",
-            "upstream_issue_or_pr": None,
-            "tracking_reference": "Evaluation Modernization Plan 01 P01-10",
-        },
-    ]
     return {
         "schema_version": _SOURCE_PROVENANCE_SCHEMA_VERSION,
-        "plan02_governance": {
-            "path": governance_reference,
-            "sha256": governance_digest,
-            "schema_version": governance["schema_version"],
-            "plan_id": governance["plan"]["id"],
-            "plan_revision": governance["plan"]["revision"],
-            "baseline_revision": baseline["revision"],
-            "baseline_package_version": baseline["package_version"],
-            "fixture_matrix_status": governance["fixture_matrix"]["status"],
-            "fork_repair_ids": [repair["id"] for repair in governance["fork_repairs"]],
-        },
-        "root": _git_provenance(
-            repository_root,
-            baseline_source="not_recorded_for_plan_02",
-        ),
+        "root": _git_provenance(repository_root),
         "package": {
             "name": "synthdata",
             "version": _package_version("synthdata"),
@@ -3164,15 +3131,14 @@ def collect_source_provenance(
         "synthcity": _fork_provenance(
             repository_root / "submodules" / "synthcity",
             "synthcity",
-            governance["fork_repairs"],
-            baseline_revision=baseline["revision"],
-            baseline_source=baseline["source"],
+            _SYNTHCITY_FORK_REPAIRS,
+            baseline_revision=_SYNTHCITY_BASELINE_REVISION,
+            baseline_source=_SYNTHCITY_BASELINE_SOURCE,
         ),
         "syntheval": _fork_provenance(
             repository_root / "submodules" / "syntheval",
             "syntheval",
-            syntheval_repairs,
-            baseline_source="not_recorded_for_plan_02",
+            _SYNTHEVAL_FORK_REPAIRS,
         ),
         "config_digest": config_digest,
         "metric_contract_digest": metric_contract_digest,
@@ -4421,8 +4387,6 @@ def validate_evaluation_bundle(
     combined = load_combined_table(combined_path, validate_artifact=False)
 
     recorded_manifest = manifest.get("canonical_metric_manifest")
-    if recorded_manifest is None:
-        recorded_manifest = manifest.get("task12_metric_manifest")
     if tuple(recorded_manifest or ()) != CANONICAL_EXPECTED_MANIFEST:
         raise ValueError(
             "Evaluation bundle canonical metric manifest must exactly match canonical identities"
@@ -4969,8 +4933,6 @@ def _validate_final_holdout_evidence_payload(
                     execution_pass="main",
                 )
         release_evidence_validation = custom.get("release_evidence_validation")
-        if release_evidence_validation is None:
-            release_evidence_validation = custom.get("task12_validation")
         if state != "blocked" and not isinstance(release_evidence_validation, Mapping):
             raise ValueError(
                 "Non-blocked final-holdout evidence requires release-evidence validation"
@@ -5040,10 +5002,7 @@ def _validate_final_holdout_evidence_payload(
                             **dict(record.result_metadata),
                             **dict(record.provenance),
                         }
-                        if metadata.get("protocol_version") not in {
-                            "release-evidence-v2",
-                            "task12-evaluation-v1",
-                        }:
+                        if metadata.get("protocol_version") != "release-evidence-v2":
                             raise ValueError(
                                 f"Final-holdout release-evidence {record.expected_key} has invalid protocol_version"
                             )

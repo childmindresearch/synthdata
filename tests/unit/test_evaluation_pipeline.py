@@ -1344,10 +1344,10 @@ def test_multi_model_selection_does_not_rerank_on_final_holdout_evidence():
 
 
 @pytest.mark.parametrize("legacy_metadata", [False, True])
-def test_release_score_adapter_maps_successful_task12_aggregate_records(legacy_metadata):
+def test_release_score_adapter_maps_successful_release_evidence_aggregate_records(legacy_metadata):
     role_hashes = {"train": "train", "tuning": "tuning", "final_holdout": "holdout"}
     common = {
-        "producer": "task12-test",
+        "producer": "release-evidence-test",
         "protocol_version": release_evidence_eval.RELEASE_EVIDENCE_PROTOCOL_VERSION,
         "seed": 7,
         "release_transform_digest": "release-transform",
@@ -1424,7 +1424,7 @@ def test_release_score_adapter_maps_successful_task12_aggregate_records(legacy_m
     validations = replace(validation, records=successful_records)
 
     _utility, privacy, fairness = _release_score_inputs(
-        {("custom", "task12"): {"model_a": validations}}
+        {("custom", "release_evidence"): {"model_a": validations}}
     )
 
     assert {name: item["value"] for name, item in privacy.items()} == {
@@ -2036,7 +2036,7 @@ def test_run_evaluation_keeps_multi_model_selection_outside_final_holdout(
 
 
 @pytest.mark.parametrize("finite_final_score", [False, True])
-def test_run_evaluation_records_authoritative_final_task10_evidence(
+def test_run_evaluation_records_authoritative_final_tstr_evidence(
     make_config, make_canonical_dataset, monkeypatch, finite_final_score
 ):
     cfg = make_config()
@@ -2089,7 +2089,7 @@ def test_run_evaluation_records_authoritative_final_task10_evidence(
     tstr_calls = []
     real_run_tstr = tstr_module.run_tstr_evaluation
 
-    def run_authoritative_task10(*args, **kwargs):
+    def run_authoritative_tstr(*args, **kwargs):
         tstr_calls.append(kwargs["evaluation_role"])
         result = real_run_tstr(*args, **kwargs)
         assert result.report is not None
@@ -2104,7 +2104,7 @@ def test_run_evaluation_records_authoritative_final_task10_evidence(
         result.envelope["report"] = result.report
         return result
 
-    monkeypatch.setattr("synthdata.evaluation.run_tstr_evaluation", run_authoritative_task10)
+    monkeypatch.setattr("synthdata.evaluation.run_tstr_evaluation", run_authoritative_tstr)
 
     def valid_release(*args, **kwargs):
         synthetic_release, reference = args[:2]
@@ -2232,7 +2232,7 @@ def test_run_evaluation_records_authoritative_final_task10_evidence(
                 "status": "succeeded",
                 # Persisted release-score evidence uses finite ``score`` as
                 # its canonical value, while ``R_final`` documents formula
-                # terminology used by the authoritative Task10 contract.
+                # terminology used by the authoritative TSTR contract.
                 "score": 0.42,
                 "R_final": 0.42,
                 "audit_only": True,

@@ -889,7 +889,7 @@ def _historical_hpo_context_v1() -> dict:
         "task_type": "classification",
         "registry_digest": "historical-registry",
         "stage_a_contract_digest": None,
-        "metric_config": {"task12": ["mixed_mmd.v1"]},
+        "metric_config": {"canonical_objectives": ["mixed_mmd.v1"]},
         "expected_emitted_keys": ["mixed_mmd"],
         "group_context": {"group_mode": "row"},
         "role_context_fingerprint": "historical-roles",
@@ -3732,7 +3732,7 @@ def test_final_holdout_loader_rejects_hash_consistent_semantic_tampering(tmp_pat
         "provenance_inventory",
     ],
 )
-def test_final_holdout_loader_rejects_omitted_task15_fields(tmp_path, field):
+def test_final_holdout_loader_rejects_omitted_state_fields(tmp_path, field):
     evaluation_dir, _refit = _persist_current_final_refit_bundle(tmp_path)
     evidence_path = artifact_bundle_dir(evaluation_dir) / "final_holdout_evidence.json"
     payload = json.loads(evidence_path.read_text())
@@ -4087,52 +4087,52 @@ def test_log_disparity_loader_rejects_hash_consistent_schema_tampering(tmp_path)
 def test_source_provenance_records_editable_fork_identity():
     provenance = collect_source_provenance()
 
-    assert provenance["schema_version"] == "source-provenance-v3"
-    assert provenance["plan02_governance"]["schema_version"] == (
-        "evaluation-modernization-02-governance-v1"
-    )
-    assert provenance["plan02_governance"]["baseline_revision"] == (
-        "0ef2950c8b9991c2742c90bed849a3c3b647f61c"
-    )
+    assert provenance["schema_version"] == "source-provenance-v4"
     assert provenance["package"]["name"] == "synthdata"
     assert provenance["synthcity"]["revision"]
     assert provenance["synthcity"]["package_version"]
     assert provenance["synthcity"]["baseline_revision"] == (
         "0ef2950c8b9991c2742c90bed849a3c3b647f61c"
     )
-    assert provenance["synthcity"]["baseline_source"] == (
-        "user_confirmed_committed_pre_refactor_baseline"
-    )
+    assert provenance["synthcity"]["baseline_source"] == "pre_repair_fork_commit"
     assert "starting_revision" not in provenance["synthcity"]
     assert "dirty" in provenance["synthcity"]
     assert len(provenance["synthcity"]["worktree_content_digest"]) == 64
     assert provenance["synthcity"]["attribution"]["status"] == "passed"
     assert len(provenance["synthcity"]["attribution"]["license_digests"]["LICENSE"]) == 64
-    assert provenance["synthcity"]["fork_repairs"]
-    assert all(repair["tracking_reference"] for repair in provenance["synthcity"]["fork_repairs"])
     assert provenance["syntheval"]["revision"]
     assert provenance["syntheval"]["baseline_revision"] is None
-    assert provenance["syntheval"]["baseline_source"] == "not_recorded_for_plan_02"
+    assert provenance["syntheval"]["baseline_source"] == "not_recorded"
     assert len(provenance["syntheval"]["worktree_content_digest"]) == 64
     assert provenance["syntheval"]["attribution"]["status"] == "passed"
-    assert all(repair["tracking_reference"] for repair in provenance["syntheval"]["fork_repairs"])
+    for fork in ("synthcity", "syntheval"):
+        repairs = provenance[fork]["fork_repairs"]
+        assert repairs
+        assert all(set(repair) == {"id", "scope", "rationale"} for repair in repairs)
+        assert len({repair["id"] for repair in repairs}) == len(repairs)
 
 
-def test_source_provenance_rejects_invalid_governance_ledger(tmp_path):
-    governance_path = tmp_path / "governance.json"
-    governance_path.write_text(
-        json.dumps(
-            {
-                "schema_version": "evaluation-modernization-02-governance-v1",
-            }
-        )
+def test_source_provenance_rejects_non_sha_synthcity_baseline(tmp_path):
+    evaluation_dir = tmp_path / "evaluation"
+    evaluation_dir.mkdir()
+    _combined().to_csv(evaluation_dir / "combined_evaluation.csv")
+    provenance = collect_source_provenance()
+    provenance["synthcity"]["baseline_revision"] = "not-a-sha"
+
+    persist_evaluation_artifacts(
+        evaluation_dir,
+        _combined(),
+        {},
+        native_syntheval_plot_dir=None,
+        source_provenance=provenance,
     )
 
-    with pytest.raises(ValueError, match="governance ledger plan"):
-        collect_source_provenance(governance_path=governance_path)
+    with pytest.raises(ValueError, match="baseline revision must be a full Git SHA"):
+        validate_evaluation_bundle(evaluation_dir, allow_legacy=True)
 
 
-def test_legacy_source_provenance_schema_remains_readable(tmp_path):
+@pytest.mark.parametrize("schema_version", ["source-provenance-v2", "source-provenance-v3"])
+def test_legacy_source_provenance_schema_remains_readable(tmp_path, schema_version):
     evaluation_dir = tmp_path / "evaluation"
     evaluation_dir.mkdir()
     _combined().to_csv(evaluation_dir / "combined_evaluation.csv")
@@ -4142,11 +4142,11 @@ def test_legacy_source_provenance_schema_remains_readable(tmp_path):
         {},
         native_syntheval_plot_dir=None,
         source_provenance={
-            "schema_version": "source-provenance-v2",
+            "schema_version": schema_version,
             "synthcity": {"revision": "legacy-fork-sha"},
         },
     )
 
     manifest = validate_evaluation_bundle(evaluation_dir, allow_legacy=True)
 
-    assert manifest["source_provenance"]["schema_version"] == "source-provenance-v2"
+    assert manifest["source_provenance"]["schema_version"] == schema_version

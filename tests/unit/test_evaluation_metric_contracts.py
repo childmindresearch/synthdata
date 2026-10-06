@@ -39,7 +39,7 @@ from synthcity.metrics.eval_statistical import (
     WassersteinDistance,
 )
 
-from synthdata.evaluation.catalog import SYNTHCITY_METRIC_CONFIG, TASK12_HPO_ALLOWLIST
+from synthdata.evaluation.catalog import CANONICAL_HPO_ALLOWLIST, SYNTHCITY_METRIC_CONFIG
 from synthdata.evaluation.metric_contracts import (
     DEFAULT_METRIC_CONTRACT_REGISTRY,
     SYNTHCITY_METRIC_DIRECTIONS,
@@ -51,7 +51,7 @@ from synthdata.evaluation.metric_contracts import (
     MetricStatusRecord,
     MetricValidationResult,
     UnknownMetricContractError,
-    is_verified_task10_tstr,
+    is_verified_authoritative_tstr,
     resolve_metric_observations,
     safe_metric_metadata,
 )
@@ -510,13 +510,13 @@ def test_safe_metric_metadata_strict_rejects_adversarial_sentinel():
 
 
 class TestMetricContractRegistry:
-    def test_task12_hpo_allowlist_is_exact(self):
+    def test_canonical_hpo_allowlist_is_exact(self):
         eligible = {
             contract.emitted_key_pattern
             for contract in DEFAULT_METRIC_CONTRACT_REGISTRY
             if "hpo_objective" in contract.allowed_uses
         }
-        assert eligible == TASK12_HPO_ALLOWLIST
+        assert eligible == CANONICAL_HPO_ALLOWLIST
 
     def test_final_audit_score_is_distinct_and_legacy_is_blocked(self):
         final = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(
@@ -750,11 +750,11 @@ class TestMetricContractRegistry:
 
 
 class TestResolveMetricObservations:
-    def test_forged_task10_artifact_is_rejected(self):
-        assert not is_verified_task10_tstr(
+    def test_forged_tstr_artifact_is_rejected(self):
+        assert not is_verified_authoritative_tstr(
             {
                 "result_metadata": {
-                    "producer": "task10_tstr",
+                    "producer": "authoritative_tstr",
                     "protocol_version": "tstr-v1",
                     "evaluation_role": "final_holdout",
                     "source_role": "synthetic",
@@ -769,10 +769,10 @@ class TestResolveMetricObservations:
             }
         )
 
-    def test_task10_release_transform_digest_trust_anchor_rejects_mismatch(self):
+    def test_tstr_release_transform_digest_trust_anchor_rejects_mismatch(self):
         payload = {
             "result_metadata": {
-                "producer": "task10_tstr",
+                "producer": "authoritative_tstr",
                 "protocol_version": "tstr-v1",
                 "evaluation_role": "final_holdout",
                 "source_role": "synthetic",
@@ -784,9 +784,11 @@ class TestResolveMetricObservations:
                 "role_hashes": {"final_holdout": "2" * 64},
             },
         }
-        assert not is_verified_task10_tstr(payload, trusted_release_transform_digest="3" * 64)
+        assert not is_verified_authoritative_tstr(
+            payload, trusted_release_transform_digest="3" * 64
+        )
 
-    def test_task12_provenance_contract_rejects_wrong_roles_support_bandwidth_digest_protocol_seed(
+    def test_canonical_provenance_contract_rejects_wrong_roles_support_bandwidth_digest_protocol_seed(
         self,
     ):
         contract = DEFAULT_METRIC_CONTRACT_REGISTRY.resolve(

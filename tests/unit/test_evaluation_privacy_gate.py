@@ -239,7 +239,7 @@ def _evaluate(case: _PrivacyGateCase, **kwargs: Unpack[_EvaluateOptions]) -> pd.
 
 
 class TestEvaluatePrivacyGate:
-    def test_enabled_release_privacy_gate_consumes_task12_validation(self):
+    def test_enabled_release_privacy_gate_consumes_release_evidence_validation(self):
         digest = "a" * 64
         support = {
             "support_contract": "declared_support_v1",
@@ -259,7 +259,7 @@ class TestEvaluatePrivacyGate:
                     "contract": {
                         "contract_id": "test.custom.release_privacy.v1",
                         "required_support": "declared_support_v1",
-                        "protocol_version": "task12-evaluation-v1",
+                        "protocol_version": "release-evidence-v2",
                         "required_roles": ("train", "tuning"),
                     },
                     "observation": {
@@ -267,8 +267,8 @@ class TestEvaluatePrivacyGate:
                         "fit_roles": ("train",),
                         "support": support,
                         "provenance": {
-                            "producer": "task12_release_privacy",
-                            "protocol_version": "task12-evaluation-v1",
+                            "producer": "release_evidence_privacy",
+                            "protocol_version": "release-evidence-v2",
                             "seed": 0,
                             "release_transform_digest": digest,
                             "release_support": support,

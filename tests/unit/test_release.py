@@ -118,7 +118,7 @@ def test_canonical_release_accepts_clean_model_frames():
     assert list(roles["tuning"].columns) == ["age", "value"]
 
 
-def test_release_privacy_emits_complete_supported_task12_envelope():
+def test_release_privacy_emits_complete_supported_release_evidence_envelope():
     frame = pd.DataFrame(
         {
             "qi": ["a"] * 20,

@@ -18,7 +18,6 @@ import pandas as pd
 
 PROTOCOL_VERSION = "release-privacy-v1"
 RELEASE_EVIDENCE_PROTOCOL_VERSION = "release-evidence-v2"
-LEGACY_TASK12_PROTOCOL_VERSION = "task12-evaluation-v1"
 
 
 def release_privacy_evidence(

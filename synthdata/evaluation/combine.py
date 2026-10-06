@@ -716,7 +716,6 @@ def build_combined_table(
     metric_execution_passes: Mapping[tuple[str, str, str], str] | None = None,
     custom_validations: Mapping[str, MetricValidationResult] | None = None,
     release_evidence_validations: Mapping[str, MetricValidationResult] | None = None,
-    task12_validations: Mapping[str, MetricValidationResult] | None = None,
 ) -> pd.DataFrame:
     """Build combined audit evidence and fixed-transform tuning utility.
 
@@ -732,14 +731,6 @@ def build_combined_table(
             "evaluation.rank_weights is no longer supported; remove this argument. "
             "Ranking calculations do not consume configurable weights."
         )
-
-    legacy_validation_argument = task12_validations is not None
-    if release_evidence_validations is not None and task12_validations is not None:
-        raise ValueError(
-            "Pass only one of release_evidence_validations or legacy task12_validations"
-        )
-    if release_evidence_validations is None:
-        release_evidence_validations = task12_validations
 
     sc_raw, sc_oriented = _synthcity_frames(
         synthcity_results,
@@ -761,15 +752,6 @@ def build_combined_table(
     release_evidence_raw, release_evidence_oriented = _release_evidence_frames(
         release_evidence_validations, model_names
     )
-    if legacy_validation_argument:
-        legacy_prefix = "__model_custom_task12"
-        semantic_prefix = "__model_custom_release_evidence"
-        release_evidence_raw = release_evidence_raw.rename(
-            columns={
-                column: (*column[:2], column[2].replace(semantic_prefix, legacy_prefix))
-                for column in release_evidence_raw
-            }
-        )
 
     raw_parts = [df for df in (sc_raw, se_raw, ld_raw, release_evidence_raw) if not df.empty]
     oriented_parts = [

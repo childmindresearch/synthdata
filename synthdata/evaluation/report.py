@@ -299,9 +299,7 @@ def _fairness_highlights_section(combined: pd.DataFrame, extras: dict) -> str:
         "significance testing). Lower is better for every number below."
     )
     lines.append("")
-    release_evidence = (
-        extras.get("release_evidence_validation") or extras.get("task12_validation") or {}
-    )
+    release_evidence = extras.get("release_evidence_validation") or {}
     if release_evidence:
         lines.append("### Canonical release evidence")
         lines.append("")

@@ -298,23 +298,23 @@ SELECTED_SYNTHCITY_EMITTED_KEY_FIXTURES = (
 HPO_SYNTHCITY_EMITTED_KEY_FIXTURES = (
     (
         "elastic_net_jsd.v1",
-        {"task12": ["elastic_net_jsd.v1"]},
+        {"canonical_objectives": ["elastic_net_jsd.v1"]},
         ("elastic_net_jsd.v1",),
     ),
     (
         "mixed_mmd.v1",
-        {"task12": ["mixed_mmd.v1"]},
+        {"canonical_objectives": ["mixed_mmd.v1"]},
         ("mixed_mmd.v1",),
     ),
     (
         "tstr_macro_f1.v1",
-        {"task12": ["tstr_macro_f1.v1"]},
+        {"canonical_objectives": ["tstr_macro_f1.v1"]},
         ("tstr_macro_f1.v1",),
     ),
     (
         "default",
         {
-            "task12": [
+            "canonical_objectives": [
                 "elastic_net_jsd.v1",
                 "mixed_mmd.v1",
                 "tstr_macro_f1.v1",

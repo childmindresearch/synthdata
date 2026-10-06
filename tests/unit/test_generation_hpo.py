@@ -1174,7 +1174,7 @@ def test_stage_a_contract_persists_semantic_context():
         role_context_fingerprint="roles-a",
         role_context={"roles": {"train": {"rows": 4}}},
         group_context={"group_mode": "row"},
-        hpo_context={"metric_config": {"task12": ["mixed_mmd.v1"]}},
+        hpo_context={"metric_config": {"canonical_objectives": ["mixed_mmd.v1"]}},
     )
 
     payload = contract.to_dict()
@@ -1183,7 +1183,7 @@ def test_stage_a_contract_persists_semantic_context():
     assert payload["role_context_fingerprint"] == "roles-a"
     assert payload["role_context"] == {"roles": {"train": {"rows": 4}}}
     assert payload["group_context"] == {"group_mode": "row"}
-    assert payload["hpo_context"] == {"metric_config": {"task12": ["mixed_mmd.v1"]}}
+    assert payload["hpo_context"] == {"metric_config": {"canonical_objectives": ["mixed_mmd.v1"]}}
 
 
 def test_stage_a_trial_prune_and_persist_result(tmp_path):
@@ -3414,7 +3414,7 @@ def test_hpo_metric_config_rejects_tstr_under_alternate_category_before_evaluati
             tuning,
             "target",
             [],
-            {"task12": ["tstr_macro_f1.v1"]},
+            {"objectives": ["tstr_macro_f1.v1"]},
             seed=0,
         )
 
