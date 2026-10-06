@@ -13,7 +13,7 @@ data:
   # Source and schema
   source: csv
   path: data/loris/loris_v2_664_features_us_id.csv # Input file.
-  version: "2.1"
+  version: "2.11"
   variable_schema_path: data/loris/loris_v2_variable_schema_us.csv
 
   # Modeling columns
@@ -165,10 +165,14 @@ evaluation:
   # Resource cap for resumable per-model SynthEval processes.
   syntheval_execution:
     model_workers: auto
-    max_model_workers: 6
-    cores_per_model: 4
-    memory_reserve_gib: 16
-    memory_per_model_gib: 14
+    max_model_workers: 4
+    cores_per_model: 2
+    memory_reserve_gib: 4
+    memory_per_model_gib: 3
+    # Largest share of holdout rows with categories absent from train that
+    # cls_acc/auroc_diff/mia/att_discl resolve by mapping to the train mode;
+    # above it those metrics are blocked as a material shift. 0 always blocks.
+    max_holdout_unknown_row_fraction: 0.05
 
   privacy_gate:
     # Calibration-only starting thresholds; enable only with reviewed
