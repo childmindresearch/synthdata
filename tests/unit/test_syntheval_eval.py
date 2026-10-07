@@ -11,20 +11,24 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from syntheval.syntheval import aggregate_benchmark_results
 
 from synthdata.config import FrameworkSelectionConfig, SynthEvalExecutionConfig
 from synthdata.evaluation.catalog import FAIRNESS_METRICS_WITH_POSITIVE_CLASS, SYNTHEVAL_PRESET
 from synthdata.evaluation.syntheval_eval import (
     BINARY_ONLY_METRICS,
     _atomic_parquet,
+    _attach_metric_types,
     _checkpoint_paths,
     _compute_cache_key,
+    _evaluate_seeded,
     _load_syntheval_cache,
     _save_syntheval_cache,
     _shutdown_nested_joblib_executor,
     build_binary_preset,
     build_binary_target_series,
     build_preset,
+    extract_metric_types,
     merge_binary_target_results,
     resolve_model_workers,
 )
@@ -131,6 +135,84 @@ class TestBuildBinaryPreset:
         assert set(preset) == {"auroc_diff"}
 
 
+class TestAttachMetricTypes:
+    @staticmethod
+    def _model_result(rows):
+        return pd.DataFrame(rows, columns=["metric", "dim", "val", "err", "n_val", "n_err"])
+
+    def test_types_follow_syntheval_dim_tags(self):
+        model_results = {
+            "m1": self._model_result(
+                [
+                    ("nnaa", "u", 0.5, 0.0, 0.5, 0.0),
+                    ("priv_loss_nnaa", "p", 0.1, 0.0, 0.9, 0.0),
+                    ("statistical_parity", "f", 0.0, 0.0, 1.0, 0.0),
+                ]
+            )
+        }
+        comb, _ = aggregate_benchmark_results(model_results, "linear")
+        typed = _attach_metric_types(comb, model_results)
+        assert extract_metric_types(typed).to_dict() == {
+            "nnaa": "utility",
+            "priv_loss_nnaa": "privacy",
+            "statistical_parity": "fairness",
+        }
+
+    def test_unknown_dim_fails(self):
+        model_results = {"m1": self._model_result([("x", "q", 0.5, 0.0, 0.5, 0.0)])}
+        comb = pd.DataFrame({("x", "value"): [0.5]}, index=["m1"])
+        with pytest.raises(ValueError, match="unknown dim"):
+            _attach_metric_types(comb, model_results)
+
+
+class _RandomSynthEval:
+    """Stands in for SynthEval: each metric's value is a draw from NumPy's global state."""
+
+    def __init__(self, fail=()):
+        self.fail = set(fail)
+        self.loky_cpus = {}
+
+    def evaluate(self, synthetic_frame, analysis_target=None, _dataset_name=None, **metrics):
+        ((method, _params),) = metrics.items()
+        self.loky_cpus[method] = os.environ.get("LOKY_MAX_CPU_COUNT")
+        if method in self.fail:
+            return None
+        return pd.DataFrame(
+            [(method, "p", float(np.random.rand()), 0.0, 0.0, 0.0)],
+            columns=["metric", "dim", "val", "err", "n_val", "n_err"],
+        )
+
+
+class TestEvaluateSeeded:
+    def _run(self, preset, seed=7, se=None):
+        result, failed = _evaluate_seeded(se or _RandomSynthEval(), None, None, preset, seed, "m")
+        return dict(zip(result["metric"], result["val"], strict=True)), failed
+
+    def test_same_seed_gives_same_scores(self):
+        preset = {"mia": {}, "att_discl": {}}
+        assert self._run(preset) == self._run(preset)
+
+    def test_score_does_not_depend_on_other_selected_metrics(self):
+        alone, _ = self._run({"mia": {}})
+        together, _ = self._run({"att_discl": {}, "mia": {}})
+        assert alone["mia"] == together["mia"]
+
+    def test_different_seed_changes_scores(self):
+        assert self._run({"mia": {}}, seed=1) != self._run({"mia": {}}, seed=2)
+
+    def test_failed_metrics_are_reported(self):
+        values, failed = self._run({"mia": {}, "nnaa": {}}, se=_RandomSynthEval(fail={"nnaa"}))
+        assert set(values) == {"mia"}
+        assert failed == ["nnaa"]
+
+    def test_nnaa_runs_joblib_in_process(self, monkeypatch):
+        monkeypatch.setenv("LOKY_MAX_CPU_COUNT", "4")
+        se = _RandomSynthEval()
+        self._run({"nnaa": {}, "mia": {}}, se=se)
+        assert se.loky_cpus == {"nnaa": "1", "mia": "4"}
+        assert os.environ["LOKY_MAX_CPU_COUNT"] == "4"
+
+
 class TestMergeBinaryTargetResults:
     @staticmethod
     def _comb_df(metric_values: dict, rank: float, index=("m1",)) -> pd.DataFrame:
@@ -142,6 +224,7 @@ class TestMergeBinaryTargetResults:
         for metric, (value, error) in metric_values.items():
             df[(metric, "value")] = value
             df[(metric, "error")] = error
+            df[(metric, "type")] = "utility"
         df.columns = pd.MultiIndex.from_tuples(df.columns)
         df["rank"] = rank
         return df
@@ -181,6 +264,7 @@ class TestMergeBinaryTargetResults:
         assert results[("dwm", "value")].tolist() == [1.0]
         assert results[("auroc_diff", "value")].tolist() == [0.5]
         assert results[("auroc_diff", "error")].tolist() == [0.05]
+        assert results[("auroc_diff", "type")].tolist() == ["utility"]
         # The main pass's own aggregate rank must be untouched by the binary pass's.
         assert results["rank"].tolist() == [0.9]
         assert ranks["auroc_diff"].tolist() == [0.7]

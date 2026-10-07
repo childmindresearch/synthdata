@@ -12,6 +12,38 @@ from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
 
+#: Search-space choices left out of HPO because they make runs irreproducible.
+#: pgmpy's PC ("pc") and hill-climbing ("hillclimb") structure searches return
+#: different DAGs for the same data on repeated runs, even with NumPy and
+#: ``random`` seeded and PYTHONHASHSEED and n_jobs fixed (on the integration
+#: fixture: PC gave 3 different DAGs in 6 runs, hill climbing 3 in 5). A
+#: bayesian_network study then scored those trials differently each run and
+#: could pick a different winner. tree_search (Chow-Liu), synthcity's default,
+#: gave the same DAG every time.
+HPO_EXCLUDED_CHOICES: dict[str, dict[str, frozenset]] = {
+    "bayesian_network": {"struct_learning_search_method": frozenset({"pc", "hillclimb"})},
+}
+
+
+class _TrialWithoutChoices:
+    """Optuna trial proxy that drops excluded categorical choices.
+
+    synthcity's ``sample_hyperparameters_optuna`` reads the plugin's own search
+    space and calls ``trial.suggest_categorical`` per parameter; filtering here
+    keeps the rest of that space as synthcity defines it.
+    """
+
+    def __init__(self, trial: optuna.Trial, excluded: dict[str, frozenset]):
+        self._trial = trial
+        self._excluded = excluded
+
+    def suggest_categorical(self, name, choices):
+        drop = self._excluded.get(name, frozenset())
+        return self._trial.suggest_categorical(name, [c for c in choices if c not in drop])
+
+    def __getattr__(self, attr):
+        return getattr(self._trial, attr)
+
 
 def make_loader(
     df: pd.DataFrame,
@@ -95,7 +127,10 @@ def build_synthcity_objective(
     trial_device = "cpu" if device == "mps" else device
 
     def objective(trial: optuna.Trial) -> float:
-        params = plugin_cls.sample_hyperparameters_optuna(trial)
+        excluded = HPO_EXCLUDED_CHOICES.get(name)
+        params = plugin_cls.sample_hyperparameters_optuna(
+            _TrialWithoutChoices(trial, excluded) if excluded else trial
+        )
         if accepts_iter:
             params["n_iter"] = min(params.get("n_iter", iter_cap), iter_cap)
         params["random_state"] = seed

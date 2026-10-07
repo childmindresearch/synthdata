@@ -226,13 +226,13 @@ BOUNDED_METRICS = {
     ("synthcity", "utility", "performance.xgb.gt"): (0, 1),
     ("synthcity", "utility", "performance.xgb.syn_id"): (0, 1),
     ("synthcity", "utility", "performance.xgb.syn_ood"): (0, 1),
-    ("synthcity", "privacy", "detection.detection_xgb.mean"): (0, 1),
+    ("synthcity", "utility", "detection.detection_xgb.mean"): (0, 1),
     ("synthcity", "privacy", "privacy.identifiability_score.score"): (0, 1),
     ("synthcity", "privacy", "privacy.DomiasMIA_prior.aucroc"): (0, 1),
     ("syntheval", "utility", "avg_h_dist"): (0, 1),
     ("syntheval", "utility", "ks_tvd_stat"): (0, 1),
     ("syntheval", "privacy", "hit_rate"): (0, 1),
-    ("syntheval", "privacy", "nnaa"): (0, 1),
+    ("syntheval", "utility", "nnaa"): (0, 1),
     ("custom", "fairness", "log_disparity_share_significant"): (0, 1),
 }
 
@@ -306,12 +306,6 @@ def test_syntheval_fairness_metrics_are_reported(pipeline_run):
     assert {"statistical_parity", "equalized_odds", "equal_opportunity"} <= columns
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="catalog.classify_syntheval_metric matches preset keys, not SynthEval result "
-    "columns, so privacy results (mia_*, att_discl_risk, median_DCR, ...) fall back to "
-    "'utility' and are ranked and gated as utility.",
-)
 def test_syntheval_privacy_results_are_classified_as_privacy(pipeline_run):
     combined = pipeline_run.combined()
     types = {
@@ -321,11 +315,6 @@ def test_syntheval_privacy_results_are_classified_as_privacy(pipeline_run):
         assert types.get(metric) == "privacy", (metric, types.get(metric))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="synthcity performance.feat_rank_distance fails on every run (shap cannot read "
-    "xgboost>=3 base_score) and the failure is dropped silently from the table.",
-)
 def test_feature_importance_rank_distance_is_reported(pipeline_run):
     metrics = set(pipeline_run.combined().columns.get_level_values("metric"))
     assert any(m.startswith("performance.feat_rank_distance") for m in metrics)

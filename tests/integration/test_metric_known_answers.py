@@ -68,15 +68,12 @@ def test_copied_rows_are_at_zero_distance_from_real_rows(known_answers):
     assert dcr["shuffle"] > 0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="SynthCity evaluation passes the test split as X_gt, so its copy and "
-    "nearest-neighbour checks compare synthetic rows against data the generator never "
-    "saw; a generator that memorises train scores 0 copied rows.",
-)
-def test_synthcity_detects_rows_copied_from_train(known_answers):
+def test_synthcity_detects_rows_copied_from_train(known_answers, train_size):
+    # synthcity scores equal-size samples: it draws N_ROWS of the train rows and
+    # reports the share found among the N_ROWS copies. At most
+    # train_size - N_ROWS of those draws can fall outside the copied rows.
     common = _metric(known_answers, "sanity.common_rows_proportion.score")
-    assert common["copy"] >= 0.95
+    assert common["copy"] >= 1 - (train_size - N_ROWS) / N_ROWS - 1e-9
     assert common["shuffle"] <= 0.1
 
 
@@ -96,12 +93,6 @@ def test_syntheval_marginals_cannot_tell_shuffle_from_copy(known_answers):
         assert values["shuffle"] == pytest.approx(values["copy"], abs=1e-12), metric
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="SynthCity evaluation bootstrap-resamples each synthetic dataset with "
-    "replacement (PregeneratedSyntheticModel.sample), so two datasets with identical "
-    "marginals get different marginal scores.",
-)
 def test_synthcity_marginals_cannot_tell_shuffle_from_copy(known_answers):
     ks = _metric(known_answers, "stats.ks_test.marginal")
     assert ks["shuffle"] == pytest.approx(ks["copy"], abs=1e-12)
@@ -125,12 +116,6 @@ def test_ranking_puts_copy_above_shuffle_on_utility(known_answers):
     assert utility["copy"] > utility["shuffle"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="SynthEval MIA, NNAA, attribute disclosure and the fairness metrics draw "
-    "unseeded random samples and classifiers inside their worker processes, so identical "
-    "inputs score differently (overall rank moved by ~0.37 between two identical runs).",
-)
 def test_identical_inputs_get_identical_scores(known_answers):
     numeric = known_answers.apply(pd.to_numeric, errors="coerce")
     numeric = numeric.loc[:, numeric.notna().any()]

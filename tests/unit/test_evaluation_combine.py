@@ -106,12 +106,27 @@ class TestSynthcityFrames:
         assert "stats.alpha_precision.delta_precision_alpha_naive" not in raw_metrics
         assert oriented.columns.get_level_values(2).tolist() == raw_metrics.tolist()
 
+    def test_unranked_submetric_kept_raw_but_not_ranked(self):
+        result = pd.DataFrame(
+            {"mean": [0.8, 0.01], "direction": ["maximize", "maximize"]},
+            index=["performance.feat_rank_distance.corr", "performance.feat_rank_distance.pvalue"],
+        )
+        raw, oriented = _synthcity_frames({"model_a": result}, model_names=["model_a"])
+        assert "performance.feat_rank_distance.pvalue" in raw.columns.get_level_values(2)
+        assert oriented.columns.get_level_values(2).tolist() == [
+            "performance.feat_rank_distance.corr"
+        ]
+
 
 class TestSyntheEvalFrames:
     def _benchmark_results(self):
         df = pd.DataFrame(index=["model_a", "model_b"])
         df[("ks_test", "value")] = [0.1, 0.2]
+        df[("ks_test", "type")] = "utility"
         df[("equal_opportunity", "value")] = [0.05, 0.9]
+        df[("equal_opportunity", "type")] = "fairness"
+        df[("mia_recall", "value")] = [0.5, 0.6]
+        df[("mia_recall", "type")] = "privacy"
         df.columns = pd.MultiIndex.from_tuples(df.columns)
         return df
 
@@ -120,6 +135,7 @@ class TestSyntheEvalFrames:
             {
                 "ks_test": [0.9, 0.8],
                 "equal_opportunity": [0.6, 0.1],
+                "mia_recall": [0.5, 0.4],
                 "rank": [1, 2],
             },
             index=["model_a", "model_b"],
@@ -136,6 +152,17 @@ class TestSyntheEvalFrames:
         columns = list(raw.columns)
         assert ("syntheval", "utility", "ks_test") in columns
         assert ("custom", "fairness", "equal_opportunity") in columns
+
+    def test_types_come_from_syntheval_tags(self):
+        raw, _ = _syntheval_frames(
+            self._benchmark_results(), self._benchmark_ranks(), model_names=["model_a", "model_b"]
+        )
+        assert ("syntheval", "privacy", "mia_recall") in list(raw.columns)
+
+    def test_untyped_results_fail_loudly(self):
+        untyped = self._benchmark_results().drop(columns=[("mia_recall", "type")])
+        with pytest.raises(ValueError, match="mia_recall"):
+            _syntheval_frames(untyped, self._benchmark_ranks(), model_names=["model_a"])
 
     def test_raw_values_extracted_correctly(self):
         raw, _ = _syntheval_frames(
@@ -249,6 +276,7 @@ class TestBuildCombinedTable:
         }
         benchmark_results = pd.DataFrame(index=["model_a", "model_b"])
         benchmark_results[("cls_acc", "value")] = [0.0, 1.0]
+        benchmark_results[("cls_acc", "type")] = "utility"
         benchmark_results.columns = pd.MultiIndex.from_tuples(benchmark_results.columns)
         benchmark_ranks = pd.DataFrame(
             {"cls_acc": [0.0, 1.0], "rank": [0.0, 1.0]}, index=["model_a", "model_b"]

@@ -71,7 +71,6 @@ def run_evaluation(
         dataset.target_column,
         dataset.sensitive_columns,
         eval_cfg.synthcity,
-        n_samples=cfg.generation.n_samples,
         seed=cfg.seed,
         workspace=output_dir / "synthcity_workspace",
     )
@@ -97,6 +96,7 @@ def run_evaluation(
         plots_output_dir=plots_output_dir,
         positive_class=eval_cfg.positive_class,
         execution_cfg=eval_cfg.syntheval_execution,
+        seed=cfg.seed,
     )
 
     if eval_cfg.binary_target.enabled:
@@ -109,6 +109,7 @@ def run_evaluation(
             ranking_strategy=eval_cfg.ranking_strategy,
             output_folder=output_dir / "syntheval_benchmark",
             execution_cfg=eval_cfg.syntheval_execution,
+            seed=cfg.seed,
         )
         benchmark_results, benchmark_ranks = syntheval_eval.merge_binary_target_results(
             benchmark_results, benchmark_ranks, binary_results, binary_ranks

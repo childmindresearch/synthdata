@@ -57,14 +57,29 @@ SYNTHCITY_METRIC_CONFIG = {
 }
 
 #: synthcity's own "category" (sanity/stats/.../attack) rolled up to utility/privacy.
+#: Detection metrics are the AUC of a classifier telling real rows from
+#: synthetic ones, a fidelity measure: a generator that adds noise to every
+#: record scores well on it without being any more private.
 SYNTHCITY_CATEGORY_TO_TYPE = {
     "sanity": "utility",
     "stats": "utility",
     "performance": "utility",
-    "detection": "privacy",
+    "detection": "utility",
     "privacy": "privacy",
     "attack": "privacy",
 }
+
+
+def synthcity_metric_uses_held_out(category: str, name: str) -> bool:
+    """Whether a synthcity metric must be scored against held-out real rows.
+
+    Performance metrics train on synthetic rows and test on real ones, so the
+    real rows must be unseen by the generator; DomiasMIA contrasts the
+    generator's training rows (members) with held-out rows (non-members).
+    Every other metric compares synthetic rows with the real train split.
+    """
+    return category == "performance" or name.startswith("DomiasMIA")
+
 
 #: ``stats.alpha_precision``'s "_naive" sub-metrics (delta_precision_alpha_naive,
 #: delta_coverage_beta_naive, authenticity_naive) duplicate the "_OC"
@@ -78,6 +93,14 @@ SYNTHCITY_CATEGORY_TO_TYPE = {
 #: combine.py's ``_synthcity_frames``) -- the OC variants are kept since they're
 #: the currently-preferred/default computation.
 SYNTHCITY_REDUNDANT_SUBMETRIC_SUFFIXES = ("_naive",)
+
+
+#: synthcity result columns reported in the combined table but left out of the
+#: ranking. ``feat_rank_distance.pvalue`` is the p-value of the rank
+#: correlation in ``feat_rank_distance.corr``: it says how sure that score is,
+#: and shares the metric's single "maximize" direction, which would reward
+#: uncertain correlations.
+SYNTHCITY_UNRANKED_SUBMETRICS = frozenset({"performance.feat_rank_distance.pvalue"})
 
 
 def is_redundant_synthcity_submetric(metric_key: str) -> bool:
@@ -134,6 +157,9 @@ FAIRNESS_METRICS_WITH_POSITIVE_CLASS = frozenset(
     {"statistical_parity", "equalized_odds", "equal_opportunity"}
 )
 
+#: Type of each PRESET key, used only to resolve selection by category. A preset
+#: key's result columns can differ in type (``nnaa`` also returns the privacy
+#: column ``priv_loss_nnaa``); the combined table uses SynthEval's own tags.
 SYNTHEVAL_METRIC_TYPE = {
     "dwm": "utility",
     "pca": "utility",
@@ -158,40 +184,11 @@ SYNTHEVAL_METRIC_TYPE = {
     "equal_opportunity": "fairness",
 }
 
-#: Some SynthEval metrics' RESULT COLUMN names differ from their preset/
-#: selection key, or add extra per-(target_var[, protected_attribute])
-#: breakdown columns when `full_output: True` is set (as SYNTHEVAL_PRESET
-#: does for the 3 fairness metrics) -- none of these are literal keys in
-#: SYNTHEVAL_METRIC_TYPE above, so a plain dict lookup would silently
-#: misclassify them as "utility" (the fallback default). See:
-#: - metric_auroc_difference.py: primary column is "auroc" (not "auroc_diff"),
-#:   per-target sub-columns are "auroc_<target_var>".
-#: - metric_statistical_parity.py / metric_equal_opportunity.py /
-#:   metric_equalized_odds.py: per-(target_var, protected_attribute)
-#:   sub-columns are "sp_"/"eo_"/"eqo_" + "<target_var>_<protected_attribute>".
-_SYNTHEVAL_SUBMETRIC_PREFIX_TYPE = {
-    "auroc_": "utility",
-    "sp_": "fairness",
-    "eo_": "fairness",
-    "eqo_": "fairness",
-}
-
-#: Same idea, for which of these prefixed sub-columns belong to the custom
-#: (fork-only) fairness metrics -- see SYNTHEVAL_CUSTOM_FAIRNESS_KEYS below.
+#: Prefixes of the per-(target_var, protected_attribute) sub-columns that the
+#: custom (fork-only) fairness metrics return with ``full_output: True`` -- see
+#: SYNTHEVAL_CUSTOM_FAIRNESS_KEYS below. Result column TYPES are not looked up
+#: here: SynthEval tags each result itself (see syntheval_eval.extract_metric_types).
 _SYNTHEVAL_CUSTOM_SUBMETRIC_PREFIXES = ("eo_", "eqo_")
-
-
-def classify_syntheval_metric(name: str) -> str:
-    """Classify a SynthEval RESULT COLUMN name (not necessarily its preset/
-    selection key -- see _SYNTHEVAL_SUBMETRIC_PREFIX_TYPE above) into
-    utility/privacy/fairness.
-    """
-    if name in SYNTHEVAL_METRIC_TYPE:
-        return SYNTHEVAL_METRIC_TYPE[name]
-    for prefix, type_ in _SYNTHEVAL_SUBMETRIC_PREFIX_TYPE.items():
-        if name.startswith(prefix):
-            return type_
-    return "utility"
 
 
 def is_custom_syntheval_metric(name: str) -> bool:
