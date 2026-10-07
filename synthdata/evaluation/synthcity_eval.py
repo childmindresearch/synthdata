@@ -100,6 +100,9 @@ def run_synthcity_metrics(
         "task_type": task_type,
         "random_state": random_state,
         "workspace": Path(workspace) if workspace else Path("workspace"),
+        # synthcity's cache keys on the data and metric name, not the code, so
+        # a cached result would survive a metric fix in the fork.
+        "use_cache": False,
     }
     results = []
     if on_train:
