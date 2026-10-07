@@ -306,12 +306,6 @@ def test_syntheval_fairness_metrics_are_reported(pipeline_run):
     assert {"statistical_parity", "equalized_odds", "equal_opportunity"} <= columns
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="catalog.classify_syntheval_metric matches preset keys, not SynthEval result "
-    "columns, so privacy results (mia_*, att_discl_risk, median_DCR, ...) fall back to "
-    "'utility' and are ranked and gated as utility.",
-)
 def test_syntheval_privacy_results_are_classified_as_privacy(pipeline_run):
     combined = pipeline_run.combined()
     types = {

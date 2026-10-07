@@ -7,7 +7,6 @@ import pytest
 
 from synthdata.evaluation.catalog import (
     LOG_DISPARITY_METRICS,
-    classify_syntheval_metric,
     is_custom_syntheval_metric,
     is_redundant_synthcity_submetric,
     resolve_selection,
@@ -50,27 +49,6 @@ class TestResolveSelection:
         # An empty (falsy) explicit list should not be treated as "given".
         result = resolve_selection(True, ["utility"], [], ALL_METRICS, TYPE_MAP)
         assert result == ["m1", "m2"]
-
-
-class TestClassifySynthevalMetric:
-    def test_known_metric_key_matches_dict(self):
-        assert classify_syntheval_metric("statistical_parity") == "fairness"
-        assert classify_syntheval_metric("dwm") == "utility"
-        assert classify_syntheval_metric("nnaa") == "privacy"
-
-    def test_auroc_diffs_actual_result_column_name_is_utility(self):
-        # auroc_diff's own result column is literally "auroc", not "auroc_diff".
-        assert classify_syntheval_metric("auroc") == "utility"
-
-    def test_auroc_per_target_submetric_is_utility(self):
-        assert classify_syntheval_metric("auroc_CGAS_class") == "utility"
-
-    @pytest.mark.parametrize("prefix", ["sp_", "eo_", "eqo_"])
-    def test_fairness_submetrics_are_fairness(self, prefix):
-        assert classify_syntheval_metric(f"{prefix}CGAS_class_Sex") == "fairness"
-
-    def test_unknown_metric_defaults_to_utility(self):
-        assert classify_syntheval_metric("some_unrecognised_metric") == "utility"
 
 
 class TestIsCustomSynthevalMetric:

@@ -29,7 +29,14 @@ from synthdata.utils import ensure_dir, get_logger, save_json
 logger = get_logger(__name__)
 
 _RANK_COLUMNS = {"rank", "u_rank", "p_rank", "f_rank"}
-_CHECKPOINT_SCHEMA_VERSION = 1
+_CHECKPOINT_SCHEMA_VERSION = 2
+
+#: SynthEval tags every result row it returns with a ``dim`` of "u", "p" or "f"
+#: (see each metric's ``normalize_output``). That tag, not the preset key the
+#: metric was selected by, decides a result column's type: one preset key can
+#: return several columns of different types (``nnaa`` returns the utility
+#: column ``nnaa`` and the privacy column ``priv_loss_nnaa``).
+_SYNTHEVAL_DIM_TO_TYPE = {"u": "utility", "p": "privacy", "f": "fairness"}
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
@@ -617,7 +624,35 @@ def _run_resumable_syntheval(
             )
 
     ordered_results = {name: results[name] for name in synthetic_datasets}
-    return aggregate_benchmark_results(ordered_results, ranking_strategy)
+    benchmark_results, benchmark_ranks = aggregate_benchmark_results(
+        ordered_results, ranking_strategy
+    )
+    return _attach_metric_types(benchmark_results, ordered_results), benchmark_ranks
+
+
+def _attach_metric_types(
+    benchmark_results: pd.DataFrame, model_results: dict[str, pd.DataFrame]
+) -> pd.DataFrame:
+    """Add a ``(metric, "type")`` column per metric from SynthEval's own ``dim`` tags.
+
+    ``aggregate_benchmark_results`` keeps each metric's value and error but
+    drops the ``dim`` SynthEval assigned it, so it is carried over here from
+    the per-model results.
+    """
+    types: dict[str, str] = {}
+    for frame in model_results.values():
+        for metric, dim in zip(frame["metric"], frame["dim"], strict=True):
+            if dim not in _SYNTHEVAL_DIM_TO_TYPE:
+                raise ValueError(f"SynthEval returned unknown dim {dim!r} for metric {metric!r}")
+            type_ = _SYNTHEVAL_DIM_TO_TYPE[dim]
+            if types.setdefault(metric, type_) != type_:
+                raise ValueError(
+                    f"SynthEval tagged metric {metric!r} as both {types[metric]!r} and {type_!r}"
+                )
+    out = benchmark_results.copy()
+    for metric in extract_raw_values(benchmark_results).columns:
+        out[(metric, "type")] = types[metric]
+    return out
 
 
 def run_syntheval_evaluation(
@@ -891,6 +926,7 @@ def merge_binary_target_results(
     for metric in new_metrics:
         benchmark_results[(metric, "value")] = binary_results[(metric, "value")]
         benchmark_results[(metric, "error")] = binary_results[(metric, "error")]
+        benchmark_results[(metric, "type")] = binary_results[(metric, "type")]
         benchmark_ranks[metric] = binary_ranks[metric]
     return benchmark_results, benchmark_ranks
 
@@ -898,6 +934,22 @@ def merge_binary_target_results(
 def extract_raw_values(benchmark_results: pd.DataFrame) -> pd.DataFrame:
     """Models x metrics table of raw metric values from SynthEval's benchmark_results."""
     return benchmark_results.xs("value", axis=1, level=1)
+
+
+def extract_metric_types(benchmark_results: pd.DataFrame) -> pd.Series:
+    """Metric -> utility/privacy/fairness, as SynthEval itself tagged each result column.
+
+    Fails loudly if any metric lacks a type (e.g. results cached before types
+    were recorded) instead of guessing one.
+    """
+    metrics = extract_raw_values(benchmark_results).columns
+    if "type" not in benchmark_results.columns.get_level_values(1):
+        raise ValueError("SynthEval results carry no metric types; re-run the evaluation")
+    types = benchmark_results.xs("type", axis=1, level=1).iloc[0]
+    missing = [m for m in metrics if m not in types.index or pd.isna(types[m])]
+    if missing:
+        raise ValueError(f"SynthEval results carry no type for metric(s) {missing}")
+    return types[metrics]
 
 
 def extract_oriented_values(benchmark_ranks: pd.DataFrame) -> pd.DataFrame:

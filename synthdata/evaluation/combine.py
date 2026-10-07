@@ -13,12 +13,15 @@ import pandas as pd
 from synthdata.evaluation.catalog import (
     LOG_DISPARITY_METRICS,
     SYNTHCITY_CATEGORY_TO_TYPE,
-    classify_syntheval_metric,
     is_custom_syntheval_metric,
     is_redundant_synthcity_submetric,
 )
 from synthdata.evaluation.custom_eval import build_log_disparity_summary_table
-from synthdata.evaluation.syntheval_eval import extract_oriented_values, extract_raw_values
+from synthdata.evaluation.syntheval_eval import (
+    extract_metric_types,
+    extract_oriented_values,
+    extract_raw_values,
+)
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -90,6 +93,7 @@ def _syntheval_frames(
 ) -> "tuple[pd.DataFrame, pd.DataFrame]":
     """Build (raw, oriented) models x metric-name tables from SynthEval results.
 
+    Each column's type is the one SynthEval itself tagged the result with.
     Metrics matching is_custom_syntheval_metric() (fork-only additions, plus
     their full_output=True per-(target_var, protected_attribute) sub-columns)
     are tagged framework="custom" instead of "syntheval".
@@ -99,12 +103,13 @@ def _syntheval_frames(
         return empty, empty
 
     raw = extract_raw_values(benchmark_results).reindex(model_names)
+    types = extract_metric_types(benchmark_results)
     oriented = extract_oriented_values(benchmark_ranks).reindex(model_names)
 
     def _framework(metric: str) -> str:
         return "custom" if is_custom_syntheval_metric(metric) else "syntheval"
 
-    columns = [(_framework(col), classify_syntheval_metric(col), col) for col in raw.columns]
+    columns = [(_framework(col), types[col], col) for col in raw.columns]
     raw.columns = pd.MultiIndex.from_tuples(columns)
     oriented.columns = pd.MultiIndex.from_tuples(columns)
     return raw, oriented

@@ -134,6 +134,9 @@ FAIRNESS_METRICS_WITH_POSITIVE_CLASS = frozenset(
     {"statistical_parity", "equalized_odds", "equal_opportunity"}
 )
 
+#: Type of each PRESET key, used only to resolve selection by category. A preset
+#: key's result columns can differ in type (``nnaa`` also returns the privacy
+#: column ``priv_loss_nnaa``); the combined table uses SynthEval's own tags.
 SYNTHEVAL_METRIC_TYPE = {
     "dwm": "utility",
     "pca": "utility",
@@ -158,40 +161,11 @@ SYNTHEVAL_METRIC_TYPE = {
     "equal_opportunity": "fairness",
 }
 
-#: Some SynthEval metrics' RESULT COLUMN names differ from their preset/
-#: selection key, or add extra per-(target_var[, protected_attribute])
-#: breakdown columns when `full_output: True` is set (as SYNTHEVAL_PRESET
-#: does for the 3 fairness metrics) -- none of these are literal keys in
-#: SYNTHEVAL_METRIC_TYPE above, so a plain dict lookup would silently
-#: misclassify them as "utility" (the fallback default). See:
-#: - metric_auroc_difference.py: primary column is "auroc" (not "auroc_diff"),
-#:   per-target sub-columns are "auroc_<target_var>".
-#: - metric_statistical_parity.py / metric_equal_opportunity.py /
-#:   metric_equalized_odds.py: per-(target_var, protected_attribute)
-#:   sub-columns are "sp_"/"eo_"/"eqo_" + "<target_var>_<protected_attribute>".
-_SYNTHEVAL_SUBMETRIC_PREFIX_TYPE = {
-    "auroc_": "utility",
-    "sp_": "fairness",
-    "eo_": "fairness",
-    "eqo_": "fairness",
-}
-
-#: Same idea, for which of these prefixed sub-columns belong to the custom
-#: (fork-only) fairness metrics -- see SYNTHEVAL_CUSTOM_FAIRNESS_KEYS below.
+#: Prefixes of the per-(target_var, protected_attribute) sub-columns that the
+#: custom (fork-only) fairness metrics return with ``full_output: True`` -- see
+#: SYNTHEVAL_CUSTOM_FAIRNESS_KEYS below. Result column TYPES are not looked up
+#: here: SynthEval tags each result itself (see syntheval_eval.extract_metric_types).
 _SYNTHEVAL_CUSTOM_SUBMETRIC_PREFIXES = ("eo_", "eqo_")
-
-
-def classify_syntheval_metric(name: str) -> str:
-    """Classify a SynthEval RESULT COLUMN name (not necessarily its preset/
-    selection key -- see _SYNTHEVAL_SUBMETRIC_PREFIX_TYPE above) into
-    utility/privacy/fairness.
-    """
-    if name in SYNTHEVAL_METRIC_TYPE:
-        return SYNTHEVAL_METRIC_TYPE[name]
-    for prefix, type_ in _SYNTHEVAL_SUBMETRIC_PREFIX_TYPE.items():
-        if name.startswith(prefix):
-            return type_
-    return "utility"
 
 
 def is_custom_syntheval_metric(name: str) -> bool:
