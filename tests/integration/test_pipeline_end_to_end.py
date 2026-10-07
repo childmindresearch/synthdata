@@ -226,13 +226,13 @@ BOUNDED_METRICS = {
     ("synthcity", "utility", "performance.xgb.gt"): (0, 1),
     ("synthcity", "utility", "performance.xgb.syn_id"): (0, 1),
     ("synthcity", "utility", "performance.xgb.syn_ood"): (0, 1),
-    ("synthcity", "privacy", "detection.detection_xgb.mean"): (0, 1),
+    ("synthcity", "utility", "detection.detection_xgb.mean"): (0, 1),
     ("synthcity", "privacy", "privacy.identifiability_score.score"): (0, 1),
     ("synthcity", "privacy", "privacy.DomiasMIA_prior.aucroc"): (0, 1),
     ("syntheval", "utility", "avg_h_dist"): (0, 1),
     ("syntheval", "utility", "ks_tvd_stat"): (0, 1),
     ("syntheval", "privacy", "hit_rate"): (0, 1),
-    ("syntheval", "privacy", "nnaa"): (0, 1),
+    ("syntheval", "utility", "nnaa"): (0, 1),
     ("custom", "fairness", "log_disparity_share_significant"): (0, 1),
 }
 
