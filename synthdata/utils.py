@@ -43,6 +43,23 @@ def set_global_seed(seed: int) -> None:
         pass
 
 
+#: Separates a model name from its replicate index in synthetic dataset names.
+REPLICATE_SEPARATOR = "__rep"
+
+
+def replicate_name(name: str, replicate: int) -> str:
+    """Dataset name for replicate ``replicate`` of ``name`` (replicate 0 keeps ``name``)."""
+    return name if replicate == 0 else f"{name}{REPLICATE_SEPARATOR}{replicate}"
+
+
+def split_replicate_name(name: str) -> tuple[str, int]:
+    """Inverse of :func:`replicate_name`: ``"ctgan__rep2"`` -> ``("ctgan", 2)``."""
+    base, sep, index = str(name).rpartition(REPLICATE_SEPARATOR)
+    if sep and base and index.isdigit():
+        return base, int(index)
+    return str(name), 0
+
+
 def resolve_device(device: str = "auto") -> str:
     """Resolve "auto" to the best available torch device string ("cuda"/"mps"/"cpu").
 

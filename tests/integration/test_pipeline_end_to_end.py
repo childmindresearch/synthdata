@@ -27,6 +27,7 @@ COLUMNS = [*FEATURES, "target"]
 CATEGORICAL = ["SEX", "SITE", "SMOKER", "SEVERITY", "DIAGNOSIS", "target"]
 NUMERIC = ["AGE", "BMI", "LAB_A", "LAB_B"]
 MODELS = ["bayesian_network", "bayesian_network_hpo", "ctgan", "ctgan_hpo"]
+BASELINES = ["baseline_marginals", "baseline_train_copy"]
 
 
 @pytest.fixture(scope="module")
@@ -239,7 +240,7 @@ BOUNDED_METRICS = {
 
 def test_combined_table_has_one_complete_row_per_model(pipeline_run):
     combined = pipeline_run.combined()
-    assert sorted(combined.index) == sorted(MODELS)
+    assert sorted(combined.index) == sorted(MODELS + BASELINES)
     assert set(combined.columns.get_level_values("framework")) >= {
         "synthcity",
         "syntheval",
@@ -284,7 +285,7 @@ def test_tstr_has_signal_on_the_fixture(pipeline_run, dataset):
     assert real_auc.astype(float).between(0, 1).all()
 
 
-def test_ranks_are_normalised_and_overall_is_their_sum(pipeline_run):
+def test_ranks_are_normalised_and_overall_is_their_geometric_mean(pipeline_run):
     combined = pipeline_run.combined()
     dims = ["utility", "privacy", "fairness"]
     for dim in dims:
@@ -292,8 +293,22 @@ def test_ranks_are_normalised_and_overall_is_their_sum(pipeline_run):
         assert ((rank >= 0) & (rank <= 1)).all(), dim
     overall = combined[("__all__", "overall", "rank")].astype(float)
     weights = pipeline_run.cfg.evaluation.rank_weights
-    expected = sum(weights[d] * combined[("__all__", d, "rank")].astype(float) for d in dims)
+    logs = sum(
+        weights[d] * np.log(combined[("__all__", d, "rank")].astype(float).clip(lower=0.01))
+        for d in dims
+    )
+    expected = np.exp(logs / sum(weights[d] for d in dims))
     np.testing.assert_allclose(overall, expected, rtol=1e-6)
+
+
+def test_copying_training_rows_does_not_pay_off_overall(pipeline_run):
+    # The copy has the best utility and the worst privacy; a sum of the two
+    # ranked it above every generator but one. Its privacy must now keep it
+    # below the best generator. (The fixture's generators are tiny, so a
+    # stricter "below every generator" would test the fixture, not the score.)
+    overall = pipeline_run.combined()[("__all__", "overall", "rank")].astype(float)
+    generators = overall[[m for m in overall.index if not m.startswith("baseline_")]]
+    assert overall["baseline_train_copy"] < generators.max(), overall.to_dict()
 
 
 def test_privacy_gate_verdict_is_boolean(pipeline_run):
@@ -318,6 +333,15 @@ def test_syntheval_privacy_results_are_classified_as_privacy(pipeline_run):
 def test_feature_importance_rank_distance_is_reported(pipeline_run):
     metrics = set(pipeline_run.combined().columns.get_level_values("metric"))
     assert any(m.startswith("performance.feat_rank_distance") for m in metrics)
+
+
+def test_ranking_summary_has_one_row_per_model(pipeline_run):
+    summary = pd.read_csv(pipeline_run.evaluation_dir / "ranking_summary.csv", index_col=0)
+    assert sorted(summary.index) == sorted(MODELS + BASELINES)
+    assert (summary["n_replicates"] == 1).all()
+    assert summary.loc[summary["baseline"], "eligible"].eq(False).all()
+    report = (pipeline_run.evaluation_dir / "report.md").read_text()
+    assert "Single seed" in report
 
 
 def test_report_covers_every_model(pipeline_run):

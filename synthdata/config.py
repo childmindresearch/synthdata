@@ -326,6 +326,11 @@ class HPOConfig:
 @dataclasses.dataclass
 class GenerationConfig:
     n_samples: int = 200
+    #: Times each model is fitted and sampled, with seeds seed, seed+1, ...
+    #: Replicate r > 0 is saved as "<model>__rep<r>". With 2 or more, the
+    #: evaluation reports each score as a mean with a 95% confidence interval
+    #: and flags models it cannot tell apart from the best. HPO runs once.
+    n_replicates: int = 1
     #: Base artifact root. Runtime stage paths are versioned under
     #: ``<output_dir>/<data.version or 'unversioned'>/<experiment-id>/``.
     output_dir: str = "output/dataset/synthetic_data"
@@ -455,6 +460,11 @@ class SynthEvalExecutionConfig:
     memory_per_model_gib: float | None = None
 
 
+#: Reference rows ``evaluation.baselines`` may name; built by
+#: synthdata.evaluation.baselines.
+EVALUATION_BASELINES = ("train_copy", "marginals")
+
+
 @dataclasses.dataclass
 class EvaluationConfig:
     #: Base artifact root. Runtime stage paths are versioned under
@@ -462,6 +472,12 @@ class EvaluationConfig:
     output_dir: str = "output/dataset/evaluation"
     #: Restrict evaluation to a subset of generated model names (None = all found on disk).
     models: list | None = None
+    #: Fixed reference rows scored alongside the generators so every run has
+    #: the same anchors (see synthdata.evaluation.baselines): "train_copy"
+    #: (real training rows: the utility ceiling and privacy floor) and
+    #: "marginals" (each column sampled independently: no joint structure).
+    #: They are never recommended. Empty list = no baselines.
+    baselines: list = dataclasses.field(default_factory=lambda: ["train_copy", "marginals"])
     positive_class: Any = 1
 
     synthcity: FrameworkSelectionConfig = dataclasses.field(
@@ -482,7 +498,7 @@ class EvaluationConfig:
     )
 
     #: Per-"type" (utility/privacy/fairness) weight applied when rolling up
-    #: type-level ranks into the overall rank (see
+    #: type-level ranks into the overall rank, a weighted geometric mean (see
     #: synthdata.evaluation.combine.build_combined_table). Keys must be
     #: exactly {"utility","privacy","fairness"}; values must be non-negative.
     #: Default is equal weight -- ``privacy_gate`` (pass/fail) below is this
@@ -744,6 +760,10 @@ def _validate(cfg: Config) -> None:
             raise ValueError(
                 f"imputation.benchmark.hpo.{field_name} must be a non-empty list, got {values!r}"
             )
+    if not isinstance(cfg.generation.n_replicates, int) or cfg.generation.n_replicates < 1:
+        raise ValueError(
+            f"generation.n_replicates must be a positive integer, got {cfg.generation.n_replicates!r}"
+        )
     if cfg.evaluation.ranking_strategy not in ("linear", "summation"):
         raise ValueError(
             "evaluation.ranking_strategy must be 'linear' or 'summation', "
@@ -821,6 +841,12 @@ def _validate(cfg: Config) -> None:
                 "evaluation.binary_target.positive_classes and .negative_classes must not "
                 f"overlap: {sorted(overlap, key=str)}"
             )
+    unknown_baselines = [b for b in cfg.evaluation.baselines if b not in EVALUATION_BASELINES]
+    if unknown_baselines:
+        raise ValueError(
+            f"evaluation.baselines must be drawn from {list(EVALUATION_BASELINES)}, "
+            f"got {unknown_baselines}"
+        )
     rank_weight_keys = set(cfg.evaluation.rank_weights)
     if rank_weight_keys != {"utility", "privacy", "fairness"}:
         raise ValueError(

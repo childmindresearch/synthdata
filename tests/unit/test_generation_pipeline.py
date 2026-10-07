@@ -78,3 +78,31 @@ def test_continuous_target_fails_before_tabpfn_cache_lookup(make_config, make_da
 
     mock_generate.assert_not_called()
     assert cached_path.read_text() == cached_contents
+
+
+def test_each_replicate_is_built_with_its_own_seed(make_config, make_dataset, mocker):
+    cfg = make_config()
+    cfg.generation.tabpfn.enabled = False
+    cfg.generation.tabpfgen.enabled = False
+    cfg.generation.hpo.enabled = False
+    cfg.generation.synthcity.names = ["ctgan"]
+    cfg.generation.n_replicates = 3
+    dataset = make_dataset()
+    dataset.train_imputed_df = dataset.train_df
+    mocker.patch("synthdata.generation.pipeline.sc.make_loader")
+    mock_fit = mocker.patch(
+        "synthdata.generation.pipeline.sc.fit_generate",
+        side_effect=lambda *args, **kwargs: dataset.train_df.assign(seed=args[4]),
+    )
+
+    result = run_generation(cfg, dataset)
+
+    assert sorted(result) == ["ctgan", "ctgan__rep1", "ctgan__rep2"]
+    assert [call.args[4] for call in mock_fit.call_args_list] == [
+        cfg.seed,
+        cfg.seed + 1,
+        cfg.seed + 2,
+    ]
+    assert result["ctgan__rep2"]["seed"].eq(cfg.seed + 2).all()
+    output_dir = Path(cfg.generation.output_dir)
+    assert (output_dir / "ctgan__rep1.csv").exists()

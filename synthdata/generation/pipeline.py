@@ -16,7 +16,14 @@ from synthdata.data import Dataset
 from synthdata.generation import hpo as hpo_mod
 from synthdata.generation import synthcity_backend as sc
 from synthdata.generation import tabpfn_backend as tpfn
-from synthdata.utils import ensure_dir, get_logger, resolve_device
+from synthdata.utils import (
+    ensure_dir,
+    get_logger,
+    replicate_name,
+    resolve_device,
+    set_global_seed,
+    split_replicate_name,
+)
 
 # tabpfgen_backend is imported lazily (see the `gen_cfg.tabpfgen.enabled` branch
 # below) because it does `from tabpfgen import TabPFGen` at module scope (to
@@ -95,6 +102,17 @@ def run_generation(
         )
 
     def _cached_or_build(name, build_fn):
+        """Load or build every replicate of ``name``; ``build_fn(seed)`` makes one.
+
+        Replicate ``r`` is saved as ``replicate_name(name, r)`` and generated
+        with seed ``cfg.seed + r`` (replicate 0 keeps the plain name and the
+        base seed), so the spread across replicates measures how much a
+        model's scores depend on its random seed.
+        """
+        for replicate in range(gen_cfg.n_replicates):
+            _build_one(replicate_name(name, replicate), seed + replicate, build_fn)
+
+    def _build_one(name, replicate_seed, build_fn):
         path = output_dir / f"{name}.csv"
         if path.exists() and not gen_cfg.force_retrain:
             logger.info("[%s] using cached synthetic data at %s", name, path)
@@ -102,11 +120,26 @@ def run_generation(
             synthetic_datasets[name] = df
             return df
 
-        logger.info("[%s] generating synthetic data (n_samples=%d)", name, n_samples)
-        result = build_fn()
+        logger.info(
+            "[%s] generating synthetic data (n_samples=%d, seed=%d)",
+            name,
+            n_samples,
+            replicate_seed,
+        )
+        # Backends without a seed argument draw from the global RNGs.
+        set_global_seed(replicate_seed)
+        result = build_fn(replicate_seed)
         df, extra = result if isinstance(result, tuple) else (result, None)
         df.to_csv(path, index=False)
         synthetic_datasets[name] = df
+        base, replicate = split_replicate_name(name)
+        if replicate and df.equals(synthetic_datasets.get(base)):
+            logger.warning(
+                "[%s] replicate is identical to %s: this backend ignores the seed, so its "
+                "replicates add no uncertainty information",
+                name,
+                base,
+            )
         if plot_callback is not None:
             try:
                 plot_callback(name, df, extra)
@@ -151,7 +184,7 @@ def run_generation(
         for name in gen_cfg.synthcity.names:
             _cached_or_build(
                 name,
-                lambda name=name: sc.fit_generate(
+                lambda seed, name=name: sc.fit_generate(
                     name,
                     {},
                     train_loader,
@@ -192,7 +225,7 @@ def run_generation(
 
                 _cached_or_build(
                     f"{name}_hpo",
-                    lambda name=name, params=params: sc.fit_generate(
+                    lambda seed, name=name, params=params: sc.fit_generate(
                         name,
                         params,
                         train_loader,
@@ -220,7 +253,7 @@ def run_generation(
             if "standard" in gen_cfg.tabpfn.variants:
                 _cached_or_build(
                     f"tabpfn_standard{suffix}",
-                    lambda train_df_variant=train_df_variant: tpfn.generate_tabpfn_standard(
+                    lambda seed, train_df_variant=train_df_variant: tpfn.generate_tabpfn_standard(
                         train_df_variant,
                         dataset.feature_columns,
                         dataset.categorical_columns,
@@ -233,7 +266,7 @@ def run_generation(
             if "custom" in gen_cfg.tabpfn.variants:
                 _cached_or_build(
                     f"tabpfn_custom{suffix}",
-                    lambda train_df_variant=train_df_variant: tpfn.generate_tabpfn_custom(
+                    lambda seed, train_df_variant=train_df_variant: tpfn.generate_tabpfn_custom(
                         train_df_variant,
                         dataset.categorical_columns,
                         dataset.target_column,
@@ -254,7 +287,7 @@ def run_generation(
         if "standard" in gen_cfg.tabpfgen.variants:
             _cached_or_build(
                 "tabpfgen_standard",
-                lambda: tpfgen.generate_tabpfgen_standard(
+                lambda seed: tpfgen.generate_tabpfgen_standard(
                     dataset.train_imputed_df,
                     dataset.feature_columns,
                     dataset.categorical_columns,
@@ -288,7 +321,7 @@ def run_generation(
 
                 _cached_or_build(
                     "tabpfgen_standard_hpo",
-                    lambda params=params: tpfgen.generate_tabpfgen_standard(
+                    lambda seed, params=params: tpfgen.generate_tabpfgen_standard(
                         dataset.train_imputed_df,
                         dataset.feature_columns,
                         dataset.categorical_columns,
@@ -302,7 +335,7 @@ def run_generation(
         if "custom" in gen_cfg.tabpfgen.variants:
             _cached_or_build(
                 "tabpfgen_custom",
-                lambda: tpfgen.generate_tabpfgen_custom(
+                lambda seed: tpfgen.generate_tabpfgen_custom(
                     dataset.train_imputed_df,
                     dataset.feature_columns,
                     dataset.categorical_columns,
@@ -338,7 +371,7 @@ def run_generation(
 
                 _cached_or_build(
                     "tabpfgen_custom_hpo",
-                    lambda params=params: tpfgen.generate_tabpfgen_custom(
+                    lambda seed, params=params: tpfgen.generate_tabpfgen_custom(
                         dataset.train_imputed_df,
                         dataset.feature_columns,
                         dataset.categorical_columns,

@@ -71,9 +71,15 @@ def get_plugin_class(name: str):
 
 
 def plugin_accepts(name: str, param_name: str) -> bool:
-    cls = get_plugin_class(name)
-    sig = inspect.signature(cls.__init__)
-    return param_name in sig.parameters
+    from synthcity.plugins.core.plugin import Plugin
+
+    params = inspect.signature(get_plugin_class(name).__init__).parameters
+    if param_name in params:
+        return True
+    # Plugins such as marginal_distributions take only **kwargs and forward
+    # them to the base Plugin, which accepts workspace, device and random_state.
+    forwards = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    return forwards and param_name in inspect.signature(Plugin.__init__).parameters
 
 
 def fit_generate(
@@ -92,6 +98,10 @@ def fit_generate(
     plugin_kwargs = dict(params)
     if workspace is not None and plugin_accepts(name, "workspace"):
         plugin_kwargs["workspace"] = Path(workspace)
+    # Seed training as well as sampling; plugins otherwise train with their
+    # default random_state (0) whatever seed the run uses.
+    if "random_state" not in plugin_kwargs and plugin_accepts(name, "random_state"):
+        plugin_kwargs["random_state"] = random_state
     if device is not None and "device" not in plugin_kwargs and plugin_accepts(name, "device"):
         plugin_kwargs["device"] = torch.device(device)
 
