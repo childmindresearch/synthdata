@@ -8,10 +8,12 @@ import hashlib
 import json
 import multiprocessing
 import os
+import random
 import socket
 import time
 import traceback
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +31,7 @@ from synthdata.utils import ensure_dir, get_logger, save_json
 logger = get_logger(__name__)
 
 _RANK_COLUMNS = {"rank", "u_rank", "p_rank", "f_rank"}
-_CHECKPOINT_SCHEMA_VERSION = 2
+_CHECKPOINT_SCHEMA_VERSION = 3
 
 #: SynthEval tags every result row it returns with a ``dim`` of "u", "p" or "f"
 #: (see each metric's ``normalize_output``). That tag, not the preset key the
@@ -163,6 +165,68 @@ def _shutdown_nested_joblib_executor() -> None:
         executor.shutdown(wait=True, kill_workers=True)
 
 
+@contextmanager
+def _in_process_joblib():
+    """Make joblib run in this process for the duration of the block.
+
+    SynthEval's NNAA resampling dispatches rounds to loky worker processes,
+    whose random state is outside the seed set in this process. With one CPU
+    visible, joblib falls back to its sequential backend.
+    """
+    previous = os.environ.get("LOKY_MAX_CPU_COUNT")
+    os.environ["LOKY_MAX_CPU_COUNT"] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("LOKY_MAX_CPU_COUNT", None)
+        else:
+            os.environ["LOKY_MAX_CPU_COUNT"] = previous
+
+
+#: SynthEval metrics that draw from joblib worker processes; see _in_process_joblib.
+_METRICS_WITH_PROCESS_RANDOMNESS = frozenset({"nnaa"})
+
+
+def _evaluate_seeded(se, synthetic_frame, analysis_config, preset: dict, seed: int, model_name):
+    """Run each preset metric on its own, from the same seeded random state.
+
+    SynthEval's MIA, attribute disclosure, NNAA and fairness metrics draw
+    samples, shuffles and random forests from NumPy's global random state
+    without a seed parameter. Reseeding before every metric makes each score a
+    function of the inputs and ``seed`` alone, independent of which other
+    metrics are selected. Metrics that fail are logged and omitted, as
+    SynthEval itself does; their names are returned for the checkpoint.
+    """
+    parts, failed = [], []
+    for method, params in preset.items():
+        np.random.seed(seed)
+        random.seed(seed)
+        if method in _METRICS_WITH_PROCESS_RANDOMNESS:
+            with _in_process_joblib():
+                part = se.evaluate(
+                    synthetic_frame,
+                    analysis_target=analysis_config,
+                    _dataset_name=model_name,
+                    **{method: params},
+                )
+        else:
+            part = se.evaluate(
+                synthetic_frame,
+                analysis_target=analysis_config,
+                _dataset_name=model_name,
+                **{method: params},
+            )
+        if part is None or part.empty:
+            failed.append(method)
+            logger.warning("[syntheval] %s: metric %s produced no result", model_name, method)
+        else:
+            parts.append(part)
+    if not parts:
+        return None, failed
+    return pd.concat(parts, ignore_index=True), failed
+
+
 def _model_worker(
     model_name: str,
     synthetic_frame: pd.DataFrame,
@@ -178,6 +242,7 @@ def _model_worker(
     model_fingerprint: str,
     plots_output_dir: str | None,
     cores_per_model: int,
+    seed: int,
 ) -> None:
     """Run exactly one model in a disposable child process and checkpoint it."""
     os.environ["LOKY_MAX_CPU_COUNT"] = str(cores_per_model)
@@ -233,11 +298,9 @@ def _model_worker(
             console="off",
             show_warnings=False,
         )
-        result = se.evaluate(
-            synthetic_frame,
-            analysis_target=analysis_config,
-            presets_file=preset_path,
-            _dataset_name=model_name,
+        preset = json.loads(Path(preset_path).read_text())
+        result, failed_metrics = _evaluate_seeded(
+            se, synthetic_frame, analysis_config, preset, seed, model_name
         )
         if result is None:
             raise RuntimeError("SynthEval returned no normalized metric results")
@@ -265,6 +328,7 @@ def _model_worker(
                 "shape": list(synthetic_frame.shape),
                 "plots_completed": plot_dir is not None,
                 "plot_files": plot_files,
+                "failed_metrics": failed_metrics,
             },
         )
     except (OSError, ValueError, RuntimeError) as exc:
@@ -455,11 +519,13 @@ def _evaluation_context_fingerprint(
     preset: dict,
     pass_name: str,
     plots_enabled: bool,
+    seed: int,
 ) -> str:
     """Fingerprint inputs shared by every model in one evaluation pass."""
     payload = {
         "schema_version": _CHECKPOINT_SCHEMA_VERSION,
         "pass_name": pass_name,
+        "seed": seed,
         "preset": preset,
         "dataset_name": dataset.name,
         "dataset_version": dataset.version,
@@ -482,6 +548,7 @@ def _run_resumable_syntheval(
     ranking_strategy: str,
     execution_cfg,
     pass_name: str,
+    seed: int,
     plots_output_dir: str | Path | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Evaluate models in disposable bounded processes and resume checkpoints.
@@ -493,7 +560,9 @@ def _run_resumable_syntheval(
 
     checkpoint_root = ensure_dir(output_folder).resolve()
     plots_enabled = plots_output_dir is not None
-    context_fingerprint = _evaluation_context_fingerprint(dataset, preset, pass_name, plots_enabled)
+    context_fingerprint = _evaluation_context_fingerprint(
+        dataset, preset, pass_name, plots_enabled, seed
+    )
     results: dict[str, pd.DataFrame] = {}
     pending: list[tuple[str, pd.DataFrame, str]] = []
     for model_name, frame in synthetic_datasets.items():
@@ -555,6 +624,7 @@ def _run_resumable_syntheval(
                     model_fingerprint,
                     str(plots_output_dir) if plots_output_dir else None,
                     execution_cfg.cores_per_model,
+                    seed,
                 ),
                 name=f"syntheval-{pass_name}-{model_name}",
             )
@@ -665,6 +735,7 @@ def run_syntheval_evaluation(
     plots_output_dir: str | Path | None = None,
     positive_class=1,
     execution_cfg=None,
+    seed: int = 0,
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
     """Run SynthEval's benchmark() across all datasets. Returns (benchmark_results, benchmark_ranks).
 
@@ -689,7 +760,7 @@ def run_syntheval_evaluation(
 
     cache_dir = Path(output_folder) if output_folder else preset_dir / "syntheval_benchmark"
     context_fingerprint = _evaluation_context_fingerprint(
-        dataset, preset, "main", plots_output_dir is not None
+        dataset, preset, "main", plots_output_dir is not None, seed
     )
     model_fingerprints = {
         name: _frame_fingerprint(frame) for name, frame in synthetic_datasets.items()
@@ -722,6 +793,7 @@ def run_syntheval_evaluation(
         ranking_strategy,
         execution_cfg,
         "main",
+        seed,
         plots_output_dir,
     )
 
@@ -807,6 +879,7 @@ def run_binary_target_syntheval_evaluation(
     ranking_strategy: str = "linear",
     output_folder: str | Path | None = None,
     execution_cfg=None,
+    seed: int = 0,
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
     """Run a second, separate SynthEval benchmark() pass against a binary-
     collapsed copy of the target column, for the metrics that require exactly
@@ -852,7 +925,7 @@ def run_binary_target_syntheval_evaluation(
     )
     cache_dir = Path(output_folder) if output_folder else preset_dir / "syntheval_benchmark"
     context_fingerprint = _evaluation_context_fingerprint(
-        binary_dataset, preset, "binary_target", False
+        binary_dataset, preset, "binary_target", False, seed
     )
     model_fingerprints = {
         name: _frame_fingerprint(frame) for name, frame in binary_synthetic_datasets.items()
@@ -893,6 +966,7 @@ def run_binary_target_syntheval_evaluation(
         ranking_strategy,
         execution_cfg,
         "binary_target",
+        seed,
     )
     _save_syntheval_cache(benchmark_results, benchmark_ranks, cache_dir, "binary_target", cache_key)
 

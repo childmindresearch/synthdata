@@ -125,12 +125,6 @@ def test_ranking_puts_copy_above_shuffle_on_utility(known_answers):
     assert utility["copy"] > utility["shuffle"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="SynthEval MIA, NNAA, attribute disclosure and the fairness metrics draw "
-    "unseeded random samples and classifiers inside their worker processes, so identical "
-    "inputs score differently (overall rank moved by ~0.37 between two identical runs).",
-)
 def test_identical_inputs_get_identical_scores(known_answers):
     numeric = known_answers.apply(pd.to_numeric, errors="coerce")
     numeric = numeric.loc[:, numeric.notna().any()]

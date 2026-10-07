@@ -52,12 +52,6 @@ def test_same_seed_gives_identical_synthetic_data(pipeline_run, rerun):
     assert not different, different
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="SynthEval MIA, NNAA, attribute disclosure and the fairness metrics draw "
-    "unseeded random samples and classifiers inside their worker processes, so identical "
-    "inputs score differently (overall rank moved by ~0.37 between two identical runs).",
-)
 def test_same_inputs_give_the_same_metrics(pipeline_run, rerun):
     first, second = pipeline_run.combined(), rerun.combined()
     second = second.loc[first.index, first.columns]

@@ -21,6 +21,7 @@ from synthdata.evaluation.syntheval_eval import (
     _attach_metric_types,
     _checkpoint_paths,
     _compute_cache_key,
+    _evaluate_seeded,
     _load_syntheval_cache,
     _save_syntheval_cache,
     _shutdown_nested_joblib_executor,
@@ -162,6 +163,54 @@ class TestAttachMetricTypes:
         comb = pd.DataFrame({("x", "value"): [0.5]}, index=["m1"])
         with pytest.raises(ValueError, match="unknown dim"):
             _attach_metric_types(comb, model_results)
+
+
+class _RandomSynthEval:
+    """Stands in for SynthEval: each metric's value is a draw from NumPy's global state."""
+
+    def __init__(self, fail=()):
+        self.fail = set(fail)
+        self.loky_cpus = {}
+
+    def evaluate(self, synthetic_frame, analysis_target=None, _dataset_name=None, **metrics):
+        ((method, _params),) = metrics.items()
+        self.loky_cpus[method] = os.environ.get("LOKY_MAX_CPU_COUNT")
+        if method in self.fail:
+            return None
+        return pd.DataFrame(
+            [(method, "p", float(np.random.rand()), 0.0, 0.0, 0.0)],
+            columns=["metric", "dim", "val", "err", "n_val", "n_err"],
+        )
+
+
+class TestEvaluateSeeded:
+    def _run(self, preset, seed=7, se=None):
+        result, failed = _evaluate_seeded(se or _RandomSynthEval(), None, None, preset, seed, "m")
+        return dict(zip(result["metric"], result["val"], strict=True)), failed
+
+    def test_same_seed_gives_same_scores(self):
+        preset = {"mia": {}, "att_discl": {}}
+        assert self._run(preset) == self._run(preset)
+
+    def test_score_does_not_depend_on_other_selected_metrics(self):
+        alone, _ = self._run({"mia": {}})
+        together, _ = self._run({"att_discl": {}, "mia": {}})
+        assert alone["mia"] == together["mia"]
+
+    def test_different_seed_changes_scores(self):
+        assert self._run({"mia": {}}, seed=1) != self._run({"mia": {}}, seed=2)
+
+    def test_failed_metrics_are_reported(self):
+        values, failed = self._run({"mia": {}, "nnaa": {}}, se=_RandomSynthEval(fail={"nnaa"}))
+        assert set(values) == {"mia"}
+        assert failed == ["nnaa"]
+
+    def test_nnaa_runs_joblib_in_process(self, monkeypatch):
+        monkeypatch.setenv("LOKY_MAX_CPU_COUNT", "4")
+        se = _RandomSynthEval()
+        self._run({"nnaa": {}, "mia": {}}, se=se)
+        assert se.loky_cpus == {"nnaa": "1", "mia": "4"}
+        assert os.environ["LOKY_MAX_CPU_COUNT"] == "4"
 
 
 class TestMergeBinaryTargetResults:
