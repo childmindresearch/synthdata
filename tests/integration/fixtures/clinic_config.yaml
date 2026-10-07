@@ -1,0 +1,121 @@
+# Integration-test config for the committed clinic fixture (tests/integration).
+# "{root}" is rewritten to a per-test scratch directory and "{fixtures}" to
+# this folder by the test harness. Settings are sized so the whole pipeline
+# runs on a CPU-only CI runner in a few minutes; see tests/integration/README.md.
+
+name: clinic
+seed: 7
+device: cpu
+
+experiment:
+  tag: integration
+  id: null
+
+data:
+  source: csv
+  path: "{fixtures}/clinic.csv"
+  version: "fixture-1"
+  variable_schema_path: "{fixtures}/clinic_schema.csv"
+
+  target_column: target
+  # On this pipeline version sensitive columns drive both attribute-disclosure
+  # (privacy) and SynthEval fairness, which needs a binary column (SEX).
+  sensitive_columns: [SEX, DIAGNOSIS]
+  # The fixture carries repeat encounters per patient. This pipeline version
+  # splits by row, so the identifier is dropped before modeling.
+  drop_columns: [patient_id]
+  drop_rows_missing_target: true
+
+  uppercase_columns: false
+  remap_binary_one_two: false
+  outlier_zscore_threshold: null
+  outlier_columns: []
+  train_size: 0.7
+  stratify: true
+
+  data_dir: "{root}/data/clinic"
+  raw_cache_subdir: raw
+
+imputation:
+  enabled: true
+  method: refidiff
+  device: cpu
+  cache: true
+  validation_margin: 0.2
+  round_to_int_default: false
+  round_rules: { BMI: 1, LAB_A: 2 }
+  refidiff:
+    hidden_dim: 16
+    epochs: 60
+    early_stopping_patience: 20
+    batch_size: 256
+    num_steps: 5
+    num_trials: 1
+    denoiser: mlp
+    checkpoint_every: 1000
+    catboost_warmup_iterations: 20
+
+generation:
+  output_dir: "{root}/output/clinic/synthetic_data"
+  n_samples: 120
+  force_retrain: false
+
+  synthcity:
+    enabled: true
+    names: [bayesian_network, ctgan]
+
+  tabpfn:
+    enabled: false
+  tabpfgen:
+    enabled: false
+
+  hpo:
+    enabled: true
+    n_trials: 2
+    timeout_seconds: 300
+    n_iter_cap: 20
+    model_iter_caps: {}
+    metric_config:
+      stats: [wasserstein_dist]
+      performance: [xgb]
+    storage: null
+    best_params_path: null
+    final_n_iter_override: 20
+
+evaluation:
+  output_dir: "{root}/output/clinic/evaluation"
+  models: null
+  positive_class: 1
+  ranking_strategy: linear
+  generate_report: true
+  save_per_model_syntheval_plots: false
+
+  synthcity: { enabled: true, categories: null, metrics: null }
+  syntheval: { enabled: true, categories: null, metrics: null }
+  custom: { enabled: true, categories: null, metrics: null }
+
+  log_disparity:
+    protected_columns: [SEX, AGE]
+    target_map: { 0: negative, 1: positive }
+    protected_map: [null, null]
+    protected_bins: [null, [18, 40, 60, 80]]
+
+  binary_target:
+    { enabled: false, column: null, positive_classes: [], negative_classes: [] }
+
+  syntheval_execution:
+    model_workers: 1
+    max_model_workers: 1
+    cores_per_model: 1
+    memory_reserve_gib: 1
+    memory_per_model_gib: 1
+
+  rank_weights: { utility: 1.0, privacy: 1.0, fairness: 1.0 }
+  privacy_gate:
+    enabled: true
+
+plots:
+  output_dir: "{root}/output/clinic/plots"
+  sections: [data, imputation, generation, hpo, evaluation]
+  dpi: 60
+  formats: [png]

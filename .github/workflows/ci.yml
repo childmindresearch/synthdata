@@ -47,5 +47,26 @@ jobs:
       # synthdata/generation/pipeline.py's lazy tabpfgen_backend import, which
       # is what makes this possible.
       - run: uv sync
-      - name: Run tests (excluding slow/network-marked tests)
-        run: uv run pytest -m "not slow and not network" --cov=synthdata --cov-report=term-missing
+      - name: Run unit tests (excluding integration/slow/network-marked tests)
+        run: uv run pytest -m "not integration and not slow and not network" --cov=synthdata --cov-report=term-missing
+
+  integration:
+    name: Integration (end-to-end pipeline)
+    runs-on: ubuntu-latest
+    env:
+      UV_TORCH_BACKEND: cpu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync
+      # Runs the real impute -> generate -> evaluate -> plot CLIs on the
+      # committed fixture (tests/integration). RefiDiff imputation needs
+      # catboost, which lives in the `refidiff` extra next to CUDA-only
+      # packages, so it is added on its own here.
+      - name: Run end-to-end tests on the fixture dataset
+        run: uv run --with catboost pytest tests/integration -m "integration and not slow and not network" --durations=10
