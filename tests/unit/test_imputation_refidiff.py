@@ -14,13 +14,16 @@ import pandas as pd
 import pytest
 
 from synthdata.config import RefiDiffConfig
-from synthdata.imputation.pipeline import _impute_dataframe
+from synthdata.imputation import refidiff_backend
+from synthdata.imputation.pipeline import _impute_splits
 from synthdata.imputation.refidiff_backend import (
+    _apply_refiners,
     _checkpoint_dir,
     _checkpoint_identity,
     _decode_bits_to_categorical,
     _encode_categorical_to_bits,
     _fit_categorical_binary_encoders,
+    _fit_refiners,
     _mean_std,
     impute_dataframe,
 )
@@ -117,30 +120,66 @@ class TestMeanStd:
 
 
 class TestPipelineDispatch:
-    def test_dispatches_to_tabimpute_backend(self, make_config, make_dataset, mocker):
+    def test_tabimpute_imputes_train_alone_then_test_with_train_context(
+        self, make_config, make_dataset, mocker
+    ):
         cfg = make_config()
         dataset = make_dataset()
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",
-            return_value=dataset.full_df.copy(),
+            side_effect=lambda frame, *args, **kwargs: frame.fillna(0),
         )
-        _impute_dataframe(cfg, dataset.full_df, dataset, device="cpu")
-        mock_impute.assert_called_once()
+        train_imputed, test_imputed = _impute_splits(cfg, dataset, device="cpu")
+        first, second = (call.args[0] for call in mock_impute.call_args_list)
+        assert first.index.equals(dataset.train_df.index)
+        assert second.index.equals(dataset.train_df.index.append(dataset.test_df.index))
+        assert train_imputed.index.equals(dataset.train_df.index)
+        assert test_imputed.index.equals(dataset.test_df.index)
 
-    def test_dispatches_to_refidiff_backend_with_data_dir(self, make_config, make_dataset, mocker):
+    def test_refidiff_fits_on_train_and_transforms_test(self, make_config, make_dataset, mocker):
         cfg = make_config()
         cfg.imputation.method = "refidiff"
         dataset = make_dataset()
-        mock_impute = mocker.patch(
-            "synthdata.imputation.refidiff_backend.impute_dataframe",
-            return_value=dataset.full_df.copy(),
+        state = object()
+        mock_fit = mocker.patch.object(
+            refidiff_backend, "fit", return_value=(state, dataset.train_df.fillna(0))
         )
-        _impute_dataframe(cfg, dataset.full_df, dataset, device="cpu")
-        mock_impute.assert_called_once()
-        _, kwargs = mock_impute.call_args
+        mock_transform = mocker.patch.object(
+            refidiff_backend, "transform", side_effect=lambda _, frame: frame.fillna(0)
+        )
+        _impute_splits(cfg, dataset, device="cpu")
+        args, kwargs = mock_fit.call_args
+        assert args[0].index.equals(dataset.train_df.index)
         assert kwargs["data_dir"] == dataset.data_dir
         assert kwargs["refidiff_cfg"] is cfg.imputation.refidiff
         assert kwargs["seed"] == cfg.seed
+        assert mock_transform.call_args.args[0] is state
+        assert mock_transform.call_args.args[1].index.equals(dataset.test_df.index)
+
+
+class TestRefiners:
+    @pytest.fixture(autouse=True)
+    def _needs_catboost(self):
+        # Refinement imports catboost, which lives in the optional refidiff extra.
+        pytest.importorskip("catboost", reason="RefiDiff refinement needs catboost")
+
+    def test_replaying_a_fitted_pass_matches_the_fit_pass(self):
+        rng = np.random.default_rng(0)
+        X = rng.normal(size=(60, 3))
+        X[:, 2] = (X[:, 0] > 0).astype(float)
+        missing = rng.random(X.shape) < 0.15
+        start = np.where(missing, 0.0, X)
+        filled, refiners = _fit_refiners(start, missing, 2, catboost_warmup_iterations=5)
+        np.testing.assert_allclose(_apply_refiners(start, missing, refiners), filled)
+
+    def test_columns_complete_in_fit_rows_still_get_a_model_when_requested(self):
+        rng = np.random.default_rng(1)
+        X = rng.normal(size=(40, 2))
+        no_missing = np.zeros_like(X, dtype=bool)
+        _, refiners = _fit_refiners(
+            X, no_missing, 2, catboost_warmup_iterations=5, model_columns=np.array([False, True])
+        )
+        assert [refiner[0] for refiner in refiners] == [1]
 
 
 class TestCheckpointIdentity:
@@ -279,3 +318,48 @@ class TestRefiDiffEndToEnd:
         assert (result.loc[~missing, "activity_level"] == df.loc[~missing, "activity_level"]).all()
         assert "label-encoded as a fallback" in caplog.text
         assert "activity_level" in caplog.text
+
+    def test_fit_is_repeatable_and_transform_fills_held_out_rows(self, tmp_path):
+        rng = np.random.default_rng(3)
+        n = 60
+        df = pd.DataFrame(
+            {
+                "num1": rng.normal(size=n),
+                "num2": rng.normal(size=n),
+                "cat1": rng.choice(["a", "b", "c"], size=n),
+                "target": rng.integers(0, 2, size=n),
+            }
+        )
+        df.loc[rng.random(n) < 0.2, "num1"] = np.nan
+        df.loc[rng.random(n) < 0.2, "cat1"] = np.nan
+        train, test = df.iloc[:40], df.iloc[40:].copy()
+        cfg = RefiDiffConfig(
+            hidden_dim=8,
+            epochs=5,
+            early_stopping_patience=5,
+            batch_size=32,
+            num_steps=3,
+            num_trials=1,
+            denoiser="mlp",
+            checkpoint_every=5,
+            catboost_warmup_iterations=5,
+        )
+        kwargs = dict(device="cpu", refidiff_cfg=cfg, data_dir=tmp_path, seed=0)
+        features = ["num1", "num2", "cat1"]
+
+        state, train_imputed = refidiff_backend.fit(
+            train, features, ["cat1"], "target", model_columns=["num2"], **kwargs
+        )
+        # A label never seen in train is passed through, not decoded to another.
+        test.loc[test.index[0], "cat1"] = "unseen"
+        test.loc[test.index[1], "num2"] = np.nan
+        test_imputed = refidiff_backend.transform(state, test)
+        _, train_again = refidiff_backend.fit(
+            train, features, ["cat1"], "target", model_columns=["num2"], **kwargs
+        )
+
+        pd.testing.assert_frame_equal(train_imputed, train_again)
+        assert not test_imputed[features].isna().any().any()
+        assert test_imputed.loc[test.index[0], "cat1"] == "unseen"
+        observed = test["num1"].notna()
+        assert (test_imputed.loc[observed, "num1"] == test.loc[observed, "num1"]).all()

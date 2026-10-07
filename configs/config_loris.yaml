@@ -46,6 +46,7 @@ data:
   outlier_columns: null
   train_size: 0.6667
   stratify: true
+  tuning_size: 0.2 # Share of train patients held out to score HPO candidates.
 
   # Local derived-data storage
   data_dir: data/loris

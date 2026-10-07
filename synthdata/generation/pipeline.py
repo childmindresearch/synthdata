@@ -62,6 +62,11 @@ def run_generation(
         raise RuntimeError(
             "Dataset must be imputed before generation (run synthdata.imputation.run_imputation first)"
         )
+    if cfg.generation.hpo.enabled and dataset.tuning_index.empty:
+        raise RuntimeError(
+            "generation.hpo.enabled needs a tuning split to score candidates on; set "
+            "data.tuning_size above 0"
+        )
 
     gen_cfg = cfg.generation
     output_dir = ensure_dir(gen_cfg.output_dir)
@@ -73,6 +78,21 @@ def run_generation(
     best_params = hpo_mod.BestParamsCache(best_params_path)
 
     synthetic_datasets: dict[str, pd.DataFrame] = {}
+
+    # Hyperparameter search fits candidates on train minus tuning and scores
+    # them on tuning. Final models (default and tuned) are fitted on all of
+    # train, so the test split is only ever used by evaluation.
+    hpo_eval_fn = None
+    if gen_cfg.hpo.enabled and needs_imputed_data(gen_cfg):
+        hpo_eval_fn = hpo_mod.build_synthetic_eval_fn(
+            dataset.search_train_imputed_df,
+            dataset.tuning_imputed_df,
+            dataset.target_column,
+            dataset.sensitive_columns,
+            gen_cfg.hpo.metric_config,
+            seed,
+            workspace=output_dir / "synthcity_workspace",
+        )
 
     def _cached_or_build(name, build_fn):
         path = output_dir / f"{name}.csv"
@@ -116,6 +136,17 @@ def run_generation(
             random_state=seed,
             fairness_column=fairness_column,
         )
+        search_loader = (
+            sc.make_loader(
+                dataset.search_train_imputed_df,
+                dataset.target_column,
+                dataset.sensitive_columns,
+                random_state=seed,
+                fairness_column=fairness_column,
+            )
+            if gen_cfg.hpo.enabled
+            else None
+        )
 
         for name in gen_cfg.synthcity.names:
             _cached_or_build(
@@ -135,9 +166,11 @@ def run_generation(
                 if not best_params.has("synthcity", name):
                     objective = sc.build_synthcity_objective(
                         name,
-                        train_loader,
+                        search_loader,
                         gen_cfg.hpo,
                         seed,
+                        hpo_eval_fn,
+                        n_samples,
                         workspace=output_dir / "synthcity_workspace",
                         device=device,
                     )
@@ -216,17 +249,7 @@ def run_generation(
     if gen_cfg.tabpfgen.enabled:
         from synthdata.generation import tabpfgen_backend as tpfgen
 
-        eval_fn = None
-        if gen_cfg.hpo.enabled:
-            eval_fn = hpo_mod.build_synthetic_eval_fn(
-                dataset.train_imputed_df,
-                dataset.test_imputed_df,
-                dataset.target_column,
-                dataset.sensitive_columns,
-                gen_cfg.hpo.metric_config,
-                seed,
-                workspace=output_dir / "synthcity_workspace",
-            )
+        eval_fn = hpo_eval_fn
 
         if "standard" in gen_cfg.tabpfgen.variants:
             _cached_or_build(
@@ -244,7 +267,7 @@ def run_generation(
             if gen_cfg.hpo.enabled:
                 if not best_params.has("tabpfgen", "tabpfgen_standard"):
                     objective = tpfgen.build_tabpfgen_standard_objective(
-                        dataset.train_imputed_df,
+                        dataset.search_train_imputed_df,
                         dataset.feature_columns,
                         dataset.categorical_columns,
                         dataset.target_column,
@@ -293,7 +316,7 @@ def run_generation(
             if gen_cfg.hpo.enabled:
                 if not best_params.has("tabpfgen", "tabpfgen_custom"):
                     objective = tpfgen.build_tabpfgen_custom_objective(
-                        dataset.train_imputed_df,
+                        dataset.search_train_imputed_df,
                         dataset.feature_columns,
                         dataset.categorical_columns,
                         dataset.target_column,

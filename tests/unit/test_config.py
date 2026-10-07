@@ -164,6 +164,21 @@ class TestValidate:
         with pytest.raises(ValueError, match="data.source"):
             _validate(cfg)
 
+    def test_patient_id_column_cannot_be_the_target(self):
+        cfg = self._base_valid()
+        cfg.data.patient_id_column = cfg.data.target_column
+        with pytest.raises(ValueError, match="patient_id_column"):
+            _validate(cfg)
+
+    def test_hpo_needs_a_tuning_split(self):
+        cfg = self._base_valid()
+        cfg.generation.hpo.enabled = True
+        cfg.data.tuning_size = 0.0
+        with pytest.raises(ValueError, match="tuning_size"):
+            _validate(cfg)
+        cfg.generation.hpo.enabled = False
+        _validate(cfg)  # no tuning split needed without HPO
+
     def test_uci_requires_uci_id(self):
         cfg = Config(data=DataConfig(source="uci", uci_id=None, target_column="target"))
         with pytest.raises(ValueError, match="data.uci_id"):

@@ -167,8 +167,8 @@ addopts = "-ra --strict-markers --strict-config"
 markers = [
     "unit: fast, pure-logic tests with no I/O or external dependencies",
     "cache: tests exercising file/SQLite caching and resumability logic",
-    "integration: multi-module orchestration tests (may use tmp_path, mocks)",
-    "slow: exercises real model training (synthcity/tabpfgen/tabpfn); not run by default in CI",
+    "integration: multi-module orchestration tests; tests/integration runs the real CLIs end to end on a fixture",
+    "slow: full-size training (every generator, TabPFN, GPU); not run in CI",
     "network: requires a live external/hosted API (e.g. hosted TabPFN); skipped in CI",
 ]
 

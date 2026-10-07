@@ -50,6 +50,12 @@ class DataConfig:
     sensitive_columns: list = dataclasses.field(default_factory=list)
     #: Columns to drop entirely before any modeling (e.g. free-text/ID columns).
     drop_columns: list = dataclasses.field(default_factory=list)
+    #: Column identifying the patient (or other independent unit) each row
+    #: belongs to. When set, the train/test split assigns whole patients, so
+    #: repeat encounters of one patient never end up on both sides, and the
+    #: column is then removed so no model ever sees it. Leave unset only when
+    #: every row is a different patient.
+    patient_id_column: str | None = None
     #: Drop rows where target_column is null before splitting/imputing. Every
     #: downstream stage assumes a fully-observed target (imputation only fills
     #: feature_columns; the target is passed through as-is), so datasets whose
@@ -99,9 +105,18 @@ class DataConfig:
     #: sentinel/corrupted values, not just a skewed distribution.
     outlier_columns: list = dataclasses.field(default_factory=list)
 
-    #: Train/test split.
+    #: Train/test split. ``train_size`` is the share of patients (of rows when
+    #: ``patient_id_column`` is unset) assigned to train. ``stratify`` balances
+    #: the target across the split; with patient groups each patient is
+    #: stratified by their most frequent target value.
     train_size: float = 0.6667
     stratify: bool = True
+    #: Share of the train patients set aside as a tuning split. Hyperparameter
+    #: search fits candidates on the rest of train and scores them on tuning,
+    #: and the imputer is fitted on that same rest, so neither ever sees the
+    #: test split. Final models are then refitted on all of train (tuning
+    #: included) and evaluated on test. Must be above 0 when HPO is enabled.
+    tuning_size: float = 0.2
 
     #: Where cached/derived CSVs (raw, imputed, train/test splits) are written.
     data_dir: str = "data/dataset"
@@ -631,6 +646,23 @@ def _validate(cfg: Config) -> None:
         raise ValueError("data.path is required when data.source == 'csv'/'parquet'")
     if not cfg.data.target_column:
         raise ValueError("data.target_column must be set")
+    patient_id_column = cfg.data.patient_id_column
+    if patient_id_column is not None:
+        if patient_id_column == cfg.data.target_column:
+            raise ValueError("data.patient_id_column must not be the target column")
+        if patient_id_column in cfg.data.sensitive_columns:
+            raise ValueError("data.patient_id_column must not be a sensitive column")
+    if not 0 < cfg.data.train_size < 1:
+        raise ValueError(f"data.train_size must be between 0 and 1, got {cfg.data.train_size!r}")
+    if not 0 <= cfg.data.tuning_size < 1:
+        raise ValueError(
+            f"data.tuning_size must be at least 0 and below 1, got {cfg.data.tuning_size!r}"
+        )
+    if cfg.generation.hpo.enabled and cfg.data.tuning_size == 0:
+        raise ValueError(
+            "generation.hpo.enabled needs a tuning split to score candidates on; set "
+            "data.tuning_size above 0 (for example 0.2)"
+        )
     if cfg.device not in ("auto", "cpu", "cuda", "mps"):
         raise ValueError(f"device must be one of auto/cpu/cuda/mps, got {cfg.device!r}")
     if cfg.imputation.method not in ("tabimpute", "refidiff"):

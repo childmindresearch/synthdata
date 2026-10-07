@@ -1,0 +1,11 @@
+column,kind,ordinal_order
+AGE,continuous,
+SEX,categorical,
+SITE,categorical,
+SMOKER,categorical,
+BMI,continuous,
+LAB_A,continuous,
+LAB_B,continuous,
+SEVERITY,categorical,"[0, 1, 2, 3]"
+DIAGNOSIS,categorical,
+target,categorical,

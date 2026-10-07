@@ -21,6 +21,7 @@ from synthdata.data import (
     mask_outliers_as_missing,
     remap_binary_one_two,
     schema_column_roles,
+    split_by_patient,
     warn_non_numeric_feature_columns,
 )
 
@@ -190,6 +191,7 @@ class TestVariableSchema:
                 data_dir=str(tmp_path / "derived"),
                 train_size=0.5,
                 stratify=True,
+                tuning_size=0.0,
             ),
         )
 
@@ -242,6 +244,101 @@ class TestVariableSchema:
         assert dataset.target_is_categorical is False
         assert dataset.all_categorical_columns == []
         assert pd.api.types.is_float_dtype(dataset.full_df["target"])
+
+
+class TestSplitByPatient:
+    @staticmethod
+    def _visits(n_patients=60, seed=0):
+        rng = np.random.default_rng(seed)
+        visits = rng.integers(1, 4, size=n_patients)
+        patient = np.repeat([f"p{i:03d}" for i in range(n_patients)], visits)
+        label = np.repeat(np.arange(n_patients) % 3 == 0, visits).astype(int)
+        df = pd.DataFrame({"x": rng.normal(size=len(patient)), "target": label})
+        return df, pd.Series(patient, index=df.index)
+
+    def test_no_patient_is_on_both_sides(self):
+        df, patients = self._visits()
+        train, test = split_by_patient(df, patients, "target", 0.7, seed=1, stratify=True)
+        assert set(patients[train.index]).isdisjoint(patients[test.index])
+        assert sorted([*train.index, *test.index]) == list(df.index)
+        assert patients[train.index].nunique() == 42
+
+    def test_patients_are_stratified_by_their_target(self):
+        df, patients = self._visits()
+        train, test = split_by_patient(df, patients, "target", 0.5, seed=3, stratify=True)
+        positive = patients[df["target"] == 1].unique()
+        assert len(set(patients[train.index]) & set(positive)) == len(positive) // 2
+
+    def test_same_seed_gives_the_same_split(self):
+        df, patients = self._visits()
+        first = split_by_patient(df, patients, "target", 0.7, seed=5, stratify=False)
+        second = split_by_patient(df, patients, "target", 0.7, seed=5, stratify=False)
+        assert first[0].index.equals(second[0].index)
+
+    def test_without_patients_matches_a_stratified_row_split(self):
+        from sklearn.model_selection import train_test_split
+
+        df, _ = self._visits()
+        train, test = split_by_patient(df, None, "target", 0.7, seed=9, stratify=True)
+        expected, _ = train_test_split(df, train_size=0.7, random_state=9, stratify=df["target"])
+        assert sorted(train.index) == sorted(expected.index)
+
+    def test_missing_patient_id_is_rejected(self):
+        df, patients = self._visits()
+        patients.iloc[0] = None
+        with pytest.raises(ValueError, match="missing value"):
+            split_by_patient(df, patients, "target", 0.7, seed=1, stratify=True)
+
+    def test_load_dataset_groups_by_patient_and_drops_the_identifier(self, tmp_path):
+        df, patients = self._visits()
+        df.insert(0, "subject", patients)
+        raw_path = tmp_path / "raw.csv"
+        df.to_csv(raw_path, index=False)
+        cfg = Config(
+            name="patients",
+            data=DataConfig(
+                source="csv",
+                path=str(raw_path),
+                target_column="target",
+                patient_id_column="subject",
+                nominal_columns=[],
+                data_dir=str(tmp_path / "derived"),
+                train_size=0.7,
+            ),
+        )
+
+        dataset = load_dataset(cfg)
+
+        assert "subject" not in dataset.full_df.columns
+        assert "subject" not in dataset.feature_columns
+        train_patients = set(df.loc[dataset.train_df.index, "subject"])
+        test_patients = set(df.loc[dataset.test_df.index, "subject"])
+        assert train_patients.isdisjoint(test_patients)
+        tuning_patients = set(df.loc[dataset.tuning_index, "subject"])
+        assert tuning_patients <= train_patients
+        assert tuning_patients.isdisjoint(df.loc[dataset.search_train_df.index, "subject"])
+        assert dataset.n_patients == {"train": 42, "tuning": 9, "test": 18}
+        manifest = json.loads((dataset.data_dir / "dataset_manifest.json").read_text())
+        assert manifest["patient_id_column"] == "subject"
+        assert manifest["n_patients"] == {"train": 42, "tuning": 9, "test": 18}
+
+    def test_unknown_patient_column_is_rejected(self, tmp_path):
+        df, _ = self._visits()
+        raw_path = tmp_path / "raw.csv"
+        df.to_csv(raw_path, index=False)
+        cfg = Config(
+            name="patients",
+            data=DataConfig(
+                source="csv",
+                path=str(raw_path),
+                target_column="target",
+                patient_id_column="subject",
+                nominal_columns=[],
+                data_dir=str(tmp_path / "derived"),
+            ),
+        )
+        with pytest.raises(KeyError, match="patient_id_column"):
+            load_dataset(cfg)
 
 
 def test_legacy_dataset_assumes_categorical_target(make_dataset):
