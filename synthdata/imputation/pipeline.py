@@ -56,15 +56,21 @@ def _persist_decoded_imputed_splits(dataset: Dataset) -> None:
 
 
 def _impute_splits(cfg: Config, dataset: Dataset, device: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Impute train and test with an imputer that learns from train only.
+    """Impute train and test with an imputer that never learns from tuning or test.
 
-    RefiDiff is fitted on the train split and then fills the test split with
-    that fitted model, so test rows never change a train value. TabImpute has
-    no fitting step (it is a pretrained in-context model), so train is imputed
-    on its own and test is imputed with the train rows as context; test rows
-    can inform each other's imputations but never train's.
+    The imputer is fitted on the train rows outside the tuning split (see
+    :attr:`Dataset.search_train_df`), so neither hyperparameter scores nor
+    test results are shaped by imputations that saw the rows they are
+    measured on. RefiDiff is fitted on those rows and then fills the tuning
+    and test splits separately with the fitted model. TabImpute has no fitting
+    step (it is a pretrained in-context model), so the fitting rows are
+    imputed on their own and each held-out split with them as context; rows
+    of one held-out split can inform each other's imputations but never the
+    fitting rows' or another split's. Returns ``(train_imputed, test_imputed)``
+    with train (tuning included) in ``dataset.train_df`` row order.
     """
-    train_df, test_df = dataset.train_df, dataset.test_df
+    fit_df = dataset.search_train_df
+    held_out = {"tuning": dataset.tuning_df, "test": dataset.test_df}
     method = cfg.imputation.method
     if method == "tabimpute":
         from synthdata.imputation.tabimpute_backend import impute_dataframe
@@ -78,16 +84,16 @@ def _impute_splits(cfg: Config, dataset: Dataset, device: str) -> tuple[pd.DataF
                 device=device,
             )
 
-        train_imputed = _impute(train_df)
-        if test_df.empty:
-            return train_imputed, test_df.copy()
-        with_context = _impute(pd.concat([train_df, test_df]))
-        return train_imputed, with_context.iloc[len(train_df) :]
-    if method == "refidiff":
+        fit_imputed = _impute(fit_df)
+
+        def _transform(frame: pd.DataFrame) -> pd.DataFrame:
+            return _impute(pd.concat([fit_df, frame])).iloc[len(fit_df) :]
+
+    elif method == "refidiff":
         from synthdata.imputation import refidiff_backend
 
-        state, train_imputed = refidiff_backend.fit(
-            train_df,
+        state, fit_imputed = refidiff_backend.fit(
+            fit_df,
             dataset.feature_columns,
             dataset.categorical_columns,
             dataset.target_column,
@@ -95,14 +101,27 @@ def _impute_splits(cfg: Config, dataset: Dataset, device: str) -> tuple[pd.DataF
             refidiff_cfg=cfg.imputation.refidiff,
             data_dir=dataset.data_dir,
             seed=cfg.seed,
-            model_columns=[c for c in dataset.feature_columns if test_df[c].isna().any()],
+            model_columns=[
+                c
+                for c in dataset.feature_columns
+                if any(frame[c].isna().any() for frame in held_out.values())
+            ],
         )
-        if test_df.empty:
-            return train_imputed, test_df.copy()
-        return train_imputed, refidiff_backend.transform(state, test_df)
-    # Unreachable in practice: Config._validate() already restricts
-    # imputation.method to {"tabimpute", "refidiff"} before this runs.
-    raise ValueError(f"Unknown imputation.method: {method!r}")
+
+        def _transform(frame: pd.DataFrame) -> pd.DataFrame:
+            return refidiff_backend.transform(state, frame)
+
+    else:
+        # Unreachable in practice: Config._validate() already restricts
+        # imputation.method to {"tabimpute", "refidiff"} before this runs.
+        raise ValueError(f"Unknown imputation.method: {method!r}")
+
+    imputed = {
+        name: _transform(frame) if not frame.empty else frame.copy()
+        for name, frame in held_out.items()
+    }
+    train_imputed = pd.concat([fit_imputed, imputed["tuning"]]).loc[dataset.train_df.index]
+    return train_imputed, imputed["test"]
 
 
 def apply_rounding(
@@ -190,7 +209,7 @@ def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
         "imputation_enabled": imp_cfg.enabled,
         "imputation_method": imp_cfg.method,
         # Caches written before the imputer was fitted on train only are stale.
-        "imputer_fit_split": "train",
+        "imputer_fit_split": "train_without_tuning",
         "round_rules": imp_cfg.round_rules,
         "round_to_int_default": imp_cfg.round_to_int_default,
         "dataset_version": dataset.version,
@@ -199,6 +218,7 @@ def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
         "full_fingerprint": dataframe_fingerprint(dataset.full_df),
         "train_split_fingerprint": dataframe_fingerprint(dataset.train_df),
         "test_split_fingerprint": dataframe_fingerprint(dataset.test_df),
+        "tuning_split_fingerprint": dataframe_fingerprint(dataset.tuning_df),
     }
     if imp_cfg.method == "refidiff":
         payload["refidiff"] = dataclasses.asdict(imp_cfg.refidiff)
@@ -319,12 +339,12 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
         n_missing = int(dataset.full_df[dataset.feature_columns].isna().sum().sum())
         logger.info(
             "Imputing %d missing values across %d feature columns via method=%s on device=%s "
-            "(imputer fitted on the %d train rows only)",
+            "(imputer fitted on the %d train rows outside the tuning split)",
             n_missing,
             len(dataset.feature_columns),
             cfg.imputation.method,
             device,
-            len(dataset.train_df),
+            len(dataset.search_train_df),
         )
         train_imputed, test_imputed = (
             apply_rounding(

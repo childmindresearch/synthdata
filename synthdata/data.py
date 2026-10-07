@@ -93,6 +93,9 @@ class Dataset:
     #: the number of distinct patients per split (rows when no column is set).
     patient_id_column: str | None = None
     n_patients: dict = dataclasses.field(default_factory=dict)
+    #: Labels of the ``train_df`` rows held out as the tuning split (see
+    #: ``DataConfig.tuning_size``). Empty when no tuning split was requested.
+    tuning_index: pd.Index = dataclasses.field(default_factory=lambda: pd.Index([]))
 
     #: Numeric model-space frames populated once imputation has run
     #: (see synthdata.imputation).
@@ -112,6 +115,35 @@ class Dataset:
             self.train_split_fingerprint = dataframe_fingerprint(self.train_df)
         if self.test_split_fingerprint is None:
             self.test_split_fingerprint = dataframe_fingerprint(self.test_df)
+
+    @property
+    def tuning_df(self) -> pd.DataFrame:
+        """Train rows held out to score hyperparameter candidates."""
+        return self.train_df.loc[self.tuning_index]
+
+    @property
+    def search_train_df(self) -> pd.DataFrame:
+        """Train rows that HPO candidates and the imputer are fitted on (train minus tuning)."""
+        return self.train_df.drop(index=self.tuning_index)
+
+    def _imputed_rows(self, rows: pd.DataFrame) -> pd.DataFrame | None:
+        if self.full_imputed_df is None:
+            return None
+        if len(self.full_imputed_df) != len(self.full_df):
+            # Imputation disabled: the imputed frames are the complete cases,
+            # and their row labels do not survive the CSV round trip.
+            return rows.dropna()
+        return self.full_imputed_df.loc[rows.index]
+
+    @property
+    def tuning_imputed_df(self) -> pd.DataFrame | None:
+        """Imputed tuning rows (``None`` before imputation)."""
+        return self._imputed_rows(self.tuning_df)
+
+    @property
+    def search_train_imputed_df(self) -> pd.DataFrame | None:
+        """Imputed train rows outside the tuning split (``None`` before imputation)."""
+        return self._imputed_rows(self.search_train_df)
 
     @property
     def categorical_columns(self) -> list:
@@ -812,6 +844,8 @@ def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
         "n_rows": int(len(dataset.full_df)),
         "n_train": int(len(dataset.train_df)),
         "n_test": int(len(dataset.test_df)),
+        "n_tuning": int(len(dataset.tuning_index)),
+        "tuning_split_fingerprint": dataframe_fingerprint(dataset.tuning_df),
         "patient_id_column": dataset.patient_id_column,
         "n_patients": dataset.n_patients,
         "seed": cfg.seed,
@@ -962,13 +996,26 @@ def load_dataset(cfg: Config) -> Dataset:
         seed=cfg.seed,
         stratify=cfg.data.stratify,
     )
+    tuning_index = pd.Index([])
+    if cfg.data.tuning_size > 0:
+        # The same patient-disjoint split again, inside train.
+        _, tuning_df = split_by_patient(
+            train_df,
+            patient_ids.loc[train_df.index] if patient_ids is not None else None,
+            target_column,
+            train_size=1 - cfg.data.tuning_size,
+            seed=cfg.seed,
+            stratify=cfg.data.stratify,
+        )
+        tuning_index = tuning_df.index
     if patient_ids is not None:
         n_patients = {
             "train": int(patient_ids.loc[train_df.index].nunique()),
+            "tuning": int(patient_ids.loc[tuning_index].nunique()),
             "test": int(patient_ids.loc[test_df.index].nunique()),
         }
     else:
-        n_patients = {"train": len(train_df), "test": len(test_df)}
+        n_patients = {"train": len(train_df), "tuning": len(tuning_index), "test": len(test_df)}
 
     dataset = Dataset(
         name=cfg.name,
@@ -987,6 +1034,7 @@ def load_dataset(cfg: Config) -> Dataset:
         source_fingerprint=source_fingerprint,
         patient_id_column=patient_id_column,
         n_patients=n_patients,
+        tuning_index=tuning_index,
     )
 
     paths = dataset.paths()
@@ -998,7 +1046,8 @@ def load_dataset(cfg: Config) -> Dataset:
 
     logger.info(
         "Loaded dataset '%s' (version=%s): %d rows, %d features (%d categorical: %d nominal + "
-        "%d ordinal), target=%r, sensitive=%s, train=%d/test=%d rows (%d/%d patients)",
+        "%d ordinal), target=%r, sensitive=%s, train=%d (of which tuning=%d)/test=%d rows "
+        "(%d/%d/%d patients)",
         cfg.name,
         cfg.data.version or "unversioned",
         len(df),
@@ -1009,8 +1058,10 @@ def load_dataset(cfg: Config) -> Dataset:
         target_column,
         dataset.sensitive_columns,
         len(train_df),
+        len(tuning_index),
         len(test_df),
         n_patients["train"],
+        n_patients["tuning"],
         n_patients["test"],
     )
     return dataset
@@ -1054,6 +1105,7 @@ def load_imputed_splits(dataset: Dataset) -> Dataset:
         "full_fingerprint": dataframe_fingerprint(dataset.full_df),
         "train_split_fingerprint": dataframe_fingerprint(dataset.train_df),
         "test_split_fingerprint": dataframe_fingerprint(dataset.test_df),
+        "tuning_split_fingerprint": dataframe_fingerprint(dataset.tuning_df),
     }
     mismatches = {
         field: (provenance.get(field), expected)

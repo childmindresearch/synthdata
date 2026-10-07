@@ -83,6 +83,17 @@ def test_patients_do_not_span_train_and_test(dataset, source):
     assert train_patients.isdisjoint(test_patients)
 
 
+def test_tuning_split_is_a_patient_disjoint_part_of_train(dataset, source, pipeline_run):
+    tuning = dataset.tuning_df
+    search = dataset.search_train_df
+    assert set(tuning.index) <= set(dataset.train_df.index)
+    tuning_patients = set(source.loc[tuning.index, "patient_id"])
+    assert tuning_patients.isdisjoint(source.loc[search.index, "patient_id"])
+    assert tuning_patients.isdisjoint(source.loc[dataset.test_df.index, "patient_id"])
+    share = len(tuning_patients) / dataset.n_patients["train"]
+    assert abs(share - pipeline_run.cfg.data.tuning_size) <= 0.02
+
+
 # ---------------------------------------------------------------------------
 # Imputation
 # ---------------------------------------------------------------------------

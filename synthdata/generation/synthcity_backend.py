@@ -1,13 +1,13 @@
 """synthcity plugin fit/generate/hyperparameter-search glue."""
 
 import inspect
+from collections.abc import Callable
 
 import optuna
 import pandas as pd
 import torch
 
 from synthdata.config import HPOConfig
-from synthdata.generation.hpo import hpo_score
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -73,27 +73,25 @@ def build_synthcity_objective(
     train_loader,
     hpo_cfg: HPOConfig,
     seed: int,
+    eval_fn: Callable[[pd.DataFrame], float],
+    n_samples: int,
     workspace: str | None = None,
     device: str = "cpu",
 ):
     """Build an Optuna objective for a synthcity plugin's native hyperparameter space.
 
-    Mirrors the hepatitis notebook's HPO cell: samples from the plugin's own
-    ``sample_hyperparameters_optuna``, caps ``n_iter`` for speed (only if the
-    plugin exposes it), forces CPU for MPS (which lacks the float64 support
-    synthcity's metrics need internally) but otherwise uses ``device``, and
-    scores each trial via a single-model, single-repeat ``Benchmarks.evaluate``
-    call.
+    Each trial samples from the plugin's own ``sample_hyperparameters_optuna``,
+    caps ``n_iter`` for speed (only if the plugin exposes it), forces CPU for
+    MPS (which lacks the float64 support synthcity's metrics need internally)
+    but otherwise uses ``device``, fits the plugin on ``train_loader`` and
+    scores ``n_samples`` generated rows with ``eval_fn`` (lower is better).
+    ``eval_fn`` compares against the tuning split, so the search never sees
+    the test split.
     """
-    from pathlib import Path
-
-    from synthcity.benchmark import Benchmarks
-
     plugin_cls = get_plugin_class(name)
     accepts_device = plugin_accepts(name, "device")
     accepts_iter = plugin_accepts(name, "n_iter")
     iter_cap = hpo_cfg.model_iter_caps.get(name, hpo_cfg.n_iter_cap)
-    workspace_path = Path(workspace) if workspace else Path("workspace")
     trial_device = "cpu" if device == "mps" else device
 
     def objective(trial: optuna.Trial) -> float:
@@ -104,19 +102,13 @@ def build_synthcity_objective(
         if accepts_device:
             params["device"] = torch.device(trial_device)
 
-        trial_id = f"trial_{trial.number}"
         try:
-            report = Benchmarks.evaluate(
-                [(trial_id, name, params)],
-                train_loader,
-                repeats=1,
-                metrics=hpo_cfg.metric_config,
-                task_type="classification",
-                workspace=workspace_path,
+            synthetic = fit_generate(
+                name, params, train_loader, n_samples, seed, workspace=workspace
             )
+            return eval_fn(synthetic)
         except (ValueError, RuntimeError) as exc:
             logger.warning("[%s] trial %d failed: %s", name, trial.number, exc)
             raise optuna.TrialPruned() from exc
-        return hpo_score(report[trial_id])
 
     return objective

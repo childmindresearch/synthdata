@@ -191,6 +191,7 @@ class TestVariableSchema:
                 data_dir=str(tmp_path / "derived"),
                 train_size=0.5,
                 stratify=True,
+                tuning_size=0.0,
             ),
         )
 
@@ -313,10 +314,13 @@ class TestSplitByPatient:
         train_patients = set(df.loc[dataset.train_df.index, "subject"])
         test_patients = set(df.loc[dataset.test_df.index, "subject"])
         assert train_patients.isdisjoint(test_patients)
-        assert dataset.n_patients == {"train": 42, "test": 18}
+        tuning_patients = set(df.loc[dataset.tuning_index, "subject"])
+        assert tuning_patients <= train_patients
+        assert tuning_patients.isdisjoint(df.loc[dataset.search_train_df.index, "subject"])
+        assert dataset.n_patients == {"train": 42, "tuning": 9, "test": 18}
         manifest = json.loads((dataset.data_dir / "dataset_manifest.json").read_text())
         assert manifest["patient_id_column"] == "subject"
-        assert manifest["n_patients"] == {"train": 42, "test": 18}
+        assert manifest["n_patients"] == {"train": 42, "tuning": 9, "test": 18}
 
     def test_unknown_patient_column_is_rejected(self, tmp_path):
         df, _ = self._visits()

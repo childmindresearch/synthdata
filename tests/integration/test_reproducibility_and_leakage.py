@@ -86,7 +86,7 @@ def test_rerunning_generation_reuses_cached_models(rerun):
 
 @pytest.fixture(scope="module")
 def perturbed_holdout_run(pipeline_run, tmp_path_factory):
-    """Imputation on a copy of the source where only test-split rows changed.
+    """Imputation and generation on a copy of the source where only test rows changed.
 
     Feature values (never the target) of test rows are shifted, so the
     stratified row split is unchanged and only held-out information differs.
@@ -100,6 +100,7 @@ def perturbed_holdout_run(pipeline_run, tmp_path_factory):
     source.to_csv(data_path, index=False)
     run = new_run(tmp_path_factory, "holdout_canary_run", data_path=data_path)
     run.run("imputation")
+    run.run("generation")
     return run
 
 
@@ -111,3 +112,23 @@ def test_test_rows_do_not_influence_train_imputation(pipeline_run, perturbed_hol
         baseline.full_imputed_df.loc[train_rows],
         canary.full_imputed_df.loc[train_rows],
     )
+
+
+def test_test_rows_do_not_influence_tuning_or_generation(pipeline_run, perturbed_holdout_run):
+    baseline, canary = _splits(pipeline_run), _splits(perturbed_holdout_run)
+    pd.testing.assert_frame_equal(baseline.tuning_imputed_df, canary.tuning_imputed_df)
+    # Hyperparameter search and every final model only see train and tuning,
+    # so the chosen parameters and all synthetic data must be unchanged.
+    best = "hpo_best_params.json"
+    assert (pipeline_run.generation_dir / best).read_text() == (
+        perturbed_holdout_run.generation_dir / best
+    ).read_text()
+    names = sorted(path.name for path in pipeline_run.generation_dir.glob("*.csv"))
+    assert names == sorted(path.name for path in perturbed_holdout_run.generation_dir.glob("*.csv"))
+    different = [
+        name
+        for name in names
+        if _digest(pipeline_run.generation_dir / name)
+        != _digest(perturbed_holdout_run.generation_dir / name)
+    ]
+    assert not different, different

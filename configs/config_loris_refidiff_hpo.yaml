@@ -32,6 +32,7 @@ data:
     - DailyMeds__med_type_03
   train_size: 0.6667
   stratify: true
+  tuning_size: 0.2 # Share of train patients held out to score HPO candidates.
   data_dir: data/loris
   raw_cache_subdir: raw
 
