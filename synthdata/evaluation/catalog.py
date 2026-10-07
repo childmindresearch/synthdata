@@ -57,11 +57,14 @@ SYNTHCITY_METRIC_CONFIG = {
 }
 
 #: synthcity's own "category" (sanity/stats/.../attack) rolled up to utility/privacy.
+#: Detection metrics are the AUC of a classifier telling real rows from
+#: synthetic ones, a fidelity measure: a generator that adds noise to every
+#: record scores well on it without being any more private.
 SYNTHCITY_CATEGORY_TO_TYPE = {
     "sanity": "utility",
     "stats": "utility",
     "performance": "utility",
-    "detection": "privacy",
+    "detection": "utility",
     "privacy": "privacy",
     "attack": "privacy",
 }

@@ -106,3 +106,9 @@ class TestLogDisparityMetricsExcludesMedian:
     def test_mean_abs_and_share_significant_still_ranked(self):
         assert "log_disparity_mean_abs" in LOG_DISPARITY_METRICS
         assert "log_disparity_share_significant" in LOG_DISPARITY_METRICS
+
+
+def test_synthcity_detection_is_fidelity_not_privacy():
+    from synthdata.evaluation.catalog import SYNTHCITY_CATEGORY_TO_TYPE
+
+    assert SYNTHCITY_CATEGORY_TO_TYPE["detection"] == "utility"
