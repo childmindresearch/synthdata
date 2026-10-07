@@ -8,7 +8,7 @@ to resume/extend a specific past one. `synthdata-evaluate`/`synthdata-plot`
 automatically pick up the most recent experiment unless told otherwise.
 
 Usage:
-    synthdata-generate --config configs/config.yaml [--plot] [--tag baseline] [--dataset-version v2]
+    synthdata-generate --config path/to/your-config.yaml [--plot] [--tag baseline] [--dataset-version v2]
 
 Requires imputed data (run `synthdata-impute` first).
 """

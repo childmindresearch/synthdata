@@ -1,6 +1,6 @@
 """Config schema and YAML loader for the synthdata pipeline.
 
-A collaborator only needs to edit a single YAML file (see ``configs/config.yaml``)
+A collaborator only needs to edit a single YAML file (see ``configs/config_hepatitis.yaml``)
 to point the whole pipeline (imputation -> generation -> evaluation -> plots) at
 their own dataset. All four ``scripts/run_*.py`` entry points load the same
 :class:`Config` object via :func:`load_config`.

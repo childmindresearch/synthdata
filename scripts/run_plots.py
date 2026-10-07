@@ -18,7 +18,7 @@ evaluation artifact bundle. Native SynthEval diagnostics are created during
 evaluation and verified here; this command never reruns evaluation metrics.
 
 Usage:
-    synthdata-plot --config configs/config.yaml [--experiment-id ID] [--dataset-version v2]
+    synthdata-plot --config path/to/your-config.yaml [--experiment-id ID] [--dataset-version v2]
 """
 
 import argparse

@@ -3,15 +3,17 @@
 This package turns the exploratory work in ``notebooks/test_hepatitis_data.ipynb``
 and ``notebooks/ctgan_hpo_hepatitis.ipynb`` into reusable, config-driven modules:
 
-- :mod:`synthdata.data` -- generic dataset loading (UCI or local CSV), typing, splitting
-- :mod:`synthdata.imputation` -- TabImpute-based missing data imputation
+- :mod:`synthdata.data` -- generic dataset loading (UCI, local CSV, or Parquet), typing,
+  and patient-disjoint role splitting (see :mod:`synthdata.data_roles`)
+- :mod:`synthdata.imputation` -- HyperImpute-based missing data imputation
 - :mod:`synthdata.generation` -- synthcity + TabPFN + TabPFGen synthetic data generation, with
   Optuna hyperparameter optimization
 - :mod:`synthdata.evaluation` -- combined synthcity + SynthEval + custom (fairness/log-disparity)
   evaluation, merged into a single ranked, multi-index table
 - :mod:`synthdata.plotting` -- all figures produced across the pipeline
 
-Everything is driven by a single YAML config file (see ``configs/config.yaml``), loaded via
+Everything is driven by a single YAML config file (see ``configs/config_hepatitis.yaml`` or
+``configs/config_loris.yaml``), loaded via
 :func:`synthdata.config.load_config`.
 """
 

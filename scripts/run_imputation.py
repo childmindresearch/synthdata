@@ -2,7 +2,7 @@
 """CLI: load a dataset and run role-isolated fixed-plugin imputation.
 
 Usage:
-    synthdata-impute --config configs/config.yaml [--plot] [--dataset-version v2]
+    synthdata-impute --config path/to/your-config.yaml [--plot] [--dataset-version v2]
 """
 
 import argparse

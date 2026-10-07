@@ -7,7 +7,7 @@ Evaluates the most recent experiment started by `synthdata-generate` unless
 :mod:`synthdata.experiment`).
 
 Usage:
-    synthdata-evaluate --config configs/config.yaml [--plot] [--experiment-id ID] [--dataset-version v2]
+    synthdata-evaluate --config path/to/your-config.yaml [--plot] [--experiment-id ID] [--dataset-version v2]
 
 Requires generated synthetic data (run `synthdata-generate` first).
 """
