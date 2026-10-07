@@ -498,7 +498,7 @@ class EvaluationConfig:
     )
 
     #: Per-"type" (utility/privacy/fairness) weight applied when rolling up
-    #: type-level ranks into the overall rank (see
+    #: type-level ranks into the overall rank, a weighted geometric mean (see
     #: synthdata.evaluation.combine.build_combined_table). Keys must be
     #: exactly {"utility","privacy","fairness"}; values must be non-negative.
     #: Default is equal weight -- ``privacy_gate`` (pass/fail) below is this

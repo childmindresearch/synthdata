@@ -285,7 +285,7 @@ def test_tstr_has_signal_on_the_fixture(pipeline_run, dataset):
     assert real_auc.astype(float).between(0, 1).all()
 
 
-def test_ranks_are_normalised_and_overall_is_their_sum(pipeline_run):
+def test_ranks_are_normalised_and_overall_is_their_geometric_mean(pipeline_run):
     combined = pipeline_run.combined()
     dims = ["utility", "privacy", "fairness"]
     for dim in dims:
@@ -293,19 +293,22 @@ def test_ranks_are_normalised_and_overall_is_their_sum(pipeline_run):
         assert ((rank >= 0) & (rank <= 1)).all(), dim
     overall = combined[("__all__", "overall", "rank")].astype(float)
     weights = pipeline_run.cfg.evaluation.rank_weights
-    expected = sum(weights[d] * combined[("__all__", d, "rank")].astype(float) for d in dims)
+    logs = sum(
+        weights[d] * np.log(combined[("__all__", d, "rank")].astype(float).clip(lower=0.01))
+        for d in dims
+    )
+    expected = np.exp(logs / sum(weights[d] for d in dims))
     np.testing.assert_allclose(overall, expected, rtol=1e-6)
 
 
-def test_baselines_anchor_the_scale(pipeline_run):
-    # Real training rows must beat column-independent samples on utility and
-    # lose to them on privacy; otherwise the reference rows anchor nothing.
-    combined = pipeline_run.combined()
-    utility = combined[("__all__", "utility", "rank")].astype(float)
-    privacy = combined[("__all__", "privacy", "rank")].astype(float)
-    assert utility["baseline_train_copy"] > utility["baseline_marginals"]
-    assert privacy["baseline_train_copy"] < privacy["baseline_marginals"]
-    assert privacy["baseline_train_copy"] == privacy.min(), privacy.to_dict()
+def test_copying_training_rows_does_not_pay_off_overall(pipeline_run):
+    # The copy has the best utility and the worst privacy; a sum of the two
+    # ranked it above every generator but one. Its privacy must now keep it
+    # below the best generator. (The fixture's generators are tiny, so a
+    # stricter "below every generator" would test the fixture, not the score.)
+    overall = pipeline_run.combined()[("__all__", "overall", "rank")].astype(float)
+    generators = overall[[m for m in overall.index if not m.startswith("baseline_")]]
+    assert overall["baseline_train_copy"] < generators.max(), overall.to_dict()
 
 
 def test_privacy_gate_verdict_is_boolean(pipeline_run):

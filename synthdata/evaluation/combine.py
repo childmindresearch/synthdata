@@ -158,13 +158,18 @@ def _minmax_scale(col: pd.Series) -> pd.Series:
 
 
 #: Types rolled up in the combined table. Order matters for iteration below
-#: but not for correctness (weighted sum is order-independent).
+#: but not for correctness (the weighted geometric mean is order-independent).
 _TYPES = ("utility", "privacy", "fairness")
 
 #: Equal weighting used when the caller doesn't pass ``rank_weights`` (e.g.
 #: existing direct callers/tests predating evaluation.rank_weights) --
 #: mirrors the pre-existing implicit behavior before per-type weights existed.
 DEFAULT_RANK_WEIGHTS = {"utility": 1.0, "privacy": 1.0, "fairness": 1.0}
+
+#: Type scores are floored here before the geometric mean, so a row that is
+#: worst on every metric of one type (scaled score 0) is still ordered by its
+#: other types instead of collapsing to an overall score of 0.
+GEOMETRIC_FLOOR = 0.01
 
 
 def build_combined_table(
@@ -190,9 +195,12 @@ def build_combined_table(
          of the *group ranks* from step 2 across frameworks (not a flat mean/
          sum of every individual metric of that type) -- column
          ``("__all__", type, "rank")``.
-      4. One overall rank is the WEIGHTED SUM of the 3 type-level rollups from
-         step 3, using ``rank_weights`` (default: equal weight 1.0 each, see
-         ``DEFAULT_RANK_WEIGHTS``) -- column ``("__all__", "overall", "rank")``.
+      4. One overall rank is the WEIGHTED GEOMETRIC MEAN of the 3 type-level
+         rollups from step 3, using ``rank_weights`` (default: equal weight 1.0
+         each, see ``DEFAULT_RANK_WEIGHTS``) -- column
+         ``("__all__", "overall", "rank")``, in [GEOMETRIC_FLOOR, 1]. Unlike a
+         sum, a near-zero score on one type (e.g. privacy for a model that
+         copies its training rows) cannot be bought back by the others.
     Models are sorted descending by the overall rank.
     """
     rank_weights = rank_weights or DEFAULT_RANK_WEIGHTS
@@ -238,13 +246,17 @@ def build_combined_table(
         if group_rank_cols:
             combined[(_ALL, type_, _RANK)] = combined[group_rank_cols].mean(axis=1, skipna=True)
 
-    # Step 4: overall rank -- WEIGHTED SUM of the type-level rollups.
-    overall = pd.Series(0.0, index=combined.index)
+    # Step 4: overall rank -- WEIGHTED GEOMETRIC MEAN of the type-level rollups.
+    log_total = pd.Series(0.0, index=combined.index)
+    weight_total = 0.0
     for type_ in _TYPES:
         key = (_ALL, type_, _RANK)
-        if key in combined.columns:
-            weight = rank_weights.get(type_, 1.0)
-            overall = overall.add(combined[key].fillna(0.0) * weight, fill_value=0.0)
+        weight = rank_weights.get(type_, 1.0)
+        if key in combined.columns and weight > 0:
+            floored = combined[key].fillna(0.0).clip(lower=GEOMETRIC_FLOOR)
+            log_total = log_total + weight * np.log(floored)
+            weight_total += weight
+    overall = np.exp(log_total / weight_total) if weight_total else log_total
     combined[(_ALL, "overall", _RANK)] = overall
 
     combined.columns = pd.MultiIndex.from_tuples(

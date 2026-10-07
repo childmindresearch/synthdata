@@ -338,6 +338,28 @@ class TestBuildCombinedTable:
         # rank first overall.
         assert combined.index[0] == "model_a"
 
+    def test_overall_is_weighted_geometric_mean_so_privacy_loss_is_not_offset(self):
+        # model_a: utility 1, privacy 0 (a copy of train). model_b: utility
+        # 0.5, privacy 0.5. A sum ties them; the geometric mean must not.
+        synthcity_results = {
+            name: pd.DataFrame(
+                {"mean": [u, p], "direction": ["maximize", "maximize"]},
+                index=["stats.utility_metric", "privacy.identifiability_score"],
+            )
+            for name, (u, p) in {
+                "model_a": (1.0, 0.0),
+                "model_b": (0.5, 0.5),
+                "model_c": (0.0, 1.0),
+            }.items()
+        }
+        combined = build_combined_table(
+            synthcity_results, None, None, {}, model_names=["model_a", "model_b", "model_c"]
+        )
+        overall = combined[("__all__", "overall", "rank")]
+        assert overall["model_b"] == pytest.approx(0.5)
+        assert overall["model_a"] == pytest.approx(0.1)  # sqrt(1 * 0.01 floor)
+        assert combined.index[0] == "model_b"
+
     def test_default_rank_weights_used_when_none_passed(self):
         synthcity_results = {
             "model_a": pd.DataFrame(
