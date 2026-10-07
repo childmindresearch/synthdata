@@ -256,3 +256,20 @@ class TestPrepareDataForAnalysis:
             df, "outcome", ["age"], protected_bins=[[0, 30, 60]]
         )
         assert "OutOfRange" in prepared["age__GROUP"].tolist()
+
+
+class TestSummaryCountsAbsentSubgroups:
+    def test_dropped_subgroup_counts_as_misrepresented(self):
+        from synthdata.log_disparity.metric_log_disparity import compute_log_disparity_report
+
+        real = pd.DataFrame({"sex": ["M", "F"] * 40, "target": [0] * 40 + [1] * 40})
+        # The synthetic rows match real men exactly and contain no women.
+        synthetic = real[real["sex"] == "M"].reset_index(drop=True)
+
+        summary = compute_log_disparity_report(
+            real_data=real, synth_data=synthetic, target_col="target", protected_cols=["sex"]
+        )["summary_stats"]
+
+        # The two male leaves are significantly over-represented (0.5 vs 0.25)
+        # and the two female leaves are absent: every leaf is misrepresented.
+        assert summary["share_significant_bh"] == pytest.approx(1.0)

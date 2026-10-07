@@ -735,9 +735,14 @@ def compute_log_disparity_report(
         [SENTINEL_NO_INFO, SENTINEL_NO_BASE, SENTINEL_INSUFFICIENT]
     ) & ~np.isinf(leaf["EquityValue"])
     valid_values = leaf.loc[valid_mask, "EquityValue"]
-    sig_share = (
-        leaf["BH_p"].between(0, SIG_THRESHOLD, inclusive="both").mean() if len(leaf) else np.nan
+    # A subgroup the synthetic data leaves out entirely (or fills entirely)
+    # has an infinite disparity and no test p-value. Bhanot et al. (2021)
+    # label it "Absent", the worst outcome, so it counts as misrepresented
+    # here; leaving it out would reward a generator for dropping a minority.
+    misrepresented = leaf["BH_p"].between(0, SIG_THRESHOLD, inclusive="both") | np.isinf(
+        leaf["EquityValue"]
     )
+    sig_share = misrepresented.mean() if len(leaf) else np.nan
 
     summary_stats = {
         "model": model_name,
