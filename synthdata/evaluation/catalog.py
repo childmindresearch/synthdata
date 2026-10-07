@@ -69,6 +69,18 @@ SYNTHCITY_CATEGORY_TO_TYPE = {
     "attack": "privacy",
 }
 
+
+def synthcity_metric_uses_held_out(category: str, name: str) -> bool:
+    """Whether a synthcity metric must be scored against held-out real rows.
+
+    Performance metrics train on synthetic rows and test on real ones, so the
+    real rows must be unseen by the generator; DomiasMIA contrasts the
+    generator's training rows (members) with held-out rows (non-members).
+    Every other metric compares synthetic rows with the real train split.
+    """
+    return category == "performance" or name.startswith("DomiasMIA")
+
+
 #: ``stats.alpha_precision``'s "_naive" sub-metrics (delta_precision_alpha_naive,
 #: delta_coverage_beta_naive, authenticity_naive) duplicate the "_OC"
 #: (OneClass-embedding) sub-metrics' exact same 3 quantities computed in a

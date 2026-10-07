@@ -71,7 +71,6 @@ def run_evaluation(
         dataset.target_column,
         dataset.sensitive_columns,
         eval_cfg.synthcity,
-        n_samples=cfg.generation.n_samples,
         seed=cfg.seed,
         workspace=output_dir / "synthcity_workspace",
     )
