@@ -11,6 +11,7 @@ import pandas as pd
 
 from synthdata.config import Config
 from synthdata.data import Dataset
+from synthdata.evaluation.baselines import is_baseline
 from synthdata.evaluation.combine import simple_rank_summary
 from synthdata.utils import get_logger
 
@@ -64,7 +65,15 @@ def _ranked_summary_section(combined: pd.DataFrame) -> str:
     if summary.empty:
         return "## Ranked summary\n\nNo ranking columns were produced."
     table = _dataframe_to_markdown(summary.reset_index())
-    return "## Ranked summary (higher = better)\n\n" + table
+    text = "## Ranked summary (higher = better)\n\n" + table
+    if any(is_baseline(m) for m in summary.index):
+        text += (
+            "\n\nRows named `baseline_*` are fixed references, not candidates. "
+            "`baseline_train_copy` is real training data: the utility a generator can at best "
+            "reach, and the privacy it must stay well above. `baseline_marginals` samples each "
+            "column independently: the utility floor a useful generator must beat."
+        )
+    return text
 
 
 def _privacy_gate_section(combined: pd.DataFrame) -> str:
@@ -95,8 +104,11 @@ def _recommended_model_section(combined: pd.DataFrame) -> str:
     if ("__all__", "overall", "rank") not in combined.columns:
         return "## Recommended model\n\nNo overall rank column was produced."
 
+    candidates = combined[[not is_baseline(m) for m in combined.index]]
+    if candidates.empty:
+        return "## Recommended model\n\nOnly baseline rows were evaluated; nothing to recommend."
     if _GATE_PASS_COL in combined.columns:
-        eligible = combined[combined[_GATE_PASS_COL]]
+        eligible = candidates[candidates[_GATE_PASS_COL]]
         if eligible.empty:
             return (
                 "## Recommended model\n\n"
@@ -107,7 +119,7 @@ def _recommended_model_section(combined: pd.DataFrame) -> str:
                 "generator(s) before re-evaluating."
             )
     else:
-        eligible = combined
+        eligible = candidates
 
     best = eligible.sort_values(("__all__", "overall", "rank"), ascending=False).index[0]
     overall_rank = eligible.loc[best, ("__all__", "overall", "rank")]

@@ -44,3 +44,10 @@ def test_other_trial_attributes_pass_through():
     assert proxy.number == trial.number
     assert proxy.suggest_categorical("x", ["a", "b"]) == "a"
     assert proxy.suggest_int("n", 1, 1) == 1
+
+
+def test_plugin_accepts_follows_kwargs_to_the_base_plugin():
+    from synthdata.generation.synthcity_backend import plugin_accepts
+
+    assert plugin_accepts("marginal_distributions", "workspace")
+    assert not plugin_accepts("marginal_distributions", "n_iter")

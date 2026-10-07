@@ -35,6 +35,8 @@ def known_answers(pipeline_run, tmp_path_factory) -> pd.DataFrame:
     cfg.evaluation.output_dir = str(tmp_path_factory.mktemp("known_answers"))
     cfg.evaluation.generate_report = False
     cfg.evaluation.save_per_model_syntheval_plots = False
+    # The planted copy and shuffle are this module's references already.
+    cfg.evaluation.baselines = []
     dataset = load_imputed_splits(load_dataset(cfg))
 
     real = dataset.train_imputed_df.reset_index(drop=True)

@@ -50,6 +50,18 @@ class TestBuildEvaluationReport:
         text = build_evaluation_report(cfg, dataset, combined, extras)
         assert "`model_a`" in text.split("## Recommended model")[1].split("##")[0]
 
+    def test_baseline_rows_are_never_recommended(self, make_config, make_dataset):
+        cfg = make_config()
+        dataset = make_dataset()
+        combined = _combined_table()
+        combined = combined.rename(index={"model_a": "baseline_train_copy"})
+        extras = {"selected_datasets": {"baseline_train_copy": None, "model_b": None}}
+        text = build_evaluation_report(cfg, dataset, combined, extras)
+        recommended = text.split("## Recommended model")[1].split("##")[0]
+        assert "`model_b`" in recommended
+        assert "baseline_train_copy" not in recommended
+        assert "fixed references" in text.split("## Ranked summary")[1].split("##")[0]
+
     def test_gate_failing_model_excluded_from_recommendation(self, make_config, make_dataset):
         cfg = make_config()
         dataset = make_dataset()

@@ -80,6 +80,6 @@ def test_every_generator_produced_valid_output(full_run):
 
 def test_every_generator_was_evaluated(full_run):
     combined = full_run.combined()
-    assert sorted(combined.index) == EXPECTED
+    assert sorted(m for m in combined.index if not m.startswith("baseline_")) == EXPECTED
     for dim in ("utility", "privacy", "fairness", "overall"):
         assert np.isfinite(combined[("__all__", dim, "rank")].astype(float)).all(), dim

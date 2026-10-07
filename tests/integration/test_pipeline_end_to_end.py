@@ -27,6 +27,7 @@ COLUMNS = [*FEATURES, "target"]
 CATEGORICAL = ["SEX", "SITE", "SMOKER", "SEVERITY", "DIAGNOSIS", "target"]
 NUMERIC = ["AGE", "BMI", "LAB_A", "LAB_B"]
 MODELS = ["bayesian_network", "bayesian_network_hpo", "ctgan", "ctgan_hpo"]
+BASELINES = ["baseline_marginals", "baseline_train_copy"]
 
 
 @pytest.fixture(scope="module")
@@ -239,7 +240,7 @@ BOUNDED_METRICS = {
 
 def test_combined_table_has_one_complete_row_per_model(pipeline_run):
     combined = pipeline_run.combined()
-    assert sorted(combined.index) == sorted(MODELS)
+    assert sorted(combined.index) == sorted(MODELS + BASELINES)
     assert set(combined.columns.get_level_values("framework")) >= {
         "synthcity",
         "syntheval",
@@ -294,6 +295,17 @@ def test_ranks_are_normalised_and_overall_is_their_sum(pipeline_run):
     weights = pipeline_run.cfg.evaluation.rank_weights
     expected = sum(weights[d] * combined[("__all__", d, "rank")].astype(float) for d in dims)
     np.testing.assert_allclose(overall, expected, rtol=1e-6)
+
+
+def test_baselines_anchor_the_scale(pipeline_run):
+    # Real training rows must beat column-independent samples on utility and
+    # lose to them on privacy; otherwise the reference rows anchor nothing.
+    combined = pipeline_run.combined()
+    utility = combined[("__all__", "utility", "rank")].astype(float)
+    privacy = combined[("__all__", "privacy", "rank")].astype(float)
+    assert utility["baseline_train_copy"] > utility["baseline_marginals"]
+    assert privacy["baseline_train_copy"] < privacy["baseline_marginals"]
+    assert privacy["baseline_train_copy"] == privacy.min(), privacy.to_dict()
 
 
 def test_privacy_gate_verdict_is_boolean(pipeline_run):

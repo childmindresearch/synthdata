@@ -455,6 +455,11 @@ class SynthEvalExecutionConfig:
     memory_per_model_gib: float | None = None
 
 
+#: Reference rows ``evaluation.baselines`` may name; built by
+#: synthdata.evaluation.baselines.
+EVALUATION_BASELINES = ("train_copy", "marginals")
+
+
 @dataclasses.dataclass
 class EvaluationConfig:
     #: Base artifact root. Runtime stage paths are versioned under
@@ -462,6 +467,12 @@ class EvaluationConfig:
     output_dir: str = "output/dataset/evaluation"
     #: Restrict evaluation to a subset of generated model names (None = all found on disk).
     models: list | None = None
+    #: Fixed reference rows scored alongside the generators so every run has
+    #: the same anchors (see synthdata.evaluation.baselines): "train_copy"
+    #: (real training rows: the utility ceiling and privacy floor) and
+    #: "marginals" (each column sampled independently: no joint structure).
+    #: They are never recommended. Empty list = no baselines.
+    baselines: list = dataclasses.field(default_factory=lambda: ["train_copy", "marginals"])
     positive_class: Any = 1
 
     synthcity: FrameworkSelectionConfig = dataclasses.field(
@@ -821,6 +832,12 @@ def _validate(cfg: Config) -> None:
                 "evaluation.binary_target.positive_classes and .negative_classes must not "
                 f"overlap: {sorted(overlap, key=str)}"
             )
+    unknown_baselines = [b for b in cfg.evaluation.baselines if b not in EVALUATION_BASELINES]
+    if unknown_baselines:
+        raise ValueError(
+            f"evaluation.baselines must be drawn from {list(EVALUATION_BASELINES)}, "
+            f"got {unknown_baselines}"
+        )
     rank_weight_keys = set(cfg.evaluation.rank_weights)
     if rank_weight_keys != {"utility", "privacy", "fairness"}:
         raise ValueError(

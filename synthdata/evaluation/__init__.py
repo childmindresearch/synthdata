@@ -10,6 +10,7 @@ from synthdata.config import Config
 from synthdata.data import Dataset
 from synthdata.evaluation import (
     artifacts,
+    baselines,
     combine,
     custom_eval,
     privacy_gate,
@@ -61,6 +62,18 @@ def run_evaluation(
     output_dir = ensure_dir(eval_cfg.output_dir)
 
     selected_datasets = select_models(cfg, synthetic_datasets)
+    selected_datasets = {
+        **selected_datasets,
+        **baselines.build_baselines(
+            eval_cfg.baselines,
+            dataset.train_imputed_df,
+            dataset.target_column,
+            dataset.sensitive_columns,
+            cfg.generation.n_samples,
+            cfg.seed,
+            workspace=output_dir / "synthcity_workspace",
+        ),
+    }
     model_names = sorted(selected_datasets)
     logger.info("Evaluating %d models: %s", len(model_names), model_names)
 
