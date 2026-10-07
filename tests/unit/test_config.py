@@ -413,6 +413,13 @@ class TestValidate:
         cfg.evaluation.binary_target.negative_classes = [2]
         _validate(cfg)  # should not raise
 
+    @pytest.mark.parametrize("value", [0, -1, 1.5])
+    def test_non_positive_replicates_raise(self, value):
+        cfg = self._base_valid()
+        cfg.generation.n_replicates = value
+        with pytest.raises(ValueError, match="n_replicates"):
+            _validate(cfg)
+
     def test_unknown_baseline_raises(self):
         cfg = self._base_valid()
         cfg.evaluation.baselines = ["train_copy", "holdout"]

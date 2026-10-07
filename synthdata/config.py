@@ -326,6 +326,11 @@ class HPOConfig:
 @dataclasses.dataclass
 class GenerationConfig:
     n_samples: int = 200
+    #: Times each model is fitted and sampled, with seeds seed, seed+1, ...
+    #: Replicate r > 0 is saved as "<model>__rep<r>". With 2 or more, the
+    #: evaluation reports each score as a mean with a 95% confidence interval
+    #: and flags models it cannot tell apart from the best. HPO runs once.
+    n_replicates: int = 1
     #: Base artifact root. Runtime stage paths are versioned under
     #: ``<output_dir>/<data.version or 'unversioned'>/<experiment-id>/``.
     output_dir: str = "output/dataset/synthetic_data"
@@ -755,6 +760,10 @@ def _validate(cfg: Config) -> None:
             raise ValueError(
                 f"imputation.benchmark.hpo.{field_name} must be a non-empty list, got {values!r}"
             )
+    if not isinstance(cfg.generation.n_replicates, int) or cfg.generation.n_replicates < 1:
+        raise ValueError(
+            f"generation.n_replicates must be a positive integer, got {cfg.generation.n_replicates!r}"
+        )
     if cfg.evaluation.ranking_strategy not in ("linear", "summation"):
         raise ValueError(
             "evaluation.ranking_strategy must be 'linear' or 'summation', "

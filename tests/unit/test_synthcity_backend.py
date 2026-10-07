@@ -51,3 +51,14 @@ def test_plugin_accepts_follows_kwargs_to_the_base_plugin():
 
     assert plugin_accepts("marginal_distributions", "workspace")
     assert not plugin_accepts("marginal_distributions", "n_iter")
+
+
+def test_fit_generate_seeds_training_not_only_sampling(mocker):
+    from synthcity.plugins import Plugins
+
+    from synthdata.generation import synthcity_backend as sc
+
+    get = mocker.patch.object(Plugins, "get")
+    sc.fit_generate("ctgan", {}, mocker.Mock(), 5, random_state=11)
+    _, kwargs = get.call_args
+    assert kwargs["random_state"] == 11

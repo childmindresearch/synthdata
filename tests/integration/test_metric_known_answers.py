@@ -30,7 +30,7 @@ N_ROWS = 120
 
 
 @pytest.fixture(scope="module")
-def known_answers(pipeline_run, tmp_path_factory) -> pd.DataFrame:
+def known_answer_run(pipeline_run, tmp_path_factory) -> tuple[pd.DataFrame, dict]:
     cfg = copy_module.deepcopy(pipeline_run.cfg)
     cfg.evaluation.output_dir = str(tmp_path_factory.mktemp("known_answers"))
     cfg.evaluation.generate_report = False
@@ -45,12 +45,26 @@ def known_answers(pipeline_run, tmp_path_factory) -> pd.DataFrame:
     shuffled = pd.DataFrame(
         {column: rng.permutation(copied[column].to_numpy()) for column in copied.columns}
     )
-    combined, _ = run_evaluation(
+    # A second seed replicate of the shuffle (a fresh permutation) gives the
+    # ranking summary one model with a real spread to put an interval on.
+    reshuffled = pd.DataFrame(
+        {column: rng.permutation(copied[column].to_numpy()) for column in copied.columns}
+    )
+    return run_evaluation(
         cfg,
         dataset,
-        {"copy": copied, "copy_twin": copied.copy(), "shuffle": shuffled},
+        {
+            "copy": copied,
+            "copy_twin": copied.copy(),
+            "shuffle": shuffled,
+            "shuffle__rep1": reshuffled,
+        },
     )
-    return combined
+
+
+@pytest.fixture(scope="module")
+def known_answers(known_answer_run) -> pd.DataFrame:
+    return known_answer_run[0]
 
 
 @pytest.fixture(scope="module")
@@ -124,3 +138,16 @@ def test_identical_inputs_get_identical_scores(known_answers):
     first, twin = numeric.loc["copy"], numeric.loc["copy_twin"]
     differs = [c for c in numeric.columns if not np.isclose(first[c], twin[c], equal_nan=True)]
     assert not differs, differs
+
+
+def test_ranking_summary_pools_seed_replicates(known_answer_run):
+    combined, extras = known_answer_run
+    summary = extras["ranking_summary"]
+    assert sorted(summary.index) == ["copy", "copy_twin", "shuffle"]
+    shuffle = summary.loc["shuffle"]
+    assert shuffle["n_replicates"] == 2
+    utility = combined[("__all__", "utility", "rank")].astype(float)
+    assert shuffle["utility_mean"] == pytest.approx(utility[["shuffle", "shuffle__rep1"]].mean())
+    assert shuffle["utility_ci_low"] <= shuffle["utility_mean"] <= shuffle["utility_ci_high"]
+    # The copy's utility sits above everything seed noise allows the shuffle.
+    assert summary.loc["copy", "utility_mean"] > shuffle["utility_ci_high"]

@@ -18,7 +18,7 @@ from synthdata.evaluation import (
     synthcity_eval,
     syntheval_eval,
 )
-from synthdata.utils import ensure_dir, get_logger
+from synthdata.utils import ensure_dir, get_logger, replicate_name
 
 logger = get_logger(__name__)
 
@@ -62,18 +62,22 @@ def run_evaluation(
     output_dir = ensure_dir(eval_cfg.output_dir)
 
     selected_datasets = select_models(cfg, synthetic_datasets)
-    selected_datasets = {
-        **selected_datasets,
-        **baselines.build_baselines(
+    # Baselines are replicated like the generators so their scores carry the
+    # same seed-to-seed spread.
+    for replicate in range(cfg.generation.n_replicates):
+        rows = baselines.build_baselines(
             eval_cfg.baselines,
             dataset.train_imputed_df,
             dataset.target_column,
             dataset.sensitive_columns,
             cfg.generation.n_samples,
-            cfg.seed,
+            cfg.seed + replicate,
             workspace=output_dir / "synthcity_workspace",
-        ),
-    }
+        )
+        selected_datasets = {
+            **selected_datasets,
+            **{replicate_name(name, replicate): frame for name, frame in rows.items()},
+        }
     model_names = sorted(selected_datasets)
     logger.info("Evaluating %d models: %s", len(model_names), model_names)
 
@@ -145,6 +149,8 @@ def run_evaluation(
     combined = privacy_gate.merge_privacy_gate_results(combined, gate_result)
 
     combined.to_csv(output_dir / "combined_evaluation.csv")
+    ranking_summary = combine.summarize_replicates(combined)
+    ranking_summary.to_csv(output_dir / "ranking_summary.csv")
 
     artifact_manifest = artifacts.persist_evaluation_artifacts(
         output_dir,
@@ -160,6 +166,7 @@ def run_evaluation(
         "syntheval_benchmark_ranks": benchmark_ranks,
         "log_disparity_reports": log_disparity_reports,
         "privacy_gate_result": gate_result,
+        "ranking_summary": ranking_summary,
         "artifact_manifest": str(artifact_manifest),
     }
 

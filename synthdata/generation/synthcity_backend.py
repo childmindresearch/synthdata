@@ -98,6 +98,10 @@ def fit_generate(
     plugin_kwargs = dict(params)
     if workspace is not None and plugin_accepts(name, "workspace"):
         plugin_kwargs["workspace"] = Path(workspace)
+    # Seed training as well as sampling; plugins otherwise train with their
+    # default random_state (0) whatever seed the run uses.
+    if "random_state" not in plugin_kwargs and plugin_accepts(name, "random_state"):
+        plugin_kwargs["random_state"] = random_state
     if device is not None and "device" not in plugin_kwargs and plugin_accepts(name, "device"):
         plugin_kwargs["device"] = torch.device(device)
 

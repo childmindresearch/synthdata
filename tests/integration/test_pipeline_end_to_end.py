@@ -332,6 +332,15 @@ def test_feature_importance_rank_distance_is_reported(pipeline_run):
     assert any(m.startswith("performance.feat_rank_distance") for m in metrics)
 
 
+def test_ranking_summary_has_one_row_per_model(pipeline_run):
+    summary = pd.read_csv(pipeline_run.evaluation_dir / "ranking_summary.csv", index_col=0)
+    assert sorted(summary.index) == sorted(MODELS + BASELINES)
+    assert (summary["n_replicates"] == 1).all()
+    assert summary.loc[summary["baseline"], "eligible"].eq(False).all()
+    report = (pipeline_run.evaluation_dir / "report.md").read_text()
+    assert "Single seed" in report
+
+
 def test_report_covers_every_model(pipeline_run):
     report = (pipeline_run.evaluation_dir / "report.md").read_text()
     for model in MODELS:

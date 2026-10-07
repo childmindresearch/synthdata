@@ -62,6 +62,30 @@ class TestBuildEvaluationReport:
         assert "baseline_train_copy" not in recommended
         assert "fixed references" in text.split("## Ranked summary")[1].split("##")[0]
 
+    def test_replicates_report_intervals_and_ties(self, make_config, make_dataset):
+        from synthdata.evaluation.combine import summarize_replicates
+
+        cfg = make_config()
+        dataset = make_dataset()
+        combined = pd.DataFrame(index=["a", "a__rep1", "b", "b__rep1", "c", "c__rep1"])
+        combined[("__all__", "overall", "rank")] = [2.0, 2.2, 1.9, 2.3, 0.1, 0.2]
+        combined.columns = pd.MultiIndex.from_tuples(combined.columns)
+        extras = {"ranking_summary": summarize_replicates(combined)}
+        text = build_evaluation_report(cfg, dataset, combined, extras)
+        ranked = text.split("## Ranked summary")[1].split("##")[0]
+        assert "95% confidence interval" in ranked
+        assert "2.100 [" in ranked
+        recommended = text.split("## Recommended model")[1].split("##")[0]
+        assert "`a`" in recommended or "`b`" in recommended
+        assert "Not distinguishable" in recommended
+        assert "`c`" not in recommended
+
+    def test_single_seed_report_says_there_is_no_uncertainty(self, make_config, make_dataset):
+        text = build_evaluation_report(
+            make_config(), make_dataset(), _combined_table(), {"selected_datasets": {}}
+        )
+        assert "Single seed" in text.split("## Ranked summary")[1].split("##")[0]
+
     def test_gate_failing_model_excluded_from_recommendation(self, make_config, make_dataset):
         cfg = make_config()
         dataset = make_dataset()

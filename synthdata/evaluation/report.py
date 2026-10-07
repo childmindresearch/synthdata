@@ -60,12 +60,51 @@ def _run_metadata_section(cfg: Config, dataset: Dataset, model_names: list, expe
     return "\n".join(lines)
 
 
-def _ranked_summary_section(combined: pd.DataFrame) -> str:
-    summary = simple_rank_summary(combined)
-    if summary.empty:
-        return "## Ranked summary\n\nNo ranking columns were produced."
-    table = _dataframe_to_markdown(summary.reset_index())
-    text = "## Ranked summary (higher = better)\n\n" + table
+def _has_replicates(ranking_summary: pd.DataFrame | None) -> bool:
+    return (
+        ranking_summary is not None
+        and "overall_mean" in ranking_summary.columns
+        and ranking_summary["n_replicates"].max() >= 2
+    )
+
+
+def _replicate_summary_section(ranking_summary: pd.DataFrame) -> str:
+    def _interval(row, dim):
+        mean, low, high = row[f"{dim}_mean"], row[f"{dim}_ci_low"], row[f"{dim}_ci_high"]
+        if pd.isna(low):
+            return _fmt_metric(mean)
+        return f"{mean:.3f} [{low:.3f}, {high:.3f}]"
+
+    dims = [
+        d for d in ("overall", "utility", "privacy", "fairness") if f"{d}_mean" in ranking_summary
+    ]
+    rows = []
+    for model, row in ranking_summary.iterrows():
+        tied = row["tied_with_best"]
+        rows.append(
+            {
+                "rank": row["rank"],
+                "model": model,
+                "seeds": row["n_replicates"],
+                **{dim: _interval(row, dim) for dim in dims},
+                "tied with best": "" if pd.isna(tied) else ("yes" if tied else "no"),
+            }
+        )
+    return (
+        "## Ranked summary (higher = better)\n\n"
+        "Each score is the mean over seed replicates with its 95% confidence interval. "
+        '"Tied with best" is yes when a one-sided Welch t-test (5% level) cannot place the '
+        "model's overall score below the best eligible model's: the order among tied models "
+        "is within seed noise.\n\n" + _dataframe_to_markdown(pd.DataFrame(rows))
+    )
+
+
+def _ranked_summary_section(combined: pd.DataFrame, ranking_summary=None) -> str:
+    if _has_replicates(ranking_summary):
+        text = _replicate_summary_section(ranking_summary)
+        summary = ranking_summary
+    else:
+        text, summary = _point_summary_section(combined)
     if any(is_baseline(m) for m in summary.index):
         text += (
             "\n\nRows named `baseline_*` are fixed references, not candidates. "
@@ -74,6 +113,20 @@ def _ranked_summary_section(combined: pd.DataFrame) -> str:
             "column independently: the utility floor a useful generator must beat."
         )
     return text
+
+
+def _point_summary_section(combined: pd.DataFrame) -> "tuple[str, pd.DataFrame]":
+    summary = simple_rank_summary(combined)
+    if summary.empty:
+        return "## Ranked summary\n\nNo ranking columns were produced.", summary
+    table = _dataframe_to_markdown(summary.reset_index())
+    text = (
+        "## Ranked summary (higher = better)\n\n"
+        + table
+        + "\n\nSingle seed: these scores carry no uncertainty estimate, so small gaps "
+        "may be noise. Set `generation.n_replicates` to 2 or more to get confidence intervals."
+    )
+    return text, summary
 
 
 def _privacy_gate_section(combined: pd.DataFrame) -> str:
@@ -100,7 +153,43 @@ def _privacy_gate_section(combined: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
-def _recommended_model_section(combined: pd.DataFrame) -> str:
+def _replicate_recommendation_section(ranking_summary: pd.DataFrame) -> str:
+    eligible = ranking_summary[ranking_summary["eligible"].astype(bool)]
+    if eligible.empty:
+        return (
+            "## Recommended model\n\n"
+            "**No candidate model passed the privacy gate in every seed replicate** -- refusing "
+            "to recommend one. See the Privacy gate section above."
+        )
+    best = eligible.index[0]
+    row = eligible.loc[best]
+    lines = [
+        "## Recommended model",
+        "",
+        f"**`{best}`** (mean overall score {row['overall_mean']:.3f}, 95% CI "
+        f"[{row['overall_ci_low']:.3f}, {row['overall_ci_high']:.3f}], "
+        f"{row['n_replicates']} seeds)",
+    ]
+    tied = [
+        m
+        for m in eligible.index[1:]
+        if pd.notna(eligible.loc[m, "tied_with_best"]) and bool(eligible.loc[m, "tied_with_best"])
+    ]
+    if tied:
+        lines += [
+            "",
+            "Not distinguishable from it at the 5% level: "
+            + ", ".join(f"`{m}`" for m in tied)
+            + ". Choose among these on other grounds (cost, the type score that matters most).",
+        ]
+    if "privacy_gate_pass" in eligible.columns:
+        lines += ["", "Only models that passed the privacy gate in every replicate were eligible."]
+    return "\n".join(lines)
+
+
+def _recommended_model_section(combined: pd.DataFrame, ranking_summary=None) -> str:
+    if _has_replicates(ranking_summary):
+        return _replicate_recommendation_section(ranking_summary)
     if ("__all__", "overall", "rank") not in combined.columns:
         return "## Recommended model\n\nNo overall rank column was produced."
 
@@ -296,11 +385,11 @@ def build_evaluation_report(
         "",
         _run_metadata_section(cfg, dataset, model_names, experiment),
         "",
-        _ranked_summary_section(combined),
+        _ranked_summary_section(combined, extras.get("ranking_summary")),
         "",
         _privacy_gate_section(combined),
         "",
-        _recommended_model_section(combined),
+        _recommended_model_section(combined, extras.get("ranking_summary")),
         "",
         _fairness_highlights_section(combined, extras),
         "",

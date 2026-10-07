@@ -8,8 +8,11 @@ appended as extra columns in the same table, both per ``(framework, type)`` grou
 and rolled up across frameworks per ``type``, plus one overall rank.
 """
 
+import numpy as np
 import pandas as pd
+from scipy import stats
 
+from synthdata.evaluation.baselines import is_baseline
 from synthdata.evaluation.catalog import (
     LOG_DISPARITY_METRICS,
     SYNTHCITY_CATEGORY_TO_TYPE,
@@ -23,7 +26,7 @@ from synthdata.evaluation.syntheval_eval import (
     extract_oriented_values,
     extract_raw_values,
 )
-from synthdata.utils import get_logger
+from synthdata.utils import get_logger, split_replicate_name
 
 logger = get_logger(__name__)
 
@@ -276,3 +279,94 @@ def simple_rank_summary(combined: pd.DataFrame) -> pd.DataFrame:
     if "overall" in summary.columns:
         summary = summary.sort_values("overall", ascending=False)
     return summary.round(3)
+
+
+#: Two-sided confidence level of the intervals in :func:`summarize_replicates`,
+#: and 1 - the significance level of its "tied with best" test.
+CONFIDENCE = 0.95
+
+_SUMMARY_DIMS = ("overall", "utility", "privacy", "fairness")
+_GATE_PASS = (_ALL, "privacy_gate", "pass")
+
+
+def _mean_and_interval(values: pd.Series, confidence: float) -> tuple[float, float, float]:
+    """Mean and Student-t confidence interval; the interval is NaN below 2 values."""
+    values = values.dropna()
+    mean = values.mean() if len(values) else np.nan
+    if len(values) < 2:
+        return mean, np.nan, np.nan
+    sem = values.std(ddof=1) / np.sqrt(len(values))
+    half = stats.t.ppf((1 + confidence) / 2, len(values) - 1) * sem
+    return mean, mean - half, mean + half
+
+
+def _differs(best: pd.Series, other: pd.Series, alpha: float) -> "bool | float":
+    """Whether ``best`` scores higher than ``other`` beyond seed noise (Welch's t-test).
+
+    NaN when either side has fewer than two replicates, so nothing can be said.
+    Replicates of two models share no randomness, so the samples are unpaired.
+    """
+    best, other = best.dropna(), other.dropna()
+    if len(best) < 2 or len(other) < 2:
+        return np.nan
+    if best.std(ddof=1) == 0 and other.std(ddof=1) == 0:
+        return bool(best.mean() > other.mean())
+    result = stats.ttest_ind(best, other, equal_var=False, alternative="greater")
+    return bool(result.pvalue < alpha)
+
+
+def summarize_replicates(combined: pd.DataFrame, confidence: float = CONFIDENCE) -> pd.DataFrame:
+    """Collapse seed replicates (``<model>__rep<r>``) into one row per model.
+
+    For each rank score (overall, utility, privacy, fairness) the table gives
+    the mean over replicates and a ``confidence`` Student-t interval
+    (``<dim>_mean``, ``<dim>_ci_low``, ``<dim>_ci_high``). The interval is
+    NaN for a single replicate: one seed carries no uncertainty estimate.
+
+    ``eligible`` marks the models a recommendation may pick: not a baseline,
+    and passing the privacy gate in every replicate when the gate ran. Among
+    them, ``tied_with_best`` is True for the model with the highest mean
+    overall score and for every model whose overall score a one-sided Welch
+    t-test cannot place below it at ``1 - confidence``; it is NaN when either
+    side has a single replicate. ``rank`` orders all rows by mean overall score.
+    """
+    alpha = 1 - confidence
+    models = pd.Series(
+        [split_replicate_name(name)[0] for name in combined.index], index=combined.index
+    )
+    dims = [d for d in _SUMMARY_DIMS if (_ALL, d, _RANK) in combined.columns]
+    scores = {d: combined[(_ALL, d, _RANK)].astype(float) for d in dims}
+
+    rows = {}
+    overall_by_model = {}
+    for model, names in models.groupby(models, sort=False).groups.items():
+        row: dict = {"n_replicates": len(names), "baseline": is_baseline(model)}
+        for dim in dims:
+            mean, low, high = _mean_and_interval(scores[dim][names], confidence)
+            row[f"{dim}_mean"] = mean
+            row[f"{dim}_ci_low"] = low
+            row[f"{dim}_ci_high"] = high
+        if _GATE_PASS in combined.columns:
+            row["privacy_gate_pass"] = bool(combined.loc[names, _GATE_PASS].astype(bool).all())
+        row["eligible"] = not row["baseline"] and row.get("privacy_gate_pass", True)
+        rows[model] = row
+        if "overall" in scores:
+            overall_by_model[model] = scores["overall"][names]
+
+    summary = pd.DataFrame.from_dict(rows, orient="index")
+    summary.index.name = "model"
+    if "overall_mean" not in summary.columns:
+        return summary
+
+    summary = summary.sort_values("overall_mean", ascending=False)
+    summary.insert(0, "rank", range(1, len(summary) + 1))
+    tied = pd.Series(np.nan, index=summary.index, dtype=object)
+    eligible = summary.index[summary["eligible"].astype(bool)]
+    if len(eligible):
+        best = eligible[0]
+        tied[best] = True
+        for model in eligible[1:]:
+            differs = _differs(overall_by_model[best], overall_by_model[model], alpha)
+            tied[model] = np.nan if pd.isna(differs) else not differs
+    summary["tied_with_best"] = tied
+    return summary
