@@ -10,13 +10,16 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: Lint (ruff)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
       # Lint doesn't need the project installed at all -- just ruff itself.
       - run: uvx ruff check .
       - run: uvx ruff format --check .
@@ -40,7 +43,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
       # Base dependencies only -- deliberately not the optional `tabpfn` extra
       # (tabpfgen/tabpfn/tabpfn-extensions/tabimpute), which is heavy (git
       # dependency) and not needed for the current test suite. See
@@ -62,7 +65,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
       - run: uv sync
       # Runs the real impute -> generate -> evaluate -> plot CLIs on the
       # committed fixture (tests/integration). RefiDiff imputation needs
