@@ -21,9 +21,10 @@ data:
   # On this pipeline version sensitive columns drive both attribute-disclosure
   # (privacy) and SynthEval fairness, which needs a binary column (SEX).
   sensitive_columns: [SEX, DIAGNOSIS]
-  # The fixture carries repeat encounters per patient. This pipeline version
-  # splits by row, so the identifier is dropped before modeling.
-  drop_columns: [patient_id]
+  # The fixture carries repeat encounters per patient: split by patient, then
+  # drop the identifier before modeling.
+  patient_id_column: patient_id
+  drop_columns: []
   drop_rows_missing_target: true
 
   uppercase_columns: false

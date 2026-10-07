@@ -52,15 +52,18 @@ def _category_set(values: pd.Series) -> set[str]:
 # ---------------------------------------------------------------------------
 
 
-def test_split_is_disjoint_complete_and_stratified(dataset, pipeline_run):
+def test_split_is_disjoint_complete_and_stratified(dataset, pipeline_run, source):
     cfg = pipeline_run.cfg
     train, test = dataset.train_df, dataset.test_df
     assert set(train.index).isdisjoint(test.index)
     assert sorted([*train.index, *test.index]) == list(range(len(dataset.full_df)))
-    assert len(train) == round(cfg.data.train_size * len(dataset.full_df))
-    # Stratified on the target: class balance matches within one row's worth.
-    tolerance = 1.5 / len(test)
-    assert abs(train["target"].mean() - test["target"].mean()) <= tolerance
+    # train_size is a share of patients; rows follow within a few visits.
+    n_patients = source["patient_id"].nunique()
+    assert dataset.n_patients["train"] == int(cfg.data.train_size * n_patients)
+    assert dataset.n_patients["train"] + dataset.n_patients["test"] == n_patients
+    assert abs(len(train) / len(dataset.full_df) - cfg.data.train_size) <= 0.05
+    # Stratified on each patient's target; row-level balance stays close.
+    assert abs(train["target"].mean() - test["target"].mean()) <= 0.05
 
 
 def test_patient_identifier_never_reaches_models(dataset, pipeline_run):
@@ -74,11 +77,6 @@ def test_patient_identifier_never_reaches_models(dataset, pipeline_run):
         assert "patient_id" not in frame.columns, name
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Splits are by row, so a patient's repeat encounters can land in both train and "
-    "test. Remove when patient-group splitting is ported from feat/final-release-evaluation.",
-)
 def test_patients_do_not_span_train_and_test(dataset, source):
     train_patients = set(source.loc[dataset.train_df.index, "patient_id"])
     test_patients = set(source.loc[dataset.test_df.index, "patient_id"])
@@ -252,11 +250,27 @@ def test_bounded_metrics_are_present_finite_and_in_range(pipeline_run, column):
     assert ((values >= low) & (values <= high)).all(), values.to_dict()
 
 
-def test_tstr_has_signal_on_the_fixture(pipeline_run):
-    # The fixture's target follows a known logistic model, so training on real
-    # data must clearly beat chance. Guards against target/feature misalignment.
+def test_tstr_has_signal_on_the_fixture(pipeline_run, dataset):
+    # The fixture's target follows a known logistic model, so a model trained on
+    # real train must clearly beat chance on test. Guards against target/feature
+    # misalignment. (SynthCity's performance.xgb.gt cross-validates inside the
+    # small test split, so it is too noisy to threshold here.)
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import roc_auc_score
+
+    def features(frame):
+        nominal = ["SEX", "SITE", "SMOKER", "DIAGNOSIS"]
+        encoded = frame[FEATURES].astype({c: str for c in nominal})
+        return pd.get_dummies(encoded, columns=nominal).astype(float)
+
+    train, test = dataset.train_imputed_df, dataset.test_imputed_df
+    x_train = features(train)
+    x_test = features(test).reindex(columns=x_train.columns, fill_value=0.0)
+    model = LogisticRegression(max_iter=2000).fit(x_train, train["target"])
+    auc = roc_auc_score(test["target"], model.predict_proba(x_test)[:, 1])
+    assert auc > 0.65, auc
     real_auc = pipeline_run.combined()[("synthcity", "utility", "performance.xgb.gt")]
-    assert (real_auc.astype(float) > 0.7).all(), real_auc.to_dict()
+    assert real_auc.astype(float).between(0, 1).all()
 
 
 def test_ranks_are_normalised_and_overall_is_their_sum(pipeline_run):

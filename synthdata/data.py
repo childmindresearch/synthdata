@@ -89,6 +89,10 @@ class Dataset:
     full_fingerprint: str | None = None
     train_split_fingerprint: str | None = None
     test_split_fingerprint: str | None = None
+    #: Source column the split grouped rows by (removed from every frame), and
+    #: the number of distinct patients per split (rows when no column is set).
+    patient_id_column: str | None = None
+    n_patients: dict = dataclasses.field(default_factory=dict)
 
     #: Numeric model-space frames populated once imputation has run
     #: (see synthdata.imputation).
@@ -732,6 +736,51 @@ def mask_outliers_as_missing(df: pd.DataFrame, columns: list, threshold: float) 
 # ---------------------------------------------------------------------------
 
 
+def split_by_patient(
+    df: pd.DataFrame,
+    patient_ids: pd.Series | None,
+    target_column: str,
+    train_size: float,
+    seed: int,
+    stratify: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split ``df`` into train/test so that no patient appears on both sides.
+
+    Whole patients are assigned with :func:`sklearn.model_selection.train_test_split`
+    over the unique ``patient_ids``, so ``train_size`` is a share of patients.
+    When ``stratify`` is set, each patient is stratified by their most frequent
+    target value (ties broken by the smallest value). With ``patient_ids=None``
+    every row is its own patient, which reproduces a plain stratified row split.
+    Both frames keep ``df``'s index labels and row order.
+    """
+    groups = pd.Series(df.index, index=df.index) if patient_ids is None else patient_ids
+    if not groups.index.equals(df.index):
+        raise ValueError("patient_ids must be aligned to the rows of df")
+    if groups.isna().any():
+        raise ValueError(
+            f"data.patient_id_column has {int(groups.isna().sum())} missing value(s); "
+            "every row needs a patient identifier"
+        )
+    patient_labels = None
+    if stratify:
+        patient_labels = (
+            df[target_column].groupby(groups, sort=True).agg(lambda values: values.mode().iloc[0])
+        )
+        unique_patients = patient_labels.index.to_numpy()
+        labels = patient_labels.to_numpy()
+    else:
+        unique_patients = np.sort(groups.unique())
+        labels = None
+    train_patients, _ = train_test_split(
+        unique_patients,
+        train_size=train_size,
+        random_state=seed,
+        stratify=labels,
+    )
+    in_train = groups.isin(set(train_patients))
+    return df.loc[in_train], df.loc[~in_train]
+
+
 def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
     """Record which dataset version/source produced ``dataset.data_dir``.
 
@@ -763,6 +812,8 @@ def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
         "n_rows": int(len(dataset.full_df)),
         "n_train": int(len(dataset.train_df)),
         "n_test": int(len(dataset.test_df)),
+        "patient_id_column": dataset.patient_id_column,
+        "n_patients": dataset.n_patients,
         "seed": cfg.seed,
         "last_loaded_at": datetime.now(UTC).isoformat(),
         "git_commit": git_commit(),
@@ -797,8 +848,17 @@ def load_dataset(cfg: Config) -> Dataset:
         if variable_types is not None:
             variable_types = {k.upper(): v for k, v in variable_types.items()}
 
+    patient_id_column = cfg.data.patient_id_column
+    if patient_id_column is not None and patient_id_column not in df.columns:
+        raise KeyError(
+            f"data.patient_id_column {patient_id_column!r} not found in loaded data columns: "
+            f"{list(df.columns)}"
+        )
+
     if cfg.data.drop_columns:
-        df = df.drop(columns=[c for c in cfg.data.drop_columns if c in df.columns])
+        df = df.drop(
+            columns=[c for c in cfg.data.drop_columns if c in df.columns and c != patient_id_column]
+        )
 
     if cfg.data.raw_target_column and cfg.data.raw_target_column in df.columns:
         df = df.rename(columns={cfg.data.raw_target_column: cfg.data.target_column})
@@ -823,6 +883,9 @@ def load_dataset(cfg: Config) -> Dataset:
                 n_before,
                 target_column,
             )
+
+    # The identifier only decides the split; it is never a modeling column.
+    patient_ids = df.pop(patient_id_column) if patient_id_column is not None else None
 
     feature_columns = [c for c in df.columns if c != target_column]
     modeling_columns = feature_columns + [target_column]
@@ -891,12 +954,21 @@ def load_dataset(cfg: Config) -> Dataset:
     if missing_sensitive:
         raise KeyError(f"sensitive_columns not found in data: {missing_sensitive}")
 
-    train_df, test_df = train_test_split(
+    train_df, test_df = split_by_patient(
         df,
+        patient_ids,
+        target_column,
         train_size=cfg.data.train_size,
-        random_state=cfg.seed,
-        stratify=df[target_column] if cfg.data.stratify else None,
+        seed=cfg.seed,
+        stratify=cfg.data.stratify,
     )
+    if patient_ids is not None:
+        n_patients = {
+            "train": int(patient_ids.loc[train_df.index].nunique()),
+            "test": int(patient_ids.loc[test_df.index].nunique()),
+        }
+    else:
+        n_patients = {"train": len(train_df), "test": len(test_df)}
 
     dataset = Dataset(
         name=cfg.name,
@@ -913,6 +985,8 @@ def load_dataset(cfg: Config) -> Dataset:
         variable_schema=variable_schema,
         variable_schema_fingerprint=variable_schema_fingerprint,
         source_fingerprint=source_fingerprint,
+        patient_id_column=patient_id_column,
+        n_patients=n_patients,
     )
 
     paths = dataset.paths()
@@ -924,7 +998,7 @@ def load_dataset(cfg: Config) -> Dataset:
 
     logger.info(
         "Loaded dataset '%s' (version=%s): %d rows, %d features (%d categorical: %d nominal + "
-        "%d ordinal), target=%r, sensitive=%s, train=%d/test=%d",
+        "%d ordinal), target=%r, sensitive=%s, train=%d/test=%d rows (%d/%d patients)",
         cfg.name,
         cfg.data.version or "unversioned",
         len(df),
@@ -936,6 +1010,8 @@ def load_dataset(cfg: Config) -> Dataset:
         dataset.sensitive_columns,
         len(train_df),
         len(test_df),
+        n_patients["train"],
+        n_patients["test"],
     )
     return dataset
 
