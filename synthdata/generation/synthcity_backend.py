@@ -13,13 +13,15 @@ from synthdata.utils import get_logger
 logger = get_logger(__name__)
 
 #: Search-space choices left out of HPO because they make runs irreproducible.
-#: pgmpy's PC structure search ("pc") returns different DAGs for the same data
-#: on repeated runs, even with NumPy, ``random`` and PYTHONHASHSEED fixed and
-#: n_jobs=1 (3 different DAGs in 6 identical runs on the integration fixture),
-#: so a bayesian_network study scored "pc" differently each time and could pick
-#: a different winner. hillclimb and tree_search are deterministic.
+#: pgmpy's PC ("pc") and hill-climbing ("hillclimb") structure searches return
+#: different DAGs for the same data on repeated runs, even with NumPy and
+#: ``random`` seeded and PYTHONHASHSEED and n_jobs fixed (on the integration
+#: fixture: PC gave 3 different DAGs in 6 runs, hill climbing 3 in 5). A
+#: bayesian_network study then scored those trials differently each run and
+#: could pick a different winner. tree_search (Chow-Liu), synthcity's default,
+#: gave the same DAG every time.
 HPO_EXCLUDED_CHOICES: dict[str, dict[str, frozenset]] = {
-    "bayesian_network": {"struct_learning_search_method": frozenset({"pc"})},
+    "bayesian_network": {"struct_learning_search_method": frozenset({"pc", "hillclimb"})},
 }
 
 

@@ -29,12 +29,12 @@ def _sampled(name: str, n_trials: int) -> list[dict]:
     return sampled
 
 
-def test_bayesian_network_search_never_tries_pc():
+def test_bayesian_network_search_only_tries_tree_search():
     pytest.importorskip("synthcity.plugins")
     methods = {
         params["struct_learning_search_method"] for params in _sampled("bayesian_network", 30)
     }
-    assert methods == {"hillclimb", "tree_search"}
+    assert methods == {"tree_search"}
 
 
 def test_other_trial_attributes_pass_through():
