@@ -315,11 +315,6 @@ def test_syntheval_privacy_results_are_classified_as_privacy(pipeline_run):
         assert types.get(metric) == "privacy", (metric, types.get(metric))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="synthcity performance.feat_rank_distance fails on every run (shap cannot read "
-    "xgboost>=3 base_score) and the failure is dropped silently from the table.",
-)
 def test_feature_importance_rank_distance_is_reported(pipeline_run):
     metrics = set(pipeline_run.combined().columns.get_level_values("metric"))
     assert any(m.startswith("performance.feat_rank_distance") for m in metrics)

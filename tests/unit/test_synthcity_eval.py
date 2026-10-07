@@ -114,3 +114,29 @@ def test_performance_and_domias_use_held_out_rows(captured):
 def test_results_of_both_passes_are_stacked(captured):
     *_, result, _, _ = _run(captured)
     assert len(result) == sum(len(names) for names in METRICS.values())
+
+
+def test_failed_metrics_are_logged(monkeypatch, caplog):
+    metrics_module = pytest.importorskip("synthcity.metrics")
+
+    def drops_xgb(x_gt, x_syn, *args, metrics, **kwargs):
+        keys = [
+            f"{cat}.{name}.score"
+            for cat, names in metrics.items()
+            for name in names
+            if name != "xgb"
+        ]
+        return pd.DataFrame({"mean": 0.0, "direction": "maximize"}, index=keys)
+
+    monkeypatch.setattr(metrics_module.Metrics, "evaluate", staticmethod(drops_xgb))
+    train, test, synthetic = _frames()
+    synthcity_eval.logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level("WARNING"):
+            synthcity_eval.run_synthcity_metrics(
+                synthetic, test, train, "target", [], METRICS, workspace=None
+            )
+    finally:
+        synthcity_eval.logger.removeHandler(caplog.handler)
+    assert "'performance.xgb'" in caplog.text
+    assert "xgb_augmentation" not in caplog.text

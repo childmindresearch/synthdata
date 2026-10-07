@@ -13,6 +13,7 @@ import pandas as pd
 from synthdata.evaluation.catalog import (
     LOG_DISPARITY_METRICS,
     SYNTHCITY_CATEGORY_TO_TYPE,
+    SYNTHCITY_UNRANKED_SUBMETRICS,
     is_custom_syntheval_metric,
     is_redundant_synthcity_submetric,
 )
@@ -71,18 +72,23 @@ def _synthcity_frames(
             directions.setdefault(metric_key, direction)
     sign = pd.Series(directions).map({"maximize": 1.0, "minimize": -1.0})
 
-    common = raw.columns.intersection(sign.index)
+    # Unranked sub-metrics stay in the raw table but carry no score.
+    common = [c for c in raw.columns if c in sign.index and c not in SYNTHCITY_UNRANKED_SUBMETRICS]
     oriented = raw[common].multiply(sign[common], axis=1)
 
     raw = raw.reindex(model_names)
     oriented = oriented.reindex(model_names)
 
-    columns = [
-        ("synthcity", SYNTHCITY_CATEGORY_TO_TYPE.get(col.split(".")[0], "utility"), col)
-        for col in raw.columns
-    ]
-    raw.columns = pd.MultiIndex.from_tuples(columns)
-    oriented.columns = pd.MultiIndex.from_tuples(columns)
+    def _columns(frame: pd.DataFrame) -> pd.MultiIndex:
+        return pd.MultiIndex.from_tuples(
+            [
+                ("synthcity", SYNTHCITY_CATEGORY_TO_TYPE.get(col.split(".")[0], "utility"), col)
+                for col in frame.columns
+            ]
+        )
+
+    raw.columns = _columns(raw)
+    oriented.columns = _columns(oriented)
     return raw, oriented
 
 

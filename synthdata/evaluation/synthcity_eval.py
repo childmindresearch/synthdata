@@ -118,7 +118,22 @@ def run_synthcity_metrics(
                 **common,
             )
         )
-    return pd.concat(results)
+    combined = pd.concat(results)
+    missing = [
+        f"{category}.{name}"
+        for category, names in metrics.items()
+        for name in names
+        if not any(key.startswith(f"{category}.{name}.") for key in combined.index)
+    ]
+    if missing:
+        # synthcity catches a metric's exception, logs it at error level on
+        # its own logger and leaves the metric out of its results.
+        logger.warning(
+            "[synthcity] metric(s) failed and are missing from the results: %s "
+            "(see synthcity's log for the error)",
+            missing,
+        )
+    return combined
 
 
 def resolve_metric_config(selection_cfg) -> dict:
@@ -177,7 +192,7 @@ def run_synthcity_evaluation(
                 random_state=seed,
                 workspace=workspace,
             )
-        except (ValueError, RuntimeError) as exc:
-            logger.warning("[synthcity] evaluation failed for %s: %s", name, exc)
+        except Exception as exc:  # noqa: BLE001 -- one model's failure must not stop the rest
+            logger.warning("[synthcity] evaluation failed for %s: %r", name, exc)
             results[name] = pd.DataFrame({"error": [str(exc)], "error_type": [type(exc).__name__]})
     return results

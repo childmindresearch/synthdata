@@ -106,6 +106,17 @@ class TestSynthcityFrames:
         assert "stats.alpha_precision.delta_precision_alpha_naive" not in raw_metrics
         assert oriented.columns.get_level_values(2).tolist() == raw_metrics.tolist()
 
+    def test_unranked_submetric_kept_raw_but_not_ranked(self):
+        result = pd.DataFrame(
+            {"mean": [0.8, 0.01], "direction": ["maximize", "maximize"]},
+            index=["performance.feat_rank_distance.corr", "performance.feat_rank_distance.pvalue"],
+        )
+        raw, oriented = _synthcity_frames({"model_a": result}, model_names=["model_a"])
+        assert "performance.feat_rank_distance.pvalue" in raw.columns.get_level_values(2)
+        assert oriented.columns.get_level_values(2).tolist() == [
+            "performance.feat_rank_distance.corr"
+        ]
+
 
 class TestSyntheEvalFrames:
     def _benchmark_results(self):

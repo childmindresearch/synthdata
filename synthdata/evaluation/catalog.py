@@ -95,6 +95,14 @@ def synthcity_metric_uses_held_out(category: str, name: str) -> bool:
 SYNTHCITY_REDUNDANT_SUBMETRIC_SUFFIXES = ("_naive",)
 
 
+#: synthcity result columns reported in the combined table but left out of the
+#: ranking. ``feat_rank_distance.pvalue`` is the p-value of the rank
+#: correlation in ``feat_rank_distance.corr``: it says how sure that score is,
+#: and shares the metric's single "maximize" direction, which would reward
+#: uncertain correlations.
+SYNTHCITY_UNRANKED_SUBMETRICS = frozenset({"performance.feat_rank_distance.pvalue"})
+
+
 def is_redundant_synthcity_submetric(metric_key: str) -> bool:
     """Whether a synthcity result column (e.g.
     ``"stats.alpha_precision.authenticity_naive"``) is a known-redundant
