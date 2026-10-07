@@ -103,12 +103,6 @@ def perturbed_holdout_run(pipeline_run, tmp_path_factory):
     return run
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="The imputer is fit on train+test together (imputation.pipeline.run_imputation "
-    "imputes full_df), so held-out rows change the values imputed into train. Remove when "
-    "train-only imputer fitting is ported from feat/final-release-evaluation.",
-)
 def test_test_rows_do_not_influence_train_imputation(pipeline_run, perturbed_holdout_run):
     baseline, canary = _splits(pipeline_run), _splits(perturbed_holdout_run)
     assert baseline.test_df.index.equals(canary.test_df.index), "split must not change"

@@ -1,9 +1,9 @@
 """Method-agnostic imputation pipeline: caching, dispatch, rounding, validation.
 
 :func:`run_imputation` dispatches to the configured backend's
-``impute_dataframe`` (``synthdata.imputation.tabimpute_backend`` by default, or
+backend (``synthdata.imputation.tabimpute_backend`` by default, or
 ``synthdata.imputation.refidiff_backend`` when ``imputation.method ==
-"refidiff"``), then applies shared post-processing (rounding, caching to CSV,
+"refidiff"``) with the imputer fitted on the train split only, then applies shared post-processing (rounding, caching to CSV,
 validation reporting) identically regardless of which backend produced the
 imputed values.
 """
@@ -55,24 +55,39 @@ def _persist_decoded_imputed_splits(dataset: Dataset) -> None:
     )
 
 
-def _impute_dataframe(cfg: Config, df: pd.DataFrame, dataset: Dataset, device: str) -> pd.DataFrame:
-    """Dispatch to the configured imputation backend's ``impute_dataframe``."""
+def _impute_splits(cfg: Config, dataset: Dataset, device: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Impute train and test with an imputer that learns from train only.
+
+    RefiDiff is fitted on the train split and then fills the test split with
+    that fitted model, so test rows never change a train value. TabImpute has
+    no fitting step (it is a pretrained in-context model), so train is imputed
+    on its own and test is imputed with the train rows as context; test rows
+    can inform each other's imputations but never train's.
+    """
+    train_df, test_df = dataset.train_df, dataset.test_df
     method = cfg.imputation.method
     if method == "tabimpute":
         from synthdata.imputation.tabimpute_backend import impute_dataframe
 
-        return impute_dataframe(
-            df,
-            dataset.feature_columns,
-            dataset.categorical_columns,
-            dataset.target_column,
-            device=device,
-        )
-    if method == "refidiff":
-        from synthdata.imputation.refidiff_backend import impute_dataframe
+        def _impute(frame: pd.DataFrame) -> pd.DataFrame:
+            return impute_dataframe(
+                frame,
+                dataset.feature_columns,
+                dataset.categorical_columns,
+                dataset.target_column,
+                device=device,
+            )
 
-        return impute_dataframe(
-            df,
+        train_imputed = _impute(train_df)
+        if test_df.empty:
+            return train_imputed, test_df.copy()
+        with_context = _impute(pd.concat([train_df, test_df]))
+        return train_imputed, with_context.iloc[len(train_df) :]
+    if method == "refidiff":
+        from synthdata.imputation import refidiff_backend
+
+        state, train_imputed = refidiff_backend.fit(
+            train_df,
             dataset.feature_columns,
             dataset.categorical_columns,
             dataset.target_column,
@@ -80,7 +95,11 @@ def _impute_dataframe(cfg: Config, df: pd.DataFrame, dataset: Dataset, device: s
             refidiff_cfg=cfg.imputation.refidiff,
             data_dir=dataset.data_dir,
             seed=cfg.seed,
+            model_columns=[c for c in dataset.feature_columns if test_df[c].isna().any()],
         )
+        if test_df.empty:
+            return train_imputed, test_df.copy()
+        return train_imputed, refidiff_backend.transform(state, test_df)
     # Unreachable in practice: Config._validate() already restricts
     # imputation.method to {"tabimpute", "refidiff"} before this runs.
     raise ValueError(f"Unknown imputation.method: {method!r}")
@@ -144,7 +163,7 @@ def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
     """Build the dict of config/dataset fields that determine imputed values.
 
     Deliberately narrower than "the whole Config": only fields that actually
-    change what :func:`_impute_dataframe`/:func:`apply_rounding` produce, so an
+    change what :func:`_impute_splits`/:func:`apply_rounding` produce, so an
     unrelated config edit (e.g. ``evaluation.*``, ``imputation.validation_margin``,
     which only affects the post-hoc report, not the imputed values themselves)
     doesn't force an unnecessary retrain. Uses ``dataset.feature_columns``/
@@ -170,6 +189,8 @@ def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
         },
         "imputation_enabled": imp_cfg.enabled,
         "imputation_method": imp_cfg.method,
+        # Caches written before the imputer was fitted on train only are stale.
+        "imputer_fit_split": "train",
         "round_rules": imp_cfg.round_rules,
         "round_to_int_default": imp_cfg.round_to_int_default,
         "dataset_version": dataset.version,
@@ -219,7 +240,10 @@ def _load_cached_key(path: Path) -> str | None:
 
 
 def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
-    """Impute ``dataset.full_df`` and populate the ``*_imputed`` splits.
+    """Impute the train and test splits and populate the ``*_imputed`` frames.
+
+    The imputer learns from the train split only and then fills test (see
+    :func:`_impute_splits`), so held-out rows never influence train values.
 
     Caches to ``full_imputed.csv``/``train_imputed.csv``/``test_imputed.csv`` under
     ``cfg.data.data_dir``; reused on subsequent runs unless ``cfg.imputation.cache``
@@ -278,43 +302,43 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
                 "at least one missing feature value (0 complete cases out of "
                 f"{len(dataset.full_df)}). Set imputation.enabled: true in the config."
             )
+        # full_imputed is a complete-case subset of full_df, so intersect
+        # rather than assume every train/test row survived.
+        train_imputed = full_imputed.loc[full_imputed.index.intersection(dataset.train_df.index)]
+        test_imputed = full_imputed.loc[full_imputed.index.intersection(dataset.test_df.index)]
+        if len(train_imputed) < len(dataset.train_df) or len(test_imputed) < len(dataset.test_df):
+            logger.info(
+                "Complete-case filtering dropped train %d->%d, test %d->%d rows",
+                len(dataset.train_df),
+                len(train_imputed),
+                len(dataset.test_df),
+                len(test_imputed),
+            )
     else:
         device = resolve_device(cfg.imputation.device)
         n_missing = int(dataset.full_df[dataset.feature_columns].isna().sum().sum())
         logger.info(
-            "Imputing %d missing values across %d feature columns via method=%s on device=%s",
+            "Imputing %d missing values across %d feature columns via method=%s on device=%s "
+            "(imputer fitted on the %d train rows only)",
             n_missing,
             len(dataset.feature_columns),
             cfg.imputation.method,
             device,
+            len(dataset.train_df),
         )
-        full_imputed = _impute_dataframe(cfg, dataset.full_df, dataset, device)
-        full_imputed = apply_rounding(
-            full_imputed,
-            dataset.feature_columns,
-            cfg.imputation.round_rules,
-            cfg.imputation.round_to_int_default,
+        train_imputed, test_imputed = (
+            apply_rounding(
+                frame,
+                dataset.feature_columns,
+                cfg.imputation.round_rules,
+                cfg.imputation.round_to_int_default,
+            )
+            for frame in _impute_splits(cfg, dataset, device)
         )
+        full_imputed = pd.concat([train_imputed, test_imputed]).loc[dataset.full_df.index]
 
     ensure_dir(dataset.data_dir)
     full_imputed.to_csv(paths["full_imputed"], index=False)
-
-    # When imputation is disabled, full_imputed is a complete-case subset of
-    # full_df (dropna()), so its index may no longer contain every train/test
-    # row -- intersect rather than assume a full match (still a strict subset
-    # when imputation ran, since full_imputed then shares full_df's index).
-    train_imputed = full_imputed.loc[full_imputed.index.intersection(dataset.train_df.index)]
-    test_imputed = full_imputed.loc[full_imputed.index.intersection(dataset.test_df.index)]
-    if not cfg.imputation.enabled and (
-        len(train_imputed) < len(dataset.train_df) or len(test_imputed) < len(dataset.test_df)
-    ):
-        logger.info(
-            "Complete-case filtering dropped train %d->%d, test %d->%d rows",
-            len(dataset.train_df),
-            len(train_imputed),
-            len(dataset.test_df),
-            len(test_imputed),
-        )
     train_imputed.to_csv(paths["train_imputed"], index=False)
     test_imputed.to_csv(paths["test_imputed"], index=False)
     cache_record["imputed_row_counts"] = {

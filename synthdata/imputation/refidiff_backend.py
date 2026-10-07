@@ -224,7 +224,7 @@ def _mean_std(data: np.ndarray, missing_mask: np.ndarray) -> tuple:
     return mean, std
 
 
-def _warmup_refine(
+def _fit_refiners(
     X: np.ndarray,
     missing_mask: np.ndarray,
     len_num: int,
@@ -232,8 +232,16 @@ def _warmup_refine(
     device: str = "cpu",
     refine_indices: list[int] | None = None,
     refinement_pass: str = "warm-up",
-) -> np.ndarray:
+    model_columns: np.ndarray | None = None,
+) -> tuple[np.ndarray, list]:
     """Single-pass per-column imputation: XGBRegressor (numeric) / CatBoostClassifier (bit).
+
+    Returns the filled matrix and the fitted per-column refiners, in the order
+    they were applied, so :func:`_apply_refiners` can replay the same pass on
+    rows that were not used for fitting. A refiner is fitted for every column
+    that has missing entries in ``X`` or is flagged in ``model_columns`` (a
+    boolean per encoded column), so held-out rows can be filled in columns
+    that happen to be complete in the fitting rows.
 
     Ported from RefiDiff's ``diffusion_utils.refinement()``. Each column's
     missing entries are predicted from all *other* columns' current values in
@@ -284,9 +292,13 @@ def _warmup_refine(
             len(refine_indices),
             n_features,
         )
+    needs_model = missing_mask.any(axis=0)
+    if model_columns is not None:
+        needs_model = needs_model | model_columns
+    refiners: list = []
     for col in tqdm(columns, desc=f"refidiff {refinement_pass} refinement", unit="col"):
         missing_idx = np.where(missing_mask[:, col])[0]
-        if len(missing_idx) == 0:
+        if not needs_model[col]:
             continue
         observed_idx = np.where(~missing_mask[:, col])[0]
         if len(observed_idx) == 0:
@@ -305,6 +317,7 @@ def _warmup_refine(
             unique_vals = sorted(set(y_obs.tolist()))
             if len(unique_vals) == 1:
                 X[missing_idx, col] = unique_vals[0]
+                refiners.append((col, "constant", unique_vals[0]))
                 continue
             val_to_label = {val: i for i, val in enumerate(unique_vals)}
             label_to_val = {i: val for val, i in val_to_label.items()}
@@ -320,8 +333,9 @@ def _warmup_refine(
                 allow_writing_files=False,
             )
             model.fit(X_obs_input, y_obs_mapped, verbose=False)
-            y_pred_labels = np.asarray(model.predict(X_miss_input)).reshape(-1)
-            X[missing_idx, col] = np.array([label_to_val[int(v)] for v in y_pred_labels])
+            refiner = (col, "classifier", (model, label_to_val))
+            refiners.append(refiner)
+            X[missing_idx, col] = _predict_refiner(refiner, X_miss_input)
         else:
             model = XGBRegressor(tree_method="hist", device="cuda" if use_xgb_gpu else "cpu")
             model.fit(X_obs_input, y_obs)
@@ -335,8 +349,58 @@ def _warmup_refine(
                 # this costs nothing measurable -- confirmed empirically (0.06s
                 # with the fallback vs 0.018s without, next to a ~1s GPU fit).
                 model.get_booster().set_param({"device": "cpu"})
-            X[missing_idx, col] = model.predict(X_miss_input)
+            refiner = (col, "regressor", model)
+            refiners.append(refiner)
+            X[missing_idx, col] = _predict_refiner(refiner, X_miss_input)
+    return X, refiners
+
+
+def _predict_refiner(refiner: tuple, X_input: np.ndarray) -> np.ndarray:
+    """Predict one column's missing entries with a refiner from :func:`_fit_refiners`."""
+    _, kind, payload = refiner
+    if len(X_input) == 0:
+        return np.zeros(0)
+    if kind == "constant":
+        return np.full(len(X_input), payload)
+    if kind == "classifier":
+        model, label_to_val = payload
+        labels = np.asarray(model.predict(X_input)).reshape(-1)
+        return np.array([label_to_val[int(v)] for v in labels])
+    return payload.predict(X_input)
+
+
+def _apply_refiners(X: np.ndarray, missing_mask: np.ndarray, refiners: list) -> np.ndarray:
+    """Replay a fitted refinement pass on new rows, column by column in fit order."""
+    X = X.copy()
+    for refiner in refiners:
+        col = refiner[0]
+        missing_idx = np.where(missing_mask[:, col])[0]
+        if len(missing_idx) == 0:
+            continue
+        X[missing_idx, col] = _predict_refiner(refiner, np.delete(X[missing_idx], col, axis=1))
     return X
+
+
+def _warmup_refine(
+    X: np.ndarray,
+    missing_mask: np.ndarray,
+    len_num: int,
+    catboost_warmup_iterations: int,
+    device: str = "cpu",
+    refine_indices: list[int] | None = None,
+    refinement_pass: str = "warm-up",
+) -> np.ndarray:
+    """Fit and apply one refinement pass on the same rows (see :func:`_fit_refiners`)."""
+    filled, _ = _fit_refiners(
+        X,
+        missing_mask,
+        len_num,
+        catboost_warmup_iterations,
+        device=device,
+        refine_indices=refine_indices,
+        refinement_pass=refinement_pass,
+    )
+    return filled
 
 
 # ---------------------------------------------------------------------------
@@ -828,11 +892,176 @@ def _train(
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Public entry points
 # ---------------------------------------------------------------------------
 
 
-def impute_dataframe(
+@dataclasses.dataclass
+class RefiDiffState:
+    """Everything :func:`transform` needs, learned from the fitting rows only."""
+
+    feature_columns: list
+    numeric_columns: list
+    categorical_columns: list
+    target_column: str
+    numeric_category_maps: dict
+    cat_encoders: dict
+    cat_bin_widths: list
+    mean: np.ndarray
+    std: np.ndarray
+    warmup_refiners: list
+    polish_refiners: list
+    net: nn.Module
+    cfg: RefiDiffConfig
+    device: str
+    seed: int
+
+
+def _encode_categories(series: pd.Series, categories: pd.Index) -> tuple[pd.Series, pd.Series]:
+    """Map labels to codes from fitted ``categories``; unseen labels become missing.
+
+    Returns the codes and a mask of observed values that were unseen while
+    fitting. Those cells are hidden from the model and restored unchanged in
+    the output.
+    """
+    codes = pd.Series(
+        pd.Categorical(series, categories=categories).codes, index=series.index, dtype=float
+    )
+    codes[codes == -1] = np.nan
+    return codes, codes.isna() & series.notna()
+
+
+def _encode(state: RefiDiffState, df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """Encode ``df`` with fitted encoders into a standardized matrix and missing mask.
+
+    The third value marks observed cells the encoders have never seen; they
+    are treated as missing for the model and copied back verbatim afterwards.
+    """
+    n_samples = len(df)
+    unseen = pd.DataFrame(False, index=df.index, columns=state.feature_columns)
+    numeric_df = df[state.numeric_columns].copy()
+    for col, categories in state.numeric_category_maps.items():
+        numeric_df[col], unseen[col] = _encode_categories(df[col], categories)
+    if state.numeric_columns:
+        numeric_missing = numeric_df.isna().to_numpy()
+        numeric_values = np.nan_to_num(numeric_df.to_numpy(dtype=np.float64), nan=0.0)
+    else:
+        numeric_missing = np.zeros((n_samples, 0), dtype=bool)
+        numeric_values = np.zeros((n_samples, 0))
+
+    cat_bit_blocks, cat_missing_blocks = [], []
+    for col in state.categorical_columns:
+        encoder = state.cat_encoders[col]
+        known = df[col].isin(list(encoder["cat_to_idx"]))
+        unseen[col] = df[col].notna() & ~known
+        bits, missing = _encode_categorical_to_bits(df[col].where(known), encoder)
+        cat_bit_blocks.append(bits)
+        cat_missing_blocks.append(np.repeat(missing[:, None], bits.shape[1], axis=1))
+    cat_values = (
+        np.concatenate(cat_bit_blocks, axis=1) if cat_bit_blocks else np.zeros((n_samples, 0))
+    )
+    cat_missing = (
+        np.concatenate(cat_missing_blocks, axis=1)
+        if cat_missing_blocks
+        else np.zeros((n_samples, 0), dtype=bool)
+    )
+    x_raw = np.concatenate([numeric_values, cat_values], axis=1)
+    missing_mask = np.concatenate([numeric_missing, cat_missing], axis=1)
+    return x_raw, missing_mask, unseen
+
+
+def _sample(state: RefiDiffState, x_warm: np.ndarray, missing_mask: np.ndarray) -> np.ndarray:
+    """Average ``num_trials`` reverse-diffusion trajectories from a fixed seed."""
+    cfg, device = state.cfg, state.device
+    # Reseed so the draw depends only on these rows, not on what ran before
+    # (training from scratch vs. a reused checkpoint, or another split first).
+    torch.manual_seed(state.seed)
+    x_known = torch.tensor(x_warm, dtype=torch.float32, device=device)
+    mask_tensor = torch.tensor(missing_mask, dtype=torch.float32, device=device)
+    logger.info(
+        "refidiff: sampling %d reverse-diffusion trajectories (%d steps each) for %d rows",
+        cfg.num_trials,
+        cfg.num_steps,
+        len(x_warm),
+    )
+    trial_results = []
+    for _trial in tqdm(range(cfg.num_trials), desc="refidiff sampling", unit="trial"):
+        rec = _impute_mask(state.net, x_known, mask_tensor, cfg.num_steps, device)
+        rec = rec * mask_tensor + x_known * (1 - mask_tensor)
+        trial_results.append(rec)
+    return torch.stack(trial_results, dim=0).mean(0).detach().cpu().numpy()
+
+
+def _decode(
+    state: RefiDiffState,
+    rec_x: np.ndarray,
+    df: pd.DataFrame,
+    unseen: pd.DataFrame,
+    decode_diagnostics_path: Path | None = None,
+) -> pd.DataFrame:
+    """De-standardize ``rec_x`` and rebuild ``df``'s layout with every gap filled."""
+    rec_x = rec_x * 2.0 * state.std + state.mean
+    len_num = len(state.numeric_columns)
+
+    # Build numeric and categorical columns as plain dicts first and construct
+    # each block's DataFrame in one shot, then concat once. Assigning columns
+    # one at a time onto a single growing DataFrame (result[col] = ...) forces
+    # a `frame.insert` per column, which for ~1000+ columns triggers pandas'
+    # "DataFrame is highly fragmented" PerformanceWarning repeatedly.
+    numeric_result = pd.DataFrame(
+        {col: rec_x[:, i] for i, col in enumerate(state.numeric_columns)}, index=df.index
+    )
+    numeric_result = decode_label_encoded_columns(numeric_result, state.numeric_category_maps)
+
+    categorical_data = {}
+    decode_diagnostics: list[dict] = []
+    offset = len_num
+    for col, width in zip(state.categorical_columns, state.cat_bin_widths, strict=True):
+        bits = rec_x[:, offset : offset + width]
+        categorical_data[col] = _decode_bits_to_categorical(
+            bits,
+            state.cat_encoders[col],
+            col,
+            policy=state.cfg.categorical_decode_policy,
+            diagnostics=decode_diagnostics,
+        )
+        offset += width
+
+    if decode_diagnostics_path is not None:
+        ensure_dir(Path(decode_diagnostics_path).parent)
+        diagnostics_payload = {
+            "policy": state.cfg.categorical_decode_policy,
+            "n_categorical_columns": len(state.categorical_columns),
+            "n_columns_with_invalid_codes": len(decode_diagnostics),
+            "n_invalid_codes": sum(entry["n_invalid"] for entry in decode_diagnostics),
+            "columns": decode_diagnostics,
+        }
+        with open(decode_diagnostics_path, "w") as f:
+            json.dump(diagnostics_payload, f, indent=2, sort_keys=True)
+        logger.info(
+            "refidiff: wrote categorical decode diagnostics (%d invalid codes across %d columns) "
+            "to %s",
+            diagnostics_payload["n_invalid_codes"],
+            diagnostics_payload["n_columns_with_invalid_codes"],
+            decode_diagnostics_path,
+        )
+    categorical_result = pd.DataFrame(categorical_data, index=df.index)
+
+    result = pd.concat([numeric_result, categorical_result], axis=1)
+    # Observed values pass through exactly: numeric ones would otherwise carry
+    # standardization round-off, and unseen labels have no code to decode.
+    keep = {
+        col: df[col].notna()
+        for col in state.feature_columns
+        if col in state.numeric_columns or unseen[col].any()
+    }
+    for col, observed in keep.items():
+        result[col] = result[col].where(~observed, df[col])
+    result[state.target_column] = df[state.target_column].values
+    return result[list(df.columns)]
+
+
+def fit(
     df: pd.DataFrame,
     feature_columns: list,
     categorical_columns: list,
@@ -843,12 +1072,16 @@ def impute_dataframe(
     seed: int = 0,
     refinement_columns: list | None = None,
     decode_diagnostics_path: Path | None = None,
-) -> pd.DataFrame:
-    """Impute missing values in ``feature_columns`` of ``df`` via RefiDiff.
+    model_columns: list | None = None,
+) -> tuple[RefiDiffState, pd.DataFrame]:
+    """Fit RefiDiff on ``df`` and return the fitted state plus ``df`` imputed.
 
-    The target column is assumed fully observed and is passed through
-    unchanged. Returns a new DataFrame with the same column order as ``df``.
-    Training checkpoints are stored under
+    Every learned quantity (category codes, standardization, refinement
+    models and the diffusion model) comes from ``df`` alone, so imputing other
+    rows with :func:`transform` never lets them influence these values.
+    ``model_columns`` lists feature columns that need a refinement model even
+    though they are complete in ``df`` (because rows imputed later have gaps
+    there). Training checkpoints are stored under
     ``data_dir/.refidiff_checkpoints/<config-hash>/``.
     """
     cfg = refidiff_cfg
@@ -860,11 +1093,11 @@ def impute_dataframe(
                 f"{unknown_refinement_columns}"
             )
     numeric_columns = [c for c in feature_columns if c not in categorical_columns]
-    n_samples = len(df)
+    torch.manual_seed(seed)
 
     logger.info(
-        "refidiff: imputing %d rows, %d numeric + %d categorical feature columns on device=%s",
-        n_samples,
+        "refidiff: fitting on %d rows, %d numeric + %d categorical feature columns on device=%s",
+        len(df),
         len(numeric_columns),
         len(categorical_columns),
         device,
@@ -878,7 +1111,7 @@ def impute_dataframe(
     # (e.g. an ordinal band stored as text like "Light"/"Heavy"). Label-encode
     # any such column as a fallback -- mirrors tabimpute_backend's identical
     # use of this helper, so both backends handle the same input the same way.
-    numeric_df, numeric_category_maps = label_encode_non_numeric_columns(df, numeric_columns)
+    _, numeric_category_maps = label_encode_non_numeric_columns(df, numeric_columns)
     if numeric_category_maps:
         logger.warning(
             "refidiff: %d feature column(s) not listed in data.categorical_columns contain "
@@ -890,68 +1123,67 @@ def impute_dataframe(
             len(numeric_category_maps),
             sorted(numeric_category_maps),
         )
-    if numeric_columns:
-        numeric_missing = numeric_df.isna().to_numpy()
-        numeric_values = np.nan_to_num(numeric_df.to_numpy(dtype=np.float64), nan=0.0)
-    else:
-        numeric_missing = np.zeros((n_samples, 0), dtype=bool)
-        numeric_values = np.zeros((n_samples, 0))
-
     cat_encoders = _fit_categorical_binary_encoders(df, categorical_columns)
-    cat_bit_blocks, cat_missing_blocks, cat_bin_widths = [], [], []
-    for col in categorical_columns:
-        bits, missing = _encode_categorical_to_bits(df[col], cat_encoders[col])
-        cat_bit_blocks.append(bits)
-        cat_missing_blocks.append(np.repeat(missing[:, None], bits.shape[1], axis=1))
-        cat_bin_widths.append(bits.shape[1])
-
-    cat_values = (
-        np.concatenate(cat_bit_blocks, axis=1) if cat_bit_blocks else np.zeros((n_samples, 0))
+    cat_bin_widths = [cat_encoders[col]["n_bits"] for col in categorical_columns]
+    state = RefiDiffState(
+        feature_columns=list(feature_columns),
+        numeric_columns=numeric_columns,
+        categorical_columns=list(categorical_columns),
+        target_column=target_column,
+        numeric_category_maps=numeric_category_maps,
+        cat_encoders=cat_encoders,
+        cat_bin_widths=cat_bin_widths,
+        mean=np.zeros(0),
+        std=np.ones(0),
+        warmup_refiners=[],
+        polish_refiners=[],
+        net=nn.Identity(),
+        cfg=cfg,
+        device=device,
+        seed=seed,
     )
-    cat_missing = (
-        np.concatenate(cat_missing_blocks, axis=1)
-        if cat_missing_blocks
-        else np.zeros((n_samples, 0), dtype=bool)
-    )
-
+    x_raw, missing_mask, unseen = _encode(state, df)
     len_num = len(numeric_columns)
-    x_raw = np.concatenate([numeric_values, cat_values], axis=1)
-    missing_mask = np.concatenate([numeric_missing, cat_missing], axis=1)
 
-    refine_indices = None
-    if refinement_columns is not None:
-        refine_indices = []
+    # Encoded-column view of refinement_columns / model_columns.
+    def _encoded_indices(columns: list) -> list[int]:
+        indices = []
         numeric_index = {column: index for index, column in enumerate(numeric_columns)}
         offset = len_num
         for column, width in zip(categorical_columns, cat_bin_widths, strict=True):
-            if column in refinement_columns:
-                refine_indices.extend(range(offset, offset + width))
+            if column in columns:
+                indices.extend(range(offset, offset + width))
             offset += width
-        refine_indices.extend(
-            numeric_index[column] for column in refinement_columns if column in numeric_index
-        )
-        refine_indices.sort()
+        indices.extend(numeric_index[column] for column in columns if column in numeric_index)
+        return sorted(indices)
+
+    refine_indices = None
+    if refinement_columns is not None:
+        refine_indices = _encoded_indices(refinement_columns)
+    extra_model_columns = np.zeros(x_raw.shape[1], dtype=bool)
+    if model_columns:
+        extra_model_columns[_encoded_indices(model_columns)] = True
 
     logger.info(
         "refidiff: encoded feature matrix shape=%s (%d numeric + %d binary-encoded categorical "
         "bit columns), %d/%d missing entries",
         x_raw.shape,
         len_num,
-        cat_values.shape[1],
+        x_raw.shape[1] - len_num,
         int(missing_mask.sum()),
         missing_mask.size,
     )
 
     # --- Standardize (z-score using observed entries only), then /2 to
     # match RefiDiff's own diffusion input scale (main.py: (X-mean)/std/2). ---
-    mean, std = _mean_std(x_raw, missing_mask)
-    x = (x_raw - mean) / std / 2.0
+    state.mean, state.std = _mean_std(x_raw, missing_mask)
+    x = (x_raw - state.mean) / state.std / 2.0
 
     # --- Warm-up refinement: single-pass per-column fill. ---
     logger.info("refidiff: running warm-up refinement pass")
     x_warm = x.copy()
     x_warm[missing_mask] = 0.0
-    x_warm = _warmup_refine(
+    x_warm, state.warmup_refiners = _fit_refiners(
         x_warm,
         missing_mask,
         len_num,
@@ -959,6 +1191,7 @@ def impute_dataframe(
         device=device,
         refine_indices=refine_indices,
         refinement_pass="warm-up",
+        model_columns=extra_model_columns,
     )
 
     # --- Train the EDM diffusion model on the warm-up-filled data. ---
@@ -997,28 +1230,13 @@ def impute_dataframe(
     checkpoint_dir = _checkpoint_dir(data_dir, checkpoint_identity)
     logger.info("refidiff: checkpoint namespace=%s", checkpoint_dir)
     model = _train(model, train_data, device, cfg, checkpoint_dir, checkpoint_identity)
-
-    # --- Reverse-diffusion sampling: average num_trials trajectories. ---
     model.eval()
-    net = model.denoise_fn_D
-    x_known = torch.tensor(x_warm, dtype=torch.float32, device=device)
-    mask_tensor = torch.tensor(missing_mask, dtype=torch.float32, device=device)
+    state.net = model.denoise_fn_D
 
-    logger.info(
-        "refidiff: sampling %d reverse-diffusion trajectories (%d steps each)",
-        cfg.num_trials,
-        cfg.num_steps,
-    )
-    trial_results = []
-    for _trial in tqdm(range(cfg.num_trials), desc="refidiff sampling", unit="trial"):
-        rec = _impute_mask(net, x_known, mask_tensor, cfg.num_steps, device)
-        rec = rec * mask_tensor + x_known * (1 - mask_tensor)
-        trial_results.append(rec)
-    rec_x = torch.stack(trial_results, dim=0).mean(0).detach().cpu().numpy()
-
-    # --- Polishing pass: re-run warm-up refinement on the diffusion output. ---
+    # --- Reverse-diffusion sampling, then the polishing refinement pass. ---
+    rec_x = _sample(state, x_warm, missing_mask)
     logger.info("refidiff: running polishing refinement pass")
-    rec_x = _warmup_refine(
+    rec_x, state.polish_refiners = _fit_refiners(
         rec_x,
         missing_mask,
         len_num,
@@ -1026,56 +1244,57 @@ def impute_dataframe(
         device=device,
         refine_indices=refine_indices,
         refinement_pass="polishing",
+        model_columns=extra_model_columns,
     )
+    return state, _decode(state, rec_x, df, unseen, decode_diagnostics_path)
 
-    # --- De-standardize back to raw feature units. ---
-    rec_x = rec_x * 2.0 * std + mean
 
-    # --- Reassemble into the original DataFrame layout. ---
-    # Build numeric and categorical columns as plain dicts first and construct
-    # each block's DataFrame in one shot, then concat once. Assigning columns
-    # one at a time onto a single growing DataFrame (result[col] = ...) forces
-    # a `frame.insert` per column, which for ~1000+ columns triggers pandas'
-    # "DataFrame is highly fragmented" PerformanceWarning repeatedly.
-    numeric_result = pd.DataFrame(
-        {col: rec_x[:, i] for i, col in enumerate(numeric_columns)}, index=df.index
+def transform(state: RefiDiffState, df: pd.DataFrame) -> pd.DataFrame:
+    """Impute ``df`` with a state from :func:`fit`; ``df`` itself is never learned from.
+
+    Each row is filled from its own observed values through the fitted
+    encoders, refinement models and diffusion model. Observed labels unseen
+    while fitting are hidden from the model and passed through unchanged.
+    """
+    logger.info("refidiff: imputing %d held-out rows with the fitted model", len(df))
+    x_raw, missing_mask, unseen = _encode(state, df)
+    x = (x_raw - state.mean) / state.std / 2.0
+    x_warm = x.copy()
+    x_warm[missing_mask] = 0.0
+    x_warm = _apply_refiners(x_warm, missing_mask, state.warmup_refiners)
+    rec_x = _sample(state, x_warm, missing_mask)
+    rec_x = _apply_refiners(rec_x, missing_mask, state.polish_refiners)
+    return _decode(state, rec_x, df, unseen)
+
+
+def impute_dataframe(
+    df: pd.DataFrame,
+    feature_columns: list,
+    categorical_columns: list,
+    target_column: str,
+    device: str,
+    refidiff_cfg: RefiDiffConfig,
+    data_dir: Path,
+    seed: int = 0,
+    refinement_columns: list | None = None,
+    decode_diagnostics_path: Path | None = None,
+) -> pd.DataFrame:
+    """Impute missing values in ``feature_columns`` of ``df`` via RefiDiff.
+
+    Fits on ``df`` and imputes the same rows (see :func:`fit`). The target
+    column is assumed fully observed and is passed through unchanged. Returns
+    a new DataFrame with the same column order as ``df``.
+    """
+    _, imputed = fit(
+        df,
+        feature_columns,
+        categorical_columns,
+        target_column,
+        device=device,
+        refidiff_cfg=refidiff_cfg,
+        data_dir=data_dir,
+        seed=seed,
+        refinement_columns=refinement_columns,
+        decode_diagnostics_path=decode_diagnostics_path,
     )
-    numeric_result = decode_label_encoded_columns(numeric_result, numeric_category_maps)
-
-    categorical_data = {}
-    decode_diagnostics: list[dict] = []
-    offset = len_num
-    for col, width in zip(categorical_columns, cat_bin_widths, strict=True):
-        bits = rec_x[:, offset : offset + width]
-        categorical_data[col] = _decode_bits_to_categorical(
-            bits,
-            cat_encoders[col],
-            col,
-            policy=cfg.categorical_decode_policy,
-            diagnostics=decode_diagnostics,
-        )
-        offset += width
-
-    if decode_diagnostics_path is not None:
-        ensure_dir(Path(decode_diagnostics_path).parent)
-        diagnostics_payload = {
-            "policy": cfg.categorical_decode_policy,
-            "n_categorical_columns": len(categorical_columns),
-            "n_columns_with_invalid_codes": len(decode_diagnostics),
-            "n_invalid_codes": sum(entry["n_invalid"] for entry in decode_diagnostics),
-            "columns": decode_diagnostics,
-        }
-        with open(decode_diagnostics_path, "w") as f:
-            json.dump(diagnostics_payload, f, indent=2, sort_keys=True)
-        logger.info(
-            "refidiff: wrote categorical decode diagnostics (%d invalid codes across %d columns) "
-            "to %s",
-            diagnostics_payload["n_invalid_codes"],
-            diagnostics_payload["n_columns_with_invalid_codes"],
-            decode_diagnostics_path,
-        )
-    categorical_result = pd.DataFrame(categorical_data, index=df.index)
-
-    result = pd.concat([numeric_result, categorical_result], axis=1)
-    result[target_column] = df[target_column].values
-    return result[list(df.columns)]
+    return imputed

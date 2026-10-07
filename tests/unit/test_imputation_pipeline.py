@@ -17,6 +17,13 @@ from synthdata.imputation.pipeline import (
 
 pytestmark = pytest.mark.unit
 
+#: TabImpute runs once on train alone, then once on test with train as context.
+CALLS_PER_RUN = 2
+
+
+def _fill_zero(frame, *args, **kwargs):
+    return frame.fillna(0)
+
 
 class TestCacheKeyPayload:
     def test_same_config_and_dataset_hash_identically(self, make_config, make_dataset):
@@ -163,7 +170,7 @@ class TestRunImputationCaching:
         }
         mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",
-            return_value=encoded.fillna({"activity": 1.0}),
+            side_effect=lambda frame, *args, **kwargs: frame.fillna({"activity": 1.0}),
         )
 
         run_imputation(cfg, dataset)
@@ -204,10 +211,10 @@ class TestRunImputationCaching:
         dataset = make_dataset()
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",
-            return_value=dataset.full_df.fillna(0),
+            side_effect=_fill_zero,
         )
         run_imputation(cfg, dataset)
-        mock_impute.assert_called_once()
+        assert mock_impute.call_count == CALLS_PER_RUN
         assert (dataset.data_dir / _CACHE_KEY_FILENAME).exists()
 
     def test_second_run_with_unchanged_config_reuses_cache(self, make_config, make_dataset, mocker):
@@ -215,18 +222,18 @@ class TestRunImputationCaching:
         dataset = make_dataset()
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",
-            return_value=dataset.full_df.fillna(0),
+            side_effect=_fill_zero,
         )
         run_imputation(cfg, dataset)
         run_imputation(cfg, dataset)
-        mock_impute.assert_called_once()  # not called a second time -- cache hit
+        assert mock_impute.call_count == CALLS_PER_RUN  # not called again -- cache hit
 
     def test_nominal_columns_change_forces_retrain(self, make_config, make_dataset, mocker):
         cfg = make_config()
         dataset = make_dataset(nominal_columns=["smoker"])
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",
-            return_value=dataset.full_df.fillna(0),
+            side_effect=_fill_zero,
         )
         run_imputation(cfg, dataset)
 
@@ -236,14 +243,14 @@ class TestRunImputationCaching:
         dataset_b.data_dir = dataset.data_dir
         run_imputation(cfg, dataset_b)
 
-        assert mock_impute.call_count == 2  # retrained instead of reusing stale cache
+        assert mock_impute.call_count == 2 * CALLS_PER_RUN  # retrained, not the stale cache
 
     def test_source_data_change_forces_retrain(self, make_config, make_dataset, mocker):
         cfg = make_config()
         dataset = make_dataset()
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",
-            return_value=dataset.full_df.fillna(0),
+            side_effect=_fill_zero,
         )
         run_imputation(cfg, dataset)
 
@@ -253,7 +260,7 @@ class TestRunImputationCaching:
         dataset_b.full_df.loc[dataset_b.full_df.index[0], "age"] = 99
         run_imputation(cfg, dataset_b)
 
-        assert mock_impute.call_count == 2
+        assert mock_impute.call_count == 2 * CALLS_PER_RUN
 
     def test_changed_split_membership_rejects_cached_imputation(
         self, make_config, make_dataset, mocker
@@ -262,7 +269,7 @@ class TestRunImputationCaching:
         dataset = make_dataset()
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",
-            return_value=dataset.full_df.fillna(0),
+            side_effect=_fill_zero,
         )
         run_imputation(cfg, dataset)
 
@@ -274,7 +281,7 @@ class TestRunImputationCaching:
 
         assert changed.train_imputed_df is None
         assert changed.test_imputed_df is None
-        mock_impute.assert_called_once()
+        assert mock_impute.call_count == CALLS_PER_RUN
 
     def test_cache_disabled_always_retrains(self, make_config, make_dataset, mocker):
         cfg = make_config()
@@ -282,20 +289,20 @@ class TestRunImputationCaching:
         dataset = make_dataset()
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",
-            return_value=dataset.full_df.fillna(0),
+            side_effect=_fill_zero,
         )
         run_imputation(cfg, dataset)
         run_imputation(cfg, dataset)
-        assert mock_impute.call_count == 2
+        assert mock_impute.call_count == 2 * CALLS_PER_RUN
 
     def test_corrupt_cache_key_file_forces_retrain(self, make_config, make_dataset, mocker):
         cfg = make_config()
         dataset = make_dataset()
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",
-            return_value=dataset.full_df.fillna(0),
+            side_effect=_fill_zero,
         )
         run_imputation(cfg, dataset)
         (dataset.data_dir / _CACHE_KEY_FILENAME).write_text("{not valid json")
         run_imputation(cfg, dataset)
-        assert mock_impute.call_count == 2
+        assert mock_impute.call_count == 2 * CALLS_PER_RUN
