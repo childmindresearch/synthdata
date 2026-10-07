@@ -158,6 +158,11 @@ class TestPipelineDispatch:
 
 
 class TestRefiners:
+    @pytest.fixture(autouse=True)
+    def _needs_catboost(self):
+        # Refinement imports catboost, which lives in the optional refidiff extra.
+        pytest.importorskip("catboost", reason="RefiDiff refinement needs catboost")
+
     def test_replaying_a_fitted_pass_matches_the_fit_pass(self):
         rng = np.random.default_rng(0)
         X = rng.normal(size=(60, 3))
