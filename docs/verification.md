@@ -40,6 +40,21 @@ IDs such as SC-05 or SE-12 refer to the evaluation audit of 2026-10-07. Referenc
 | tabpfgen standard | Haan 2025, `sebhaan/TabPFGen` | Deviation | Upstream `generate_classification` with its default `balance_classes=True`: the output is class-balanced, not the training prevalence, and returns `n_samples // n_classes` rows per class. Labels are TabPFN's argmax, as upstream. |
 | tabpfgen custom | as above | Deviation | Subclass that labels each sample by its nearest scaled training row after SGLD (TabPFN relabelling collapsed to one class on small data), then over-generates and subsamples to the training class proportions. Assumes targets coded 0..k-1, which both shipped configs satisfy. |
 
+## Column roles
+
+`data.quasi_identifier_columns`, `data.sensitive_columns` and `data.protected_columns` follow statistical disclosure control usage (Hundepool et al., *Statistical Disclosure Control*, 2012; sdcMicro). Quasi-identifiers are public, linkable attributes (age, sex, region); sensitive columns are the secrets an attacker tries to infer (a diagnosis, income); protected columns define fairness groups. Before step 8 one `sensitive_columns` list fed all three roles, so attribute-inference metrics tried to infer sex and age. The config now fails if `sensitive_columns` is set without `protected_columns`, so a config written for the old meaning cannot carry over silently.
+
+| Consumer | Role it receives | Notes |
+| --- | --- | --- |
+| synthcity `sensitive_features` (data_leakage, distinct l-diversity) | sensitive | data_leakage predicts each sensitive column from all other columns; l-diversity counts distinct sensitive values per cluster. |
+| synthcity k-anonymization, k-map, delta-presence | every non-sensitive column | Deviation: synthcity has no quasi-identifier argument and treats every non-sensitive column as one, a stronger adversary than the declared QIs. |
+| synthcity `fairness_column` | first protected column | Used only by synthcity's augmentation benchmark. |
+| SynthEval att_discl | sensitive | Each metric gets its own `AnalysisConfig`; the attacker knows every other column, not only the QIs (stronger than the QI model). |
+| SynthEval statistical_parity, equal_opportunity, equalized_odds | protected | statistical_parity uses only binary protected columns, as upstream. |
+| log disparity | protected (`evaluation.log_disparity.protected_columns` overrides) | |
+| imputation benchmark | none of the three | Role columns are never masked or scored, as sensitive columns were before. |
+| quasi-identifiers | recorded in the dataset manifest | No current metric takes them; the planned Anonymeter linkability and inference attacks (step 8, PR 6) will use them as the attacker's auxiliary columns. |
+
 ## synthcity metrics
 
 Scored against the train split (members), except performance and DOMIAS, which use the held-out split. Detection AUC is filed as utility (fidelity), not privacy.

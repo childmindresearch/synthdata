@@ -171,10 +171,12 @@ class _RandomSynthEval:
     def __init__(self, fail=()):
         self.fail = set(fail)
         self.loky_cpus = {}
+        self.targets = {}
 
     def evaluate(self, synthetic_frame, analysis_target=None, _dataset_name=None, **metrics):
         ((method, _params),) = metrics.items()
         self.loky_cpus[method] = os.environ.get("LOKY_MAX_CPU_COUNT")
+        self.targets[method] = analysis_target
         if method in self.fail:
             return None
         return pd.DataFrame(
@@ -185,8 +187,23 @@ class _RandomSynthEval:
 
 class TestEvaluateSeeded:
     def _run(self, preset, seed=7, se=None):
-        result, failed = _evaluate_seeded(se or _RandomSynthEval(), None, None, preset, seed, "m")
+        configs = {"sensitive": "S", "protected": "P"}
+        result, failed = _evaluate_seeded(
+            se or _RandomSynthEval(), None, configs, preset, seed, "m"
+        )
         return dict(zip(result["metric"], result["val"], strict=True)), failed
+
+    def test_fairness_metrics_group_by_protected_and_others_infer_sensitive(self):
+        se = _RandomSynthEval()
+        self._run(
+            {"att_discl": {}, "statistical_parity": {}, "equalized_odds": {}, "mia": {}}, se=se
+        )
+        assert se.targets == {
+            "att_discl": "S",
+            "statistical_parity": "P",
+            "equalized_odds": "P",
+            "mia": "S",
+        }
 
     def test_same_seed_gives_same_scores(self):
         preset = {"mia": {}, "att_discl": {}}

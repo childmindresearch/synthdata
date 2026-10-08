@@ -43,7 +43,7 @@ def run_log_disparity_evaluation(
 
     from synthdata.log_disparity.metric_log_disparity import compute_log_disparity_report
 
-    protected_cols = log_disparity_cfg.protected_columns or list(dataset.sensitive_columns)
+    protected_cols = log_disparity_cfg.protected_columns or list(dataset.protected_columns)
     if not protected_cols:
         logger.warning("[custom] log_disparity requires protected columns; skipping")
         return {}

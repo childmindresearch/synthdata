@@ -63,6 +63,7 @@ class Dataset:
     feature_columns: list
     nominal_columns: list
     ordinal_columns: list
+    #: Secret columns privacy metrics try to infer (see DataConfig).
     sensitive_columns: list
     data_dir: Path
 
@@ -93,6 +94,9 @@ class Dataset:
     #: the number of distinct patients per split (rows when no column is set).
     patient_id_column: str | None = None
     n_patients: dict = dataclasses.field(default_factory=dict)
+    #: Public, linkable columns and fairness-group columns (see DataConfig).
+    quasi_identifier_columns: list = dataclasses.field(default_factory=list)
+    protected_columns: list = dataclasses.field(default_factory=list)
     #: Labels of the ``train_df`` rows held out as the tuning split (see
     #: ``DataConfig.tuning_fraction``). Empty when no tuning split was requested.
     tuning_index: pd.Index = dataclasses.field(default_factory=lambda: pd.Index([]))
@@ -106,6 +110,12 @@ class Dataset:
     full_imputed_decoded_df: pd.DataFrame | None = None
     train_imputed_decoded_df: pd.DataFrame | None = None
     test_imputed_decoded_df: pd.DataFrame | None = None
+
+    @property
+    def role_columns(self) -> list:
+        """Quasi-identifier, sensitive and protected columns, each listed once."""
+        columns = self.quasi_identifier_columns + self.sensitive_columns + self.protected_columns
+        return list(dict.fromkeys(columns))
 
     def __post_init__(self) -> None:
         """Capture fingerprints for the exact frames held by this dataset."""
@@ -898,7 +908,9 @@ def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
         "full_fingerprint": dataframe_fingerprint(dataset.full_df),
         "train_split_fingerprint": dataframe_fingerprint(dataset.train_df),
         "test_split_fingerprint": dataframe_fingerprint(dataset.test_df),
+        "quasi_identifier_columns": dataset.quasi_identifier_columns,
         "sensitive_columns": dataset.sensitive_columns,
+        "protected_columns": dataset.protected_columns,
         "n_rows": int(len(dataset.full_df)),
         "n_train": int(len(dataset.train_df)),
         "n_test": int(len(dataset.test_df)),
@@ -1049,9 +1061,10 @@ def load_dataset(cfg: Config) -> Dataset:
         ]
         df = mask_outliers_as_missing(df, outlier_columns, cfg.data.outlier_zscore_threshold)
 
-    missing_sensitive = [c for c in cfg.data.sensitive_columns if c not in df.columns]
-    if missing_sensitive:
-        raise KeyError(f"sensitive_columns not found in data: {missing_sensitive}")
+    for key in ("quasi_identifier_columns", "sensitive_columns", "protected_columns"):
+        missing = [c for c in getattr(cfg.data, key) or [] if c not in df.columns]
+        if missing:
+            raise KeyError(f"data.{key} not found in data: {missing}")
 
     fractions = (cfg.data.train_fraction, cfg.data.tuning_fraction, cfg.data.holdout_fraction)
     groups = (
@@ -1102,6 +1115,8 @@ def load_dataset(cfg: Config) -> Dataset:
         nominal_columns=nominal_columns,
         ordinal_columns=ordinal_columns,
         sensitive_columns=list(cfg.data.sensitive_columns),
+        quasi_identifier_columns=list(cfg.data.quasi_identifier_columns),
+        protected_columns=list(cfg.data.protected_columns or []),
         data_dir=data_dir,
         full_df=df,
         train_df=train_df,
@@ -1125,7 +1140,7 @@ def load_dataset(cfg: Config) -> Dataset:
 
     logger.info(
         "Loaded dataset '%s' (version=%s): %d rows, %d features (%d categorical: %d nominal + "
-        "%d ordinal), target=%r, sensitive=%s, train=%d (of which tuning=%d)/test=%d rows "
+        "%d ordinal), target=%r, QIs=%s, sensitive=%s, protected=%s, train=%d (of which tuning=%d)/test=%d rows "
         "(%d/%d/%d patients)",
         cfg.name,
         cfg.data.version or "unversioned",
@@ -1135,7 +1150,9 @@ def load_dataset(cfg: Config) -> Dataset:
         len(nominal_columns),
         len(ordinal_columns),
         target_column,
+        dataset.quasi_identifier_columns,
         dataset.sensitive_columns,
+        dataset.protected_columns,
         len(train_df),
         len(tuning_index),
         len(test_df),

@@ -161,7 +161,9 @@ def run_generation(
     # synthcity models
     # ------------------------------------------------------------------
     if gen_cfg.synthcity.enabled and gen_cfg.synthcity.names:
-        fairness_column = dataset.sensitive_columns[0] if dataset.sensitive_columns else None
+        # synthcity's sensitive_features are the secrets its attribute-inference
+        # and l-diversity metrics target; the fairness column is a protected group.
+        fairness_column = dataset.protected_columns[0] if dataset.protected_columns else None
         train_loader = sc.make_loader(
             dataset.train_imputed_df,
             dataset.target_column,

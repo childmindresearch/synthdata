@@ -11,7 +11,8 @@ data:
   version: "1.2"
   variable_schema_path: data/loris/variable_schema.csv
   target_column: CGAS_class
-  sensitive_columns: [Sex, Age, PreInt_Demos_Fam__Child_Race]
+  # Imputation benchmark only: role columns are never masked or scored.
+  protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Race]
   drop_rows_missing_target: true
   drop_columns:
     - subject_id

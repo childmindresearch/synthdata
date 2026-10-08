@@ -21,7 +21,9 @@ def fairness_dataset(make_dataset):
             "target": [0, 1, 0, 1, 1, 0, 1, 0],
         }
     )
-    return make_dataset(df=df, target_column="target", sensitive_columns=["sex"])
+    return make_dataset(
+        df=df, target_column="target", sensitive_columns=["age"], protected_columns=["sex"]
+    )
 
 
 class TestRunLogDisparityEvaluation:
@@ -35,7 +37,7 @@ class TestRunLogDisparityEvaluation:
         assert reports == {}
 
     def test_no_protected_columns_warns_and_returns_empty(self, fairness_dataset):
-        fairness_dataset.sensitive_columns = []
+        fairness_dataset.protected_columns = []
         reports = run_log_disparity_evaluation(
             {"model_a": fairness_dataset.train_df},
             fairness_dataset,
@@ -53,6 +55,25 @@ class TestRunLogDisparityEvaluation:
             FrameworkSelectionConfig(enabled=True),
         )
         assert "summary_stats" in reports["good_model"]
+
+    def test_defaults_to_the_protected_columns_not_the_sensitive_ones(
+        self, fairness_dataset, monkeypatch
+    ):
+        import synthdata.log_disparity.metric_log_disparity as ld
+
+        seen = {}
+        monkeypatch.setattr(
+            ld,
+            "compute_log_disparity_report",
+            lambda **kwargs: seen.setdefault("protected_cols", kwargs["protected_cols"]),
+        )
+        run_log_disparity_evaluation(
+            {"model_a": fairness_dataset.train_df},
+            fairness_dataset,
+            LogDisparityConfig(),
+            FrameworkSelectionConfig(enabled=True),
+        )
+        assert seen["protected_cols"] == ["sex"]
 
     def test_failing_model_recorded_not_raised(self, fairness_dataset):
         # Missing the "sex" protected column entirely -> KeyError inside

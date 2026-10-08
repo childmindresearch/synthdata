@@ -88,6 +88,8 @@ def make_dataset(tmp_path, sample_mixed_df):
         nominal_columns: list | None = None,
         ordinal_columns: list | None = None,
         sensitive_columns: list | None = None,
+        protected_columns: list | None = None,
+        quasi_identifier_columns: list | None = None,
         name: str = "testds",
     ) -> Dataset:
         df = sample_mixed_df.copy() if df is None else df
@@ -104,6 +106,8 @@ def make_dataset(tmp_path, sample_mixed_df):
             nominal_columns=nominal_columns,
             ordinal_columns=ordinal_columns,
             sensitive_columns=sensitive_columns,
+            protected_columns=protected_columns or [],
+            quasi_identifier_columns=quasi_identifier_columns or [],
             data_dir=data_dir,
             full_df=df,
             train_df=train_df,
