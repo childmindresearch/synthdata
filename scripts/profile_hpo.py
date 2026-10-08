@@ -238,6 +238,13 @@ def main() -> None:
                 workspace=workspace,
                 device=device,
                 classification=classification,
+                class_prior=(
+                    dataset.search_train_imputed_df[dataset.target_column].value_counts(
+                        normalize=True
+                    )
+                    if match_prior
+                    else None
+                ),
             )
             try:
                 hpo_mod.run_study(f"hpo_{name}", objective, hpo_cfg, out, cfg.seed)

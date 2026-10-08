@@ -259,7 +259,7 @@ Synthcity models are chosen with `generation.synthcity.names`. TabPFN runs when 
 ### Rows, class balance and replicates
 
 - `generation.n_samples` is the number of synthetic rows per model. Setting it close to the real train size makes utility and privacy scores easier to compare with the real data.
-- `generation.match_class_prior: true` resamples every synthetic dataset to the class shares of the real train data. Without it, a generator that produces too many minority-class rows can look better on macro-F1 without being more faithful.
+- `generation.match_class_prior: true` gives every synthetic dataset the class shares of the real train data. Each class gets its share of `n_samples` rows (with 2500 rows and shares 70/20/10%, that is 1750/500/250). DDPM is given those labels and generates them directly. Every other model is sampled again until each class has its rows, at most 10 batches in all. Rows are never repeated to fill a class. A class still short after the last batch stays short, so the dataset can have fewer than `n_samples` rows. `diagnostics/class_sampling.csv` in the generation folder lists, per model and class, the rows wanted (`quota`), the rows kept (`filled`), the class share of the model's first batch (`raw_share`) and the batches drawn. A `raw_share` far from the train share means the model gets the class balance wrong on its own. Without this setting, a generator that produces too many minority-class rows can look better on macro-F1 without being more faithful.
 - `generation.n_replicates` retrains every model that many times with seeds `seed`, `seed+1`, and so on. Replicate r > 0 is saved as `<model>__rep<r>`. With 2 or more, the report gives every score a 95% confidence interval and says which models cannot be told apart from the best. HPO runs only once per model.
 
 ### How the hyperparameter search works
@@ -267,9 +267,9 @@ Synthcity models are chosen with `generation.synthcity.names`. TabPFN runs when 
 For each model, [Optuna](https://optuna.org/) tries a number of settings ("trials"):
 
 1. Fit the model on search-train with the trial's settings.
-2. Generate synthetic rows and resample them to the train class shares.
+2. Generate synthetic rows, class by class, to the search-train class shares (as described above).
 3. Train a fixed XGBoost classifier on the synthetic rows and test it on the real tuning rows (**TSTR**, train on synthetic, test on real). The score is macro-F1, averaged over `tstr_seeds` (3) seeds. Macro-F1 weighs every class equally, so a rare class counts as much as a common one. Set `objective: tstr_macro_auprc` for a threshold-free alternative.
-4. Check three lenient screens in `hpo.constraints`. A trial that copies training rows (`copy_margin`), drops categories or classes (`min_category_coverage`), or produces out-of-range values (`max_out_of_range`) is marked infeasible and cannot be chosen as best.
+4. Check four lenient screens in `hpo.constraints`. A trial that copies training rows (`copy_margin`), drops categories or classes (`min_category_coverage`), produces out-of-range values (`max_out_of_range`), or leaves a class short of its rows (`max_class_share_gap`, the largest allowed total variation distance from the class shares) is marked infeasible and cannot be chosen as best.
 
 The trial with the best feasible score wins. The final model is refitted with those settings on all of train. The best settings are saved in `hpo_best_params.json`, and every trial is stored in `optuna_studies.db`, so an interrupted search resumes where it stopped when you rerun with the same experiment id.
 

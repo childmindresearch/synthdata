@@ -2,9 +2,11 @@
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
+from synthdata.generation.class_quota import class_quotas
 from synthdata.generation.pipeline import run_generation
 
 pytestmark = pytest.mark.unit
@@ -95,6 +97,7 @@ def test_each_replicate_is_built_with_its_own_seed(make_config, make_dataset, mo
     cfg.generation.hpo.enabled = False
     cfg.generation.synthcity.names = ["ctgan"]
     cfg.generation.n_replicates = 3
+    cfg.generation.match_class_prior = False
     dataset = make_dataset()
     dataset.train_imputed_df = dataset.train_df
     mocker.patch("synthdata.generation.pipeline.sc.make_loader")
@@ -116,7 +119,9 @@ def test_each_replicate_is_built_with_its_own_seed(make_config, make_dataset, mo
     assert (output_dir / "ctgan__rep1.csv").exists()
 
 
-def test_saved_synthetic_data_gets_the_train_class_shares(make_config, make_dataset, mocker):
+def test_synthcity_models_are_drawn_to_the_train_class_shares(make_config, make_dataset, mocker):
+    from synthdata.generation.class_quota import ClassSamplingReport
+
     cfg = make_config()
     cfg.generation.tabpfn.enabled = False
     cfg.generation.tabpfgen.enabled = False
@@ -124,22 +129,51 @@ def test_saved_synthetic_data_gets_the_train_class_shares(make_config, make_data
     cfg.generation.synthcity.names = ["ctgan"]
     dataset = make_dataset()
     dataset.train_imputed_df = dataset.train_df
-    target = dataset.target_column
-    classes = sorted(dataset.train_df[target].unique())
-    # A generator that rebalances: equal rows per class.
-    balanced = pd.concat(
-        [
-            dataset.train_df[dataset.train_df[target] == c].sample(30, replace=True, random_state=0)
-            for c in classes
-        ]
+    generated = dataset.train_df.copy()
+    generated.attrs["class_sampling"] = ClassSamplingReport(
+        "rejection", {0: 3, 1: 2}, {0: 3, 1: 1}, {0: 0.9, 1: 0.1}, 4
     )
     mocker.patch("synthdata.generation.pipeline.sc.make_loader")
-    mocker.patch("synthdata.generation.pipeline.sc.fit_generate", return_value=balanced)
+    fit = mocker.patch("synthdata.generation.pipeline.sc.fit_generate", return_value=generated)
 
-    result = run_generation(cfg, dataset)
+    run_generation(cfg, dataset)
 
-    shares = result["ctgan"][target].value_counts(normalize=True)
-    expected = dataset.train_df[target].value_counts(normalize=True)
-    assert len(result["ctgan"]) == len(balanced)
-    for c in classes:
-        assert abs(shares[c] - expected[c]) < 1 / len(balanced) + 1e-9
+    expected = dataset.train_df[dataset.target_column].value_counts(normalize=True)
+    pd.testing.assert_series_equal(fit.call_args.kwargs["class_prior"], expected)
+    record = pd.read_csv(Path(cfg.generation.output_dir) / "diagnostics" / "class_sampling.csv")
+    assert record[["model", "class", "quota", "filled", "rounds"]].values.tolist() == [
+        ["ctgan", 0, 3, 3, 4],
+        ["ctgan", 1, 2, 1, 4],
+    ]
+
+
+def test_other_backends_are_rejection_sampled_without_repeating_rows(
+    make_config, make_dataset, mocker
+):
+    cfg = make_config()
+    _configure_tabpfn_only(cfg)
+    cfg.generation.match_class_prior = True
+    cfg.generation.n_samples = 100
+    dataset = make_dataset()
+    _set_schema(dataset, target_kind="categorical")
+    target = dataset.target_column
+    calls = iter(range(100))
+
+    def generate(*args, **kwargs):
+        # A generator that makes class 1 only 10% of the time.
+        rng = np.random.default_rng(next(calls))
+        frame = pd.DataFrame({c: rng.normal(size=100) for c in dataset.feature_columns}).assign(
+            **{target: (rng.random(100) < 0.1).astype(int)}
+        )
+        return frame, None
+
+    mocker.patch("synthdata.generation.pipeline.tpfn.generate_tabpfn_custom", side_effect=generate)
+
+    result = run_generation(cfg, dataset)["tabpfn_custom"]
+
+    quotas = class_quotas(dataset.train_df[target].value_counts(normalize=True), 100)
+    assert result[target].value_counts().sort_index().tolist() == quotas.sort_index().tolist()
+    assert not result.duplicated().any()
+    record = pd.read_csv(Path(cfg.generation.output_dir) / "diagnostics" / "class_sampling.csv")
+    assert set(record["method"]) == {"rejection"}
+    assert record["rounds"].iloc[0] > 1

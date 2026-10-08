@@ -13,8 +13,7 @@ import pandas as pd
 
 from synthdata.config import Config
 from synthdata.data import Dataset, remask_synthetic
-from synthdata.evaluation.tstr import match_class_prior
-from synthdata.generation import cart_fill
+from synthdata.generation import cart_fill, class_quota
 from synthdata.generation import hpo as hpo_mod
 from synthdata.generation import synthcity_backend as sc
 from synthdata.generation import tabpfn_backend as tpfn
@@ -88,10 +87,28 @@ def run_generation(
 
     synthetic_datasets: dict[str, pd.DataFrame] = {}
 
-    # Every synthetic dataset gets the real train class shares, so no
-    # generator gains macro-F1 by rebalancing the classes.
+    # Every synthetic dataset is drawn to the real train class shares (per-class
+    # quotas, see class_quota), so no generator gains macro-F1 by rebalancing
+    # the classes. HPO candidates get the search-train shares.
     match_prior = gen_cfg.match_class_prior and dataset.target_is_categorical
     train_prior = dataset.train_df[dataset.target_column].value_counts(normalize=True)
+    class_prior = train_prior if match_prior else None
+    search_prior = (
+        dataset.search_train_imputed_df[dataset.target_column].value_counts(normalize=True)
+        if match_prior and gen_cfg.hpo.enabled and dataset.search_train_imputed_df is not None
+        else None
+    )
+    # Not in output_dir itself: every CSV there is read as a synthetic dataset.
+    class_sampling_path = output_dir / "diagnostics" / "class_sampling.csv"
+
+    def _record_class_sampling(name, report):
+        """Keep each model's quotas, rows kept and raw class shares in class_sampling.csv."""
+        rows = report.to_frame(name)
+        if class_sampling_path.exists():
+            previous = pd.read_csv(class_sampling_path)
+            rows = pd.concat([previous[previous["model"] != name], rows], ignore_index=True)
+        ensure_dir(class_sampling_path.parent)
+        rows.to_csv(class_sampling_path, index=False)
 
     # Hyperparameter search fits candidates on train minus tuning and scores
     # them on tuning. Final models (default and tuned) are fitted on all of
@@ -189,7 +206,25 @@ def run_generation(
         result = build_fn(replicate_seed)
         df, extra = result if isinstance(result, tuple) else (result, None)
         if match_prior and dataset.target_column in df:
-            df = match_class_prior(df, dataset.target_column, train_prior, replicate_seed)
+            report = df.attrs.get("class_sampling")
+            if report is None:
+                # Backend without per-class sampling: draw whole new datasets
+                # (rejection sampling) until every class has its quota.
+                def sample(count, round_seed, labels):
+                    set_global_seed(round_seed)
+                    more = build_fn(round_seed)
+                    return more[0] if isinstance(more, tuple) else more
+
+                df, report = class_quota.sample_to_quota(
+                    sample,
+                    dataset.target_column,
+                    train_prior,
+                    n_samples,
+                    replicate_seed,
+                    first_batch=df,
+                )
+            df.attrs.pop("class_sampling", None)
+            _record_class_sampling(name, report)
         df.to_csv(path, index=False)
         _write_released(name, df, overwrite=True, replicate_seed=replicate_seed)
         synthetic_datasets[name] = df
@@ -256,6 +291,7 @@ def run_generation(
                     workspace=output_dir / "synthcity_workspace",
                     device=device,
                     classification=dataset.target_is_categorical,
+                    class_prior=class_prior,
                 ),
             )
 
@@ -271,6 +307,7 @@ def run_generation(
                         workspace=output_dir / "synthcity_workspace",
                         device=device,
                         classification=dataset.target_is_categorical,
+                        class_prior=search_prior,
                     )
                     params = hpo_mod.run_study(
                         f"hpo_{name}",
@@ -299,6 +336,7 @@ def run_generation(
                         workspace=output_dir / "synthcity_workspace",
                         device=device,
                         classification=dataset.target_is_categorical,
+                        class_prior=class_prior,
                     ),
                 )
 
