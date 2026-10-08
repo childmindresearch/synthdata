@@ -148,10 +148,12 @@ Privacy and fairness metrics need to know what each column means. Three lists in
 | Role | Meaning | Used by | Example |
 | --- | --- | --- | --- |
 | `quasi_identifier_columns` | Public attributes an attacker could already know and use to link a record to a person | Anonymeter linkability and inference attacks (as attacker knowledge); both need at least one quasi-identifier and one sensitive column | age, sex, region |
-| `sensitive_columns` | Secrets an attacker would try to learn | Anonymeter inference attacks (as targets) | a diagnosis, income |
+| `sensitive_columns` | Secrets an attacker would try to learn | Anonymeter inference attacks (as targets); synthcity data_leakage and distinct l-diversity; SynthEval att_discl | a diagnosis, income |
 | `protected_columns` | Groups whose fair treatment you want to check | Fairness metrics | sex, ethnicity, age band |
 
 A column can be both a quasi-identifier and protected, or sensitive and protected, but never both a quasi-identifier and sensitive. None of the lists may contain the target or the patient ID. If you set `sensitive_columns`, you must also set `protected_columns` (even to `[]`).
+
+Only Anonymeter reads the quasi-identifiers. synthcity and SynthEval have no quasi-identifier setting: their attribute attacks assume the attacker knows every other column and have no holdout control, so treat them as a worst-case screen and Anonymeter inference as the evidence for your declared threat model. The full table is in [verification.md, Column roles](verification.md#column-roles).
 
 ### The patient-level split
 
