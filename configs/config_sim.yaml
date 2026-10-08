@@ -73,6 +73,7 @@ generation:
     enabled: true
     variants: [standard, custom]
     data_variants: [raw, imputed]
+    model_version: v3 # TabPFN weights; v3.5 needs its own license (docs/verification.md).
 
   # Off: TabPFGen outputs near-copies of training rows (docs/verification.md).
   tabpfgen:

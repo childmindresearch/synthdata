@@ -400,6 +400,11 @@ class TabPFNConfig:
     #: performs with vs. without imputation; imputed-variant outputs are
     #: cached as e.g. "tabpfn_standard_imputed" (raw keeps the unsuffixed name).
     data_variants: list = dataclasses.field(default_factory=lambda: ["raw"])
+    #: TabPFN weights to load ("v2", "v2.5", "v2.6", "v3", "v3.5"). Pinned so a
+    #: tabpfn upgrade cannot change the model silently: tabpfn 9.x defaults to
+    #: v3.5, which has its own non-commercial license to accept on
+    #: ux.priorlabs.ai. Also used by TabPFGen's classifier.
+    model_version: str = "v3"
 
 
 @dataclasses.dataclass

@@ -166,6 +166,16 @@ def _patch_regression_prediction_device():
     cls._synthdata_cpu_prediction_patched = True
 
 
+def set_model_version(version: str) -> None:
+    """Make every TabPFN model created afterwards in this process load the
+    given weights (``tabpfn.constants.ModelVersion`` value, e.g. ``"v3"``)."""
+    from tabpfn.constants import ModelVersion
+    from tabpfn.settings import settings
+
+    settings.tabpfn.model_version = ModelVersion(version)
+    logger.info("[tabpfn] using model weights %s", version)
+
+
 def _make_experiment():
     from tabpfn import TabPFNClassifier, TabPFNRegressor
     from tabpfn_extensions import unsupervised

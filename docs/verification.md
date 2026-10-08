@@ -15,7 +15,7 @@ IDs such as SC-05 or SE-12 refer to the evaluation audit of 2026-10-07. Referenc
 | --- | --- | --- |
 | synthcity | fork `alperkent-cmi/synthcity` | upstream `vanderschaarlab/synthcity@23f322f` plus metric fixes listed below, a joblib-free metric loop, quieter plugin loading, and the PATE-GAN and DDPM fixes in the generator rows. Upstream has had no commits since June 2025 (reviewed 2026-10-08). |
 | SynthEval | fork `alperkent-cmi/syntheval` | upstream `schneiderkamplab/syntheval@42a3d34` plus two fairness metrics, parallel execution and the fixes listed below. |
-| TabPFN | `tabpfn==9.1.0` | PyPI release, unmodified; three runtime patches to tabpfn-extensions in `synthdata/generation/tabpfn_backend.py` (below). Satisfies the locked tabpfn-extensions' `tabpfn>=8.1.0`. |
+| TabPFN | `tabpfn==9.1.0` | PyPI release, unmodified; three runtime patches to tabpfn-extensions in `synthdata/generation/tabpfn_backend.py` (below). Satisfies the locked tabpfn-extensions' `tabpfn>=8.1.0`. Weights pinned to TabPFN-3 (`generation.tabpfn.model_version: v3`, the 8.0.8 default); 9.1 would otherwise load TabPFN-3.5, whose license allows non-commercial use only, outputs included. |
 | tabpfn-extensions | git `6ed13f6` (locked in `uv.lock`) | unsupervised generation API, unmodified. |
 | TabPFGen | `tabpfgen==0.1.4` | PyPI release; the custom variant subclasses it. |
 | arfpy | `arfpy==0.1.1` | PyPI release, unmodified; used by synthcity's ARF plugin. |

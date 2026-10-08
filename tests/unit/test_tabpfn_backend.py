@@ -123,3 +123,18 @@ def test_regression_prediction_patch_returns_a_cpu_copy_of_the_criterion(monkeyp
     pred, sampled = Model().sample_from_model_prediction_(0, None, None, None, 1.0)
     assert pred["criterion"] is not criterion
     assert pred["logits"].device.type == "cpu" and sampled.device.type == "cpu"
+
+
+def test_set_model_version_selects_the_weights_new_models_load():
+    pytest.importorskip("tabpfn")
+    from tabpfn.constants import ModelVersion
+    from tabpfn.settings import settings
+
+    before = settings.tabpfn.model_version
+    try:
+        tabpfn_backend.set_model_version("v3")
+        assert settings.tabpfn.model_version == ModelVersion.V3
+        with pytest.raises(ValueError):
+            tabpfn_backend.set_model_version("v9")
+    finally:
+        settings.tabpfn.model_version = before

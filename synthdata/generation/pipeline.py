@@ -306,6 +306,8 @@ def run_generation(
     # TabPFN models (no HPO; can fit on the original pre-imputation train
     # split and/or the imputed one -- see gen_cfg.tabpfn.data_variants)
     # ------------------------------------------------------------------
+    if gen_cfg.tabpfn.enabled or gen_cfg.tabpfgen.enabled:
+        tpfn.set_model_version(gen_cfg.tabpfn.model_version)
     if gen_cfg.tabpfn.enabled:
         tpfn.validate_tabpfn_target(dataset.target_column, dataset.target_is_categorical)
         for data_variant in gen_cfg.tabpfn.data_variants:

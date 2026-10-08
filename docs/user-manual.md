@@ -236,7 +236,7 @@ Imputed CSVs are cached in `data_dir/data_v_<version>/`. They are reused only if
 | TabPFN `custom` | Foundation model | Generates features and target jointly |
 | TabPFGen | Energy-based sampling | Off by default: its output is near-copies of training rows (see [verification](verification.md)) |
 
-Synthcity models are chosen with `generation.synthcity.names`. TabPFN runs when `generation.tabpfn.enabled` is true; `variants` picks `standard` and/or `custom`, and `data_variants` picks whether it learns from the `raw` data (TabPFN handles missing values itself) or the `imputed` data. Imputed-data outputs get an `_imputed` suffix, for example `tabpfn_custom_imputed`.
+Synthcity models are chosen with `generation.synthcity.names`. TabPFN runs when `generation.tabpfn.enabled` is true; `variants` picks `standard` and/or `custom`, and `data_variants` picks whether it learns from the `raw` data (TabPFN handles missing values itself) or the `imputed` data. Imputed-data outputs get an `_imputed` suffix, for example `tabpfn_custom_imputed`. `model_version` picks the TabPFN weights (default `v3`); `v3.5` works only after you accept its non-commercial license on ux.priorlabs.ai with the account behind your `TABPFN_TOKEN`.
 
 ### Rows, class balance and replicates
 
