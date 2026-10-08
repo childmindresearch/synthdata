@@ -16,6 +16,7 @@ Everything is driven by a single YAML config file (see ``configs/config.yaml``),
 """
 
 import ctypes
+import logging
 import os
 import platform
 from pathlib import Path
@@ -96,5 +97,16 @@ matplotlib.use("Agg", force=True)
 os.environ.setdefault(
     "PYTHONWARNINGS", "ignore:Clustering metrics expects discrete values:UserWarning"
 )
+
+# Windows-only startup noise from optional GPU backends this package never uses:
+# - KeOps (pulled in via geomloss by synthcity's WassersteinDistance) does not
+#   support Windows, so it always warns about a missing g++/CUDA/OpenMP and falls
+#   back. geomloss only uses KeOps for N*M > 5000^2 samples anyway and runs its
+#   plain-torch backend otherwise. Set KEOPS_VERBOSE=1 to see the checks again.
+# - Torch logs "triton not found" when importing its FLOP counter; triton has
+#   no official Windows wheels, and this package doesn't count FLOPs.
+if platform.system() == "Windows":
+    os.environ.setdefault("KEOPS_VERBOSE", "0")
+    logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
 
 __all__ = ["Config", "load_config"]
