@@ -81,6 +81,9 @@ generation:
     standard_params: {}
     custom_params: { n_sgld_steps: 1000, sgld_noise_scale: 0.1 }
 
+  # Resample synthetic data to the real train class shares.
+  match_class_prior: true
+
   hpo:
     enabled: true
     n_trials: 10
@@ -88,6 +91,13 @@ generation:
     n_iter_cap: 300
     model_iter_caps: { pategan: 5 }
     sgld_step_cap: 500
+    # Objective scored on the tuning split: tstr_macro_f1 (fixed XGBoost
+    # trained on synthetic, tested on real), tstr_macro_auprc, or the older
+    # synthcity_composite (uses metric_config below, privacy included).
+    objective: tstr_macro_f1
+    tstr_seeds: 3
+    # Lenient sanity screens; a trial that fails one can't be chosen as best.
+    constraints: { copy_margin: 0.02, min_category_coverage: 0.9, max_out_of_range: 0.01 }
     metric_config:
       stats: [prdc, alpha_precision, wasserstein_dist, inv_kl_divergence]
       sanity: [nearest_syn_neighbor_distance]

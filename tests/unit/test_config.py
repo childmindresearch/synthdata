@@ -217,6 +217,23 @@ class TestValidate:
         cfg.generation.hpo.enabled = False
         _validate(cfg)  # no tuning split needed without HPO
 
+    def test_hpo_objective_and_screens_are_validated(self):
+        cfg = self._base_valid()
+        assert cfg.generation.hpo.objective == "tstr_macro_f1"
+        cfg.generation.hpo.objective = "accuracy"
+        with pytest.raises(ValueError, match="hpo.objective"):
+            _validate(cfg)
+        cfg.generation.hpo.objective = "tstr_macro_auprc"
+        cfg.generation.hpo.tstr_seeds = 0
+        with pytest.raises(ValueError, match="tstr_seeds"):
+            _validate(cfg)
+        cfg.generation.hpo.tstr_seeds = 2
+        cfg.generation.hpo.constraints.max_out_of_range = 1.5
+        with pytest.raises(ValueError, match="max_out_of_range"):
+            _validate(cfg)
+        cfg.generation.hpo.constraints.max_out_of_range = None
+        _validate(cfg)
+
     def test_split_fractions_must_sum_to_one(self):
         cfg = self._base_valid()
         cfg.data.holdout_fraction = 0.3

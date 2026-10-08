@@ -8,6 +8,7 @@ import pandas as pd
 import torch
 
 from synthdata.config import HPOConfig
+from synthdata.generation.hpo import TrialScore, score_candidate
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -115,7 +116,7 @@ def build_synthcity_objective(
     train_loader,
     hpo_cfg: HPOConfig,
     seed: int,
-    eval_fn: Callable[[pd.DataFrame], float],
+    eval_fn: Callable[[pd.DataFrame], TrialScore],
     n_samples: int,
     workspace: str | None = None,
     device: str = "cpu",
@@ -126,7 +127,7 @@ def build_synthcity_objective(
     caps ``n_iter`` for speed (only if the plugin exposes it), forces CPU for
     MPS (which lacks the float64 support synthcity's metrics need internally)
     but otherwise uses ``device``, fits the plugin on ``train_loader`` and
-    scores ``n_samples`` generated rows with ``eval_fn`` (lower is better).
+    scores ``n_samples`` generated rows with ``eval_fn``.
     ``eval_fn`` compares against the tuning split, so the search never sees
     the test split.
     """
@@ -147,13 +148,8 @@ def build_synthcity_objective(
         if accepts_device:
             params["device"] = torch.device(trial_device)
 
-        try:
-            synthetic = fit_generate(
-                name, params, train_loader, n_samples, seed, workspace=workspace
-            )
-            return eval_fn(synthetic)
-        except (ValueError, RuntimeError) as exc:
-            logger.warning("[%s] trial %d failed: %s", name, trial.number, exc)
-            raise optuna.TrialPruned() from exc
+        # A crash propagates and run_study marks the trial failed.
+        synthetic = fit_generate(name, params, train_loader, n_samples, seed, workspace=workspace)
+        return score_candidate(trial, eval_fn, synthetic)
 
     return objective

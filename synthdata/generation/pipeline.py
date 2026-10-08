@@ -13,6 +13,7 @@ import pandas as pd
 
 from synthdata.config import Config
 from synthdata.data import Dataset, remask_synthetic
+from synthdata.evaluation.tstr import match_class_prior
 from synthdata.generation import cart_fill
 from synthdata.generation import hpo as hpo_mod
 from synthdata.generation import synthcity_backend as sc
@@ -87,18 +88,27 @@ def run_generation(
 
     synthetic_datasets: dict[str, pd.DataFrame] = {}
 
+    # Every synthetic dataset gets the real train class shares, so no
+    # generator gains macro-F1 by rebalancing the classes.
+    match_prior = gen_cfg.match_class_prior and dataset.target_is_categorical
+    train_prior = dataset.train_df[dataset.target_column].value_counts(normalize=True)
+
     # Hyperparameter search fits candidates on train minus tuning and scores
     # them on tuning. Final models (default and tuned) are fitted on all of
     # train, so the test split is only ever used by evaluation.
     hpo_eval_fn = None
     if gen_cfg.hpo.enabled and needs_imputed_data(gen_cfg):
-        hpo_eval_fn = hpo_mod.build_synthetic_eval_fn(
+        hpo_eval_fn = hpo_mod.build_hpo_eval_fn(
             dataset.search_train_imputed_df,
             dataset.tuning_imputed_df,
             dataset.target_column,
+            dataset.nominal_columns,
+            dataset.categorical_columns,
+            dataset.target_is_categorical,
             dataset.sensitive_columns,
-            gen_cfg.hpo.metric_config,
+            gen_cfg.hpo,
             seed,
+            match_prior=match_prior,
             workspace=output_dir / "synthcity_workspace",
         )
 
@@ -178,6 +188,8 @@ def run_generation(
         set_global_seed(replicate_seed)
         result = build_fn(replicate_seed)
         df, extra = result if isinstance(result, tuple) else (result, None)
+        if match_prior and dataset.target_column in df:
+            df = match_class_prior(df, dataset.target_column, train_prior, replicate_seed)
         df.to_csv(path, index=False)
         _write_released(name, df, overwrite=True, replicate_seed=replicate_seed)
         synthetic_datasets[name] = df

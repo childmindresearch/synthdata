@@ -13,6 +13,7 @@ import torch
 from tabpfgen import TabPFGen
 
 from synthdata.data import decode_label_encoded_columns, label_encode_non_numeric_columns
+from synthdata.generation.hpo import TrialScore, score_candidate
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -191,7 +192,7 @@ def build_tabpfgen_standard_objective(
     target_column: str,
     n_samples: int,
     sgld_step_cap: int,
-    eval_fn: Callable[[pd.DataFrame], float],
+    eval_fn: Callable[[pd.DataFrame], TrialScore],
 ):
     """Optuna objective searching TabPFGen's SGLD hyperparameters (standard variant)."""
     from tabpfn import TabPFNClassifier
@@ -223,8 +224,8 @@ def build_tabpfgen_standard_objective(
             syn[target_column] = target_values
         except (ValueError, RuntimeError) as exc:
             logger.warning("tabpfgen_standard trial %d failed: %s", trial.number, exc)
-            raise optuna.TrialPruned() from exc
-        return eval_fn(syn)
+            raise
+        return score_candidate(trial, eval_fn, syn)
 
     return objective
 
@@ -236,7 +237,7 @@ def build_tabpfgen_custom_objective(
     target_column: str,
     n_samples: int,
     sgld_step_cap: int,
-    eval_fn: Callable[[pd.DataFrame], float],
+    eval_fn: Callable[[pd.DataFrame], TrialScore],
     seed: int = 42,
 ):
     """Optuna objective searching TabPFGenSGLDLabels's SGLD hyperparameters."""
@@ -279,7 +280,7 @@ def build_tabpfgen_custom_objective(
             syn = pd.concat(parts).sample(frac=1, random_state=seed).reset_index(drop=True)
         except (ValueError, RuntimeError) as exc:
             logger.warning("tabpfgen_custom trial %d failed: %s", trial.number, exc)
-            raise optuna.TrialPruned() from exc
-        return eval_fn(syn)
+            raise
+        return score_candidate(trial, eval_fn, syn)
 
     return objective

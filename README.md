@@ -45,7 +45,7 @@ target,categorical,
 The four commands form an ordered pipeline:
 
 1. **Impute** missing feature values with MissForest (default), median/mode, TabImpute or RefiDiff. The imputer is fitted on train minus tuning for HPO and refitted on all of train for the final models; frequently missing columns get `<column>__missing` indicators, and synthetic values are blanked again where the synthetic indicator is 1 (`released/` next to the synthetic CSVs).
-2. **Generate** candidate synthetic datasets with configured SynthCity, TabPFN, and TabPFGen models; optional Optuna hyperparameter searches are persisted and resumable.
+2. **Generate** candidate synthetic datasets with configured SynthCity, TabPFN, and TabPFGen models; optional Optuna hyperparameter searches are persisted and resumable. Each search trial fits on train minus tuning and maximizes the macro-F1 of a fixed XGBoost trained on the synthetic rows and tested on the real tuning rows (TSTR, averaged over 3 seeds; macro AUPRC and the real-data ceiling are logged too). Trials that copy training rows, drop categories or classes, or produce out-of-range values fail lenient screens and are never picked. Every synthetic dataset is resampled to the real train class shares (`generation.match_class_prior`).
 3. **Evaluate** candidates for utility, privacy, and fairness. Evaluation can process models in parallel within configured resource limits and writes a ranked table, report, and diagnostics.
 4. **Plot** recorded data-quality, generation, HPO, and evaluation artifacts without rerunning earlier stages.
 

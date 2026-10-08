@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from synthdata.generation.pipeline import run_generation
@@ -16,6 +17,7 @@ def _configure_tabpfn_only(cfg):
     cfg.generation.tabpfn.enabled = True
     cfg.generation.tabpfn.variants = ["custom"]
     cfg.generation.tabpfn.data_variants = ["raw"]
+    cfg.generation.match_class_prior = False
 
 
 def _set_schema(dataset, *, target_kind):
@@ -106,3 +108,32 @@ def test_each_replicate_is_built_with_its_own_seed(make_config, make_dataset, mo
     assert result["ctgan__rep2"]["seed"].eq(cfg.seed + 2).all()
     output_dir = Path(cfg.generation.output_dir)
     assert (output_dir / "ctgan__rep1.csv").exists()
+
+
+def test_saved_synthetic_data_gets_the_train_class_shares(make_config, make_dataset, mocker):
+    cfg = make_config()
+    cfg.generation.tabpfn.enabled = False
+    cfg.generation.tabpfgen.enabled = False
+    cfg.generation.hpo.enabled = False
+    cfg.generation.synthcity.names = ["ctgan"]
+    dataset = make_dataset()
+    dataset.train_imputed_df = dataset.train_df
+    target = dataset.target_column
+    classes = sorted(dataset.train_df[target].unique())
+    # A generator that rebalances: equal rows per class.
+    balanced = pd.concat(
+        [
+            dataset.train_df[dataset.train_df[target] == c].sample(30, replace=True, random_state=0)
+            for c in classes
+        ]
+    )
+    mocker.patch("synthdata.generation.pipeline.sc.make_loader")
+    mocker.patch("synthdata.generation.pipeline.sc.fit_generate", return_value=balanced)
+
+    result = run_generation(cfg, dataset)
+
+    shares = result["ctgan"][target].value_counts(normalize=True)
+    expected = dataset.train_df[target].value_counts(normalize=True)
+    assert len(result["ctgan"]) == len(balanced)
+    for c in classes:
+        assert abs(shares[c] - expected[c]) < 1 / len(balanced) + 1e-9

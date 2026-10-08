@@ -1,11 +1,15 @@
 """Generic Optuna study management shared by all generation backends.
 
 Provides:
-- ``hpo_score``: the direction-aware composite objective used throughout the
-  hepatitis notebooks (orient every metric so higher = better, then average).
-- ``build_synthetic_eval_fn``: scores an arbitrary candidate synthetic DataFrame
-  via synthcity's ``Metrics.evaluate`` (used as the HPO objective for generators,
-  like TabPFGen, that don't go through synthcity's ``Benchmarks``).
+- ``build_hpo_eval_fn``: scores a candidate synthetic DataFrame on the tuning
+  split. The default objective is TSTR macro-F1 of a fixed XGBoost
+  (:mod:`synthdata.evaluation.tstr`); privacy is reported by evaluation, not
+  optimized. It also computes the sanity screens that Optuna treats as
+  constraints (``screen_violations``).
+- ``score_candidate``: records a candidate's screens and logged scores on its
+  Optuna trial and returns the objective value.
+- ``hpo_score``/``build_synthetic_eval_fn``: the older direction-aware
+  synthcity composite (``hpo.objective: synthcity_composite``).
 - ``create_study``/``run_study``: Optuna study creation with SQLite-backed
   persistence (resumable across runs, inspectable with optuna-dashboard).
 - ``BestParamsCache``: JSON-backed cache of best hyperparameters per model,
@@ -13,14 +17,18 @@ Provides:
   ``output/hepatitis/hpo_best_params.json`` from the notebooks.
 """
 
+import dataclasses
 import re
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 
+import numpy as np
 import optuna
 import pandas as pd
 
-from synthdata.config import HPOConfig
+from synthdata.config import HPOConfig, HPOConstraintsConfig
+from synthdata.evaluation.tstr import match_class_prior, tstr_scores
 from synthdata.utils import ensure_dir, get_logger, load_json, save_json
 
 logger = get_logger(__name__)
@@ -87,6 +95,238 @@ def build_synthetic_eval_fn(
     return eval_fn
 
 
+#: Constraint order stored on every trial; a value above 0 marks it infeasible.
+SCREENS = ("copies", "missing_classes", "category_coverage", "out_of_range")
+
+#: Categories rarer than this in train are not required in the synthetic data.
+MIN_CATEGORY_FREQUENCY = 0.01
+
+
+@dataclasses.dataclass
+class TrialScore:
+    """One candidate's objective value, constraint violations and logged scores."""
+
+    value: float
+    constraints: list = dataclasses.field(default_factory=lambda: [0.0] * len(SCREENS))
+    attrs: dict = dataclasses.field(default_factory=dict)
+
+
+def objective_direction(objective: str) -> str:
+    return "minimize" if objective == "synthcity_composite" else "maximize"
+
+
+def _comparable(series: pd.Series) -> pd.Series:
+    """Numbers as floats, everything else as strings, so 1, 1.0 and "1" agree."""
+    numeric = pd.to_numeric(series, errors="coerce")
+    if numeric.notna().sum() == series.notna().sum():
+        return numeric.astype(float)
+    return series.astype(str)
+
+
+def _row_hashes(df: pd.DataFrame, columns: list) -> pd.Series:
+    normalized = pd.DataFrame({c: _comparable(df[c]) for c in columns})
+    return pd.util.hash_pandas_object(normalized, index=False)
+
+
+def exact_match_rate(rows: pd.DataFrame, reference: pd.DataFrame) -> float:
+    """Share of ``rows`` that equal some ``reference`` row on every shared column."""
+    columns = [c for c in reference.columns if c in rows.columns]
+    if rows.empty:
+        return 0.0
+    return float(_row_hashes(rows, columns).isin(set(_row_hashes(reference, columns))).mean())
+
+
+def out_of_range_share(rows: pd.DataFrame, reference: pd.DataFrame, columns: list) -> float:
+    """Share of numeric values in ``rows`` outside ``reference``'s [min, max] per column."""
+    outside, total = 0, 0
+    for column in columns:
+        values = pd.to_numeric(rows[column], errors="coerce").dropna()
+        low, high = reference[column].min(), reference[column].max()
+        outside += int(((values < low) | (values > high)).sum())
+        total += len(values)
+    return outside / total if total else 0.0
+
+
+def screen_violations(
+    synthetic_df: pd.DataFrame,
+    search_train_df: pd.DataFrame,
+    tuning_df: pd.DataFrame,
+    target_column: str,
+    categorical_columns: list,
+    constraints: HPOConstraintsConfig,
+) -> dict:
+    """Lenient sanity screens; each value is a violation size (<= 0 is feasible).
+
+    - ``copies``: exact-match rate of synthetic rows against search-train,
+      minus that of the real tuning rows, minus ``copy_margin``. Calibrating
+      on held-out real rows keeps legitimately repeated clinical rows from
+      failing the screen.
+    - ``missing_classes``: number of real target classes the synthetic data lacks.
+    - ``category_coverage``: ``min_category_coverage`` minus the lowest
+      coverage of train categories (with at least 1% frequency) over the
+      categorical columns.
+    - ``out_of_range``: share of numeric values outside the search-train
+      range, minus that share for the real tuning rows (fresh real rows fall
+      outside too, about 2/n per column), minus ``max_out_of_range``.
+
+    A screen turned off in the config reports -1.
+    """
+    violations = dict.fromkeys(SCREENS, -1.0)
+
+    if constraints.copy_margin is not None:
+        baseline = exact_match_rate(tuning_df, search_train_df)
+        violations["copies"] = (
+            exact_match_rate(synthetic_df, search_train_df) - baseline - constraints.copy_margin
+        )
+
+    if constraints.min_category_coverage is not None:
+        real_classes = set(_comparable(search_train_df[target_column]).dropna())
+        if target_column in synthetic_df:
+            synthetic_classes = set(_comparable(synthetic_df[target_column]).dropna())
+        else:
+            synthetic_classes = set()
+        violations["missing_classes"] = float(len(real_classes - synthetic_classes)) or -1.0
+        coverages = []
+        for column in categorical_columns:
+            if column not in synthetic_df or column not in search_train_df:
+                continue
+            shares = _comparable(search_train_df[column]).value_counts(normalize=True)
+            required = set(shares[shares >= MIN_CATEGORY_FREQUENCY].index)
+            if required:
+                present = set(_comparable(synthetic_df[column]).dropna())
+                coverages.append(len(required & present) / len(required))
+        if coverages:
+            violations["category_coverage"] = constraints.min_category_coverage - min(coverages)
+
+    if constraints.max_out_of_range is not None:
+        numeric = [
+            c
+            for c in search_train_df.columns
+            if c != target_column
+            and c not in categorical_columns
+            and c in synthetic_df
+            and pd.api.types.is_numeric_dtype(search_train_df[c])
+        ]
+        if numeric:
+            violations["out_of_range"] = (
+                out_of_range_share(synthetic_df, search_train_df, numeric)
+                - out_of_range_share(tuning_df, search_train_df, numeric)
+                - constraints.max_out_of_range
+            )
+
+    return violations
+
+
+def build_hpo_eval_fn(
+    search_train_df: pd.DataFrame,
+    tuning_df: pd.DataFrame,
+    target_column: str,
+    nominal_columns: list,
+    categorical_columns: list,
+    target_is_categorical: bool,
+    sensitive_features: list,
+    hpo_cfg: HPOConfig,
+    seed: int,
+    match_prior: bool = True,
+    workspace: str | Path | None = None,
+) -> Callable[[pd.DataFrame], TrialScore]:
+    """Build a ``synthetic_df -> TrialScore`` function scored on the tuning split.
+
+    Candidates are fitted on ``search_train_df`` and never see the tuning or
+    test rows. Before scoring, a candidate with a categorical target is
+    resampled to the search-train class shares (``match_prior``), the same
+    rule generation applies to every released dataset. The TSTR scores of the
+    same classifier trained on the real search-train rows (TRTR) are the
+    ceiling, logged on every trial.
+    """
+    tstr = hpo_cfg.objective.startswith("tstr_")
+    if tstr and not target_is_categorical:
+        raise ValueError(
+            f"hpo.objective {hpo_cfg.objective!r} needs a categorical target; use "
+            "synthcity_composite for a numeric target"
+        )
+    prior = search_train_df[target_column].value_counts(normalize=True)
+    classes = sorted(prior.index, key=str)
+    seeds = [seed + i for i in range(hpo_cfg.tstr_seeds)]
+
+    def _tstr(fit_df):
+        return tstr_scores(fit_df, tuning_df, target_column, nominal_columns, classes, seeds)
+
+    trtr = None
+    if target_is_categorical:
+        trtr = _tstr(search_train_df)
+        logger.info(
+            "HPO ceiling (fixed XGBoost trained on real search-train rows, scored on tuning): "
+            "macro-F1=%.4f macro-AUPRC=%.4f",
+            trtr.macro_f1,
+            trtr.macro_auprc,
+        )
+    composite_fn = (
+        None
+        if tstr
+        else build_synthetic_eval_fn(
+            search_train_df,
+            tuning_df,
+            target_column,
+            sensitive_features,
+            hpo_cfg.metric_config,
+            seed,
+            workspace=workspace,
+        )
+    )
+
+    def eval_fn(synthetic_df: pd.DataFrame) -> TrialScore:
+        # Class presence is screened before resampling, which can't create a class.
+        violations = screen_violations(
+            synthetic_df,
+            search_train_df,
+            tuning_df,
+            target_column,
+            categorical_columns,
+            hpo_cfg.constraints,
+        )
+        if not target_is_categorical:
+            violations["missing_classes"] = -1.0
+        attrs = {"screens": violations}
+        if target_is_categorical:
+            if match_prior:
+                synthetic_df = match_class_prior(synthetic_df, target_column, prior, seed)
+            scores = _tstr(synthetic_df)
+            attrs |= {
+                "tstr_macro_f1": scores.macro_f1,
+                "tstr_macro_auprc": scores.macro_auprc,
+                "tstr_balanced_accuracy": scores.balanced_accuracy,
+                "tstr_per_class_f1": scores.per_class_f1,
+                "trtr_macro_f1": trtr.macro_f1,
+                "trtr_macro_auprc": trtr.macro_auprc,
+            }
+        value = attrs[hpo_cfg.objective] if tstr else composite_fn(synthetic_df)
+        if not np.isfinite(value):
+            raise ValueError(f"HPO objective {hpo_cfg.objective} is not finite: {value}")
+        return TrialScore(value, [violations[name] for name in SCREENS], attrs)
+
+    return eval_fn
+
+
+def score_candidate(
+    trial: optuna.Trial, eval_fn: Callable[[pd.DataFrame], TrialScore], synthetic_df
+) -> float:
+    """Score one candidate, store its screens and logged scores on ``trial``."""
+    score = eval_fn(synthetic_df)
+    trial.set_user_attr("constraints", list(score.constraints))
+    for key, value in score.attrs.items():
+        trial.set_user_attr(key, value)
+    failed = [name for name, v in zip(SCREENS, score.constraints, strict=True) if v > 0]
+    if failed:
+        logger.info("trial %d is infeasible: failed screens %s", trial.number, failed)
+    return score.value
+
+
+def _trial_constraints(trial: optuna.trial.FrozenTrial) -> list:
+    # Trials stopped before scoring have no screens; they are never "best".
+    return trial.user_attrs.get("constraints", [0.0] * len(SCREENS))
+
+
 def default_storage_url(output_dir: str | Path) -> str:
     db_path = Path(output_dir) / "optuna_studies.db"
     ensure_dir(db_path.parent)
@@ -101,6 +341,7 @@ def cleanup_hpo_generator_checkpoints(
     workspace: str | Path,
     study: optuna.Study,
     plugin_name: str,
+    best_trial_number: int | None = None,
 ) -> int:
     """Compact completed synthcity HPO generator caches.
 
@@ -164,7 +405,9 @@ def cleanup_hpo_generator_checkpoints(
         )
         return 0
 
-    keep_trial_numbers = {study.best_trial.number, max(checkpoints_by_trial)}
+    if best_trial_number is None:
+        best_trial_number = study.best_trial.number
+    keep_trial_numbers = {best_trial_number, max(checkpoints_by_trial)}
     to_delete = [
         path
         for trial_number, paths in checkpoints_by_trial.items()
@@ -215,10 +458,16 @@ def create_study(
     study_name: str, hpo_cfg: HPOConfig, output_dir: str | Path, seed: int
 ) -> optuna.Study:
     storage = hpo_cfg.storage or default_storage_url(output_dir)
+    with warnings.catch_warnings():
+        # constraints_func is marked experimental but stable since Optuna 3.0.
+        warnings.simplefilter("ignore", optuna.exceptions.ExperimentalWarning)
+        sampler = optuna.samplers.TPESampler(seed=seed, constraints_func=_trial_constraints)
     return optuna.create_study(
         study_name=study_name,
-        direction="minimize",
-        sampler=optuna.samplers.TPESampler(seed=seed),
+        direction=objective_direction(hpo_cfg.objective),
+        # Constrained TPE (Watanabe & Hutter, 2023): infeasible trials keep
+        # their true value and teach the sampler where screens fail.
+        sampler=sampler,
         storage=storage,
         load_if_exists=True,
     )
@@ -264,6 +513,8 @@ def run_study(
             objective_fn,
             n_trials=n_remaining,
             timeout=hpo_cfg.timeout_seconds,
+            # A crashed fit or a non-finite score marks the trial failed.
+            catch=(ValueError, RuntimeError),
             show_progress_bar=False,
         )
 
@@ -271,12 +522,25 @@ def run_study(
     if not completed:
         logger.warning("[%s] all trials pruned/failed; falling back to defaults", study_name)
         return {}
+    feasible = [t for t in completed if all(v <= 0 for v in _trial_constraints(t))]
+    if not feasible:
+        logger.warning(
+            "[%s] no trial passed the HPO screens (%d completed); falling back to defaults",
+            study_name,
+            len(completed),
+        )
+        return {}
 
-    best = {k: v for k, v in study.best_params.items() if k not in drop_keys}
+    pick = max if study.direction == optuna.study.StudyDirection.MAXIMIZE else min
+    best_trial = pick(feasible, key=lambda t: t.value)
+    best = {k: v for k, v in best_trial.params.items() if k not in drop_keys}
     logger.info(
-        "[%s] best score=%.4f (n_trials=%d) params=%s",
+        "[%s] best %s=%.4f (trial %d; %d feasible of %d completed) params=%s",
         study_name,
-        study.best_value,
+        hpo_cfg.objective,
+        best_trial.value,
+        best_trial.number,
+        len(feasible),
         len(completed),
         best,
     )
@@ -285,6 +549,7 @@ def run_study(
             checkpoint_workspace,
             study,
             checkpoint_plugin,
+            best_trial_number=best_trial.number,
         )
     return best
 
