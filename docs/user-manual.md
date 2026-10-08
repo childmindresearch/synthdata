@@ -374,7 +374,7 @@ How to interpret it:
 Outputs are organized by dataset version and experiment:
 
 ```
-data/<name>/data_v_<version>/                  splits, imputed data, split_report.csv
+data/<name>/data_v_<version>/                               splits, imputed data, split_report.csv
 output/<name>/synthetic_data/data_v_<version>/exp_v_<id>/   synthetic data, HPO
 output/<name>/evaluation/data_v_<version>/exp_v_<id>/       metrics, report.md
 output/<name>/plots/data_v_<version>/exp_v_<id>/            figures
