@@ -269,9 +269,17 @@ Each model's search stops at its trial count or its time limit, whichever comes 
 
 A good way to set budgets for a new dataset:
 
-1. Time one trial per model at your data's size (one fit on search-train, then generation and scoring).
-2. Choose trials: about 10 plus 10 per hyperparameter the model tunes, capped by how long you can wait.
-3. Set the timeout to trials × time per trial × 1.5, so one slow model cannot eat into another's budget.
+1. Time a few trials per model at your data's size on the machine you will run on:
+
+   ```bash
+   uv run python -m scripts.profile_hpo --config configs/<your_config>.yaml --impute
+   ```
+
+   This runs two real HPO trials per synthcity model in your config (fit on search-train, generate, score on tuning) with training fixed at 50 epochs (PATE-GAN 10 iterations, DDPM 100 epochs), and nothing else. Re-running the same command resumes. It writes timings only, no data rows, to `output/<name>/profile/`. Its `summary.csv` gives, per model, the time per epoch (or per tree for ARF), the peak GPU memory, and `default_fit_h_est`, the time the untuned default model will take at the library's full length (CTGAN trains 2000 epochs by default).
+2. Time per trial: time per epoch × the middle of the model's `hpo.epoch_ranges` (for CTGAN 25-150, 87.5 epochs).
+3. Choose trials: about 10 plus 10 per hyperparameter the model tunes, capped by how long you can wait.
+4. Set the timeout to trials × time per trial × 1.5, so one slow model cannot eat into another's budget.
+5. Check the whole run fits your time: the timeouts, plus `default_fit_h_est` for every model, plus one final fit per tuned model.
 
 [`config_sim.yaml`](../configs/config_sim.yaml) shows the result for a 12,600 by 682 search-train table on one GPU: about 30 hours per GAN or VAE and roughly 3.5 to 5 days in total. The timing table is in [verification.md, HPO budgets](verification.md#hpo-budgets). For a quick look at a new dataset, turn HPO off or use a handful of trials.
 
