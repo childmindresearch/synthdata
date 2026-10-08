@@ -258,7 +258,7 @@ def run_generation(
                 ),
             )
 
-            if gen_cfg.hpo.enabled:
+            if gen_cfg.hpo.enabled and hpo_mod.model_budget(gen_cfg.hpo, name)[0] > 0:
                 if not best_params.has("synthcity", name):
                     objective = sc.build_synthcity_objective(
                         name,
@@ -360,7 +360,10 @@ def run_generation(
                 ),
             )
 
-            if gen_cfg.hpo.enabled:
+            if (
+                gen_cfg.hpo.enabled
+                and hpo_mod.model_budget(gen_cfg.hpo, "tabpfgen_standard")[0] > 0
+            ):
                 if not best_params.has("tabpfgen", "tabpfgen_standard"):
                     objective = tpfgen.build_tabpfgen_standard_objective(
                         dataset.search_train_imputed_df,
@@ -368,7 +371,9 @@ def run_generation(
                         dataset.categorical_columns,
                         dataset.target_column,
                         n_samples,
-                        gen_cfg.hpo.sgld_step_cap,
+                        hpo_mod.epoch_range(
+                            gen_cfg.hpo, "tabpfgen_standard", tpfgen.SGLD_STEP_RANGE
+                        ),
                         eval_fn,
                     )
                     params = hpo_mod.run_study(
@@ -377,7 +382,6 @@ def run_generation(
                         gen_cfg.hpo,
                         output_dir,
                         seed,
-                        drop_keys=(),
                     )
                     best_params.set("tabpfgen", "tabpfgen_standard", params)
                 params = best_params.get("tabpfgen", "tabpfgen_standard")
@@ -409,7 +413,7 @@ def run_generation(
                 ),
             )
 
-            if gen_cfg.hpo.enabled:
+            if gen_cfg.hpo.enabled and hpo_mod.model_budget(gen_cfg.hpo, "tabpfgen_custom")[0] > 0:
                 if not best_params.has("tabpfgen", "tabpfgen_custom"):
                     objective = tpfgen.build_tabpfgen_custom_objective(
                         dataset.search_train_imputed_df,
@@ -417,7 +421,7 @@ def run_generation(
                         dataset.categorical_columns,
                         dataset.target_column,
                         n_samples,
-                        gen_cfg.hpo.sgld_step_cap,
+                        hpo_mod.epoch_range(gen_cfg.hpo, "tabpfgen_custom", tpfgen.SGLD_STEP_RANGE),
                         eval_fn,
                         seed=seed,
                     )
@@ -427,7 +431,6 @@ def run_generation(
                         gen_cfg.hpo,
                         output_dir,
                         seed,
-                        drop_keys=(),
                     )
                     best_params.set("tabpfgen", "tabpfgen_custom", params)
                 params = best_params.get("tabpfgen", "tabpfgen_custom")

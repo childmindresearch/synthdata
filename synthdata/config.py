@@ -400,14 +400,27 @@ class HPOConfig:
     #: XGBoost seeds averaged per TSTR score.
     tstr_seeds: int = 3
     constraints: HPOConstraintsConfig = dataclasses.field(default_factory=HPOConstraintsConfig)
+    #: Trials and wall-clock seconds per study, for models not listed in the
+    #: per-model budgets below.
     n_trials: int = 10
     timeout_seconds: int | None = 300
-    #: Hard cap on generator training iterations during search (speed/quality tradeoff).
-    n_iter_cap: int = 300
-    #: Per-model overrides of n_iter_cap (e.g. pategan trains much slower per iteration).
-    model_iter_caps: dict = dataclasses.field(default_factory=lambda: {"pategan": 50})
-    #: Cap on TabPFGen custom variant's SGLD step count during search.
-    sgld_step_cap: int = 500
+    #: Trials per model (keys: synthcity plugin names, ``tabpfgen_standard``,
+    #: ``tabpfgen_custom``). 0 skips the search; the model keeps its defaults.
+    n_trials_per_model: dict = dataclasses.field(default_factory=dict)
+    #: Seconds per model study; set from a profiling run as trials x measured
+    #: trial time x 1.5, so one slow model can't use up another's budget.
+    timeout_seconds_per_model: dict = dataclasses.field(default_factory=dict)
+    #: Training length searched per model as ``[low, high, step]`` (synthcity
+    #: ``n_iter`` epochs, TabPFGen SGLD steps). Unlisted models use their
+    #: library's own range (``EPOCH_RANGE_DEFAULTS`` where the library has none).
+    epoch_ranges: dict = dataclasses.field(default_factory=dict)
+    #: "median": Optuna's MedianPruner stops a trial whose intermediate score
+    #: falls below the median of earlier trials at the same step. null = off.
+    pruner: str | None = "median"
+    #: Trials that finish before pruning starts, and intermediate scores a
+    #: trial reports before it can be pruned (1: from its first check on).
+    pruner_startup_trials: int = 5
+    pruner_warmup_steps: int = 1
     #: Metrics of the "synthcity_composite" objective, oriented to "higher is
     #: better" and averaged. Unused by the TSTR objectives.
     metric_config: dict = dataclasses.field(
@@ -775,6 +788,8 @@ def _from_dict(cls, data: dict | None):
     for key, value in data.items():
         if cls is DataConfig and key in _REMOVED_DATA_KEYS:
             raise ValueError(f"data.{key} was replaced by {_REMOVED_DATA_KEYS[key]}")
+        if cls is HPOConfig and key in _REMOVED_HPO_KEYS:
+            raise ValueError(f"generation.hpo.{key} was replaced by {_REMOVED_HPO_KEYS[key]}")
         if key not in field_types:
             raise ValueError(
                 f"Unknown config key '{key}' for {cls.__name__}. Valid keys: {sorted(field_types)}"
@@ -840,6 +855,12 @@ _REMOVED_DATA_KEYS = {
     "stratify": "data.stratify_columns (an empty list turns stratification off)",
 }
 
+#: Search-time training caps removed in favour of searched training length.
+_REMOVED_HPO_KEYS = {
+    key: "generation.hpo.epoch_ranges (training length searched per model) and generation.hpo.pruner"
+    for key in ("n_iter_cap", "model_iter_caps", "sgld_step_cap")
+}
+
 
 def split_fold_count(fractions: tuple[float, ...]) -> int:
     """Smallest k <= 20 for which every fraction is a whole number of 1/k folds."""
@@ -884,6 +905,7 @@ def _validate_split(cfg: Config) -> None:
 
 
 HPO_OBJECTIVES = ("tstr_macro_f1", "tstr_macro_auprc", "synthcity_composite")
+HPO_PRUNERS = ("median", None)
 
 
 def _validate_hpo(hpo: HPOConfig) -> None:
@@ -899,6 +921,27 @@ def _validate_hpo(hpo: HPOConfig) -> None:
         raise ValueError(
             f"generation.hpo.tstr_seeds must be a positive integer, got {hpo.tstr_seeds!r}"
         )
+    if hpo.pruner not in HPO_PRUNERS:
+        raise ValueError(
+            f"generation.hpo.pruner must be one of {list(HPO_PRUNERS)}, got {hpo.pruner!r}"
+        )
+    for key in ("n_trials_per_model", "timeout_seconds_per_model"):
+        for model, value in getattr(hpo, key).items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"generation.hpo.{key}.{model} must be a non-negative integer, got {value!r}"
+                )
+    for model, bounds in hpo.epoch_ranges.items():
+        if (
+            not isinstance(bounds, list | tuple)
+            or len(bounds) != 3
+            or not all(isinstance(b, int) and b > 0 for b in bounds)
+            or bounds[0] > bounds[1]
+        ):
+            raise ValueError(
+                f"generation.hpo.epoch_ranges.{model} must be [low, high, step] with "
+                f"0 < low <= high, got {bounds!r}"
+            )
     for field in dataclasses.fields(HPOConstraintsConfig):
         value = getattr(hpo.constraints, field.name)
         if value is not None and not 0 <= value <= 1:

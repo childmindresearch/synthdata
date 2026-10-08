@@ -62,7 +62,7 @@ class TestFromDict:
         assert cfg.generation.hpo.n_trials == 3
         assert cfg.generation.n_samples == 50
         # HPOConfig's other defaults are preserved.
-        assert cfg.generation.hpo.n_iter_cap == 300
+        assert cfg.generation.hpo.pruner == "median"
 
     def test_unknown_top_level_key_raises(self):
         with pytest.raises(ValueError, match="Unknown config key"):

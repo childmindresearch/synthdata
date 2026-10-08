@@ -127,9 +127,27 @@ generation:
     enabled: true
     n_trials: 50
     timeout_seconds: 14400
-    n_iter_cap: 100
-    model_iter_caps: { pategan: 30 }
-    sgld_step_cap: 2000
+    # Per-model budgets from a GPU profiling run on sim 1.2 (search-train
+    # 12600 rows x 682 columns, RTX 5070 Ti, 2026-10-08). One synthcity epoch
+    # takes about 19-21 s at this width (26 s per PATE-GAN iteration);
+    # TabPFGen takes about 35 s per 1000 SGLD steps. Trials: about 10 random
+    # start-up trials plus 10 per tuned dimension, capped for run time.
+    # Timeout = trials x mean trial time x 1.5.
+    n_trials_per_model:
+      { ctgan: 40, tvae: 40, adsgan: 40, rtvae: 40, pategan: 40,
+        tabpfgen_standard: 25, tabpfgen_custom: 25 }
+    timeout_seconds_per_model:
+      { ctgan: 108000, tvae: 103000, adsgan: 100000, rtvae: 111000, pategan: 28000,
+        tabpfgen_standard: 1400, tabpfgen_custom: 1200 }
+    # Training length is searched, [low, high, step]. The libraries' ranges
+    # (100-1000 epochs; PATE-GAN 1-500) would take 3+ hours per trial here.
+    epoch_ranges:
+      { ctgan: [25, 150, 25], tvae: [25, 150, 25], adsgan: [25, 150, 25],
+        rtvae: [25, 150, 25], pategan: [5, 30, 5] }
+    # Median pruning on synthcity's early-stopping metric (CTGAN, ADS-GAN).
+    pruner: median
+    pruner_startup_trials: 5
+    pruner_warmup_steps: 1
     # Objective scored on the tuning split: tstr_macro_f1 (fixed XGBoost
     # trained on synthetic, tested on real), tstr_macro_auprc, or the older
     # synthcity_composite (uses metric_config below, privacy included).

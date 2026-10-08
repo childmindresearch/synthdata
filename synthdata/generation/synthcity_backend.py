@@ -2,13 +2,14 @@
 
 import inspect
 from collections.abc import Callable
+from pathlib import Path
 
 import optuna
 import pandas as pd
 import torch
 
 from synthdata.config import HPOConfig
-from synthdata.generation.hpo import TrialScore, score_candidate
+from synthdata.generation.hpo import TrialScore, epoch_range, score_candidate
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -26,21 +27,76 @@ HPO_EXCLUDED_CHOICES: dict[str, dict[str, frozenset]] = {
 }
 
 
-class _TrialWithoutChoices:
-    """Optuna trial proxy that drops excluded categorical choices.
+#: Searched epochs for plugins that take ``n_iter`` but leave it out of their
+#: own search space: ADS-GAN gets CTGAN's range (the same conditional GAN
+#: family); its default of 10000 epochs with early stopping is far too long
+#: for a search.
+EPOCH_RANGE_DEFAULTS: dict[str, tuple[int, int, int]] = {"adsgan": (100, 1000, 100)}
+
+
+def _pruning_patience_metric_class():
+    from synthcity.metrics.weighted_metrics import WeightedMetrics
+
+    class PruningPatienceMetric(WeightedMetrics):
+        """synthcity's default GAN early-stopping metric, reported to Optuna.
+
+        CTGAN and ADS-GAN evaluate their ``patience_metric`` (detection by an
+        MLP on a held-back slice of the training rows, lower is better) every
+        ``n_iter_print`` epochs to stop early. This subclass keeps that metric
+        and that early stopping, reports the negated score as the trial's
+        intermediate value and raises ``TrialPruned`` when Optuna's pruner
+        says so. It is the only per-epoch hook synthcity's GANs offer; the
+        VAEs and PATE-GAN have none and are not pruned.
+        """
+
+        def __init__(self, trial: optuna.Trial, workspace=None):
+            super().__init__(
+                metrics=[("detection", "detection_mlp")],
+                weights=[1],
+                **({"workspace": Path(workspace)} if workspace is not None else {}),
+            )
+            self._trial = trial
+            self._step = 0
+
+        def evaluate(self, X_gt, X_syn):
+            score = super().evaluate(X_gt, X_syn)
+            self._step += 1
+            self._trial.report(-score if self.direction() == "minimize" else score, self._step)
+            if self._trial.should_prune():
+                raise optuna.TrialPruned(f"pruned at check {self._step}")
+            return score
+
+    return PruningPatienceMetric
+
+
+class _SearchSpaceTrial:
+    """Optuna trial proxy that adjusts synthcity's own search space.
 
     synthcity's ``sample_hyperparameters_optuna`` reads the plugin's own search
-    space and calls ``trial.suggest_categorical`` per parameter; filtering here
-    keeps the rest of that space as synthcity defines it.
+    space and calls ``trial.suggest_*`` per parameter. This proxy drops
+    excluded categorical choices and replaces the ``n_iter`` range with
+    ``epochs`` when given, and keeps the rest of the space as synthcity
+    defines it.
     """
 
-    def __init__(self, trial: optuna.Trial, excluded: dict[str, frozenset]):
+    def __init__(
+        self,
+        trial: optuna.Trial,
+        excluded: dict[str, frozenset] | None = None,
+        epochs: tuple[int, int, int] | None = None,
+    ):
         self._trial = trial
-        self._excluded = excluded
+        self._excluded = excluded or {}
+        self._epochs = epochs
 
     def suggest_categorical(self, name, choices):
         drop = self._excluded.get(name, frozenset())
         return self._trial.suggest_categorical(name, [c for c in choices if c not in drop])
+
+    def suggest_int(self, name, low, high, step=1, log=False):
+        if name == "n_iter" and self._epochs is not None:
+            low, high, step = self._epochs
+        return self._trial.suggest_int(name, low, high, step=step, log=log)
 
     def __getattr__(self, attr):
         return getattr(self._trial, attr)
@@ -92,8 +148,6 @@ def fit_generate(
     workspace: str | None = None,
     device: str | None = None,
 ) -> pd.DataFrame:
-    from pathlib import Path
-
     from synthcity.plugins import Plugins
 
     plugin_kwargs = dict(params)
@@ -123,8 +177,8 @@ def build_synthcity_objective(
 ):
     """Build an Optuna objective for a synthcity plugin's native hyperparameter space.
 
-    Each trial samples from the plugin's own ``sample_hyperparameters_optuna``,
-    caps ``n_iter`` for speed (only if the plugin exposes it), forces CPU for
+    Each trial samples from the plugin's own ``sample_hyperparameters_optuna``
+    (training length included, see ``hpo.epoch_ranges``), forces CPU for
     MPS (which lacks the float64 support synthcity's metrics need internally)
     but otherwise uses ``device``, fits the plugin on ``train_loader`` and
     scores ``n_samples`` generated rows with ``eval_fn``.
@@ -134,19 +188,24 @@ def build_synthcity_objective(
     plugin_cls = get_plugin_class(name)
     accepts_device = plugin_accepts(name, "device")
     accepts_iter = plugin_accepts(name, "n_iter")
-    iter_cap = hpo_cfg.model_iter_caps.get(name, hpo_cfg.n_iter_cap)
+    accepts_patience_metric = plugin_accepts(name, "patience_metric")
+    native_iter = any(d.name == "n_iter" for d in plugin_cls.hyperparameter_space())
+    default_range = None if native_iter else EPOCH_RANGE_DEFAULTS.get(name)
+    epochs = epoch_range(hpo_cfg, name, default_range) if accepts_iter else None
     trial_device = "cpu" if device == "mps" else device
 
     def objective(trial: optuna.Trial) -> float:
-        excluded = HPO_EXCLUDED_CHOICES.get(name)
-        params = plugin_cls.sample_hyperparameters_optuna(
-            _TrialWithoutChoices(trial, excluded) if excluded else trial
-        )
-        if accepts_iter:
-            params["n_iter"] = min(params.get("n_iter", iter_cap), iter_cap)
+        # Training length is searched, not capped: the plugin's own n_iter
+        # range unless hpo.epoch_ranges (or EPOCH_RANGE_DEFAULTS) sets one.
+        proxy = _SearchSpaceTrial(trial, HPO_EXCLUDED_CHOICES.get(name), epochs)
+        params = plugin_cls.sample_hyperparameters_optuna(proxy)
+        if epochs is not None and "n_iter" not in params:
+            params["n_iter"] = proxy.suggest_int("n_iter", *epochs)
         params["random_state"] = seed
         if accepts_device:
             params["device"] = torch.device(trial_device)
+        if accepts_patience_metric and hpo_cfg.pruner:
+            params["patience_metric"] = _pruning_patience_metric_class()(trial, workspace)
 
         # A crash propagates and run_study marks the trial failed.
         synthetic = fit_generate(name, params, train_loader, n_samples, seed, workspace=workspace)

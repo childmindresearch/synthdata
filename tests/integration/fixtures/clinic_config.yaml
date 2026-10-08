@@ -83,8 +83,8 @@ generation:
     enabled: true
     n_trials: 2
     timeout_seconds: 300
-    n_iter_cap: 20
-    model_iter_caps: {}
+    # Short training so the fixture stays fast (libraries search 100-1000 epochs).
+    epoch_ranges: { ctgan: [10, 20, 10] }
     # Objective scored on the tuning split: tstr_macro_f1 (fixed XGBoost
     # trained on synthetic, tested on real), tstr_macro_auprc, or the older
     # synthcity_composite (uses metric_config below, privacy included).

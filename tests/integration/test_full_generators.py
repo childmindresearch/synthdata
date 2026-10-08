@@ -47,9 +47,9 @@ OVERRIDES = {
         },
         "hpo": {
             "n_trials": 3,
-            "n_iter_cap": 50,
-            "model_iter_caps": {"pategan": 5},
-            "sgld_step_cap": 200,
+            "epoch_ranges": {name: [10, 50, 10] for name in ("ctgan", "tvae", "adsgan", "rtvae")}
+            | {"pategan": [1, 5, 1], "tabpfgen_standard": [100, 200, 100]}
+            | {"tabpfgen_custom": [100, 200, 100]},
             "final_n_iter_override": 50,
         },
     },

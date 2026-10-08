@@ -211,3 +211,69 @@ def test_crashed_trials_are_failed_and_infeasible_studies_fall_back(tmp_path):
     study = optuna.load_study(study_name="hpo_y", storage=default_storage_url(tmp_path))
     assert study.trials[0].state == optuna.trial.TrialState.FAIL
     assert best == {}
+
+
+def test_per_model_budget_and_zero_trials_skip(tmp_path):
+    from synthdata.generation.hpo import model_budget
+
+    cfg = HPOConfig(
+        n_trials=5,
+        timeout_seconds=100,
+        n_trials_per_model={"ctgan": 2, "tvae": 0},
+        timeout_seconds_per_model={"ctgan": 7},
+    )
+    assert model_budget(cfg, "ctgan") == (2, 7)
+    assert model_budget(cfg, "rtvae") == (5, 100)
+
+    calls = []
+
+    def objective(trial):
+        calls.append(trial.number)
+        return trial.suggest_float("p", 0, 1)
+
+    assert run_study("hpo_tvae", objective, cfg, tmp_path, 0) == {}
+    assert calls == []
+    run_study("hpo_ctgan", objective, cfg, tmp_path, 0)
+    assert calls == [0, 1]
+
+
+def test_median_pruner_stops_weak_trials_and_they_count_towards_the_budget(tmp_path):
+    cfg = HPOConfig(
+        n_trials=8, timeout_seconds=None, pruner_startup_trials=2, pruner_warmup_steps=0
+    )
+
+    def objective(trial):
+        x = trial.suggest_float("p", 0, 1)
+        # Trials 0-1 learn well; later ones report a flat, lower curve.
+        level = 1.0 if trial.number < 2 else 0.1
+        for step in range(3):
+            trial.report(level * (step + 1), step)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+        return level + x * 0
+
+    run_study("hpo_p", objective, cfg, tmp_path, 0)
+    study = optuna.load_study(study_name="hpo_p", storage=default_storage_url(tmp_path))
+    states = [t.state for t in study.trials]
+    assert states.count(optuna.trial.TrialState.PRUNED) == 6
+    # Resuming does not rerun pruned trials: the budget is already used.
+    run_study("hpo_p", objective, cfg, tmp_path, 0)
+    assert (
+        len(optuna.load_study(study_name="hpo_p", storage=default_storage_url(tmp_path)).trials)
+        == 8
+    )
+
+
+def test_pruner_off_and_removed_cap_keys():
+    from synthdata.config import _from_dict, _validate_hpo
+    from synthdata.generation.hpo import make_pruner
+
+    assert isinstance(make_pruner(HPOConfig(pruner=None)), optuna.pruners.NopPruner)
+    with pytest.raises(ValueError, match="pruner"):
+        _validate_hpo(HPOConfig(pruner="hyperband"))
+    with pytest.raises(ValueError, match="epoch_ranges"):
+        _validate_hpo(HPOConfig(epoch_ranges={"ctgan": [100, 10, 10]}))
+    with pytest.raises(ValueError, match="n_trials_per_model"):
+        _validate_hpo(HPOConfig(n_trials_per_model={"ctgan": -1}))
+    with pytest.raises(ValueError, match="epoch_ranges"):
+        _from_dict(HPOConfig, {"n_iter_cap": 100})
