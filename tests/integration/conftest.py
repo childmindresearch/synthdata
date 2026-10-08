@@ -43,7 +43,7 @@ def _deep_merge(base: dict, overrides: dict) -> dict:
 def render_config(root: Path, overrides: dict | None = None, data_path: Path | None = None) -> Path:
     """Write a runnable config for ``root`` and return its path."""
     text = CONFIG_TEMPLATE.read_text()
-    text = text.replace("{root}", str(root)).replace("{fixtures}", str(FIXTURES))
+    text = text.replace("{root}", root.as_posix()).replace("{fixtures}", FIXTURES.as_posix())
     raw = yaml.safe_load(text)
     if data_path is not None:
         raw["data"]["path"] = str(data_path)

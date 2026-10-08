@@ -7,12 +7,18 @@ import pandas as pd
 
 from synthdata.config import Config
 from synthdata.plotting import save_matplotlib_figure, save_plotly_figure
-from synthdata.utils import get_logger
+from synthdata.utils import get_logger, split_replicate_name
 
 logger = get_logger(__name__)
 
 
+def _is_hpo(name: str) -> bool:
+    return split_replicate_name(name)[0].endswith("_hpo")
+
+
 def _base_model(name: str) -> str:
+    """Generator a row belongs to: ``"ctgan_hpo__rep2"`` -> ``"ctgan"``."""
+    name = split_replicate_name(name)[0]
     return name[: -len("_hpo")] if name.endswith("_hpo") else name
 
 
@@ -33,11 +39,13 @@ def plot_rank_tradeoff(
 
     models = list(combined.index)
     base_models = sorted({_base_model(model) for model in models})
-    palette = dict(zip(base_models, plt.cm.tab20.colors[: len(base_models)], strict=True))
+    # tab20 has 20 colors; reuse them rather than fail when a run has more generators.
+    colors = plt.cm.tab20.colors
+    palette = {base: colors[i % len(colors)] for i, base in enumerate(base_models)}
 
     fig, ax = plt.subplots(figsize=(11, 7))
     for model in models:
-        is_hpo = model.endswith("_hpo")
+        is_hpo = _is_hpo(model)
         base = _base_model(model)
         x_value = combined.loc[model, x_key]
         y_value = combined.loc[model, y_key]
@@ -130,7 +138,7 @@ def plot_rank_tradeoff_3d(combined: pd.DataFrame):
     }
     fig = go.Figure()
     for model in models:
-        is_hpo = model.endswith("_hpo")
+        is_hpo = _is_hpo(model)
         ranks = [combined.loc[model, key] for key in rank_keys.values()]
         if pd.isna(ranks).any():
             raise ValueError(f"Cannot plot 3D rank trade-off; {model} has missing ranks: {ranks}")

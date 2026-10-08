@@ -152,3 +152,26 @@ class TestNearestNeighbourAdversarialAccuracy:
 
         assert row["n_val"] == pytest.approx(expected)
         assert row["n_err"] == pytest.approx(0.02)
+
+
+class TestAnalysisConfigTargetTypes:
+    """Integer and categorical targets must be typed categorical on every platform.
+
+    The fork used ``dtype == "int"``, which is int32 on Windows with NumPy < 2, so
+    an int64 target was typed numeric there and every classification and fairness
+    metric failed with "no categorical target variables".
+    """
+
+    @pytest.mark.parametrize("dtype", ["int64", "int32", "category", "object", "bool"])
+    def test_discrete_targets_are_categorical(self, dtype):
+        frame = pd.DataFrame({"x": [0.1, 0.2, 0.3, 0.4], "y": [0, 1, 1, 0]})
+        frame["y"] = frame["y"].astype(dtype)
+
+        config = AnalysisConfig(dataset=frame, target_vars="y")
+
+        assert config.target_types == {"y": 2}
+
+    def test_float_targets_stay_numeric(self):
+        frame = pd.DataFrame({"x": [0.1, 0.2, 0.3], "y": [0.5, 1.5, 2.5]})
+
+        assert AnalysisConfig(dataset=frame, target_vars="y").target_types == {"y": "num"}
