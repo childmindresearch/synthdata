@@ -12,7 +12,7 @@ from collections.abc import Callable
 import pandas as pd
 
 from synthdata.config import Config
-from synthdata.data import Dataset
+from synthdata.data import Dataset, remask_synthetic
 from synthdata.generation import hpo as hpo_mod
 from synthdata.generation import synthcity_backend as sc
 from synthdata.generation import tabpfn_backend as tpfn
@@ -112,12 +112,24 @@ def run_generation(
         for replicate in range(gen_cfg.n_replicates):
             _build_one(replicate_name(name, replicate), seed + replicate, build_fn)
 
+    remask = cfg.imputation.missing_indicators.remask_synthetic and bool(
+        dataset.missing_indicator_columns
+    )
+
+    def _write_released(name, df, overwrite):
+        """Save the re-masked copy that is shared (evaluation scores the filled one)."""
+        released = output_dir / "released" / f"{name}.csv"
+        if remask and (overwrite or not released.exists()):
+            ensure_dir(released.parent)
+            remask_synthetic(df, dataset.missing_indicator_columns).to_csv(released, index=False)
+
     def _build_one(name, replicate_seed, build_fn):
         path = output_dir / f"{name}.csv"
         if path.exists() and not gen_cfg.force_retrain:
             logger.info("[%s] using cached synthetic data at %s", name, path)
             df = pd.read_csv(path)
             synthetic_datasets[name] = df
+            _write_released(name, df, overwrite=False)
             return df
 
         logger.info(
@@ -131,6 +143,7 @@ def run_generation(
         result = build_fn(replicate_seed)
         df, extra = result if isinstance(result, tuple) else (result, None)
         df.to_csv(path, index=False)
+        _write_released(name, df, overwrite=True)
         synthetic_datasets[name] = df
         base, replicate = split_replicate_name(name)
         if replicate and df.equals(synthetic_datasets.get(base)):

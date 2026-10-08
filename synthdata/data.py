@@ -106,6 +106,13 @@ class Dataset:
     full_imputed_df: pd.DataFrame | None = None
     train_imputed_df: pd.DataFrame | None = None
     test_imputed_df: pd.DataFrame | None = None
+    #: Train rows (``train_df`` order) imputed by the imputer fitted on train
+    #: minus tuning; HPO reads its search and tuning rows from here. ``None``
+    #: when that fit did not run (HPO off), and HPO then reads ``full_imputed_df``.
+    search_imputed_df: pd.DataFrame | None = None
+    #: ``{indicator column: source column}`` for the ``<column>__missing``
+    #: features added at load time (see ``imputation.missing_indicators``).
+    missing_indicator_columns: dict = dataclasses.field(default_factory=dict)
     #: User-facing copies with configured ordinal labels restored.
     full_imputed_decoded_df: pd.DataFrame | None = None
     train_imputed_decoded_df: pd.DataFrame | None = None
@@ -139,6 +146,8 @@ class Dataset:
     def _imputed_rows(self, rows: pd.DataFrame) -> pd.DataFrame | None:
         if self.full_imputed_df is None:
             return None
+        if self.search_imputed_df is not None:
+            return self.search_imputed_df.loc[rows.index]
         if len(self.full_imputed_df) != len(self.full_df):
             # Imputation disabled: the imputed frames are the complete cases,
             # and their row labels do not survive the CSV round trip.
@@ -147,12 +156,12 @@ class Dataset:
 
     @property
     def tuning_imputed_df(self) -> pd.DataFrame | None:
-        """Imputed tuning rows (``None`` before imputation)."""
+        """Tuning rows imputed for HPO (``None`` before imputation)."""
         return self._imputed_rows(self.tuning_df)
 
     @property
     def search_train_imputed_df(self) -> pd.DataFrame | None:
-        """Imputed train rows outside the tuning split (``None`` before imputation)."""
+        """Train rows outside the tuning split imputed for HPO (``None`` before imputation)."""
         return self._imputed_rows(self.search_train_df)
 
     @property
@@ -213,6 +222,7 @@ class Dataset:
             "full_imputed": d / "full_imputed.csv",
             "train_imputed": d / "train_imputed.csv",
             "test_imputed": d / "test_imputed.csv",
+            "search_imputed": d / "search_imputed.csv",
             "full_imputed_decoded": d / "full_imputed_decoded.csv",
             "train_imputed_decoded": d / "train_imputed_decoded.csv",
             "test_imputed_decoded": d / "test_imputed_decoded.csv",
@@ -778,6 +788,49 @@ def mask_outliers_as_missing(df: pd.DataFrame, columns: list, threshold: float) 
 # ---------------------------------------------------------------------------
 
 
+MISSING_INDICATOR_SUFFIX = "__missing"
+
+
+def add_missing_indicators(
+    df: pd.DataFrame, columns: list, fit_index: pd.Index, min_missing_fraction: float
+) -> tuple[pd.DataFrame, dict]:
+    """Append a 0/1 ``<column>__missing`` feature for frequently missing columns.
+
+    A column gets one when at least ``min_missing_fraction`` of the
+    ``fit_index`` rows miss it. The indicator is computed from the raw values
+    (scikit-learn's ``MissingIndicator`` gives the same matrix), so it is
+    fully observed and identical whichever imputer runs later. Missing
+    indicators are standard in clinical prediction models (Sperrin et al.,
+    *Stat Med* 2020). Returns the widened frame and ``{indicator: column}``.
+    """
+    fractions = df.loc[fit_index, columns].isna().mean()
+    chosen = [c for c in columns if fractions[c] >= min_missing_fraction]
+    indicators = {f"{c}{MISSING_INDICATOR_SUFFIX}": c for c in chosen}
+    clash = [c for c in indicators if c in df.columns]
+    if clash:
+        raise ValueError(f"Missing-indicator column names already exist in the data: {clash}")
+    if not indicators:
+        return df, {}
+    flags = pd.DataFrame(
+        {name: df[column].isna().astype(int) for name, column in indicators.items()},
+        index=df.index,
+    )
+    return pd.concat([df, flags], axis=1), indicators
+
+
+def remask_synthetic(synthetic: pd.DataFrame, indicators: dict) -> pd.DataFrame:
+    """Blank synthetic values whose synthetic indicator is 1, then drop the indicators.
+
+    This gives the released data the missingness pattern the generator
+    learned instead of a fully filled table.
+    """
+    out = synthetic.copy()
+    for name, column in indicators.items():
+        if name in out.columns and column in out.columns:
+            out[column] = out[column].where(pd.to_numeric(out[name], errors="coerce").round() != 1)
+    return out.drop(columns=[c for c in indicators if c in out.columns])
+
+
 def stratification_key(
     df: pd.DataFrame,
     columns: list,
@@ -1090,6 +1143,22 @@ def load_dataset(cfg: Config) -> Dataset:
     train_only, tuning_index, holdout_index = split_by_patient(
         df, patient_ids, fractions, seed=cfg.seed, strata=strata
     )
+    missing_indicator_columns = {}
+    indicator_cfg = cfg.imputation.missing_indicators
+    if cfg.imputation.enabled and indicator_cfg.enabled:
+        # Chosen on the rows the first imputer fits on, so both fits and the
+        # holdout share one column set that no held-out row influenced.
+        df, missing_indicator_columns = add_missing_indicators(
+            df, feature_columns, train_only, indicator_cfg.min_missing_fraction
+        )
+        feature_columns = feature_columns + list(missing_indicator_columns)
+        nominal_columns = nominal_columns + list(missing_indicator_columns)
+        variable_schema = {
+            **variable_schema,
+            **{
+                c: {"kind": "categorical", "ordinal_order": None} for c in missing_indicator_columns
+            },
+        }
     # train_df keeps the tuning rows: HPO searches on train_df minus tuning,
     # final models refit on all of it.
     train_df = df.loc[~df.index.isin(holdout_index)]
@@ -1128,6 +1197,7 @@ def load_dataset(cfg: Config) -> Dataset:
         patient_id_column=patient_id_column,
         n_patients=n_patients,
         tuning_index=tuning_index,
+        missing_indicator_columns=missing_indicator_columns,
     )
 
     paths = dataset.paths()
@@ -1246,8 +1316,28 @@ def load_imputed_splits(dataset: Dataset) -> Dataset:
         )
         return dataset
 
+    search_imputed = None
+    if provenance.get("search_phase"):
+        if not paths["search_imputed"].exists():
+            logger.warning(
+                "Ignoring imputed CSVs under %s because %s is missing; rerun imputation",
+                dataset.data_dir,
+                paths["search_imputed"].name,
+            )
+            return dataset
+        search_imputed = pd.read_csv(paths["search_imputed"])
+        if len(search_imputed) != len(dataset.train_df) or (
+            search_imputed.columns.tolist() != expected_columns
+        ):
+            logger.warning(
+                "Ignoring stale %s under %s", paths["search_imputed"].name, dataset.data_dir
+            )
+            return dataset
+        search_imputed.index = dataset.train_df.index
+
     dataset.full_imputed_df = frames["full"]
     dataset.train_imputed_df = frames["train"]
     dataset.test_imputed_df = frames["test"]
+    dataset.search_imputed_df = search_imputed
     dataset.attach_decoded_imputed_splits()
     return dataset

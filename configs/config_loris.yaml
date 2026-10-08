@@ -49,7 +49,17 @@ data:
 
 imputation:
   enabled: true
-  method: refidiff # Avoids TabImpute one-hot expansion on this wide dataset.
+  # Fitted on train minus tuning for HPO, then refitted on all of train.
+  method: missforest # or simple (median/mode), tabimpute, refidiff
+  missforest:
+    n_estimators: 50
+    max_iter: 5
+    n_nearest_features: null
+  missing_indicators:
+    enabled: true
+    min_missing_fraction: 0.05
+    remask_synthetic: true
+  drift_warn_threshold: 0.1
   device: auto
   cache: true
   validation_margin: 0.2

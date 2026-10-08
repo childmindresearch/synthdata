@@ -124,12 +124,14 @@ class TestPipelineDispatch:
         self, make_config, make_dataset, mocker
     ):
         cfg = make_config()
+        cfg.imputation.method = "tabimpute"
         dataset = make_dataset()
         mock_impute = mocker.patch(
             "synthdata.imputation.tabimpute_backend.impute_dataframe",
             side_effect=lambda frame, *args, **kwargs: frame.fillna(0),
         )
-        train_imputed, test_imputed = _impute_splits(cfg, dataset, device="cpu")
+        train_imputed, test_imputed, search_imputed = _impute_splits(cfg, dataset, device="cpu")
+        assert search_imputed is None  # no tuning split, so no HPO fit
         first, second = (call.args[0] for call in mock_impute.call_args_list)
         assert first.index.equals(dataset.train_df.index)
         assert second.index.equals(dataset.train_df.index.append(dataset.test_df.index))

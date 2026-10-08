@@ -1,11 +1,11 @@
 """Method-agnostic imputation pipeline: caching, dispatch, rounding, validation.
 
-:func:`run_imputation` dispatches to the configured backend's
-backend (``synthdata.imputation.tabimpute_backend`` by default, or
-``synthdata.imputation.refidiff_backend`` when ``imputation.method ==
-"refidiff"``) with the imputer fitted on the train split only, then applies shared post-processing (rounding, caching to CSV,
-validation reporting) identically regardless of which backend produced the
-imputed values.
+:func:`run_imputation` dispatches to the configured backend
+(``synthdata.imputation.sklearn_backend`` for ``missforest``/``simple``,
+``tabimpute_backend`` or ``refidiff_backend``), fitting it twice (see
+:func:`_impute_splits`), then applies shared post-processing (rounding,
+caching to CSV, validation reporting) identically regardless of which backend
+produced the imputed values.
 """
 
 import dataclasses
@@ -55,24 +55,39 @@ def _persist_decoded_imputed_splits(dataset: Dataset) -> None:
     )
 
 
-def _impute_splits(cfg: Config, dataset: Dataset, device: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Impute train and test with an imputer that never learns from tuning or test.
+def _fit_and_apply(
+    cfg: Config,
+    dataset: Dataset,
+    fit_df: pd.DataFrame,
+    apply_to: pd.DataFrame,
+    device: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fit the configured imputer on ``fit_df``, then fill ``fit_df`` and ``apply_to``.
 
-    The imputer is fitted on the train rows outside the tuning split (see
-    :attr:`Dataset.search_train_df`), so neither hyperparameter scores nor
-    test results are shaped by imputations that saw the rows they are
-    measured on. RefiDiff is fitted on those rows and then fills the tuning
-    and test splits separately with the fitted model. TabImpute has no fitting
-    step (it is a pretrained in-context model), so the fitting rows are
-    imputed on their own and each held-out split with them as context; rows
-    of one held-out split can inform each other's imputations but never the
-    fitting rows' or another split's. Returns ``(train_imputed, test_imputed)``
-    with train (tuning included) in ``dataset.train_df`` row order.
+    ``apply_to`` never shapes the fitted imputer. RefiDiff and the
+    scikit-learn methods fill it with the fitted model. TabImpute has no
+    fitting step (it is a pretrained in-context model), so ``fit_df`` is
+    imputed on its own and ``apply_to`` with ``fit_df`` as context; rows of
+    ``apply_to`` can inform each other's imputations but never ``fit_df``'s.
     """
-    fit_df = dataset.search_train_df
-    held_out = {"tuning": dataset.tuning_df, "test": dataset.test_df}
     method = cfg.imputation.method
-    if method == "tabimpute":
+    if method in ("missforest", "simple"):
+        from synthdata.imputation import sklearn_backend
+
+        state, fit_imputed = sklearn_backend.fit(
+            fit_df,
+            dataset.feature_columns,
+            dataset.categorical_columns,
+            dataset.nominal_columns,
+            method,
+            seed=cfg.seed,
+            missforest_cfg=cfg.imputation.missforest,
+        )
+
+        def _transform(frame: pd.DataFrame) -> pd.DataFrame:
+            return sklearn_backend.transform(state, frame)
+
+    elif method == "tabimpute":
         from synthdata.imputation.tabimpute_backend import impute_dataframe
 
         def _impute(frame: pd.DataFrame) -> pd.DataFrame:
@@ -101,11 +116,7 @@ def _impute_splits(cfg: Config, dataset: Dataset, device: str) -> tuple[pd.DataF
             refidiff_cfg=cfg.imputation.refidiff,
             data_dir=dataset.data_dir,
             seed=cfg.seed,
-            model_columns=[
-                c
-                for c in dataset.feature_columns
-                if any(frame[c].isna().any() for frame in held_out.values())
-            ],
+            model_columns=[c for c in dataset.feature_columns if apply_to[c].isna().any()],
         )
 
         def _transform(frame: pd.DataFrame) -> pd.DataFrame:
@@ -113,15 +124,81 @@ def _impute_splits(cfg: Config, dataset: Dataset, device: str) -> tuple[pd.DataF
 
     else:
         # Unreachable in practice: Config._validate() already restricts
-        # imputation.method to {"tabimpute", "refidiff"} before this runs.
+        # imputation.method before this runs.
         raise ValueError(f"Unknown imputation.method: {method!r}")
 
-    imputed = {
-        name: _transform(frame) if not frame.empty else frame.copy()
-        for name, frame in held_out.items()
-    }
-    train_imputed = pd.concat([fit_imputed, imputed["tuning"]]).loc[dataset.train_df.index]
-    return train_imputed, imputed["test"]
+    applied = _transform(apply_to) if not apply_to.empty else apply_to.copy()
+    return fit_imputed, applied
+
+
+def runs_search_phase(cfg: Config, dataset: Dataset) -> bool:
+    """Whether HPO needs its own imputation fitted on train minus tuning."""
+    return cfg.generation.hpo.enabled and not dataset.tuning_index.empty
+
+
+def _impute_splits(
+    cfg: Config, dataset: Dataset, device: str
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
+    """Impute in two phases so no fit ever sees the rows it is scored on.
+
+    Phase 1 (only when HPO runs): fit on train minus tuning
+    (:attr:`Dataset.search_train_df`) and fill the tuning rows, so
+    hyperparameter scores are not shaped by imputations that saw the tuning
+    rows. Phase 2: refit with the same settings and seed on all of train
+    (tuning included), the data the final generators train on, and fill the
+    holdout. This is the refit-after-selection pattern of scikit-learn's
+    ``GridSearchCV(refit=True)``. Returns ``(train_imputed, test_imputed,
+    search_imputed)`` where ``search_imputed`` holds phase 1's train rows
+    (``None`` when phase 1 did not run), each in ``dataset.train_df`` order.
+    """
+    search_imputed = None
+    if runs_search_phase(cfg, dataset):
+        fit_imputed, tuning_imputed = _fit_and_apply(
+            cfg, dataset, dataset.search_train_df, dataset.tuning_df, device
+        )
+        search_imputed = pd.concat([fit_imputed, tuning_imputed]).loc[dataset.train_df.index]
+    train_imputed, test_imputed = _fit_and_apply(
+        cfg, dataset, dataset.train_df, dataset.test_df, device
+    )
+    return train_imputed.loc[dataset.train_df.index], test_imputed, search_imputed
+
+
+def imputation_drift(
+    dataset: Dataset, search_imputed: pd.DataFrame, train_imputed: pd.DataFrame
+) -> pd.DataFrame:
+    """Compare the two phases' fills of the cells both of them imputed.
+
+    Those are the missing cells of the train rows outside the tuning split.
+    Continuous columns: Wasserstein distance divided by the column's observed
+    standard deviation. Categorical columns: total variation distance between
+    the two fills' category shares. Both are 0 when the fills agree.
+    """
+    from scipy.stats import wasserstein_distance
+
+    rows = dataset.search_train_df
+    records = []
+    for column in dataset.feature_columns:
+        missing = rows[column].isna()
+        if not missing.any():
+            continue
+        index = rows.index[missing]
+        phase1, phase2 = search_imputed.loc[index, column], train_imputed.loc[index, column]
+        if column in dataset.categorical_columns or not pd.api.types.is_numeric_dtype(phase1):
+            shares = pd.concat(
+                [phase1.value_counts(normalize=True), phase2.value_counts(normalize=True)], axis=1
+            ).fillna(0)
+            metric, value = (
+                "total_variation",
+                0.5 * float((shares.iloc[:, 0] - shares.iloc[:, 1]).abs().sum()),
+            )
+        else:
+            scale = float(rows[column].std()) or 1.0
+            metric = "wasserstein_over_std"
+            value = wasserstein_distance(phase1.astype(float), phase2.astype(float)) / scale
+        records.append(
+            {"column": column, "n_cells": int(missing.sum()), "metric": metric, "drift": value}
+        )
+    return pd.DataFrame(records, columns=["column", "n_cells", "metric", "drift"])
 
 
 def apply_rounding(
@@ -208,8 +285,9 @@ def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
         },
         "imputation_enabled": imp_cfg.enabled,
         "imputation_method": imp_cfg.method,
-        # Caches written before the imputer was fitted on train only are stale.
-        "imputer_fit_split": "train_without_tuning",
+        # Caches written before the two-phase fit are stale.
+        "imputer_fit_split": "search_then_train",
+        "search_phase": runs_search_phase(cfg, dataset),
         "round_rules": imp_cfg.round_rules,
         "round_to_int_default": imp_cfg.round_to_int_default,
         "dataset_version": dataset.version,
@@ -222,6 +300,8 @@ def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
     }
     if imp_cfg.method == "refidiff":
         payload["refidiff"] = dataclasses.asdict(imp_cfg.refidiff)
+    if imp_cfg.method == "missforest":
+        payload["missforest"] = dataclasses.asdict(imp_cfg.missforest)
     return payload
 
 
@@ -285,6 +365,7 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
         paths["full_imputed"].exists()
         and paths["train_imputed"].exists()
         and paths["test_imputed"].exists()
+        and (paths["search_imputed"].exists() or not runs_search_phase(cfg, dataset))
     )
 
     if cfg.imputation.cache and cached_csvs_exist and cached_key == current_key:
@@ -313,6 +394,7 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
             current_key[:16],
         )
 
+    search_imputed = None
     if not cfg.imputation.enabled:
         logger.info("Imputation disabled; using rows with complete cases only")
         full_imputed = dataset.full_df.dropna().copy()
@@ -339,15 +421,20 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
         n_missing = int(dataset.full_df[dataset.feature_columns].isna().sum().sum())
         logger.info(
             "Imputing %d missing values across %d feature columns via method=%s on device=%s "
-            "(imputer fitted on the %d train rows outside the tuning split)",
+            "(fitted on the %d train rows outside the tuning split for HPO: %s; then on all "
+            "%d train rows for the final models and the holdout)",
             n_missing,
             len(dataset.feature_columns),
             cfg.imputation.method,
             device,
             len(dataset.search_train_df),
+            "yes" if runs_search_phase(cfg, dataset) else "skipped, HPO is off",
+            len(dataset.train_df),
         )
-        train_imputed, test_imputed = (
-            apply_rounding(
+        train_imputed, test_imputed, search_imputed = (
+            None
+            if frame is None
+            else apply_rounding(
                 frame,
                 dataset.feature_columns,
                 cfg.imputation.round_rules,
@@ -356,11 +443,17 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
             for frame in _impute_splits(cfg, dataset, device)
         )
         full_imputed = pd.concat([train_imputed, test_imputed]).loc[dataset.full_df.index]
+        if search_imputed is not None:
+            _report_drift(cfg, dataset, search_imputed, train_imputed)
 
     ensure_dir(dataset.data_dir)
     full_imputed.to_csv(paths["full_imputed"], index=False)
     train_imputed.to_csv(paths["train_imputed"], index=False)
     test_imputed.to_csv(paths["test_imputed"], index=False)
+    if search_imputed is not None:
+        search_imputed.to_csv(paths["search_imputed"], index=False)
+    else:
+        paths["search_imputed"].unlink(missing_ok=True)
     cache_record["imputed_row_counts"] = {
         "full": len(full_imputed),
         "train": len(train_imputed),
@@ -373,8 +466,28 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
     dataset.full_imputed_df = full_imputed
     dataset.train_imputed_df = train_imputed
     dataset.test_imputed_df = test_imputed
+    dataset.search_imputed_df = search_imputed
     _persist_decoded_imputed_splits(dataset)
     return dataset
+
+
+def _report_drift(
+    cfg: Config, dataset: Dataset, search_imputed: pd.DataFrame, train_imputed: pd.DataFrame
+) -> None:
+    """Write ``imputation_drift.csv`` and warn about columns above the threshold."""
+    drift = imputation_drift(dataset, search_imputed, train_imputed)
+    ensure_dir(dataset.data_dir)
+    drift.to_csv(dataset.data_dir / "imputation_drift.csv", index=False)
+    high = drift[drift["drift"] > cfg.imputation.drift_warn_threshold]
+    if not high.empty:
+        logger.warning(
+            "Imputed values differ between the HPO fit and the final fit by more than %.2f "
+            "in %d column(s): %s. Hyperparameters were tuned on the first fit's data; see "
+            "imputation_drift.csv",
+            cfg.imputation.drift_warn_threshold,
+            len(high),
+            high.sort_values("drift", ascending=False)["column"].head(10).tolist(),
+        )
 
 
 def build_validation_report(cfg: Config, dataset: Dataset) -> pd.DataFrame:

@@ -171,8 +171,10 @@ def test_every_configured_model_produced_valid_synthetic_data(pipeline_run, data
     assert sorted(synthetic) == sorted(MODELS)
     n_samples = pipeline_run.cfg.generation.n_samples
     train = dataset.train_imputed_df
+    indicators = list(dataset.missing_indicator_columns)
     for name, frame in synthetic.items():
-        assert list(frame.columns) == COLUMNS, name
+        assert list(frame.columns) == [*COLUMNS, *indicators], name
+        assert set(frame[indicators].stack().unique()) <= {0, 1}, name
         assert len(frame) == n_samples, name
         assert not frame.isna().any().any(), name
         for column in NUMERIC:
@@ -183,6 +185,27 @@ def test_every_configured_model_produced_valid_synthetic_data(pipeline_run, data
             assert generated <= categories, (name, column, generated - categories)
         # Both classes present, so downstream classifiers are trainable.
         assert frame["target"].nunique() == 2, name
+
+
+def test_missing_indicators_and_released_copies(pipeline_run, dataset):
+    indicators = dataset.missing_indicator_columns
+    assert indicators, "fixture columns with missing values must get indicators"
+    for name, column in indicators.items():
+        assert (dataset.full_df[name] == dataset.full_df[column].isna()).all(), name
+    for name, frame in pipeline_run.synthetic().items():
+        released = pd.read_csv(pipeline_run.generation_dir / "released" / f"{name}.csv")
+        assert list(released.columns) == COLUMNS, name
+        for indicator, column in indicators.items():
+            flagged = frame[indicator] == 1
+            assert released.loc[flagged, column].isna().all(), (name, column)
+            assert released.loc[~flagged, column].notna().all(), (name, column)
+
+
+def test_hpo_uses_an_imputer_fitted_without_tuning_rows(dataset):
+    assert dataset.search_imputed_df is not None
+    drift = pd.read_csv(dataset.data_dir / "imputation_drift.csv")
+    assert set(drift["column"]) <= set(FEATURES)
+    assert (drift["drift"] >= 0).all()
 
 
 def test_hpo_studies_ran_and_recorded_best_params(pipeline_run):

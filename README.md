@@ -44,7 +44,7 @@ target,categorical,
 
 The four commands form an ordered pipeline:
 
-1. **Impute** missing feature values using TabImpute or RefiDiff, with schema-aware caching and automatic CPU/GPU device selection.
+1. **Impute** missing feature values with MissForest (default), median/mode, TabImpute or RefiDiff. The imputer is fitted on train minus tuning for HPO and refitted on all of train for the final models; frequently missing columns get `<column>__missing` indicators, and synthetic values are blanked again where the synthetic indicator is 1 (`released/` next to the synthetic CSVs).
 2. **Generate** candidate synthetic datasets with configured SynthCity, TabPFN, and TabPFGen models; optional Optuna hyperparameter searches are persisted and resumable.
 3. **Evaluate** candidates for utility, privacy, and fairness. Evaluation can process models in parallel within configured resource limits and writes a ranked table, report, and diagnostics.
 4. **Plot** recorded data-quality, generation, HPO, and evaluation artifacts without rerunning earlier stages.
