@@ -161,10 +161,15 @@ def fit_generate(
     random_state: int = 42,
     workspace: str | None = None,
     device: str | None = None,
+    classification: bool = False,
 ) -> pd.DataFrame:
     from synthcity.plugins import Plugins
 
     plugin_kwargs = dict(params)
+    # TabDDPM conditions on the class label for classification; synthcity's
+    # ddpm only does so when told, and otherwise models the label as a column.
+    if classification and plugin_accepts(name, "is_classification"):
+        plugin_kwargs.setdefault("is_classification", True)
     if workspace is not None and plugin_accepts(name, "workspace"):
         plugin_kwargs["workspace"] = Path(workspace)
     # Seed training as well as sampling; plugins otherwise train with their
@@ -188,6 +193,7 @@ def build_synthcity_objective(
     n_samples: int,
     workspace: str | None = None,
     device: str = "cpu",
+    classification: bool = False,
 ):
     """Build an Optuna objective for a synthcity plugin's native hyperparameter space.
 
@@ -224,7 +230,15 @@ def build_synthcity_objective(
             params["patience_metric"] = _pruning_patience_metric_class()(trial, workspace)
 
         # A crash propagates and run_study marks the trial failed.
-        synthetic = fit_generate(name, params, train_loader, n_samples, seed, workspace=workspace)
+        synthetic = fit_generate(
+            name,
+            params,
+            train_loader,
+            n_samples,
+            seed,
+            workspace=workspace,
+            classification=classification,
+        )
         return score_candidate(trial, eval_fn, synthetic)
 
     return objective

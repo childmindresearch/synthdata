@@ -169,3 +169,18 @@ def test_fit_generate_seeds_training_not_only_sampling(mocker):
     sc.fit_generate("ctgan", {}, mocker.Mock(), 5, random_state=11)
     _, kwargs = get.call_args
     assert kwargs["random_state"] == 11
+
+
+def test_fit_generate_conditions_ddpm_on_a_categorical_target(mocker):
+    from synthcity.plugins import Plugins
+
+    from synthdata.generation import synthcity_backend as sc
+
+    get = mocker.patch.object(Plugins, "get")
+    sc.fit_generate("ddpm", {}, mocker.Mock(), 5, classification=True)
+    assert get.call_args.kwargs["is_classification"] is True
+    sc.fit_generate("ddpm", {}, mocker.Mock(), 5)
+    assert "is_classification" not in get.call_args.kwargs
+    # Plugins without the argument never receive it.
+    sc.fit_generate("ctgan", {}, mocker.Mock(), 5, classification=True)
+    assert "is_classification" not in get.call_args.kwargs
