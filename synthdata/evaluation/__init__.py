@@ -162,6 +162,13 @@ def run_evaluation(
     if not tstr_table.empty:
         tstr_table.to_csv(output_dir / "tstr_holdout.csv")
 
+    privacy_result = custom_eval.run_privacy_evaluation(
+        selected_datasets, dataset, eval_cfg.custom, eval_cfg.privacy_attacks, cfg.seed
+    )
+    privacy_attacks_table = (privacy_result or {}).get("attacks")
+    if privacy_attacks_table is not None and not privacy_attacks_table.empty:
+        privacy_attacks_table.to_csv(output_dir / "privacy_attacks.csv", index=False)
+
     combined = combine.build_combined_table(
         synthcity_results,
         benchmark_results,
@@ -170,6 +177,7 @@ def run_evaluation(
         model_names,
         rank_weights=eval_cfg.rank_weights,
         tstr_result=tstr_result,
+        privacy_result=privacy_result,
     )
 
     gate_result = privacy_gate.evaluate_privacy_gate(combined, eval_cfg.privacy_gate)
@@ -193,6 +201,7 @@ def run_evaluation(
         "syntheval_benchmark_ranks": benchmark_ranks,
         "log_disparity_reports": log_disparity_reports,
         "tstr_table": tstr_table,
+        "privacy_result": privacy_result,
         "ovr_per_class": ovr_per_class,
         "privacy_gate_result": gate_result,
         "ranking_summary": ranking_summary,

@@ -484,6 +484,46 @@ class LogDisparityConfig:
     protected_bins: list | None = None
 
 
+#: What a privacy attack counts as one individual (see PrivacyAttacksConfig.unit).
+PRIVACY_UNITS = ("patient", "row")
+
+#: Anonymeter singling-out attack modes.
+SINGLING_OUT_MODES = ("multivariate", "univariate")
+
+
+@dataclasses.dataclass
+class AnonymeterConfig:
+    """Anonymeter attacks (Giomi et al., PoPETs 2023), each scored as attack
+    success above a baseline attack, with the test split as the control set."""
+
+    #: Attack targets per attack (capped at the control-set size).
+    n_attacks: int = 500
+    singling_out_mode: str = "multivariate"
+    #: Columns per multivariate singling-out predicate.
+    singling_out_n_cols: int = 3
+    #: Candidate predicates tried before singling out stops short of
+    #: ``n_attacks`` (Anonymeter's own default, 10 million, can run for
+    #: hours on data that is hard to single out). Stopping short logs a
+    #: warning and can underestimate the risk.
+    singling_out_max_attempts: int = 100_000
+    #: Neighbours a linkability attack may match a target among.
+    linkability_n_neighbors: int = 10
+    #: Confidence level of the reported risk intervals.
+    confidence_level: float = 0.95
+
+
+@dataclasses.dataclass
+class PrivacyAttacksConfig:
+    """Custom privacy metrics: Anonymeter attacks and holdout-referenced
+    distance heuristics (DCR/NNDR; see synthdata.evaluation.privacy_attacks)."""
+
+    #: "patient": attacks target one encounter per patient and the distance
+    #: membership check scores each patient by their closest encounter, so a
+    #: frequent attender counts once; "row": every row is an individual.
+    unit: str = "patient"
+    anonymeter: AnonymeterConfig = dataclasses.field(default_factory=AnonymeterConfig)
+
+
 @dataclasses.dataclass
 class BinaryTargetConfig:
     """Collapse a multi-class target into a binary (0/1) variable for a
@@ -624,6 +664,8 @@ class EvaluationConfig:
     #: synthetic dataset, score on the test split; see
     #: synthdata.evaluation.tstr). Needs a categorical target.
     tstr_seeds: int = 3
+    #: Anonymeter attacks and holdout-referenced DCR/NNDR (custom privacy).
+    privacy_attacks: PrivacyAttacksConfig = dataclasses.field(default_factory=PrivacyAttacksConfig)
     syntheval_execution: SynthEvalExecutionConfig = dataclasses.field(
         default_factory=SynthEvalExecutionConfig
     )
@@ -771,6 +813,8 @@ _NESTED_DATACLASSES = {
     (EvaluationConfig, "binary_target"): BinaryTargetConfig,
     (EvaluationConfig, "syntheval_execution"): SynthEvalExecutionConfig,
     (EvaluationConfig, "privacy_gate"): PrivacyGateConfig,
+    (EvaluationConfig, "privacy_attacks"): PrivacyAttacksConfig,
+    (PrivacyAttacksConfig, "anonymeter"): AnonymeterConfig,
 }
 
 
@@ -1084,6 +1128,35 @@ def _validate(cfg: Config) -> None:
         )
     if cfg.evaluation.tstr_seeds < 1:
         raise ValueError(f"evaluation.tstr_seeds must be >= 1, got {cfg.evaluation.tstr_seeds}")
+    attacks = cfg.evaluation.privacy_attacks
+    if attacks.unit not in PRIVACY_UNITS:
+        raise ValueError(
+            f"evaluation.privacy_attacks.unit must be one of {list(PRIVACY_UNITS)}, "
+            f"got {attacks.unit!r}"
+        )
+    anonymeter = attacks.anonymeter
+    if anonymeter.singling_out_mode not in SINGLING_OUT_MODES:
+        raise ValueError(
+            "evaluation.privacy_attacks.anonymeter.singling_out_mode must be one of "
+            f"{list(SINGLING_OUT_MODES)}, got {anonymeter.singling_out_mode!r}"
+        )
+    for key in (
+        "n_attacks",
+        "singling_out_n_cols",
+        "singling_out_max_attempts",
+        "linkability_n_neighbors",
+    ):
+        value = getattr(anonymeter, key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(
+                f"evaluation.privacy_attacks.anonymeter.{key} must be a positive integer, "
+                f"got {value!r}"
+            )
+    if not 0 < anonymeter.confidence_level < 1:
+        raise ValueError(
+            "evaluation.privacy_attacks.anonymeter.confidence_level must be in (0, 1), "
+            f"got {anonymeter.confidence_level!r}"
+        )
     if cfg.evaluation.binary_target.enabled:
         bt = cfg.evaluation.binary_target
         if not bt.positive_classes or not bt.negative_classes:

@@ -167,6 +167,20 @@ evaluation:
   class_averaging: ovr_macro
   # XGBoost seeds averaged for holdout TSTR (fit on synthetic, score on test).
   tstr_seeds: 3
+  # Custom privacy metrics (evaluation.custom names anonymeter, holdout_distance).
+  # unit: patient = attacks target one encounter per patient and the distance
+  # membership check scores each patient by their closest encounter; row = every
+  # row is an individual. Anonymeter uses the QIs as attacker knowledge and the
+  # sensitive columns as secrets, with the test split as its control set.
+  privacy_attacks:
+    unit: patient
+    anonymeter:
+      n_attacks: 500
+      singling_out_mode: multivariate
+      singling_out_n_cols: 3
+      singling_out_max_attempts: 100000
+      linkability_n_neighbors: 10
+      confidence_level: 0.95
   # Binary collapse for class_averaging: binary: severe/moderate versus typical.
   binary_target:
     enabled: false # true together with class_averaging: binary

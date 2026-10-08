@@ -237,8 +237,12 @@ TSTR_METRICS = ("tstr_macro_f1", "tstr_balanced_accuracy", "tstr_macro_auprc")
 #: Name of the holdout TSTR evaluator in ``evaluation.custom`` selection.
 TSTR_NAME = "tstr"
 
+#: Custom privacy evaluators (synthdata.evaluation.privacy_attacks).
+PRIVACY_ATTACK_NAMES = ("anonymeter", "holdout_distance")
+
 CUSTOM_METRIC_TYPE = {
     TSTR_NAME: "utility",
+    **{name: "privacy" for name in PRIVACY_ATTACK_NAMES},
     **{name: "fairness" for name in LOG_DISPARITY_METRICS},
     **{name: "fairness" for name in SYNTHEVAL_CUSTOM_FAIRNESS_KEYS},
 }

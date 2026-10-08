@@ -327,6 +327,33 @@ def _fairness_highlights_section(combined: pd.DataFrame, extras: dict) -> str:
     return "\n".join(lines)
 
 
+def _privacy_attacks_section(extras: dict) -> str:
+    """Anonymeter risks and the holdout-referenced distance heuristics."""
+    lines = ["## Privacy attacks", ""]
+    result = extras.get("privacy_result") or {}
+    scores = result.get("scores") or {}
+    if not scores:
+        lines.append("Privacy attacks (Anonymeter, holdout-referenced distances) were not run.")
+        return "\n".join(lines)
+    unit = result.get("unit", "patient")
+    lines.append(
+        f"Individuals are counted per **{unit}**. Anonymeter risks are attack success above a "
+        "baseline attack that only sees the test split (0 = no better than guessing from "
+        "unseen data, 1 = every attack succeeds); the inference risk is the worst sensitive "
+        "column. The distance metrics are **heuristics with no privacy guarantee**, reported "
+        "only against unseen real rows: `dcr_closer_to_train_share` and `distance_mia_auc` "
+        "should be near 0.5, `dcr_holdout_ratio` and `nndr_holdout_ratio` near or above 1. "
+        "Every attack with its interval, its attack, baseline and control success rates, and "
+        "whether Anonymeter judged it reliable (the attack beat random guessing) is in "
+        "`privacy_attacks.csv`."
+    )
+    lines.append("")
+    table = pd.DataFrame.from_dict(scores, orient="index")
+    table.index.name = "model"
+    lines.append(_dataframe_to_markdown(table.sort_index().reset_index()))
+    return "\n".join(lines)
+
+
 def _class_metrics_section(cfg: Config, extras: dict) -> str:
     """Imbalance-aware utility: holdout TSTR per class, and how binary-only metrics ran."""
     lines = ["## Class-level utility (imbalance-aware)", ""]
@@ -430,6 +457,8 @@ def build_evaluation_report(
         _recommended_model_section(combined, extras.get("ranking_summary")),
         "",
         _class_metrics_section(cfg, extras),
+        "",
+        _privacy_attacks_section(extras),
         "",
         _fairness_highlights_section(combined, extras),
         "",

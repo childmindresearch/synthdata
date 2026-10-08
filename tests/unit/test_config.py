@@ -464,6 +464,26 @@ class TestValidate:
         with pytest.raises(ValueError, match="no longer supported"):
             _validate(cfg)
 
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("unit", "encounter"),
+            ("anonymeter.singling_out_mode", "bivariate"),
+            ("anonymeter.n_attacks", 0),
+            ("anonymeter.singling_out_max_attempts", True),
+            ("anonymeter.confidence_level", 1.0),
+        ],
+    )
+    def test_invalid_privacy_attack_settings_raise(self, key, value):
+        cfg = self._base_valid()
+        *parents, leaf = key.split(".")
+        target = cfg.evaluation.privacy_attacks
+        for parent in parents:
+            target = getattr(target, parent)
+        setattr(target, leaf, value)
+        with pytest.raises(ValueError, match=leaf):
+            _validate(cfg)
+
     def test_binary_target_disabled_by_default_passes(self):
         cfg = self._base_valid()
         _validate(cfg)  # should not raise

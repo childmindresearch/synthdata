@@ -1,5 +1,6 @@
 """Custom evaluation: log disparity (Bhanot et al. 2021) fairness summary
-metrics and holdout train-on-synthetic, test-on-real (TSTR) utility scores.
+metrics, holdout train-on-synthetic, test-on-real (TSTR) utility scores, and
+privacy attacks (Anonymeter, holdout-referenced DCR/NNDR).
 
 The equalized_odds/equal_opportunity metrics (custom additions to this repo's
 SynthEval fork) are *computed* via :mod:`synthdata.evaluation.syntheval_eval`
@@ -14,6 +15,11 @@ import pandas as pd
 
 from synthdata.data import Dataset
 from synthdata.evaluation.catalog import LOG_DISPARITY_METRICS, TSTR_NAME, resolve_selection
+from synthdata.evaluation.privacy_attacks import (
+    ANONYMETER_NAME,
+    HOLDOUT_DISTANCE_NAME,
+    run_privacy_attack_evaluation,
+)
 from synthdata.evaluation.tstr import tstr_scores
 from synthdata.utils import get_logger
 
@@ -22,7 +28,12 @@ logger = get_logger(__name__)
 _LOG_DISPARITY_NAME = "log_disparity"
 
 #: Every evaluator ``evaluation.custom`` selects from, with its type.
-_CUSTOM_EVALUATORS = {_LOG_DISPARITY_NAME: "fairness", TSTR_NAME: "utility"}
+_CUSTOM_EVALUATORS = {
+    _LOG_DISPARITY_NAME: "fairness",
+    TSTR_NAME: "utility",
+    ANONYMETER_NAME: "privacy",
+    HOLDOUT_DISTANCE_NAME: "privacy",
+}
 
 
 def _selected(selection_cfg, name: str) -> bool:
@@ -175,3 +186,22 @@ def build_tstr_table(tstr_result: dict) -> pd.DataFrame:
     table = pd.DataFrame({name: _row(s) for name, s in rows.items()}).T
     table.index.name = "model"
     return table
+
+
+def run_privacy_evaluation(
+    synthetic_datasets: dict[str, pd.DataFrame],
+    dataset: Dataset,
+    selection_cfg,
+    attacks_cfg,
+    seed: int,
+) -> dict:
+    """Anonymeter attacks and holdout-referenced DCR/NNDR, as selected in
+    ``evaluation.custom`` (see synthdata.evaluation.privacy_attacks)."""
+    return run_privacy_attack_evaluation(
+        synthetic_datasets,
+        dataset,
+        attacks_cfg,
+        run_anonymeter=_selected(selection_cfg, ANONYMETER_NAME),
+        run_distances=_selected(selection_cfg, HOLDOUT_DISTANCE_NAME),
+        seed=seed,
+    )

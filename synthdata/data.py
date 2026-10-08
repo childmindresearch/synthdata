@@ -94,6 +94,10 @@ class Dataset:
     #: the number of distinct patients per split (rows when no column is set).
     patient_id_column: str | None = None
     n_patients: dict = dataclasses.field(default_factory=dict)
+    #: Patient identifier of every ``full_df`` row (same index), kept outside
+    #: the frames so privacy metrics can count patients, not encounters.
+    #: ``None`` when no column is set (every row is its own patient).
+    patient_ids: pd.Series | None = None
     #: Public, linkable columns and fairness-group columns (see DataConfig).
     quasi_identifier_columns: list = dataclasses.field(default_factory=list)
     protected_columns: list = dataclasses.field(default_factory=list)
@@ -1233,6 +1237,7 @@ def load_dataset(cfg: Config) -> Dataset:
         source_fingerprint=source_fingerprint,
         patient_id_column=patient_id_column,
         n_patients=n_patients,
+        patient_ids=patient_ids,
         tuning_index=tuning_index,
         missing_indicator_columns=missing_indicator_columns,
         indicator_only_values=indicator_only_values,
