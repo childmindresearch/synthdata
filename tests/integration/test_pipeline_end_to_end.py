@@ -18,7 +18,7 @@ import pytest
 
 from synthdata.data import load_dataset, load_imputed_splits
 
-from .conftest import FIXTURE_CSV
+from .conftest import FIXTURE_CSV, new_run
 
 pytestmark = pytest.mark.integration
 
@@ -171,8 +171,10 @@ def test_every_configured_model_produced_valid_synthetic_data(pipeline_run, data
     assert sorted(synthetic) == sorted(MODELS)
     n_samples = pipeline_run.cfg.generation.n_samples
     train = dataset.train_imputed_df
+    indicators = list(dataset.missing_indicator_columns)
     for name, frame in synthetic.items():
-        assert list(frame.columns) == COLUMNS, name
+        assert list(frame.columns) == [*COLUMNS, *indicators], name
+        assert set(frame[indicators].stack().unique()) <= {0, 1}, name
         assert len(frame) == n_samples, name
         assert not frame.isna().any().any(), name
         for column in NUMERIC:
@@ -183,6 +185,27 @@ def test_every_configured_model_produced_valid_synthetic_data(pipeline_run, data
             assert generated <= categories, (name, column, generated - categories)
         # Both classes present, so downstream classifiers are trainable.
         assert frame["target"].nunique() == 2, name
+
+
+def test_missing_indicators_and_released_copies(pipeline_run, dataset):
+    indicators = dataset.missing_indicator_columns
+    assert indicators, "fixture columns with missing values must get indicators"
+    for name, column in indicators.items():
+        assert (dataset.full_df[name] == dataset.full_df[column].isna()).all(), name
+    for name, frame in pipeline_run.synthetic().items():
+        released = pd.read_csv(pipeline_run.generation_dir / "released" / f"{name}.csv")
+        assert list(released.columns) == COLUMNS, name
+        for indicator, column in indicators.items():
+            flagged = frame[indicator] == 1
+            assert released.loc[flagged, column].isna().all(), (name, column)
+            assert released.loc[~flagged, column].notna().all(), (name, column)
+
+
+def test_hpo_uses_an_imputer_fitted_without_tuning_rows(dataset):
+    assert dataset.search_imputed_df is not None
+    drift = pd.read_csv(dataset.data_dir / "imputation_drift.csv")
+    assert set(drift["column"]) <= set(FEATURES)
+    assert (drift["drift"] >= 0).all()
 
 
 def test_hpo_studies_ran_and_recorded_best_params(pipeline_run):
@@ -370,3 +393,55 @@ def test_plots_were_written_for_each_section(pipeline_run):
 
 def test_nothing_is_written_outside_the_configured_roots(pipeline_run):
     assert list(pipeline_run.cwd.iterdir()) == []
+
+
+#: BMI and LAB_A (about 10% missing) treated as mostly missing, to exercise the CART fill.
+INDICATOR_ONLY = {
+    "imputation": {"missing_indicators": {"indicator_only_fraction": 0.08}},
+    "generation": {"synthcity": {"names": ["bayesian_network"]}, "hpo": {"enabled": False}},
+}
+
+
+def _indicator_only_run(tmp_path_factory, name, data_path=None):
+    run = new_run(tmp_path_factory, name, overrides=INDICATOR_ONLY, data_path=data_path)
+    run.run("imputation")
+    run.run("generation")
+    return run
+
+
+@pytest.fixture(scope="module")
+def indicator_only_run(tmp_path_factory):
+    return _indicator_only_run(tmp_path_factory, "indicator_only")
+
+
+def test_indicator_only_columns_are_filled_in_recorded_rows_only(indicator_only_run, source):
+    dataset = load_dataset(indicator_only_run.cfg)
+    sparse = dataset.indicator_only_values.columns.tolist()
+    assert sorted(sparse) == ["BMI", "LAB_A"]
+    synthetic = indicator_only_run.synthetic()["bayesian_network"]
+    assert not set(sparse) & set(synthetic.columns), "values are never generated directly"
+    released_dir = indicator_only_run.generation_dir / "released"
+    released = pd.read_csv(released_dir / "bayesian_network.csv")
+    for column in sparse:
+        recorded = synthetic[f"{column}__missing"] == 0
+        assert released.loc[recorded, column].notna().all(), column
+        assert released.loc[~recorded, column].isna().all(), column
+        observed = source[column].dropna()
+        assert released[column].min() >= observed.min(), column
+    report = pd.read_csv(released_dir / "bayesian_network_recorded_values.csv")
+    assert sorted(report["column"]) == sorted(sparse)
+
+
+def test_holdout_rows_do_not_influence_the_cart_fill(indicator_only_run, tmp_path_factory):
+    test_rows = load_dataset(indicator_only_run.cfg).test_df.index
+    source = pd.read_csv(FIXTURE_CSV)
+    for column in ("BMI", "LAB_A", "LAB_B"):
+        source.loc[test_rows, column] = source.loc[test_rows, column] + 25.0
+    data_path = tmp_path_factory.mktemp("cart_canary") / "clinic_perturbed.csv"
+    source.to_csv(data_path, index=False)
+    canary = _indicator_only_run(tmp_path_factory, "cart_canary_run", data_path=data_path)
+    for name in ("bayesian_network.csv", "bayesian_network_recorded_values.csv"):
+        pd.testing.assert_frame_equal(
+            pd.read_csv(indicator_only_run.generation_dir / "released" / name),
+            pd.read_csv(canary.generation_dir / "released" / name),
+        )

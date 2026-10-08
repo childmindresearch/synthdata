@@ -45,7 +45,7 @@ data:
 
 imputation:
   enabled: true
-  method: refidiff
+  method: simple # median/mode keeps CI fast
   device: cpu
   cache: true
   validation_margin: 0.2

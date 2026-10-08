@@ -12,7 +12,8 @@ from collections.abc import Callable
 import pandas as pd
 
 from synthdata.config import Config
-from synthdata.data import Dataset
+from synthdata.data import Dataset, remask_synthetic
+from synthdata.generation import cart_fill
 from synthdata.generation import hpo as hpo_mod
 from synthdata.generation import synthcity_backend as sc
 from synthdata.generation import tabpfn_backend as tpfn
@@ -112,12 +113,59 @@ def run_generation(
         for replicate in range(gen_cfg.n_replicates):
             _build_one(replicate_name(name, replicate), seed + replicate, build_fn)
 
+    remask = cfg.imputation.missing_indicators.remask_synthetic and bool(
+        dataset.missing_indicator_columns
+    )
+
+    cart = {}
+
+    def _cart_fill(df, replicate_seed):
+        """Values for indicator-only columns in "recorded" synthetic rows (CART leaf sampling)."""
+        values = dataset.indicator_only_values
+        if not cart:
+            real = dataset.train_imputed_df.set_axis(dataset.train_df.index)
+            cart["reference"] = real
+            categorical = set(dataset.variable_schema) - {
+                c for c, e in dataset.variable_schema.items() if e.get("kind") == "continuous"
+            }
+            cart["categorical"] = categorical
+            cart["models"] = cart_fill.fit_cart_fills(
+                cart_fill.encode_predictors(real, real),
+                values.loc[dataset.train_df.index],
+                categorical,
+                seed,
+            )
+        filled = cart_fill.fill(
+            df,
+            cart["models"],
+            dataset.missing_indicator_columns,
+            cart_fill.encode_predictors(df, cart["reference"]),
+            replicate_seed,
+        )
+        report = cart_fill.recorded_rows_report(
+            filled, values.loc[dataset.train_df.index], cart["categorical"]
+        )
+        return filled, pd.DataFrame(report)
+
+    def _write_released(name, df, overwrite, replicate_seed):
+        """Save the re-masked copy that is shared (evaluation scores the filled one)."""
+        released = output_dir / "released" / f"{name}.csv"
+        if remask and (overwrite or not released.exists()):
+            ensure_dir(released.parent)
+            out = remask_synthetic(df, dataset.missing_indicator_columns)
+            if not dataset.indicator_only_values.empty:
+                filled, report = _cart_fill(df, replicate_seed)
+                out = pd.concat([out, filled], axis=1)
+                report.to_csv(released.with_name(f"{name}_recorded_values.csv"), index=False)
+            out.to_csv(released, index=False)
+
     def _build_one(name, replicate_seed, build_fn):
         path = output_dir / f"{name}.csv"
         if path.exists() and not gen_cfg.force_retrain:
             logger.info("[%s] using cached synthetic data at %s", name, path)
             df = pd.read_csv(path)
             synthetic_datasets[name] = df
+            _write_released(name, df, overwrite=False, replicate_seed=replicate_seed)
             return df
 
         logger.info(
@@ -131,6 +179,7 @@ def run_generation(
         result = build_fn(replicate_seed)
         df, extra = result if isinstance(result, tuple) else (result, None)
         df.to_csv(path, index=False)
+        _write_released(name, df, overwrite=True, replicate_seed=replicate_seed)
         synthetic_datasets[name] = df
         base, replicate = split_replicate_name(name)
         if replicate and df.equals(synthetic_datasets.get(base)):

@@ -21,6 +21,18 @@ pytestmark = pytest.mark.unit
 CALLS_PER_RUN = 2
 
 
+@pytest.fixture
+def make_config(make_config):
+    """These caching tests mock the TabImpute backend, so select it."""
+
+    def _make(*args, **kwargs):
+        cfg = make_config(*args, **kwargs)
+        cfg.imputation.method = "tabimpute"
+        return cfg
+
+    return _make
+
+
 def _fill_zero(frame, *args, **kwargs):
     return frame.fillna(0)
 

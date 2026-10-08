@@ -189,6 +189,54 @@ class RefiDiffConfig:
     categorical_decode_policy: str = "clip"
 
 
+IMPUTATION_METHODS = ("missforest", "simple", "tabimpute", "refidiff")
+
+
+@dataclasses.dataclass
+class MissForestConfig:
+    """Settings for ``imputation.method: missforest`` (scikit-learn ``IterativeImputer``).
+
+    Stekhoven & Buehlmann's MissForest uses 100 trees and at most 10 rounds;
+    the smaller defaults keep a 20k x 400 table in minutes on a CPU, and the
+    rounds stop early once imputations stop changing.
+    """
+
+    #: Trees per random forest.
+    n_estimators: int = 50
+    #: Maximum imputation rounds over all incomplete columns.
+    max_iter: int = 5
+    #: Predict each column from only this many most-correlated other columns
+    #: (``None`` = all of them); lowers run time on very wide tables.
+    n_nearest_features: int | None = None
+
+
+@dataclasses.dataclass
+class MissingIndicatorConfig:
+    """Binary ``<column>__missing`` features so generators learn missingness.
+
+    Indicators come from the raw data (1 where the value is missing), so both
+    imputation phases see the same ones. Synthetic values whose indicator is 1
+    are blanked again in the released copy of each synthetic dataset.
+    """
+
+    enabled: bool = True
+    #: Columns missing in at least this share of the train rows outside the
+    #: tuning split get an indicator; rarer missingness gets none.
+    min_missing_fraction: float = 0.05
+    #: Write ``released/<model>.csv`` with values blanked where the synthetic
+    #: indicator is 1 and the indicator columns dropped.
+    remask_synthetic: bool = True
+    #: Columns missing in at least this share of those rows keep only their
+    #: indicator: their values are neither imputed nor generated, and the
+    #: released copy fills "recorded" synthetic rows by CART leaf sampling
+    #: fitted on observed train values (synthpop's two-step method).
+    #: ``null`` turns this off, so every column is imputed and generated.
+    indicator_only_fraction: float | None = 0.8
+    #: Columns to keep imputing and generating whatever their missingness.
+    #: The target, stratification and role columns are always kept.
+    keep_values_columns: list = dataclasses.field(default_factory=list)
+
+
 @dataclasses.dataclass
 class RefiDiffBenchmarkHPOConfig:
     """Narrow, staged search space for masked-cell RefiDiff validation."""
@@ -228,10 +276,13 @@ class RefiDiffBenchmarkConfig:
 @dataclasses.dataclass
 class ImputationConfig:
     enabled: bool = True
-    #: "tabimpute" (default, TabPFN-based) or "refidiff" (predictive+diffusion
-    #: hybrid; better suited to wide datasets where tabimpute's one-hot
-    #: categorical encoding OOMs -- see synthdata/imputation/refidiff_backend.py).
-    method: str = "tabimpute"
+    #: "missforest" (default; iterative random-forest imputation), "simple"
+    #: (median for continuous columns, most frequent value for categorical
+    #: ones; fast, used by CI), "tabimpute" (TabPFN-based) or "refidiff"
+    #: (predictive+diffusion hybrid -- see synthdata/imputation/refidiff_backend.py).
+    #: Every method is fitted twice: on train minus tuning for HPO, then on
+    #: all of train for the final models and the holdout.
+    method: str = "missforest"
     #: "auto" | "cpu" | "cuda" | "mps"
     device: str = "auto"
     #: Optional per-column rounding precision (decimal places) applied post-imputation.
@@ -252,6 +303,14 @@ class ImputationConfig:
     cache: bool = True
     #: Fractional margin used when validating imputed continuous values fall within range.
     validation_margin: float = 0.2
+    #: Warn when a column's imputed values differ between the two fits by more
+    #: than this (see ``imputation_drift.csv``).
+    drift_warn_threshold: float = 0.1
+    #: Only used when method == "missforest".
+    missforest: MissForestConfig = dataclasses.field(default_factory=MissForestConfig)
+    missing_indicators: MissingIndicatorConfig = dataclasses.field(
+        default_factory=MissingIndicatorConfig
+    )
     #: Only used when method == "refidiff".
     refidiff: RefiDiffConfig = dataclasses.field(default_factory=RefiDiffConfig)
     #: Optional train-only artificial-masking benchmark/HPO for RefiDiff.
@@ -643,6 +702,8 @@ _NESTED_DATACLASSES = {
     (Config, "plots"): PlotsConfig,
     (Config, "experiment"): ExperimentConfig,
     (ImputationConfig, "refidiff"): RefiDiffConfig,
+    (ImputationConfig, "missforest"): MissForestConfig,
+    (ImputationConfig, "missing_indicators"): MissingIndicatorConfig,
     (ImputationConfig, "benchmark"): RefiDiffBenchmarkConfig,
     (RefiDiffBenchmarkConfig, "hpo"): RefiDiffBenchmarkHPOConfig,
     (GenerationConfig, "synthcity"): SynthcityModelsConfig,
@@ -770,10 +831,23 @@ def _validate(cfg: Config) -> None:
     _validate_split(cfg)
     if cfg.device not in ("auto", "cpu", "cuda", "mps"):
         raise ValueError(f"device must be one of auto/cpu/cuda/mps, got {cfg.device!r}")
-    if cfg.imputation.method not in ("tabimpute", "refidiff"):
+    if cfg.imputation.method not in IMPUTATION_METHODS:
         raise ValueError(
-            f"imputation.method must be 'tabimpute' or 'refidiff', got {cfg.imputation.method!r}"
+            f"imputation.method must be one of {IMPUTATION_METHODS}, got {cfg.imputation.method!r}"
         )
+    indicators = cfg.imputation.missing_indicators
+    if not 0 < indicators.min_missing_fraction <= 1:
+        raise ValueError("imputation.missing_indicators.min_missing_fraction must be in (0, 1]")
+    if indicators.indicator_only_fraction is not None and not (
+        indicators.min_missing_fraction <= indicators.indicator_only_fraction <= 1
+    ):
+        raise ValueError(
+            "imputation.missing_indicators.indicator_only_fraction must be between "
+            "min_missing_fraction and 1"
+        )
+    missforest = cfg.imputation.missforest
+    if missforest.n_estimators < 1 or missforest.max_iter < 1:
+        raise ValueError("imputation.missforest.n_estimators and max_iter must be at least 1")
     if cfg.imputation.refidiff.denoiser not in ("auto", "mamba", "mlp"):
         raise ValueError(
             "imputation.refidiff.denoiser must be 'auto', 'mamba', or 'mlp', "
