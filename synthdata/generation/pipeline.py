@@ -255,6 +255,7 @@ def run_generation(
                     seed,
                     workspace=output_dir / "synthcity_workspace",
                     device=device,
+                    classification=dataset.target_is_categorical,
                 ),
             )
 
@@ -269,6 +270,7 @@ def run_generation(
                         n_samples,
                         workspace=output_dir / "synthcity_workspace",
                         device=device,
+                        classification=dataset.target_is_categorical,
                     )
                     params = hpo_mod.run_study(
                         f"hpo_{name}",
@@ -296,6 +298,7 @@ def run_generation(
                         seed,
                         workspace=output_dir / "synthcity_workspace",
                         device=device,
+                        classification=dataset.target_is_categorical,
                     ),
                 )
 
@@ -324,6 +327,7 @@ def run_generation(
                         n_samples,
                         target_is_categorical=dataset.target_is_categorical,
                         variable_schema_fingerprint=dataset.variable_schema_fingerprint,
+                        seed=seed,
                     ),
                 )
             if "custom" in gen_cfg.tabpfn.variants:

@@ -405,8 +405,10 @@ class TabPFNConfig:
 class TabPFGenConfig:
     """TabPFGen (energy-based sampling with TabPFN as the classifier)."""
 
-    #: Train TabPFGen generators at all.
-    enabled: bool = True
+    #: Off by default: TabPFGen 0.1.4's SGLD energy is the distance to the
+    #: nearest training row, so its output is jittered copies of training rows
+    #: (see docs/verification.md). Kept for a later swap to TabEBM.
+    enabled: bool = False
     #: "standard" (TabPFGen defaults) and/or "custom" (SGLD + nearest-neighbor relabeling).
     variants: list = dataclasses.field(default_factory=lambda: ["standard", "custom"])
     #: kwargs passed to TabPFGen() for the non-HPO "standard" variant (empty = library defaults).

@@ -60,9 +60,9 @@ generation:
     variants: [standard, custom]
     data_variants: [raw, imputed]
 
+  # Off: TabPFGen outputs near-copies of training rows (docs/verification.md).
   tabpfgen:
-    enabled: true
-    variants: [standard, custom]
+    enabled: false
 
   # Resample synthetic data to the real train class shares.
   match_class_prior: true
@@ -79,8 +79,7 @@ generation:
     # Training length searched per model, [low, high, step]: shortened from the
     # libraries' ranges to keep this small CPU demo quick.
     epoch_ranges:
-      { ctgan: [100, 300, 100], adsgan: [100, 300, 100], pategan: [1, 5, 1],
-        tabpfgen_standard: [100, 500, 100], tabpfgen_custom: [100, 500, 100] }
+      { ctgan: [100, 300, 100], adsgan: [100, 300, 100], pategan: [1, 5, 1] }
     pruner: median
 
 evaluation:

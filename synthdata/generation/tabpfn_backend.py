@@ -27,6 +27,13 @@ def validate_tabpfn_target(target_column: str, target_is_categorical: bool) -> N
         )
 
 
+def sample_labels(proba: np.ndarray, classes: np.ndarray, seed: int) -> np.ndarray:
+    """Draw one label per row from its predicted class probabilities."""
+    u = np.random.default_rng(seed).random((len(proba), 1))
+    idx = (u > np.cumsum(proba, axis=1)).sum(axis=1)
+    return np.asarray(classes)[np.minimum(idx, len(classes) - 1)]
+
+
 def _patch_explicit_categorical_feature_inference():
     """Make TabPFN extensions honor the caller's categorical column list.
 
@@ -169,7 +176,10 @@ def _patch_regression_sample_inf_bug():
     add the link here and re-check whether this patch is still needed before
     deleting it.
     """
-    from tabpfn.architectures.base.bar_distribution import BarDistribution
+    try:  # tabpfn >= 9 moved the module
+        from tabpfn.architectures.shared.bar_distribution import BarDistribution
+    except ImportError:
+        from tabpfn.architectures.base.bar_distribution import BarDistribution
 
     if getattr(BarDistribution, "_synthdata_icdf_patched", False):
         return
@@ -223,8 +233,13 @@ def generate_tabpfn_standard(
     n_samples: int,
     target_is_categorical: bool = True,
     variable_schema_fingerprint: str | None = None,
+    seed: int = 0,
 ) -> tuple[pd.DataFrame, object]:
-    """Features-only synthesis; target label assigned post-hoc via a fresh classifier.
+    """Features-only synthesis; target label drawn post-hoc from a fresh classifier.
+
+    Each label is sampled from the classifier's predicted class probabilities
+    rather than taken as the most likely class, so minority classes appear at
+    their conditional rate instead of being argmax-ed away.
 
     Returns ``(synthetic_df, experiment)`` -- ``experiment.data`` (the
     real+synthetic long frame) is useful for real-vs-synthetic plotting.
@@ -288,7 +303,8 @@ def generate_tabpfn_standard(
 
     clf = TabPFNClassifier()
     clf.fit(x, y)
-    target_values = clf.predict(synthetic_encoded.to_numpy(dtype=float))
+    proba = clf.predict_proba(synthetic_encoded.to_numpy(dtype=float))
+    target_values = sample_labels(proba, clf.classes_, seed)
 
     synthetic_data = decode_label_encoded_columns(synthetic_encoded, category_maps)
     synthetic_data[target_column] = target_values

@@ -3,6 +3,7 @@
 import sys
 import types
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -74,3 +75,20 @@ def test_explicit_type_patch_is_idempotent(monkeypatch):
 def test_tabpfn_generators_reject_continuous_target(generator, arguments):
     with pytest.raises(ValueError, match="target column 'target'.*continuous"):
         generator(*arguments, target_is_categorical=False)
+
+
+def test_sample_labels_follows_class_probabilities():
+    proba = np.tile([0.8, 0.15, 0.05], (20000, 1))
+    labels = tabpfn_backend.sample_labels(proba, np.array(["a", "b", "c"]), seed=0)
+    shares = pd.Series(labels).value_counts(normalize=True)
+    # argmax would return "a" for every row
+    assert shares["a"] == pytest.approx(0.8, abs=0.01)
+    assert shares["b"] == pytest.approx(0.15, abs=0.01)
+    assert shares["c"] == pytest.approx(0.05, abs=0.01)
+
+
+def test_sample_labels_is_seeded_and_handles_certain_rows():
+    proba = np.array([[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]])
+    first = tabpfn_backend.sample_labels(proba, np.array([0, 1]), seed=3)
+    assert list(first[:2]) == [0, 1]
+    assert list(first) == list(tabpfn_backend.sample_labels(proba, np.array([0, 1]), seed=3))
