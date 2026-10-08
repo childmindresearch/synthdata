@@ -135,8 +135,6 @@ evaluation:
     memory_per_model_gib: 1
 
   rank_weights: { utility: 1.0, privacy: 1.0, fairness: 1.0 }
-  privacy_gate:
-    enabled: true
 
 plots:
   output_dir: "{root}/output/clinic/plots"

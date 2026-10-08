@@ -662,54 +662,6 @@ class BinaryTargetConfig:
 
 
 @dataclasses.dataclass
-class PrivacyGateConfig:
-    """Absolute (not merely relative-to-other-models) privacy safety floor.
-
-    Unlike the ranked/scaled columns in the combined evaluation table (which
-    only say "better/worse than the other candidate models in this run" via
-    per-metric min-max scaling), this checks each model's RAW metric value
-    against a fixed threshold, so a model can't look "best on privacy" by
-    comparison alone while still leaking an unacceptable absolute amount.
-    Gate failures are surfaced (a ``privacy_gate_pass``/
-    ``privacy_gate_violations`` column pair in the combined table, plus a
-    WARNING log line) but never silently remove a model from the ranked
-    table -- see :mod:`synthdata.evaluation.privacy_gate`.
-
-    ``thresholds`` maps a metric's exact result-column name (as it appears in
-    the combined table -- e.g. ``"mia_recall"`` or
-    ``"privacy.identifiability_score.score_OC"``) to
-    ``{"bound": "max"|"min", "value": <float>}``. ``"max"`` means the metric's
-    raw value must be ``<= value`` to pass; ``"min"`` means it must be
-    ``>= value`` to pass. A metric not computed this run (selection/failure)
-    is excluded from the gate check (logged), never silently treated as a pass.
-
-    CAUTION: the defaults below are reasonable *starting points* (grounded in
-    "meaningfully above chance/baseline"), NOT validated against any specific
-    regulatory standard (e.g. HIPAA Safe Harbor/Expert Determination) -- get a
-    domain/compliance sign-off before treating this as a real go/no-go gate
-    for an actual data release or challenge submission.
-    """
-
-    #: Check every model against ``thresholds``.
-    enabled: bool = True
-    #: ``{metric column: {"bound": "max"|"min", "value": float}}`` (see above).
-    thresholds: dict = dataclasses.field(
-        default_factory=lambda: {
-            # syntheval metrics (exact result-column names -- see catalog.py /
-            # syntheval_eval.py's normalize_output-derived column names).
-            "mia_recall": {"bound": "max", "value": 0.6},  # chance level ~0.5
-            "mia_precision": {"bound": "max", "value": 0.6},  # chance level ~0.5
-            "hit_rate": {"bound": "max", "value": 0.05},  # >5% near-duplicate rate
-            "att_discl_risk": {"bound": "max", "value": 0.6},
-            # synthcity metrics (dotted "category.metric.subkey" names).
-            "privacy.identifiability_score.score_OC": {"bound": "max", "value": 0.3},
-            "privacy.k-anonymization.syn": {"bound": "min", "value": 5.0},
-            "privacy.k-map.score": {"bound": "min", "value": 5.0},
-        }
-    )
-
-
-@dataclasses.dataclass
 class SynthEvalExecutionConfig:
     """Resource policy for resumable per-model SynthEval evaluation.
 
@@ -798,18 +750,13 @@ class EvaluationConfig:
     #: type-level ranks into the overall rank, a weighted geometric mean (see
     #: synthdata.evaluation.combine.build_combined_table). Keys must be
     #: exactly {"utility","privacy","fairness"}; values must be non-negative.
-    #: Default is equal weight -- ``privacy_gate`` (pass/fail) below is this
-    #: project's primary safeguard for sensitive data, not this weight; raise
-    #: "privacy" here too if you also want privacy to influence relative
-    #: ranking among gate-passing models.
+    #: Default is equal weight; raise "privacy" to make privacy count for more.
     rank_weights: dict = dataclasses.field(
         default_factory=lambda: {"utility": 1.0, "privacy": 1.0, "fairness": 1.0}
     )
-    #: Absolute pass/fail privacy thresholds (see PrivacyGateConfig).
-    privacy_gate: PrivacyGateConfig = dataclasses.field(default_factory=PrivacyGateConfig)
-    #: Whether to generate a human-readable Markdown evaluation report
-    #: (report.md, alongside combined_evaluation.csv) summarizing the ranked
-    #: table, privacy gate results, and a recommended model.
+    #: Whether to write report.md (alongside combined_evaluation.csv): the one
+    #: page that summarizes the run, embeds its plots and links every output.
+    #: ``synthdata-plot`` rewrites it once the plots exist.
     generate_report: bool = True
 
 
@@ -907,6 +854,11 @@ def _from_dict(cls, data: dict | None):
             raise ValueError(f"data.{key} was replaced by {_REMOVED_DATA_KEYS[key]}")
         if cls is HPOConfig and key in _REMOVED_HPO_KEYS:
             raise ValueError(f"generation.hpo.{key} was replaced by {_REMOVED_HPO_KEYS[key]}")
+        if cls is EvaluationConfig and key == "privacy_gate":
+            raise ValueError(
+                "evaluation.privacy_gate was removed: fixed thresholds cannot certify privacy. "
+                "Delete the section; report.md shows the privacy attacks next to the baselines."
+            )
         if key not in field_types:
             raise ValueError(
                 f"Unknown config key '{key}' for {cls.__name__}. Valid keys: {sorted(field_types)}"
@@ -944,7 +896,6 @@ _NESTED_DATACLASSES = {
     (EvaluationConfig, "log_disparity"): LogDisparityConfig,
     (EvaluationConfig, "binary_target"): BinaryTargetConfig,
     (EvaluationConfig, "syntheval_execution"): SynthEvalExecutionConfig,
-    (EvaluationConfig, "privacy_gate"): PrivacyGateConfig,
     (EvaluationConfig, "privacy_attacks"): PrivacyAttacksConfig,
     (PrivacyAttacksConfig, "anonymeter"): AnonymeterConfig,
 }
@@ -1351,19 +1302,3 @@ def _validate(cfg: Config) -> None:
         raise ValueError(
             f"evaluation.rank_weights values must be non-negative numbers, got {negative_weights}"
         )
-    for metric, spec in cfg.evaluation.privacy_gate.thresholds.items():
-        if not isinstance(spec, dict) or "bound" not in spec or "value" not in spec:
-            raise ValueError(
-                f"evaluation.privacy_gate.thresholds[{metric!r}] must be a dict with 'bound' and "
-                f"'value' keys, got {spec!r}"
-            )
-        if spec["bound"] not in ("max", "min"):
-            raise ValueError(
-                f"evaluation.privacy_gate.thresholds[{metric!r}]['bound'] must be 'max' or 'min', "
-                f"got {spec['bound']!r}"
-            )
-        if not isinstance(spec["value"], (int, float)):
-            raise ValueError(
-                f"evaluation.privacy_gate.thresholds[{metric!r}]['value'] must be a number, "
-                f"got {spec['value']!r}"
-            )

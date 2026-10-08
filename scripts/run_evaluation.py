@@ -101,11 +101,9 @@ def main() -> None:
         # so no separate/redundant recomputation pass is needed here.
 
         if cfg.evaluation.generate_report:
-            # The report was already written once inside run_evaluation(), but its
-            # "Plots" section links to files that only exist *after* the plotting
-            # calls above -- re-save it now (cheap: just re-renders markdown from
-            # already-computed results, no metric recomputation) so those links
-            # are accurate.
+            # The report was already written once inside run_evaluation(), but it
+            # embeds plots that only exist *after* the plotting calls above --
+            # re-save it now (cheap: re-renders markdown from computed results).
             from synthdata.evaluation.report import save_evaluation_report
 
             report_path = save_evaluation_report(cfg, dataset, combined, extras, experiment)

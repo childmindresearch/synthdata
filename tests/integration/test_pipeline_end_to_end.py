@@ -267,7 +267,7 @@ def test_combined_table_has_one_complete_row_per_model(pipeline_run):
         "custom",
         "__all__",
     }
-    metrics = [c for c in combined.columns if c[1] != "privacy_gate"]
+    metrics = list(combined.columns)
     all_missing = [c for c in metrics if combined[c].isna().all()]
     assert not all_missing, all_missing
 
@@ -331,9 +331,8 @@ def test_copying_training_rows_does_not_pay_off_overall(pipeline_run):
     assert overall["baseline_train_copy"] < generators.max(), overall.to_dict()
 
 
-def test_privacy_gate_verdict_is_boolean(pipeline_run):
-    verdict = pipeline_run.combined()[("__all__", "privacy_gate", "pass")]
-    assert verdict.astype(str).isin(["True", "False"]).all()
+def test_combined_table_has_no_privacy_gate(pipeline_run):
+    assert "privacy_gate" not in pipeline_run.combined().columns.get_level_values("type")
 
 
 def test_syntheval_fairness_metrics_are_reported(pipeline_run):
@@ -363,7 +362,7 @@ def test_holdout_tstr_is_ranked_and_reported_per_class(pipeline_run):
     table = pd.read_csv(pipeline_run.evaluation_dir / "tstr_holdout.csv", index_col=0)
     assert "trtr (real train)" in table.index
     assert {"f1_0", "f1_1"} <= set(table.columns)
-    assert "## Class-level utility" in (pipeline_run.evaluation_dir / "report.md").read_text()
+    assert "trtr (real train)" in (pipeline_run.evaluation_dir / "report.md").read_text()
 
 
 def test_ranking_summary_has_one_row_per_model(pipeline_run):
