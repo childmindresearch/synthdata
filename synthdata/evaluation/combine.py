@@ -17,10 +17,12 @@ from synthdata.evaluation.catalog import (
     LOG_DISPARITY_METRICS,
     SYNTHCITY_CATEGORY_TO_TYPE,
     SYNTHCITY_UNRANKED_SUBMETRICS,
+    TSTR_METRICS,
     is_custom_syntheval_metric,
     is_redundant_synthcity_submetric,
 )
 from synthdata.evaluation.custom_eval import build_log_disparity_summary_table
+from synthdata.evaluation.privacy_attacks import ANONYMETER_METRICS, HOLDOUT_DISTANCE_METRICS
 from synthdata.evaluation.syntheval_eval import (
     extract_metric_types,
     extract_oriented_values,
@@ -146,6 +148,55 @@ def _log_disparity_frames(
     return raw, oriented
 
 
+def _tstr_frames(
+    tstr_result: dict | None, model_names: list
+) -> "tuple[pd.DataFrame, pd.DataFrame]":
+    """Holdout TSTR macro scores as custom utility columns (all higher-is-better)."""
+    scores = (tstr_result or {}).get("scores") or {}
+    if not scores:
+        empty = pd.DataFrame(index=model_names)
+        return empty, empty
+    raw = pd.DataFrame(
+        {
+            "tstr_macro_f1": {m: s.macro_f1 for m, s in scores.items()},
+            "tstr_balanced_accuracy": {m: s.balanced_accuracy for m, s in scores.items()},
+            "tstr_macro_auprc": {m: s.macro_auprc for m, s in scores.items()},
+        }
+    ).reindex(index=model_names, columns=list(TSTR_METRICS))
+    raw.columns = pd.MultiIndex.from_tuples([("custom", "utility", c) for c in raw.columns])
+    return raw, raw.copy()
+
+
+def _privacy_attack_frames(
+    privacy_result: dict | None, model_names: list
+) -> "tuple[pd.DataFrame, pd.DataFrame]":
+    """Anonymeter risks and holdout-referenced distances as custom privacy columns.
+
+    Values on the safe side of the no-memorization reference (share or AUC
+    below 0.5, ratio above 1) earn no extra credit: being further from the
+    training rows than unseen real rows are is not more private, only less
+    useful. So the oriented share/AUC are clipped at 0.5 and the ratios at 1.
+    """
+    scores = (privacy_result or {}).get("scores") or {}
+    if not scores:
+        empty = pd.DataFrame(index=model_names)
+        return empty, empty
+    metrics = [*ANONYMETER_METRICS, *HOLDOUT_DISTANCE_METRICS]
+    raw = pd.DataFrame.from_dict(scores, orient="index").reindex(index=model_names)
+    raw = raw[[m for m in metrics if m in raw.columns]].astype(float)
+    oriented = pd.DataFrame(index=raw.index)
+    for metric in raw.columns:
+        if metric in ANONYMETER_METRICS:
+            oriented[metric] = -raw[metric]
+        elif HOLDOUT_DISTANCE_METRICS[metric]:
+            oriented[metric] = -raw[metric].clip(lower=0.5)
+        else:
+            oriented[metric] = raw[metric].clip(upper=1.0)
+    for frame in (raw, oriented):
+        frame.columns = pd.MultiIndex.from_tuples([("custom", "privacy", c) for c in frame.columns])
+    return raw, oriented
+
+
 def _minmax_scale(col: pd.Series) -> pd.Series:
     """Per-column min-max scaling; NaN-safe (ties -> 0.5, NaNs preserved)."""
     valid = col.dropna()
@@ -179,8 +230,15 @@ def build_combined_table(
     log_disparity_reports: dict[str, dict],
     model_names: list,
     rank_weights: dict | None = None,
+    tstr_result: dict | None = None,
+    privacy_result: dict | None = None,
 ) -> pd.DataFrame:
     """Build the single combined, ranked, multi-index evaluation table.
+
+    ``tstr_result`` (from :func:`synthdata.evaluation.custom_eval.run_tstr_evaluation`)
+    adds the holdout TSTR macro scores as a ``("custom", "utility")`` group, and
+    ``privacy_result`` (from :func:`synthdata.evaluation.custom_eval.run_privacy_evaluation`)
+    the Anonymeter risks and holdout-referenced distances as ``("custom", "privacy")``.
 
     Ranking scheme -- a hierarchical *mean-of-means*, not a flat sum, so a
     framework/type with many metric columns (e.g. synthcity's ~7-column
@@ -210,9 +268,15 @@ def build_combined_table(
         syntheval_benchmark_results, syntheval_benchmark_ranks, model_names
     )
     ld_raw, ld_oriented = _log_disparity_frames(log_disparity_reports, model_names)
+    ts_raw, ts_oriented = _tstr_frames(tstr_result, model_names)
+    pa_raw, pa_oriented = _privacy_attack_frames(privacy_result, model_names)
 
-    raw_parts = [df for df in (sc_raw, se_raw, ld_raw) if not df.empty]
-    oriented_parts = [df for df in (sc_oriented, se_oriented, ld_oriented) if not df.empty]
+    raw_parts = [df for df in (sc_raw, se_raw, ld_raw, ts_raw, pa_raw) if not df.empty]
+    oriented_parts = [
+        df
+        for df in (sc_oriented, se_oriented, ld_oriented, ts_oriented, pa_oriented)
+        if not df.empty
+    ]
 
     if not raw_parts:
         raise ValueError("No evaluation results to combine: check evaluation config selection")

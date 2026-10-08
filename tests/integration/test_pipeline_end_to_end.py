@@ -357,6 +357,17 @@ def test_feature_importance_rank_distance_is_reported(pipeline_run):
     assert any(m.startswith("performance.feat_rank_distance") for m in metrics)
 
 
+def test_holdout_tstr_is_ranked_and_reported_per_class(pipeline_run):
+    combined = pipeline_run.combined()
+    tstr = combined[("custom", "utility", "tstr_macro_f1")]
+    assert tstr.notna().all() and tstr.between(0, 1).all()
+    assert ("custom", "utility", "rank") in combined.columns
+    table = pd.read_csv(pipeline_run.evaluation_dir / "tstr_holdout.csv", index_col=0)
+    assert "trtr (real train)" in table.index
+    assert {"f1_0", "f1_1"} <= set(table.columns)
+    assert "## Class-level utility" in (pipeline_run.evaluation_dir / "report.md").read_text()
+
+
 def test_ranking_summary_has_one_row_per_model(pipeline_run):
     summary = pd.read_csv(pipeline_run.evaluation_dir / "ranking_summary.csv", index_col=0)
     assert sorted(summary.index) == sorted(MODELS + BASELINES)

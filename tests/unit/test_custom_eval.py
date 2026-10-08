@@ -6,7 +6,9 @@ import pytest
 from synthdata.config import FrameworkSelectionConfig, LogDisparityConfig
 from synthdata.evaluation.custom_eval import (
     build_log_disparity_summary_table,
+    build_tstr_table,
     run_log_disparity_evaluation,
+    run_tstr_evaluation,
 )
 
 pytestmark = pytest.mark.unit
@@ -127,3 +129,40 @@ class TestBuildLogDisparitySummaryTable:
         table = build_log_disparity_summary_table(reports)
         assert table.loc["good"].notna().all()
         assert table.loc["bad"].isna().all()
+
+
+class TestRunTstrEvaluation:
+    @pytest.fixture
+    def tstr_dataset(self, make_dataset):
+        import numpy as np
+
+        rng = np.random.default_rng(0)
+        x = rng.normal(size=200)
+        df = pd.DataFrame({"x": x, "target": np.digitize(x, [-0.5, 0.8])})
+        dataset = make_dataset(df=df)
+        dataset.train_imputed_df, dataset.test_imputed_df = dataset.train_df, dataset.test_df
+        return dataset
+
+    def test_scores_each_model_on_the_test_split_with_a_trtr_ceiling(self, tstr_dataset):
+        real = tstr_dataset.train_imputed_df
+        noise = real.assign(target=real["target"].sample(frac=1, random_state=0).to_numpy())
+        result = run_tstr_evaluation(
+            {"copy": real, "noise": noise}, tstr_dataset, FrameworkSelectionConfig(), 2, 0
+        )
+        assert result["classes"] == ["0", "1", "2"]
+        assert result["scores"]["copy"] == result["trtr"]
+        assert result["scores"]["noise"].macro_f1 < result["scores"]["copy"].macro_f1
+
+        table = build_tstr_table(result)
+        assert list(table.index) == ["copy", "noise", "trtr (real train)"]
+        assert {"tstr_macro_f1", "tstr_balanced_accuracy", "tstr_macro_auprc"} <= set(table.columns)
+        assert {"f1_0", "f1_1", "f1_2"} <= set(table.columns)
+
+    def test_deselected_returns_empty(self, tstr_dataset):
+        selection = FrameworkSelectionConfig(categories=["fairness"])
+        assert run_tstr_evaluation({}, tstr_dataset, selection, 1, 0) == {}
+        assert build_tstr_table({}).empty
+
+    def test_log_disparity_selection_by_name_leaves_tstr_out(self, tstr_dataset):
+        selection = FrameworkSelectionConfig(metrics=["log_disparity"])
+        assert run_tstr_evaluation({}, tstr_dataset, selection, 1, 0) == {}

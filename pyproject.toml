@@ -26,6 +26,7 @@ dependencies = [
     "tqdm",
     "ucimlrepo",
     "optuna",
+    "anonymeter>=1.1.0",
     "torch>=2.7.1",
     "torchvision>=0.22.1",
 ]

@@ -9,6 +9,7 @@ import json
 import multiprocessing
 import os
 import random
+import re
 import socket
 import time
 import traceback
@@ -895,40 +896,27 @@ def build_binary_preset(selection_cfg) -> dict:
     return {k: v for k, v in SYNTHEVAL_PRESET.items() if k in selected and k in BINARY_ONLY_METRICS}
 
 
-def run_binary_target_syntheval_evaluation(
+def _run_collapsed_target_pass(
     synthetic_datasets: dict[str, pd.DataFrame],
     dataset: Dataset,
-    selection_cfg,
-    binary_target_cfg,
+    preset: dict,
+    column: str,
+    positive_classes: list,
+    negative_classes: list,
+    pass_name: str,
     preset_dir: str | Path,
-    ranking_strategy: str = "linear",
-    output_folder: str | Path | None = None,
-    execution_cfg=None,
-    seed: int = 0,
-) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
-    """Run a second, separate SynthEval benchmark() pass against a binary-
-    collapsed copy of the target column, for the metrics that require exactly
-    2 target classes (BINARY_ONLY_METRICS) and would otherwise be unable to
-    run at all against a 3+ class target.
+    ranking_strategy: str,
+    output_folder: str | Path | None,
+    execution_cfg,
+    seed: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run one SynthEval benchmark pass with ``column`` collapsed to 0/1.
 
-    This never touches ``dataset.train_imputed_df``/``test_imputed_df``/the
-    caller's ``synthetic_datasets`` -- only disposable copies, with the target
-    column's values (not its name -- see build_binary_target_series) replaced
-    in place, so it's still correctly excluded from the model's own feature
-    set exactly like the original target (no leakage from the original,
-    finer-grained labels lingering as a feature).
-
-    Returns (benchmark_results, benchmark_ranks), both None if no
-    BINARY_ONLY_METRICS are selected.
+    Only disposable copies are changed, and only the column's values (not its
+    name -- see build_binary_target_series), so the column is still excluded
+    from the model's own feature set exactly like the original target (no
+    leakage from the original, finer-grained labels lingering as a feature).
     """
-    preset = build_binary_preset(selection_cfg)
-    if not preset:
-        logger.info("[syntheval] binary-target pass: no eligible metrics selected; skipping")
-        return None, None
-
-    column = binary_target_cfg.column or dataset.target_column
-    positive_classes = binary_target_cfg.positive_classes
-    negative_classes = binary_target_cfg.negative_classes
 
     def _binarize(df: pd.DataFrame) -> pd.DataFrame:
         out = df.copy()
@@ -940,7 +928,7 @@ def run_binary_target_syntheval_evaluation(
     binary_synthetic_datasets = {name: _binarize(df) for name, df in synthetic_datasets.items()}
 
     preset_dir = ensure_dir(preset_dir)
-    preset_path = preset_dir / "syntheval_binary_target_preset.json"
+    preset_path = preset_dir / f"syntheval_{pass_name}_preset.json"
     save_json(preset_path, preset)
     binary_dataset = dataclasses.replace(
         dataset,
@@ -950,7 +938,7 @@ def run_binary_target_syntheval_evaluation(
     )
     cache_dir = Path(output_folder) if output_folder else preset_dir / "syntheval_benchmark"
     context_fingerprint = _evaluation_context_fingerprint(
-        binary_dataset, preset, "binary_target", False, seed
+        binary_dataset, preset, pass_name, False, seed
     )
     model_fingerprints = {
         name: _frame_fingerprint(frame) for name, frame in binary_synthetic_datasets.items()
@@ -965,7 +953,7 @@ def run_binary_target_syntheval_evaluation(
             ).encode()
         ).hexdigest(),
     )
-    cached = _load_syntheval_cache(cache_dir, "binary_target", cache_key)
+    cached = _load_syntheval_cache(cache_dir, pass_name, cache_key)
     if cached is not None:
         return cached
 
@@ -974,8 +962,9 @@ def run_binary_target_syntheval_evaluation(
 
         execution_cfg = SynthEvalExecutionConfig()
     logger.info(
-        "[syntheval] binary-target pass: scheduling %d datasets across %d metric(s) "
+        "[syntheval] %s pass: scheduling %d datasets across %d metric(s) "
         "(column %r collapsed to binary: positive=%s, negative=%s)",
+        pass_name,
         len(binary_synthetic_datasets),
         len(preset),
         column,
@@ -990,12 +979,152 @@ def run_binary_target_syntheval_evaluation(
         cache_dir,
         ranking_strategy,
         execution_cfg,
-        "binary_target",
+        pass_name,
         seed,
     )
-    _save_syntheval_cache(benchmark_results, benchmark_ranks, cache_dir, "binary_target", cache_key)
-
+    _save_syntheval_cache(benchmark_results, benchmark_ranks, cache_dir, pass_name, cache_key)
     return benchmark_results, benchmark_ranks
+
+
+def run_binary_target_syntheval_evaluation(
+    synthetic_datasets: dict[str, pd.DataFrame],
+    dataset: Dataset,
+    selection_cfg,
+    binary_target_cfg,
+    preset_dir: str | Path,
+    ranking_strategy: str = "linear",
+    output_folder: str | Path | None = None,
+    execution_cfg=None,
+    seed: int = 0,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """Run a second, separate SynthEval benchmark() pass against a binary-
+    collapsed copy of the target column, for the metrics that require exactly
+    2 target classes (BINARY_ONLY_METRICS) and would otherwise be unable to
+    run at all against a 3+ class target (``evaluation.class_averaging:
+    binary``).
+
+    Returns (benchmark_results, benchmark_ranks), both None if no
+    BINARY_ONLY_METRICS are selected.
+    """
+    preset = build_binary_preset(selection_cfg)
+    if not preset:
+        logger.info("[syntheval] binary-target pass: no eligible metrics selected; skipping")
+        return None, None
+
+    return _run_collapsed_target_pass(
+        synthetic_datasets,
+        dataset,
+        preset,
+        binary_target_cfg.column or dataset.target_column,
+        binary_target_cfg.positive_classes,
+        binary_target_cfg.negative_classes,
+        "binary_target",
+        preset_dir,
+        ranking_strategy,
+        output_folder,
+        execution_cfg,
+        seed,
+    )
+
+
+def _pass_label(value) -> str:
+    """File-name-safe label for one class in a one-vs-rest pass name."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)) or "class"
+
+
+def average_ovr_results(
+    per_class_results: dict, per_class_ranks: dict
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Macro-average one-vs-rest passes: the unweighted mean over classes.
+
+    ``per_class_results``/``per_class_ranks`` map each class to that pass's
+    SynthEval ``(results, ranks)``. A metric's value, error and oriented score
+    are each averaged over the classes it ran for (the oriented scores are
+    linear in the value, so the mean of the oriented scores is the oriented
+    mean). Returns ``(results, ranks, per_class)`` where ``per_class`` is a
+    models x (metric, class) table of the raw values, so a failing minority
+    class stays visible behind the average.
+    """
+    classes = list(per_class_results)
+    first = per_class_results[classes[0]]
+    metrics = [m for m in first.columns.get_level_values(0).unique() if m not in _RANK_COLUMNS]
+    results = pd.DataFrame(index=first.index)
+    ranks = pd.DataFrame(index=first.index)
+    per_class = {}
+    for metric in metrics:
+        values = pd.concat(
+            [per_class_results[c][(metric, "value")].rename(c) for c in classes], axis=1
+        ).astype(float)
+        errors = pd.concat(
+            [per_class_results[c][(metric, "error")].rename(c) for c in classes], axis=1
+        ).astype(float)
+        oriented = pd.concat(
+            [per_class_ranks[c][metric].rename(c) for c in classes], axis=1
+        ).astype(float)
+        results[(metric, "value")] = values.mean(axis=1)
+        # Standard error of a mean of K estimates (treated as independent).
+        results[(metric, "error")] = np.sqrt((errors**2).sum(axis=1, min_count=1)) / len(classes)
+        results[(metric, "type")] = first[(metric, "type")]
+        ranks[metric] = oriented.mean(axis=1)
+        for c in classes:
+            per_class[(metric, str(c))] = values[c]
+    results.columns = pd.MultiIndex.from_tuples(results.columns)
+    per_class_df = pd.DataFrame(per_class)
+    if not per_class_df.empty:
+        per_class_df.columns = pd.MultiIndex.from_tuples(
+            per_class_df.columns, names=["metric", "class"]
+        )
+    return results, ranks, per_class_df
+
+
+def run_ovr_macro_syntheval_evaluation(
+    synthetic_datasets: dict[str, pd.DataFrame],
+    dataset: Dataset,
+    selection_cfg,
+    preset_dir: str | Path,
+    ranking_strategy: str = "linear",
+    output_folder: str | Path | None = None,
+    execution_cfg=None,
+    seed: int = 0,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
+    """Macro one-vs-rest for the binary-only metrics (``class_averaging: ovr_macro``).
+
+    For a target with K >= 3 classes, the unmodified SynthEval metrics in
+    BINARY_ONLY_METRICS run K times, each time with one class as the positive
+    outcome (1) and every other class as the negative (0), and their results
+    are averaged with equal weight per class -- the same scheme as sklearn's
+    ``roc_auc_score(multi_class="ovr", average="macro")``. Library code is
+    composed, never modified.
+
+    Returns ``(results, ranks, per_class)`` (see :func:`average_ovr_results`),
+    all None if no binary-only metric is selected.
+    """
+    preset = build_binary_preset(selection_cfg)
+    if not preset:
+        logger.info("[syntheval] one-vs-rest passes: no eligible metrics selected; skipping")
+        return None, None, None
+
+    column = dataset.target_column
+    classes = sorted(dataset.train_imputed_df[column].dropna().unique().tolist(), key=str)
+    per_class_results, per_class_ranks = {}, {}
+    for cls in classes:
+        rest = [c for c in classes if c != cls]
+        results, ranks = _run_collapsed_target_pass(
+            synthetic_datasets,
+            dataset,
+            preset,
+            column,
+            [cls],
+            rest,
+            f"ovr_{_pass_label(cls)}",
+            preset_dir,
+            ranking_strategy,
+            output_folder,
+            execution_cfg,
+            seed,
+        )
+        per_class_results[cls], per_class_ranks[cls] = results, ranks
+    return average_ovr_results(per_class_results, per_class_ranks)
 
 
 def merge_binary_target_results(

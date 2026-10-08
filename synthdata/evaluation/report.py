@@ -327,6 +327,71 @@ def _fairness_highlights_section(combined: pd.DataFrame, extras: dict) -> str:
     return "\n".join(lines)
 
 
+def _privacy_attacks_section(extras: dict) -> str:
+    """Anonymeter risks and the holdout-referenced distance heuristics."""
+    lines = ["## Privacy attacks", ""]
+    result = extras.get("privacy_result") or {}
+    scores = result.get("scores") or {}
+    if not scores:
+        lines.append("Privacy attacks (Anonymeter, holdout-referenced distances) were not run.")
+        return "\n".join(lines)
+    unit = result.get("unit", "patient")
+    lines.append(
+        f"Individuals are counted per **{unit}**. Anonymeter risks are attack success above a "
+        "baseline attack that only sees the test split (0 = no better than guessing from "
+        "unseen data, 1 = every attack succeeds); the inference risk is the worst sensitive "
+        "column. The distance metrics are **heuristics with no privacy guarantee**, reported "
+        "only against unseen real rows: `dcr_closer_to_train_share` and `distance_mia_auc` "
+        "should be near 0.5, `dcr_holdout_ratio` and `nndr_holdout_ratio` near or above 1. "
+        "Every attack with its interval, its attack, baseline and control success rates, and "
+        "whether Anonymeter judged it reliable (the attack beat random guessing) is in "
+        "`privacy_attacks.csv`."
+    )
+    lines.append("")
+    table = pd.DataFrame.from_dict(scores, orient="index")
+    table.index.name = "model"
+    lines.append(_dataframe_to_markdown(table.sort_index().reset_index()))
+    return "\n".join(lines)
+
+
+def _class_metrics_section(cfg: Config, extras: dict) -> str:
+    """Imbalance-aware utility: holdout TSTR per class, and how binary-only metrics ran."""
+    lines = ["## Class-level utility (imbalance-aware)", ""]
+    tstr_table = extras.get("tstr_table")
+    if tstr_table is not None and not tstr_table.empty:
+        lines.append(
+            "A fixed XGBoost classifier is fitted on each dataset and scored on the held-out "
+            "test split (train on synthetic, test on real). Macro-F1 and balanced accuracy weigh "
+            "every class equally, so a minority class the synthetic data gets wrong pulls them "
+            "down; per-class F1 (`f1_<class>`) shows which class. The `trtr (real train)` row is "
+            "the same classifier fitted on the real training rows: the ceiling."
+        )
+        lines.append("")
+        lines.append(_dataframe_to_markdown(tstr_table.reset_index()))
+    else:
+        lines.append("Holdout TSTR was not computed this run.")
+    lines.append("")
+    ovr = extras.get("ovr_per_class")
+    if cfg.evaluation.class_averaging == "ovr_macro" and ovr is not None and not ovr.empty:
+        lines.append(
+            "SynthEval metrics that need two classes (AUROC difference, subgroup gap metrics) "
+            "ran once per class against the rest and are averaged with equal weight per class "
+            "in the tables above. Values per class:"
+        )
+        lines.append("")
+        flat = ovr.copy()
+        flat.columns = [f"{metric} [{cls}]" for metric, cls in flat.columns]
+        flat.index.name = "model"
+        lines.append(_dataframe_to_markdown(flat.reset_index()))
+    elif cfg.evaluation.class_averaging == "binary" and cfg.evaluation.binary_target.enabled:
+        bt = cfg.evaluation.binary_target
+        lines.append(
+            "SynthEval metrics that need two classes ran on the target collapsed to "
+            f"positive {bt.positive_classes} versus negative {bt.negative_classes}."
+        )
+    return "\n".join(lines)
+
+
 def _plot_links_section(report_dir: Path, cfg: Config, log_disparity_reports: dict) -> str:
     """List links to evaluation plots, relative to where ``report.md`` is written.
 
@@ -390,6 +455,10 @@ def build_evaluation_report(
         _privacy_gate_section(combined),
         "",
         _recommended_model_section(combined, extras.get("ranking_summary")),
+        "",
+        _class_metrics_section(cfg, extras),
+        "",
+        _privacy_attacks_section(extras),
         "",
         _fairness_highlights_section(combined, extras),
         "",

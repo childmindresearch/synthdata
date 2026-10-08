@@ -1,21 +1,49 @@
-"""Custom fairness evaluation: log disparity (Bhanot et al. 2021) summary metrics.
+"""Custom evaluation: log disparity (Bhanot et al. 2021) fairness summary
+metrics, holdout train-on-synthetic, test-on-real (TSTR) utility scores, and
+privacy attacks (Anonymeter, holdout-referenced DCR/NNDR).
 
 The equalized_odds/equal_opportunity metrics (custom additions to this repo's
 SynthEval fork) are *computed* via :mod:`synthdata.evaluation.syntheval_eval`
 but re-tagged to framework="custom" downstream in
-:mod:`synthdata.evaluation.combine`; this module only covers log disparity,
-which has no SynthEval equivalent.
+:mod:`synthdata.evaluation.combine`; this module covers log disparity, which
+has no SynthEval equivalent, and holdout TSTR, which reports the
+imbalance-aware scores (macro-F1, balanced accuracy, macro AUPRC, per-class
+F1) that the libraries' own classifier metrics do not.
 """
 
 import pandas as pd
 
 from synthdata.data import Dataset
-from synthdata.evaluation.catalog import LOG_DISPARITY_METRICS, resolve_selection
+from synthdata.evaluation.catalog import LOG_DISPARITY_METRICS, TSTR_NAME, resolve_selection
+from synthdata.evaluation.privacy_attacks import (
+    ANONYMETER_NAME,
+    HOLDOUT_DISTANCE_NAME,
+    run_privacy_attack_evaluation,
+)
+from synthdata.evaluation.tstr import tstr_scores
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
 
 _LOG_DISPARITY_NAME = "log_disparity"
+
+#: Every evaluator ``evaluation.custom`` selects from, with its type.
+_CUSTOM_EVALUATORS = {
+    _LOG_DISPARITY_NAME: "fairness",
+    TSTR_NAME: "utility",
+    ANONYMETER_NAME: "privacy",
+    HOLDOUT_DISTANCE_NAME: "privacy",
+}
+
+
+def _selected(selection_cfg, name: str) -> bool:
+    return name in resolve_selection(
+        selection_cfg.enabled,
+        selection_cfg.categories,
+        selection_cfg.metrics,
+        list(_CUSTOM_EVALUATORS),
+        _CUSTOM_EVALUATORS,
+    )
 
 
 def run_log_disparity_evaluation(
@@ -30,15 +58,7 @@ def run_log_disparity_evaluation(
     ``compute_log_disparity_report``, including the Plotly ``report_figure``),
     or ``{}`` if log_disparity is not in the configured selection.
     """
-    all_names = [_LOG_DISPARITY_NAME]
-    selected = resolve_selection(
-        selection_cfg.enabled,
-        selection_cfg.categories,
-        selection_cfg.metrics,
-        all_names,
-        {_LOG_DISPARITY_NAME: "fairness"},
-    )
-    if _LOG_DISPARITY_NAME not in selected:
+    if not _selected(selection_cfg, _LOG_DISPARITY_NAME):
         return {}
 
     from synthdata.log_disparity.metric_log_disparity import compute_log_disparity_report
@@ -94,3 +114,94 @@ def build_log_disparity_summary_table(reports: dict[str, dict]) -> pd.DataFrame:
 
 #: True => lower is "better" (orient as -value for ranking); mirrors LOG_DISPARITY_METRICS.
 LOG_DISPARITY_MINIMIZE = dict(LOG_DISPARITY_METRICS)
+
+
+def run_tstr_evaluation(
+    synthetic_datasets: dict[str, pd.DataFrame],
+    dataset: Dataset,
+    selection_cfg,
+    n_seeds: int,
+    seed: int,
+) -> dict:
+    """Holdout TSTR: fit the fixed XGBoost on each dataset, score on the test split.
+
+    The classifier is the one HPO tunes against (synthdata.evaluation.tstr),
+    but scored here on the test rows, which no generator or search ever saw.
+    The same classifier fitted on the real training rows (TRTR) is the
+    ceiling. Returns ``{"scores": {model: TSTRScores}, "trtr": TSTRScores,
+    "classes": [...]}``, or ``{}`` when TSTR is not selected, the target is
+    not categorical, or there is no test split. A model whose fit fails is
+    logged and left out (its row is NaN in the combined table).
+    """
+    if not _selected(selection_cfg, TSTR_NAME):
+        return {}
+    if not dataset.target_is_categorical:
+        logger.info("[custom] holdout TSTR needs a categorical target; skipping")
+        return {}
+    if dataset.test_imputed_df is None or dataset.test_imputed_df.empty:
+        logger.warning("[custom] holdout TSTR needs a test split; skipping")
+        return {}
+
+    target = dataset.target_column
+    train_df = dataset.train_imputed_df
+    test_df = dataset.test_imputed_df
+    classes = sorted(train_df[target].dropna().unique().tolist(), key=str)
+    seeds = [seed + i for i in range(n_seeds)]
+
+    def _score(fit_df):
+        return tstr_scores(fit_df, test_df, target, dataset.nominal_columns, classes, seeds)
+
+    trtr = _score(train_df)
+    logger.info(
+        "[custom] holdout TRTR ceiling: macro-F1=%.4f balanced-accuracy=%.4f macro-AUPRC=%.4f",
+        trtr.macro_f1,
+        trtr.balanced_accuracy,
+        trtr.macro_auprc,
+    )
+    scores = {}
+    for name, syn_df in synthetic_datasets.items():
+        try:
+            scores[name] = _score(syn_df[train_df.columns])
+        except Exception as exc:  # noqa: BLE001 -- one bad dataset must not stop the rest
+            logger.warning("[custom] holdout TSTR failed for %s: %s", name, exc)
+    return {"scores": scores, "trtr": trtr, "classes": [str(c) for c in classes]}
+
+
+def build_tstr_table(tstr_result: dict) -> pd.DataFrame:
+    """Models x (macro scores + ``f1_<class>``) table of holdout TSTR, with a
+    ``trtr (real train)`` reference row last."""
+    if not tstr_result:
+        return pd.DataFrame()
+    rows = dict(tstr_result["scores"])
+    rows["trtr (real train)"] = tstr_result["trtr"]
+
+    def _row(s):
+        return {
+            "tstr_macro_f1": s.macro_f1,
+            "tstr_balanced_accuracy": s.balanced_accuracy,
+            "tstr_macro_auprc": s.macro_auprc,
+            **{f"f1_{c}": v for c, v in s.per_class_f1.items()},
+        }
+
+    table = pd.DataFrame({name: _row(s) for name, s in rows.items()}).T
+    table.index.name = "model"
+    return table
+
+
+def run_privacy_evaluation(
+    synthetic_datasets: dict[str, pd.DataFrame],
+    dataset: Dataset,
+    selection_cfg,
+    attacks_cfg,
+    seed: int,
+) -> dict:
+    """Anonymeter attacks and holdout-referenced DCR/NNDR, as selected in
+    ``evaluation.custom`` (see synthdata.evaluation.privacy_attacks)."""
+    return run_privacy_attack_evaluation(
+        synthetic_datasets,
+        dataset,
+        attacks_cfg,
+        run_anonymeter=_selected(selection_cfg, ANONYMETER_NAME),
+        run_distances=_selected(selection_cfg, HOLDOUT_DISTANCE_NAME),
+        seed=seed,
+    )
