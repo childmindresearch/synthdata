@@ -5,6 +5,7 @@ import pytest
 
 from synthdata.generation.synthcity_backend import (
     HPO_EXCLUDED_CHOICES,
+    HPO_FIXED_PARAMS,
     _SearchSpaceTrial,
     get_plugin_class,
 )
@@ -20,7 +21,9 @@ def _sampled(name: str, n_trials: int) -> list[dict]:
     def objective(trial):
         sampled.append(
             plugin_cls.sample_hyperparameters_optuna(
-                _SearchSpaceTrial(trial, HPO_EXCLUDED_CHOICES[name])
+                _SearchSpaceTrial(
+                    trial, HPO_EXCLUDED_CHOICES.get(name), fixed=HPO_FIXED_PARAMS.get(name)
+                )
             )
         )
         return 0.0
@@ -35,6 +38,34 @@ def test_bayesian_network_search_only_tries_tree_search():
         params["struct_learning_search_method"] for params in _sampled("bayesian_network", 30)
     }
     assert methods == {"tree_search"}
+
+
+def test_arf_search_holds_delta_at_zero_and_fits():
+    """synthcity searches ARF's delta over 0-50; arfpy rejects anything above 0.5."""
+    pytest.importorskip("arfpy")
+    import numpy as np
+    import pandas as pd
+
+    from synthdata.generation.synthcity_backend import fit_generate, make_loader
+
+    sampled = _sampled("arf", 20)
+    assert {params["delta"] for params in sampled} == {0}
+    assert len({params["num_trees"] for params in sampled}) > 1
+
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame({"x": rng.normal(size=60), "c": rng.integers(0, 3, 60)})
+    df["y"] = (df["x"] > 0).astype(int)
+    params = sampled[0] | {"num_trees": 10, "max_iters": 1, "verbose": False}
+    syn = fit_generate("arf", params, make_loader(df, "y", []), 30, random_state=1)
+    assert syn.shape == (30, 3)
+
+
+def test_fixed_params_skip_the_search():
+    study = optuna.create_study()
+    proxy = _SearchSpaceTrial(study.ask(), fixed={"d": 0, "k": "a"})
+    assert proxy.suggest_int("d", 0, 50, 2) == 0
+    assert proxy.suggest_categorical("k", ["a", "b"]) == "a"
+    assert proxy.params == {}
 
 
 def test_other_trial_attributes_pass_through():

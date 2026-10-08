@@ -53,7 +53,7 @@ generation:
 
   synthcity:
     enabled: true
-    names: [ctgan, tvae, adsgan, bayesian_network, pategan, rtvae, ddpm]
+    names: [ctgan, tvae, adsgan, bayesian_network, pategan, rtvae, ddpm, arf]
 
   tabpfn:
     enabled: true
