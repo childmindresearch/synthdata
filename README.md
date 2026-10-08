@@ -5,6 +5,8 @@ SynthData is a config-driven pipeline for tabular-data imputation, synthetic dat
 > [!NOTE]
 > The example configurations cover the public UCI Hepatitis dataset (small, runs on a CPU), a simulated clinical dataset, and LORIS. The simulated and LORIS data are not distributed with the repository; they are used to test the pipeline at a larger scale. Configure your own dataset rather than relying on them.
 
+New to the pipeline? Read the [user manual](docs/user-manual.md): it walks through every stage, the config file, the report and troubleshooting.
+
 ## Quick start
 
 Clone the repository, initialize its editable library submodules, and install the pipeline dependencies:
@@ -103,6 +105,7 @@ The pipeline above is the supported path for new work. The following areas are o
 
 ## Repository layout
 
+- [`docs/`](docs/): the [user manual](docs/user-manual.md) and the [verification of generators and metrics](docs/verification.md).
 - [`synthdata/`](synthdata/): pipeline implementation.
 - [`configs/`](configs/): example configurations (Hepatitis, simulated data, LORIS).
 - [`scripts/`](scripts/): installed CLI entry points.
