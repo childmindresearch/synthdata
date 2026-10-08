@@ -31,7 +31,10 @@ from synthdata.utils import ensure_dir, get_logger, save_json
 logger = get_logger(__name__)
 
 _RANK_COLUMNS = {"rank", "u_rank", "p_rank", "f_rank"}
-_CHECKPOINT_SCHEMA_VERSION = 3
+#: Bump whenever the SynthEval fork changes a metric's value, so checkpoints
+#: written by the old code are recomputed instead of reused (v4: Hellinger
+#: bins, eps-identifiability, fairness and NNAA fixes).
+_CHECKPOINT_SCHEMA_VERSION = 4
 
 #: SynthEval tags every result row it returns with a ``dim`` of "u", "p" or "f"
 #: (see each metric's ``normalize_output``). That tag, not the preset key the
