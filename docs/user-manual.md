@@ -62,7 +62,7 @@ uv sync --extra tabpfn
 
 ### TabPFN model license
 
-The `tabpfn` Python package and the TabPFN model weights are licensed separately. The weights come under a Prior Labs non-commercial license per model version, which you accept once per account on the Licenses tab at [ux.priorlabs.ai](https://ux.priorlabs.ai); your API key from the same site goes in `TABPFN_TOKEN`. The pipeline loads the version set in `generation.tabpfn.model_version` (default `v3`). TabPFN-3 License v1.0 (24 March 2026) and TabPFN-3.5 License v1.0 (9 September 2026) have the same terms. This summary is not legal advice; the license text governs.
+The `tabpfn` Python package and the TabPFN model weights are licensed separately. The weights come under a Prior Labs non-commercial license per model version, which you accept once per account on the Licenses tab at [ux.priorlabs.ai](https://ux.priorlabs.ai); your API key from the same site goes in `TABPFN_TOKEN`. The pipeline loads the version set in `generation.tabpfn.model_version` (default `v3.5`). TabPFN-3 License v1.0 (24 March 2026) and TabPFN-3.5 License v1.0 (9 September 2026) have the same terms. This summary is not legal advice; the license text governs.
 
 Who it affects: anyone who runs `tabpfn_*` or `tabpfgen_*` generators, or uses their outputs. The terms cover outputs, so they apply to every synthetic table those generators write, including the labels TabPFN assigns.
 
@@ -254,7 +254,7 @@ Imputed CSVs are cached in `data_dir/data_v_<version>/`. They are reused only if
 | TabPFN `custom` | Foundation model | Generates features and target jointly |
 | TabPFGen | Energy-based sampling | Off by default: its output is near-copies of training rows (see [verification](verification.md)) |
 
-Synthcity models are chosen with `generation.synthcity.names`. TabPFN runs when `generation.tabpfn.enabled` is true; `variants` picks `standard` and/or `custom`, and `data_variants` picks whether it learns from the `raw` data (TabPFN handles missing values itself) or the `imputed` data. Imputed-data outputs get an `_imputed` suffix, for example `tabpfn_custom_imputed`. `model_version` picks the TabPFN weights (default `v3`); `v3.5` works only after you accept its non-commercial license on ux.priorlabs.ai with the account behind your `TABPFN_TOKEN`.
+Synthcity models are chosen with `generation.synthcity.names`. TabPFN runs when `generation.tabpfn.enabled` is true; `variants` picks `standard` and/or `custom`, and `data_variants` picks whether it learns from the `raw` data (TabPFN handles missing values itself) or the `imputed` data. Imputed-data outputs get an `_imputed` suffix, for example `tabpfn_custom_imputed`. `model_version` picks the TabPFN weights (default `v3.5`, which did slightly better than `v3` on Hepatitis and runs faster). Each version works only after you accept its non-commercial license on ux.priorlabs.ai with the account behind your `TABPFN_TOKEN`.
 
 ### Rows, class balance and replicates
 
