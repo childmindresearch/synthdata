@@ -22,6 +22,7 @@ from synthdata.data import (
     remap_binary_one_two,
     schema_column_roles,
     split_by_patient,
+    stratification_key,
     warn_non_numeric_feature_columns,
 )
 
@@ -189,9 +190,9 @@ class TestVariableSchema:
                 target_column="target",
                 variable_schema_path=str(schema_path),
                 data_dir=str(tmp_path / "derived"),
-                train_size=0.5,
-                stratify=True,
-                tuning_size=0.0,
+                train_fraction=0.5,
+                tuning_fraction=0.0,
+                holdout_fraction=0.5,
             ),
         )
 
@@ -234,8 +235,9 @@ class TestVariableSchema:
                 target_column="target",
                 variable_schema_path=str(schema_path),
                 data_dir=str(tmp_path / "derived"),
-                train_size=0.5,
-                stratify=False,
+                train_fraction=0.5,
+                tuning_fraction=0.0,
+                holdout_fraction=0.5,
             ),
         )
 
@@ -256,38 +258,59 @@ class TestSplitByPatient:
         df = pd.DataFrame({"x": rng.normal(size=len(patient)), "target": label})
         return df, pd.Series(patient, index=df.index)
 
-    def test_no_patient_is_on_both_sides(self):
-        df, patients = self._visits()
-        train, test = split_by_patient(df, patients, "target", 0.7, seed=1, stratify=True)
-        assert set(patients[train.index]).isdisjoint(patients[test.index])
-        assert sorted([*train.index, *test.index]) == list(df.index)
-        assert patients[train.index].nunique() == 42
+    FRACTIONS = (0.6, 0.2, 0.2)
 
-    def test_patients_are_stratified_by_their_target(self):
+    def test_no_patient_spans_two_splits(self):
         df, patients = self._visits()
-        train, test = split_by_patient(df, patients, "target", 0.5, seed=3, stratify=True)
-        positive = patients[df["target"] == 1].unique()
-        assert len(set(patients[train.index]) & set(positive)) == len(positive) // 2
+        splits = split_by_patient(df, patients, self.FRACTIONS, seed=1, strata=None)
+        sets = [set(patients[index]) for index in splits]
+        assert sets[0].isdisjoint(sets[1]) and sets[0].isdisjoint(sets[2])
+        assert sets[1].isdisjoint(sets[2])
+        assert sorted(i for index in splits for i in index) == list(df.index)
+        # Folds balance rows (encounters), with whole patients in each.
+        shares = [len(index) / len(df) for index in splits]
+        assert shares == pytest.approx(self.FRACTIONS, abs=0.03)
+
+    def test_patients_are_stratified_by_their_rows_target(self):
+        df, patients = self._visits()
+        strata = stratification_key(df, ["target"], None, patients, min_groups=5)
+        splits = split_by_patient(df, patients, self.FRACTIONS, seed=3, strata=strata)
+        overall = df["target"].mean()
+        for index in splits:
+            assert abs(df.loc[index, "target"].mean() - overall) <= 0.05
 
     def test_same_seed_gives_the_same_split(self):
         df, patients = self._visits()
-        first = split_by_patient(df, patients, "target", 0.7, seed=5, stratify=False)
-        second = split_by_patient(df, patients, "target", 0.7, seed=5, stratify=False)
-        assert first[0].index.equals(second[0].index)
+        first = split_by_patient(df, patients, self.FRACTIONS, seed=5, strata=None)
+        second = split_by_patient(df, patients, self.FRACTIONS, seed=5, strata=None)
+        assert all(a.equals(b) for a, b in zip(first, second, strict=True))
 
-    def test_without_patients_matches_a_stratified_row_split(self):
-        from sklearn.model_selection import train_test_split
-
+    def test_without_patients_every_row_is_its_own_group(self):
         df, _ = self._visits()
-        train, test = split_by_patient(df, None, "target", 0.7, seed=9, stratify=True)
-        expected, _ = train_test_split(df, train_size=0.7, random_state=9, stratify=df["target"])
-        assert sorted(train.index) == sorted(expected.index)
+        train, tuning, holdout = split_by_patient(df, None, (0.5, 0.2, 0.3), seed=9, strata=None)
+        assert (len(train), len(tuning), len(holdout)) == pytest.approx(
+            (0.5 * len(df), 0.2 * len(df), 0.3 * len(df)), abs=1
+        )
 
     def test_missing_patient_id_is_rejected(self):
         df, patients = self._visits()
         patients.iloc[0] = None
         with pytest.raises(ValueError, match="missing value"):
-            split_by_patient(df, patients, "target", 0.7, seed=1, stratify=True)
+            split_by_patient(df, patients, self.FRACTIONS, seed=1, strata=None)
+
+    def test_sparse_joint_strata_fall_back_to_the_first_column(self):
+        df = pd.DataFrame({"target": [0] * 10 + [1] * 10, "age": [10] * 9 + [70] + [10] * 10})
+        groups = pd.Series(range(20))
+        key = stratification_key(df, ["target", "age"], [None, [30, 60]], groups, min_groups=5)
+        # The lone 70-year-old is too rare a stratum; it joins plain target 0.
+        assert key.iloc[9] == "0"
+        assert key.iloc[0] == "0|[-inf, 30.0)"
+        assert key.nunique() == 3
+
+    def test_missing_values_form_their_own_stratum(self):
+        df = pd.DataFrame({"sex": [0.0, None, 1.0]})
+        key = stratification_key(df, ["sex"], None, pd.Series(range(3)), min_groups=0)
+        assert key.tolist() == ["0.0", "missing", "1.0"]
 
     def test_load_dataset_groups_by_patient_and_drops_the_identifier(self, tmp_path):
         df, patients = self._visits()
@@ -303,7 +326,6 @@ class TestSplitByPatient:
                 patient_id_column="subject",
                 nominal_columns=[],
                 data_dir=str(tmp_path / "derived"),
-                train_size=0.7,
             ),
         )
 
@@ -317,10 +339,15 @@ class TestSplitByPatient:
         tuning_patients = set(df.loc[dataset.tuning_index, "subject"])
         assert tuning_patients <= train_patients
         assert tuning_patients.isdisjoint(df.loc[dataset.search_train_df.index, "subject"])
-        assert dataset.n_patients == {"train": 42, "tuning": 9, "test": 18}
+        # train counts tuning too.
+        n = dataset.n_patients
+        assert n["train"] + n["test"] == 60 and 0 < n["tuning"] < n["train"]
         manifest = json.loads((dataset.data_dir / "dataset_manifest.json").read_text())
         assert manifest["patient_id_column"] == "subject"
-        assert manifest["n_patients"] == {"train": 42, "tuning": 9, "test": 18}
+        assert manifest["n_patients"] == n
+        report = pd.read_csv(dataset.data_dir / "split_report.csv")
+        assert set(report["split"]) == {"train", "tuning", "holdout"}
+        assert set(report["column"]) == {"target", "(all)"}
 
     def test_unknown_patient_column_is_rejected(self, tmp_path):
         df, _ = self._visits()

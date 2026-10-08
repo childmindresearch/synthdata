@@ -31,9 +31,12 @@ data:
   remap_binary_one_two: false
   outlier_zscore_threshold: null
   outlier_columns: []
-  train_size: 0.7
-  stratify: true
-  tuning_size: 0.2 # Share of train patients held out to score HPO candidates.
+  # Same proportions as before the three-way split: 70% train (tuning
+  # included) and 30% holdout, in whole folds of ten.
+  train_fraction: 0.5
+  tuning_fraction: 0.2
+  holdout_fraction: 0.3
+  stratify_columns: [target, SEX]
 
   data_dir: "{root}/data/clinic"
   raw_cache_subdir: raw

@@ -6,47 +6,36 @@ seed: 42
 device: auto
 
 experiment:
-  tag: retry_all_models_hpo_4h_nitro
-  id: "0.5"
+  tag: loris_v2
+  id: "2.11"
 
 data:
-  # Source and schema
+  # Source and schema (LORIS data 2.11, transformed to match the competition data)
   source: csv
-  path: data/loris/loris_combined.csv
-  version: "1.2"
-  variable_schema_path: data/loris/variable_schema.csv
+  path: data/loris/loris_v2_664_features_us_id.csv
+  version: "2.11"
+  variable_schema_path: data/loris/loris_v2_variable_schema_us.csv
 
   # Modeling columns
   target_column: CGAS_class # 0 severe, 1 moderate, 2 typical
-  sensitive_columns: [Sex, Age, PreInt_Demos_Fam__Child_Race]
+  patient_id_column: patient_id # Split by patient, then dropped before modeling.
+  sensitive_columns: [Sex, Age, PreInt_Demos_Fam__Child_Ethnicity]
   drop_rows_missing_target: true
-  drop_columns:
-    - subject_id
-    - CGAS__CGAS_Score # Deterministically defines CGAS_class.
-    # High-cardinality diagnosis fields; DSM-category flags are retained instead.
-    - Diagnosis_ClinicianConsensus__DX_01
-    - Diagnosis_ClinicianConsensus__DX_01_Code
-    - Diagnosis_ClinicianConsensus__DX_01_Cat
-    - Diagnosis_ClinicianConsensus__DX_01_ByHx
-    - Diagnosis_ClinicianConsensus__DX_02
-    - Diagnosis_ClinicianConsensus__DX_02_Code
-    - Diagnosis_ClinicianConsensus__DX_02_Cat
-    - Diagnosis_ClinicianConsensus__DX_03
-    - Diagnosis_ClinicianConsensus__DX_03_Code
-    - Diagnosis_ClinicianConsensus__DX_03_Cat
-    # Sparse raw medication text; derived medication flags are retained instead.
-    - DailyMeds__med_type_01
-    - DailyMeds__med_type_02
-    - DailyMeds__med_type_03
+  drop_columns: []
 
   # Source normalization and split
   uppercase_columns: false
   remap_binary_one_two: false
   outlier_zscore_threshold: null # Set only with confirmed corrupt/sentinel columns.
   outlier_columns: null
-  train_size: 0.6667
-  stratify: true
-  tuning_size: 0.2 # Share of train patients held out to score HPO candidates.
+  # Patient-level 60/20/20 split, stratified jointly by target, sex and age
+  # (<30, 30-60, >=60). Strata too small to spread over the folds fall back to
+  # the target alone.
+  train_fraction: 0.6
+  tuning_fraction: 0.2
+  holdout_fraction: 0.2
+  stratify_columns: [CGAS_class, Sex, Age]
+  stratify_bins: [null, null, [30, 60]]
 
   # Local derived-data storage
   data_dir: data/loris
@@ -136,10 +125,10 @@ evaluation:
   custom: { enabled: true, categories: null, metrics: null }
 
   log_disparity:
-    protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Race]
+    protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Ethnicity]
     target_map: { 0: severe, 1: moderate, 2: typical }
-    protected_map: [{ 0: male, 1: female }, null, null]
-    protected_bins: [null, [5, 8, 11, 14, 17, 22], null]
+    protected_map: [null, null, null]
+    protected_bins: [null, [0, 18, 30, 45, 60, 200], null]
 
   # Separate binary SynthEval pass: severe/moderate versus typical.
   binary_target:

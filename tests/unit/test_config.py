@@ -173,11 +173,39 @@ class TestValidate:
     def test_hpo_needs_a_tuning_split(self):
         cfg = self._base_valid()
         cfg.generation.hpo.enabled = True
-        cfg.data.tuning_size = 0.0
-        with pytest.raises(ValueError, match="tuning_size"):
+        cfg.data.train_fraction, cfg.data.tuning_fraction = 0.8, 0.0
+        with pytest.raises(ValueError, match="tuning_fraction"):
             _validate(cfg)
         cfg.generation.hpo.enabled = False
         _validate(cfg)  # no tuning split needed without HPO
+
+    def test_split_fractions_must_sum_to_one(self):
+        cfg = self._base_valid()
+        cfg.data.holdout_fraction = 0.3
+        with pytest.raises(ValueError, match="must be 1"):
+            _validate(cfg)
+
+    def test_split_fractions_must_be_whole_folds(self):
+        cfg = self._base_valid()
+        cfg.data.train_fraction, cfg.data.holdout_fraction = 0.6123, 0.1877
+        with pytest.raises(ValueError, match="multiple of 1/k"):
+            _validate(cfg)
+
+    def test_stratify_bins_align_with_columns(self):
+        cfg = self._base_valid()
+        cfg.data.stratify_columns = ["target", "age"]
+        cfg.data.stratify_bins = [None]
+        with pytest.raises(ValueError, match="one entry"):
+            _validate(cfg)
+        cfg.data.stratify_bins = [None, [60, 30]]
+        with pytest.raises(ValueError, match="increasing"):
+            _validate(cfg)
+
+    def test_removed_split_keys_point_to_their_replacement(self, tmp_path):
+        path = tmp_path / "c.yaml"
+        path.write_text("data:\n  source: csv\n  path: x.csv\n  train_size: 0.7\n")
+        with pytest.raises(ValueError, match="train_fraction"):
+            load_config(path)
 
     def test_uci_requires_uci_id(self):
         cfg = Config(data=DataConfig(source="uci", uci_id=None, target_column="target"))

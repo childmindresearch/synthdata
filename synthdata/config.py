@@ -105,18 +105,26 @@ class DataConfig:
     #: sentinel/corrupted values, not just a skewed distribution.
     outlier_columns: list = dataclasses.field(default_factory=list)
 
-    #: Train/test split. ``train_size`` is the share of patients (of rows when
-    #: ``patient_id_column`` is unset) assigned to train. ``stratify`` balances
-    #: the target across the split; with patient groups each patient is
-    #: stratified by their most frequent target value.
-    train_size: float = 0.6667
-    stratify: bool = True
-    #: Share of the train patients set aside as a tuning split. Hyperparameter
-    #: search fits candidates on the rest of train and scores them on tuning,
-    #: and the imputer is fitted on that same rest, so neither ever sees the
-    #: test split. Final models are then refitted on all of train (tuning
-    #: included) and evaluated on test. Must be above 0 when HPO is enabled.
-    tuning_size: float = 0.2
+    #: Patient-level three-way split, as approximate shares of rows: whole
+    #: patients are assigned while the folds balance encounter counts. ``train`` fits the imputer and the HPO
+    #: candidates, ``tuning`` scores the candidates, and ``holdout`` is touched
+    #: only by evaluation. Final models are refitted on train + tuning. The
+    #: three shares must sum to 1 and be multiples of 1/k for some k <= 20,
+    #: because the split takes whole folds of
+    #: :class:`sklearn.model_selection.StratifiedGroupKFold` with k folds
+    #: (0.6/0.2/0.2 uses 5 folds). ``tuning_fraction`` may be 0 without HPO.
+    train_fraction: float = 0.6
+    tuning_fraction: float = 0.2
+    holdout_fraction: float = 0.2
+    #: Columns whose joint distribution the split keeps balanced, most
+    #: important first (put the target first). None stratifies on the target
+    #: alone; an empty list turns stratification off. Missing values form
+    #: their own stratum. A joint stratum with fewer patients than folds is
+    #: merged into the stratum of the first column alone.
+    stratify_columns: list | None = None
+    #: Optional bin edges per ``stratify_columns`` entry (null for none), e.g.
+    #: ``[null, null, [30, 60]]`` bins age into <30, 30-60 and >=60.
+    stratify_bins: list | None = None
 
     #: Where cached/derived CSVs (raw, imputed, train/test splits) are written.
     data_dir: str = "data/dataset"
@@ -600,6 +608,8 @@ def _from_dict(cls, data: dict | None):
     field_types = {f.name: f.type for f in dataclasses.fields(cls)}
     kwargs = {}
     for key, value in data.items():
+        if cls is DataConfig and key in _REMOVED_DATA_KEYS:
+            raise ValueError(f"data.{key} was replaced by {_REMOVED_DATA_KEYS[key]}")
         if key not in field_types:
             raise ValueError(
                 f"Unknown config key '{key}' for {cls.__name__}. Valid keys: {sorted(field_types)}"
@@ -653,6 +663,55 @@ def load_config(path: str | Path) -> Config:
     return cfg
 
 
+#: Split keys removed in favour of the three-way ``*_fraction`` keys.
+_REMOVED_DATA_KEYS = {
+    "train_size": "data.train_fraction, data.tuning_fraction and data.holdout_fraction",
+    "tuning_size": "data.train_fraction, data.tuning_fraction and data.holdout_fraction",
+    "stratify": "data.stratify_columns (an empty list turns stratification off)",
+}
+
+
+def split_fold_count(fractions: tuple[float, ...]) -> int:
+    """Smallest k <= 20 for which every fraction is a whole number of 1/k folds."""
+    for k in range(2, 21):
+        if all(abs(f * k - round(f * k)) < 1e-6 for f in fractions):
+            return k
+    raise ValueError(
+        f"data split fractions {list(fractions)} must each be a multiple of 1/k for some "
+        "k <= 20 (for example 0.6/0.2/0.2 or 0.5/0.2/0.3)"
+    )
+
+
+def _validate_split(cfg: Config) -> None:
+    data = cfg.data
+    fractions = (data.train_fraction, data.tuning_fraction, data.holdout_fraction)
+    if not (0 < data.train_fraction < 1 and 0 < data.holdout_fraction < 1):
+        raise ValueError("data.train_fraction and data.holdout_fraction must be between 0 and 1")
+    if not 0 <= data.tuning_fraction < 1:
+        raise ValueError("data.tuning_fraction must be at least 0 and below 1")
+    if abs(sum(fractions) - 1) > 1e-6:
+        raise ValueError(
+            f"data.train_fraction + tuning_fraction + holdout_fraction must be 1, got {sum(fractions)}"
+        )
+    split_fold_count(fractions)
+    if cfg.generation.hpo.enabled and data.tuning_fraction == 0:
+        raise ValueError(
+            "generation.hpo.enabled needs a tuning split to score candidates on; set "
+            "data.tuning_fraction above 0 (for example 0.2)"
+        )
+    if data.stratify_bins is not None:
+        columns = (
+            data.stratify_columns if data.stratify_columns is not None else [data.target_column]
+        )
+        if len(data.stratify_bins) != len(columns):
+            raise ValueError("data.stratify_bins needs one entry (or null) per stratify column")
+        for edges in data.stratify_bins:
+            if edges is not None and (not edges or list(edges) != sorted(set(edges))):
+                raise ValueError(
+                    f"data.stratify_bins entries must be strictly increasing edges, got {edges!r}"
+                )
+
+
 def _validate(cfg: Config) -> None:
     if cfg.data.source not in ("uci", "csv", "parquet"):
         raise ValueError(f"data.source must be 'uci', 'csv', or 'parquet', got {cfg.data.source!r}")
@@ -668,17 +727,7 @@ def _validate(cfg: Config) -> None:
             raise ValueError("data.patient_id_column must not be the target column")
         if patient_id_column in cfg.data.sensitive_columns:
             raise ValueError("data.patient_id_column must not be a sensitive column")
-    if not 0 < cfg.data.train_size < 1:
-        raise ValueError(f"data.train_size must be between 0 and 1, got {cfg.data.train_size!r}")
-    if not 0 <= cfg.data.tuning_size < 1:
-        raise ValueError(
-            f"data.tuning_size must be at least 0 and below 1, got {cfg.data.tuning_size!r}"
-        )
-    if cfg.generation.hpo.enabled and cfg.data.tuning_size == 0:
-        raise ValueError(
-            "generation.hpo.enabled needs a tuning split to score candidates on; set "
-            "data.tuning_size above 0 (for example 0.2)"
-        )
+    _validate_split(cfg)
     if cfg.device not in ("auto", "cpu", "cuda", "mps"):
         raise ValueError(f"device must be one of auto/cpu/cuda/mps, got {cfg.device!r}")
     if cfg.imputation.method not in ("tabimpute", "refidiff"):
