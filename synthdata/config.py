@@ -226,6 +226,15 @@ class MissingIndicatorConfig:
     #: Write ``released/<model>.csv`` with values blanked where the synthetic
     #: indicator is 1 and the indicator columns dropped.
     remask_synthetic: bool = True
+    #: Columns missing in at least this share of those rows keep only their
+    #: indicator: their values are neither imputed nor generated, and the
+    #: released copy fills "recorded" synthetic rows by CART leaf sampling
+    #: fitted on observed train values (synthpop's two-step method).
+    #: ``null`` turns this off, so every column is imputed and generated.
+    indicator_only_fraction: float | None = 0.8
+    #: Columns to keep imputing and generating whatever their missingness.
+    #: The target, stratification and role columns are always kept.
+    keep_values_columns: list = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -826,8 +835,16 @@ def _validate(cfg: Config) -> None:
         raise ValueError(
             f"imputation.method must be one of {IMPUTATION_METHODS}, got {cfg.imputation.method!r}"
         )
-    if not 0 < cfg.imputation.missing_indicators.min_missing_fraction <= 1:
+    indicators = cfg.imputation.missing_indicators
+    if not 0 < indicators.min_missing_fraction <= 1:
         raise ValueError("imputation.missing_indicators.min_missing_fraction must be in (0, 1]")
+    if indicators.indicator_only_fraction is not None and not (
+        indicators.min_missing_fraction <= indicators.indicator_only_fraction <= 1
+    ):
+        raise ValueError(
+            "imputation.missing_indicators.indicator_only_fraction must be between "
+            "min_missing_fraction and 1"
+        )
     missforest = cfg.imputation.missforest
     if missforest.n_estimators < 1 or missforest.max_iter < 1:
         raise ValueError("imputation.missforest.n_estimators and max_iter must be at least 1")

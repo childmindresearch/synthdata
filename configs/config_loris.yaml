@@ -59,6 +59,10 @@ imputation:
     enabled: true
     min_missing_fraction: 0.05
     remask_synthetic: true
+    # 80%+ missing: generate only the indicator, fill 'recorded' rows by CART on release.
+    # null = impute and generate every column as usual.
+    indicator_only_fraction: 0.8
+    keep_values_columns: []
   drift_warn_threshold: 0.1
   device: auto
   cache: true

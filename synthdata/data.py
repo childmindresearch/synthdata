@@ -113,6 +113,9 @@ class Dataset:
     #: ``{indicator column: source column}`` for the ``<column>__missing``
     #: features added at load time (see ``imputation.missing_indicators``).
     missing_indicator_columns: dict = dataclasses.field(default_factory=dict)
+    #: Raw values (``full_df`` index) of columns so often missing that only
+    #: their indicator is imputed and generated; empty frame when none.
+    indicator_only_values: pd.DataFrame = dataclasses.field(default_factory=pd.DataFrame)
     #: User-facing copies with configured ordinal labels restored.
     full_imputed_decoded_df: pd.DataFrame | None = None
     train_imputed_decoded_df: pd.DataFrame | None = None
@@ -1144,6 +1147,7 @@ def load_dataset(cfg: Config) -> Dataset:
         df, patient_ids, fractions, seed=cfg.seed, strata=strata
     )
     missing_indicator_columns = {}
+    indicator_only_values = pd.DataFrame(index=df.index)
     indicator_cfg = cfg.imputation.missing_indicators
     if cfg.imputation.enabled and indicator_cfg.enabled:
         # Chosen on the rows the first imputer fits on, so both fits and the
@@ -1159,6 +1163,39 @@ def load_dataset(cfg: Config) -> Dataset:
                 c: {"kind": "categorical", "ordinal_order": None} for c in missing_indicator_columns
             },
         }
+        protected_from_dropping = {
+            *indicator_cfg.keep_values_columns,
+            *stratify_columns,
+            *cfg.data.quasi_identifier_columns,
+            *cfg.data.sensitive_columns,
+            *(cfg.data.protected_columns or []),
+        }
+        fractions_missing = (
+            df.loc[train_only, list(missing_indicator_columns.values())].isna().mean()
+        )
+        indicator_only = [
+            column
+            for column in missing_indicator_columns.values()
+            if indicator_cfg.indicator_only_fraction is not None
+            and fractions_missing[column] >= indicator_cfg.indicator_only_fraction
+            and column not in protected_from_dropping
+        ]
+        if indicator_only:
+            # Generators model only whether these were recorded; values are
+            # filled in afterwards for "recorded" synthetic rows (see
+            # synthdata.generation.cart_fill), never imputed.
+            indicator_only_values = df[indicator_only].copy()
+            df = df.drop(columns=indicator_only)
+            feature_columns = [c for c in feature_columns if c not in indicator_only]
+            nominal_columns = [c for c in nominal_columns if c not in indicator_only]
+            ordinal_columns = [c for c in ordinal_columns if c not in indicator_only]
+            logger.info(
+                "%d column(s) missing in at least %.0f%% of train rows keep only their "
+                "indicator during imputation and generation: %s",
+                len(indicator_only),
+                100 * indicator_cfg.indicator_only_fraction,
+                indicator_only,
+            )
     # train_df keeps the tuning rows: HPO searches on train_df minus tuning,
     # final models refit on all of it.
     train_df = df.loc[~df.index.isin(holdout_index)]
@@ -1198,6 +1235,7 @@ def load_dataset(cfg: Config) -> Dataset:
         n_patients=n_patients,
         tuning_index=tuning_index,
         missing_indicator_columns=missing_indicator_columns,
+        indicator_only_values=indicator_only_values,
     )
 
     paths = dataset.paths()

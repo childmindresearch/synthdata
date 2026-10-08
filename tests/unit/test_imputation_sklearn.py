@@ -144,3 +144,85 @@ class TestMissingIndicators:
         frame = pd.DataFrame({"a": [np.nan, 1.0], "a__missing": [0, 0]})
         with pytest.raises(ValueError, match="already exist"):
             add_missing_indicators(frame, ["a"], frame.index, 0.1)
+
+
+class TestIndicatorOnlyColumns:
+    def test_mostly_missing_columns_keep_only_their_indicator(self, tmp_path):
+        from synthdata.config import Config, DataConfig
+        from synthdata.data import load_dataset
+
+        rng = np.random.default_rng(0)
+        n = 100
+        frame = pd.DataFrame(
+            {
+                "a": rng.normal(size=n),
+                "rare": np.where(rng.random(n) < 0.9, np.nan, rng.normal(size=n)),
+                "kept": np.where(rng.random(n) < 0.9, np.nan, rng.normal(size=n)),
+                "target": rng.integers(0, 2, size=n),
+            }
+        )
+        path = tmp_path / "raw.csv"
+        frame.to_csv(path, index=False)
+        cfg = Config(
+            name="sparse",
+            data=DataConfig(
+                source="csv",
+                path=str(path),
+                target_column="target",
+                nominal_columns=[],
+                data_dir=str(tmp_path / "derived"),
+            ),
+        )
+        cfg.imputation.missing_indicators.keep_values_columns = ["kept"]
+        dataset = load_dataset(cfg)
+        assert "rare" not in dataset.full_df.columns and "rare" not in dataset.feature_columns
+        assert "rare__missing" in dataset.feature_columns
+        assert "kept" in dataset.feature_columns
+        assert dataset.indicator_only_values.columns.tolist() == ["rare"]
+        pd.testing.assert_series_equal(dataset.indicator_only_values["rare"], frame["rare"])
+
+        cfg.imputation.missing_indicators.indicator_only_fraction = None
+        assert "rare" in load_dataset(cfg).feature_columns
+
+
+class TestCartFill:
+    def _data(self, n=400, seed=0):
+        rng = np.random.default_rng(seed)
+        x = rng.integers(0, 2, size=n).astype(float)
+        value = np.where(x == 1, 100 + rng.normal(size=n), rng.normal(size=n)).round(2)
+        grade = np.where(x == 1, "high", "low")
+        return pd.DataFrame({"x": x}), pd.DataFrame({"value": value, "grade": grade})
+
+    def test_draws_follow_the_leaf_and_respect_the_indicator(self):
+        from synthdata.generation import cart_fill
+
+        real_x, values = self._data()
+        models = cart_fill.fit_cart_fills(real_x, values, {"grade"}, seed=0)
+        synthetic = pd.DataFrame(
+            {"x": [1.0, 0.0, 1.0, 0.0], "value__missing": [0, 0, 1, 0], "grade__missing": 0}
+        )
+        filled = cart_fill.fill(
+            synthetic,
+            models,
+            {"value__missing": "value", "grade__missing": "grade"},
+            synthetic[["x"]],
+            seed=0,
+            smoothing=False,
+        )
+        assert filled.loc[0, "value"] > 90 and abs(filled.loc[1, "value"]) < 10
+        assert np.isnan(filled.loc[2, "value"])  # marked missing stays blank
+        # Without smoothing every draw is a real observed donor value.
+        assert set(filled["value"].dropna()) <= set(values["value"])
+        assert filled["grade"].tolist() == ["high", "low", "high", "low"]
+
+    def test_smoothing_stays_within_the_observed_range(self):
+        from synthdata.generation import cart_fill
+
+        real_x, values = self._data()
+        models = cart_fill.fit_cart_fills(real_x, values[["value"]], set(), seed=0)
+        synthetic = pd.DataFrame({"x": np.tile([0.0, 1.0], 200), "value__missing": 0})
+        filled = cart_fill.fill(
+            synthetic, models, {"value__missing": "value"}, synthetic[["x"]], seed=1
+        )["value"]
+        assert filled.min() >= values["value"].min()
+        assert not set(filled) <= set(values["value"])  # noise was added
