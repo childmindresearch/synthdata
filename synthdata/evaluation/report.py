@@ -200,7 +200,7 @@ def _privacy_flags(attacks) -> list[str]:
     flags = []
     if attacks is not None and not attacks.empty and "ci_low" in attacks.columns:
         hits = attacks[(attacks["ci_low"] > 0) & attacks["reliable"].astype(bool)]
-        hits = hits[[not is_baseline(m) for m in hits["model"]]]
+        hits = hits[~hits["model"].map(is_baseline).astype(bool)]
         for model, group in hits.groupby("model", sort=True):
             names = ", ".join(
                 sorted(

@@ -67,11 +67,8 @@ def run_evaluation(
         rows = baselines.build_baselines(
             eval_cfg.baselines,
             dataset.train_imputed_df,
-            dataset.target_column,
-            dataset.sensitive_columns,
             cfg.generation.n_samples,
             cfg.seed + replicate,
-            workspace=output_dir / "synthcity_workspace",
         )
         selected_datasets = {
             **selected_datasets,

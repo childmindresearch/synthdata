@@ -10,6 +10,12 @@ from synthdata.generation.pipeline import run_generation
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _no_tabpfn_weights(mocker):
+    """Selecting TabPFN weights imports tabpfn, which CI does not install."""
+    return mocker.patch("synthdata.generation.pipeline.tpfn.set_model_version")
+
+
 def _configure_tabpfn_only(cfg):
     cfg.generation.synthcity.enabled = False
     cfg.generation.tabpfgen.enabled = False

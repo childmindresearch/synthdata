@@ -92,3 +92,49 @@ def test_sample_labels_is_seeded_and_handles_certain_rows():
     first = tabpfn_backend.sample_labels(proba, np.array([0, 1]), seed=3)
     assert list(first[:2]) == [0, 1]
     assert list(first) == list(tabpfn_backend.sample_labels(proba, np.array([0, 1]), seed=3))
+
+
+def test_tabpfn_regressor_icdf_stays_finite_when_a_bucket_underflows():
+    """Guards the removal of our icdf patch: TabPFN >= 9 clamps it upstream."""
+    torch = pytest.importorskip("torch")
+    shared = pytest.importorskip("tabpfn.architectures.shared.bar_distribution")
+    dist = shared.FullSupportBarDistribution(torch.linspace(-1.0, 1.0, 11))
+    logits = torch.zeros(1, 10)
+    logits[0, 5] = -200.0  # this bucket's softmax probability underflows to 0
+    cumulative = logits.softmax(-1).cumsum(-1)
+    for left_prob in (float(cumulative[0, 4]) + 1e-7, 0.5, 1e-6, 1 - 1e-6):
+        assert torch.isfinite(dist.icdf(logits, left_prob)).all(), left_prob
+
+
+def test_regression_prediction_patch_returns_a_cpu_copy_of_the_criterion(monkeypatch):
+    torch = pytest.importorskip("torch")
+    _install_unsupervised_module(monkeypatch)
+    package = sys.modules["tabpfn_extensions.unsupervised"]
+    criterion = torch.nn.Linear(1, 1)
+
+    class Model:
+        def sample_from_model_prediction_(self, column_idx, X_fit, model, X_predict, t):
+            return {"logits": torch.ones(2, 3), "criterion": criterion}, torch.zeros(2)
+
+    package.TabPFNUnsupervisedModel = Model
+    tabpfn_backend._patch_regression_prediction_device()
+    tabpfn_backend._patch_regression_prediction_device()  # idempotent
+
+    pred, sampled = Model().sample_from_model_prediction_(0, None, None, None, 1.0)
+    assert pred["criterion"] is not criterion
+    assert pred["logits"].device.type == "cpu" and sampled.device.type == "cpu"
+
+
+def test_set_model_version_selects_the_weights_new_models_load():
+    pytest.importorskip("tabpfn")
+    from tabpfn.constants import ModelVersion
+    from tabpfn.settings import settings
+
+    before = settings.tabpfn.model_version
+    try:
+        tabpfn_backend.set_model_version("v3")
+        assert settings.tabpfn.model_version == ModelVersion.V3
+        with pytest.raises(ValueError):
+            tabpfn_backend.set_model_version("v9")
+    finally:
+        settings.tabpfn.model_version = before

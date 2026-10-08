@@ -18,7 +18,7 @@ git submodule update --init --recursive
 uv sync --extra tabpfn
 ```
 
-The `tabpfn` extra installs the TabPFN and TabPFGen generators; TabPFN needs a `TABPFN_TOKEN` in a `.env` file at the repository root. Add `--extra refidiff` only if you set `imputation.method: refidiff`.
+The `tabpfn` extra installs the TabPFN and TabPFGen generators; TabPFN needs a `TABPFN_TOKEN` in a `.env` file at the repository root, and its model weights are for non-commercial use only, outputs included; read [TabPFN model license](docs/user-manual.md#tabpfn-model-license) before sharing TabPFN-generated data. Add `--extra refidiff` only if you set `imputation.method: refidiff`.
 
 Start from [`configs/config_hepatitis.yaml`](configs/config_hepatitis.yaml) (or [`configs/config_sim.yaml`](configs/config_sim.yaml) for a wide, multi-encounter dataset), then update its `data:` section and variable-schema path for your local data.
 
