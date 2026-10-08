@@ -79,6 +79,8 @@ def build_synthetic_eval_fn(
             task_type="classification",
             random_state=seed,
             workspace=workspace_path,
+            # The cache keys on data and metric name, not code; see synthcity_eval.
+            use_cache=False,
         )
         return hpo_score(report)
 
