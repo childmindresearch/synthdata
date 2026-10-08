@@ -63,7 +63,7 @@ generation:
   synthcity:
     enabled: true
     # Bayesian network and DDPM do not scale reliably to this dataset width.
-    names: [ctgan, tvae, adsgan, pategan, rtvae]
+    names: [ctgan, tvae, adsgan, pategan, rtvae, arf]
 
   tabpfn:
     enabled: true
@@ -94,12 +94,15 @@ generation:
     # TabPFGen takes about 35 s per 1000 SGLD steps. Trials: about 10 random
     # start-up trials plus 10 per tuned dimension, capped for run time.
     # Timeout = trials x mean trial time x 1.5.
+    # ARF (CPU only) is a provisional budget from one default fit (30 trees)
+    # at this width on a 4-core cloud machine, 2026-10-08: about 28 min;
+    # the search goes up to 100 trees. Re-profile on the run machine.
     n_trials_per_model:
       { ctgan: 40, tvae: 40, adsgan: 40, rtvae: 40, pategan: 40,
-        tabpfgen_standard: 25, tabpfgen_custom: 25 }
+        tabpfgen_standard: 25, tabpfgen_custom: 25, arf: 25 }
     timeout_seconds_per_model:
       { ctgan: 108000, tvae: 103000, adsgan: 100000, rtvae: 111000, pategan: 28000,
-        tabpfgen_standard: 1400, tabpfgen_custom: 1200 }
+        tabpfgen_standard: 1400, tabpfgen_custom: 1200, arf: 112000 }
     # Training length is searched, [low, high, step]. The libraries' ranges
     # (100-1000 epochs; PATE-GAN 1-500) would take 3+ hours per trial here.
     epoch_ranges:
