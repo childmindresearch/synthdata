@@ -1,24 +1,30 @@
 # LORIS/HBN dataset configuration. Paths are relative to the repository root.
 # Copy this file and update the data section for a new dataset.
+#
+# This file lists the options worth reviewing for every run. Anything left out
+# uses its default; synthdata/config.py documents every option and default.
 
 name: loris
-seed: 42
-device: auto
+seed: 42 # Split, imputation, generators and metrics all derive from this.
+device: auto # auto | cpu | cuda | mps
 
 experiment:
   tag: loris_v2
-  id: "2.11"
+  id: "2.11" # Reusing an id resumes that experiment; null makes a new one per run.
 
 data:
   # Source and schema (LORIS data 2.11, transformed to match the competition data)
   source: csv
   path: data/loris/loris_v2_664_features_us_id.csv
-  version: "2.11"
+  version: "2.11" # Use a new value whenever the source data changes.
   variable_schema_path: data/loris/loris_v2_variable_schema_us.csv
+  data_dir: data/loris # Cached splits and imputed data.
 
   # Modeling columns
   target_column: CGAS_class # 0 severe, 1 moderate, 2 typical
   patient_id_column: patient_id # Split by patient, then dropped before modeling.
+  drop_columns: []
+  drop_rows_missing_target: true
   # Column roles. Quasi-identifiers are public, linkable attributes an
   # attacker may know; sensitive columns are the secrets privacy metrics try
   # to infer; protected columns are the fairness groups. QIs and sensitive
@@ -26,79 +32,33 @@ data:
   quasi_identifier_columns: [Age, Sex, region, PreInt_Demos_Fam__Child_Ethnicity]
   sensitive_columns: [Income, PreInt_TxHx__suicide, Diagnosis_Cat__Anxiety_Disorders]
   protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Ethnicity]
-  drop_rows_missing_target: true
-  drop_columns: []
 
-  # Source normalization and split
-  uppercase_columns: false
-  remap_binary_one_two: false
-  outlier_zscore_threshold: null # Set only with confirmed corrupt/sentinel columns.
-  outlier_columns: null
-  # Patient-level 60/20/20 split, stratified jointly by target, sex and age
-  # (<30, 30-60, >=60). Strata too small to spread over the folds fall back to
-  # the target alone.
+  # Patient-level 60/20/20 split: train fits the imputer and HPO candidates,
+  # tuning scores them, holdout is touched only by evaluation. Stratified
+  # jointly by target, sex and age (<30, 30-60, >=60); strata too small to
+  # spread over the folds fall back to the target alone.
   train_fraction: 0.6
   tuning_fraction: 0.2
   holdout_fraction: 0.2
   stratify_columns: [CGAS_class, Sex, Age]
   stratify_bins: [null, null, [30, 60]]
 
-  # Local derived-data storage
-  data_dir: data/loris
-  raw_cache_subdir: raw
-
 imputation:
-  enabled: true
   # Fitted on train minus tuning for HPO, then refitted on all of train.
-  method: missforest # or simple (median/mode), tabimpute, refidiff
-  missforest:
-    n_estimators: 50
-    max_iter: 5
-    n_nearest_features: null
+  method: missforest # missforest | simple (median/mode) | tabimpute | refidiff
+  round_to_int_default: false # Keep continuous features continuous.
   missing_indicators:
     enabled: true
-    min_missing_fraction: 0.05
-    remask_synthetic: true
+    min_missing_fraction: 0.05 # Columns missing this often get a <column>__missing feature.
     # 80%+ missing: generate only the indicator, fill 'recorded' rows by CART on release.
     # null = impute and generate every column as usual.
     indicator_only_fraction: 0.8
-    keep_values_columns: []
-  drift_warn_threshold: 0.1
-  device: auto
-  cache: true
-  validation_margin: 0.2
-  round_to_int_default: false
-  round_rules: {}
-  refidiff:
-    hidden_dim: 32
-    epochs: 10001
-    early_stopping_patience: 500
-    batch_size: 8192
-    num_steps: 50
-    num_trials: 10
-    denoiser: auto
-    checkpoint_every: 1000
-    catboost_warmup_iterations: 1000
-  benchmark:
-    enabled: false
-    output_dir: output/loris/imputation
-    mask_fraction: 0.3
-    n_masks: 3
-    mechanisms: [mcar]
-    hpo:
-      enabled: false
-      n_trials: 12
-      timeout_seconds: null
-      hidden_dims: [16, 32, 64]
-      num_steps: [10, 25, 50]
-      num_trials: [1, 3, 5]
-      epochs: [1000, 3000]
-      early_stopping_patience: [100, 250]
 
 generation:
   output_dir: output/loris/synthetic_data
   n_samples: 2500
-  force_retrain: false
+  # Seed replicates per model; 2+ gives every score a 95% interval.
+  n_replicates: 1
 
   synthcity:
     enabled: true
@@ -113,14 +73,18 @@ generation:
   tabpfgen:
     enabled: true
     variants: [standard, custom]
-    standard_params: {}
-    custom_params: { n_sgld_steps: 1000, sgld_noise_scale: 0.1 }
 
   # Resample synthetic data to the real train class shares.
   match_class_prior: true
 
   hpo:
     enabled: true
+    # Objective scored on the tuning split: tstr_macro_f1 (fixed XGBoost
+    # trained on synthetic, tested on real) or tstr_macro_auprc.
+    objective: tstr_macro_f1
+    # Lenient sanity screens; a trial that fails one can't be chosen as best.
+    constraints: { copy_margin: 0.02, min_category_coverage: 0.9, max_out_of_range: 0.01 }
+    # Budget for models not listed per model below.
     n_trials: 50
     timeout_seconds: 14400
     # Per-model budgets measured on the simulated data (configs/config_sim.yaml);
@@ -143,32 +107,16 @@ generation:
         rtvae: [25, 150, 25], pategan: [5, 30, 5] }
     # Median pruning on synthcity's early-stopping metric (CTGAN, ADS-GAN).
     pruner: median
-    pruner_startup_trials: 5
-    pruner_warmup_steps: 1
-    # Objective scored on the tuning split: tstr_macro_f1 (fixed XGBoost
-    # trained on synthetic, tested on real), tstr_macro_auprc, or the older
-    # synthcity_composite (uses metric_config below, privacy included).
-    objective: tstr_macro_f1
-    tstr_seeds: 3
-    # Lenient sanity screens; a trial that fails one can't be chosen as best.
-    constraints: { copy_margin: 0.02, min_category_coverage: 0.9, max_out_of_range: 0.01 }
-    metric_config:
-      stats: [prdc, alpha_precision, wasserstein_dist, inv_kl_divergence]
-      sanity: [nearest_syn_neighbor_distance]
-      performance: [xgb]
-      privacy: [identifiability_score]
-    storage: null
-    best_params_path: null
-    final_n_iter_override: null
 
 evaluation:
   output_dir: output/loris/evaluation
-  models: null
   positive_class: 0 # Used only if the target is naturally binary.
-  ranking_strategy: linear
-  generate_report: true
-  save_per_model_syntheval_plots: true
+  # Fixed reference rows scored next to the generators: real train rows
+  # (utility ceiling, privacy floor) and independent column marginals.
+  baselines: [train_copy, marginals]
 
+  # Metric selection per framework: categories (utility/privacy/fairness) or
+  # exact metric names; null runs everything.
   synthcity: { enabled: true, categories: null, metrics: null }
   syntheval: { enabled: true, categories: null, metrics: null }
   custom: { enabled: true, categories: null, metrics: null }
@@ -176,7 +124,6 @@ evaluation:
   log_disparity:
     protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Ethnicity]
     target_map: { 0: severe, 1: moderate, 2: typical }
-    protected_map: [null, null, null]
     protected_bins: [null, [0, 18, 30, 45, 60, 200], null]
 
   # Metrics that need two target classes (AUROC difference, subgroup gaps) on a
@@ -184,30 +131,21 @@ evaluation:
   # weight (per-class values in ovr_per_class.csv); binary = once on the
   # binary_target collapse below, which must then be enabled.
   class_averaging: ovr_macro
-  # XGBoost seeds averaged for holdout TSTR (fit on synthetic, score on test).
-  tstr_seeds: 3
-  # Custom privacy metrics (evaluation.custom names anonymeter, holdout_distance).
+  # Binary collapse for class_averaging: binary: severe/moderate versus typical.
+  binary_target:
+    enabled: false # true together with class_averaging: binary
+    positive_classes: [0, 1]
+    negative_classes: [2]
+  # Custom privacy metrics (Anonymeter, holdout-referenced DCR/NNDR).
   # unit: patient = attacks target one encounter per patient and the distance
   # membership check scores each patient by their closest encounter; row = every
   # row is an individual. Anonymeter uses the QIs as attacker knowledge and the
   # sensitive columns as secrets, with the test split as its control set.
   privacy_attacks:
     unit: patient
-    anonymeter:
-      n_attacks: 500
-      singling_out_mode: multivariate
-      singling_out_n_cols: 3
-      singling_out_max_attempts: 100000
-      linkability_n_neighbors: 10
-      confidence_level: 0.95
-  # Binary collapse for class_averaging: binary: severe/moderate versus typical.
-  binary_target:
-    enabled: false # true together with class_averaging: binary
-    column: null
-    positive_classes: [0, 1]
-    negative_classes: [2]
+    anonymeter: { n_attacks: 500 }
 
-  # Resource cap for resumable per-model SynthEval processes.
+  # Parallel per-model evaluation, sized to the machine.
   syntheval_execution:
     model_workers: 6
     max_model_workers: 6
@@ -215,7 +153,12 @@ evaluation:
     memory_reserve_gib: 16
     memory_per_model_gib: 14
 
+  # Overall rank = weighted geometric mean of the utility, privacy and
+  # fairness ranks.
   rank_weights: { utility: 1.0, privacy: 1.0, fairness: 1.0 }
+  # Absolute privacy floor checked on raw values; failing models are flagged,
+  # never recommended. Starting thresholds only: get a privacy/compliance
+  # review before any release.
   privacy_gate:
     enabled: true
     thresholds:
@@ -229,6 +172,3 @@ evaluation:
 
 plots:
   output_dir: output/loris/plots
-  sections: [data, imputation, generation, hpo, evaluation]
-  dpi: 150
-  formats: [png]

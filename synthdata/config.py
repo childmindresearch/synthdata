@@ -1,9 +1,13 @@
 """Config schema and YAML loader for the synthdata pipeline.
 
-A collaborator only needs to edit a single YAML file (see ``configs/config.yaml``)
-to point the whole pipeline (imputation -> generation -> evaluation -> plots) at
-their own dataset. All four ``scripts/run_*.py`` entry points load the same
-:class:`Config` object via :func:`load_config`.
+This module is the reference for every configuration option: each field below
+carries its default and an explanation. A run is driven by one YAML file (see
+``configs/``) whose sections mirror these dataclasses (``data``, ``imputation``,
+``generation``, ``evaluation``, ``plots``, ``experiment``). The YAML files list
+only the options most worth reviewing; anything left out takes the default
+defined here. Unknown keys fail loudly, so a typo never falls back silently.
+All four CLI commands (``synthdata-impute``, ``-generate``, ``-evaluate``,
+``-plot``) load the same :class:`Config` via :func:`load_config`.
 
 Relative paths in the config are resolved against the current working directory
 at the time the scripts are invoked (i.e. run commands from the repository root,
@@ -57,7 +61,10 @@ class DataConfig:
     #: so a config written for the old meaning of sensitive_columns (the
     #: fairness groups) fails instead of silently changing meaning.
     quasi_identifier_columns: list = dataclasses.field(default_factory=list)
+    #: Secret attributes privacy metrics try to infer (see above).
     sensitive_columns: list = dataclasses.field(default_factory=list)
+    #: Fairness groups (see above); also the default for
+    #: ``evaluation.log_disparity.protected_columns``.
     protected_columns: list | None = None
     #: Columns to drop entirely before any modeling (e.g. free-text/ID columns).
     drop_columns: list = dataclasses.field(default_factory=list)
@@ -89,8 +96,11 @@ class DataConfig:
     #: is supplied. ``"auto"`` is no longer accepted, so heuristics are never a
     #: default data-typing policy. Legacy support will be removed in the next
     #: breaking schema release.
+    #: Legacy: categorical columns without an order.
     nominal_columns: list | None = None
+    #: Legacy: categorical columns with an order.
     ordinal_columns: list = dataclasses.field(default_factory=list)
+    #: Legacy: ``{column: [lowest, ..., highest]}`` category order per ordinal column.
     ordinal_column_categories: dict = dataclasses.field(default_factory=dict)
 
     #: Uppercase all column names on load (matches the hepatitis notebook convention).
@@ -139,6 +149,7 @@ class DataConfig:
 
     #: Where cached/derived CSVs (raw, imputed, train/test splits) are written.
     data_dir: str = "data/dataset"
+    #: Subfolder of ``data_dir`` where a UCI download is cached.
     raw_cache_subdir: str = "raw"
 
 
@@ -162,6 +173,7 @@ class RefiDiffConfig:
     epochs: int = 10001
     #: Stop training if val loss hasn't improved for this many epochs.
     early_stopping_patience: int = 500
+    #: Training mini-batch size (rows).
     batch_size: int = 8192
     #: Number of reverse-diffusion (EDM/VE-SDE) sampling steps.
     num_steps: int = 50
@@ -219,6 +231,8 @@ class MissingIndicatorConfig:
     are blanked again in the released copy of each synthetic dataset.
     """
 
+    #: Add indicators. Turning this off makes generators see only imputed
+    #: values, so synthetic data cannot reproduce the missingness pattern.
     enabled: bool = True
     #: Columns missing in at least this share of the train rows outside the
     #: tuning split get an indicator; rarer missingness gets none.
@@ -239,10 +253,17 @@ class MissingIndicatorConfig:
 
 @dataclasses.dataclass
 class RefiDiffBenchmarkHPOConfig:
-    """Narrow, staged search space for masked-cell RefiDiff validation."""
+    """Narrow, staged search space for masked-cell RefiDiff validation.
 
+    Exploratory and not used by the main pipeline; each list is the set of
+    values the search may pick for the matching :class:`RefiDiffConfig` field.
+    """
+
+    #: Run an Optuna search instead of one fixed-parameter benchmark.
     enabled: bool = False
+    #: Trials per study.
     n_trials: int = 12
+    #: Wall-clock limit per study in seconds (None = no limit).
     timeout_seconds: int | None = None
     hidden_dims: list = dataclasses.field(default_factory=lambda: [16, 32, 64])
     num_steps: list = dataclasses.field(default_factory=lambda: [10, 25, 50])
@@ -258,23 +279,39 @@ class RefiDiffBenchmarkConfig:
     Benchmarking is deliberately separate from ordinary imputation caching:
     it creates artificial masks only in the training split and writes studies
     beneath ``output/<dataset>/imputation/data_v_<version>/benchmark_<study-id>/``.
+    Exploratory and not validated end to end; run only through the separate
+    ``synthdata-imputation-benchmark`` command, never by the main pipeline.
     """
 
+    #: Must be True for ``synthdata-imputation-benchmark`` to run.
     enabled: bool = False
+    #: Root folder for benchmark studies.
     output_dir: str = "output/dataset/imputation"
+    #: Share of observed training cells in each scored column that is hidden.
     mask_fraction: float = 0.3
+    #: Independent random masks per study (results are averaged over them).
     n_masks: int = 3
+    #: Missingness mechanisms to simulate: "mcar", "mar" and/or "mnar".
     mechanisms: list = dataclasses.field(default_factory=lambda: ["mcar"])
     #: Optional feature columns eligible for artificial masking/scoring. All
     #: feature columns remain visible to the imputer as context. ``None`` uses
     #: every non-sensitive feature; a small explicit panel is appropriate for
     #: an affordable screening study on a very wide dataset.
     score_columns: list | None = None
+    #: Optional search over RefiDiff settings (see above).
     hpo: RefiDiffBenchmarkHPOConfig = dataclasses.field(default_factory=RefiDiffBenchmarkHPOConfig)
 
 
 @dataclasses.dataclass
 class ImputationConfig:
+    """How missing feature values are filled before generation.
+
+    The target is never imputed. Imputers are fitted on training rows only,
+    so no information from the tuning or holdout rows leaks into the fill.
+    """
+
+    #: Run imputation. When False, generators that cannot handle missing
+    #: values will fail; keep it on unless the data has no missing values.
     enabled: bool = True
     #: "missforest" (default; iterative random-forest imputation), "simple"
     #: (median for continuous columns, most frequent value for categorical
@@ -308,12 +345,14 @@ class ImputationConfig:
     drift_warn_threshold: float = 0.1
     #: Only used when method == "missforest".
     missforest: MissForestConfig = dataclasses.field(default_factory=MissForestConfig)
+    #: ``<column>__missing`` indicator features (see MissingIndicatorConfig).
     missing_indicators: MissingIndicatorConfig = dataclasses.field(
         default_factory=MissingIndicatorConfig
     )
     #: Only used when method == "refidiff".
     refidiff: RefiDiffConfig = dataclasses.field(default_factory=RefiDiffConfig)
-    #: Optional train-only artificial-masking benchmark/HPO for RefiDiff.
+    #: Optional train-only artificial-masking benchmark/HPO for RefiDiff
+    #: (exploratory; used only by ``synthdata-imputation-benchmark``).
     benchmark: RefiDiffBenchmarkConfig = dataclasses.field(default_factory=RefiDiffBenchmarkConfig)
 
 
@@ -324,7 +363,13 @@ class ImputationConfig:
 
 @dataclasses.dataclass
 class SynthcityModelsConfig:
+    """Generators from the synthcity library."""
+
+    #: Train synthcity generators at all.
     enabled: bool = True
+    #: synthcity plugin names to train: "ctgan", "tvae", "rtvae", "adsgan",
+    #: "pategan" (differentially private GAN), "bayesian_network" and "ddpm".
+    #: Bayesian networks and DDPM scale poorly to hundreds of columns.
     names: list = dataclasses.field(
         default_factory=lambda: [
             "ctgan",
@@ -340,6 +385,10 @@ class SynthcityModelsConfig:
 
 @dataclasses.dataclass
 class TabPFNConfig:
+    """TabPFN unsupervised generation (needs the ``tabpfn`` extra and a
+    ``TABPFN_TOKEN`` in ``.env``)."""
+
+    #: Train TabPFN generators at all.
     enabled: bool = True
     #: "standard" (features only, label assigned post-hoc) and/or
     #: "custom" (features + target modeled jointly).
@@ -354,6 +403,9 @@ class TabPFNConfig:
 
 @dataclasses.dataclass
 class TabPFGenConfig:
+    """TabPFGen (energy-based sampling with TabPFN as the classifier)."""
+
+    #: Train TabPFGen generators at all.
     enabled: bool = True
     #: "standard" (TabPFGen defaults) and/or "custom" (SGLD + nearest-neighbor relabeling).
     variants: list = dataclasses.field(default_factory=lambda: ["standard", "custom"])
@@ -389,6 +441,14 @@ class HPOConstraintsConfig:
 
 @dataclasses.dataclass
 class HPOConfig:
+    """Optuna hyperparameter search, one study per model.
+
+    Every trial fits on train minus tuning and is scored on the tuning split;
+    the final model is refitted with the best parameters on all of train.
+    Studies are stored on disk, so an interrupted search resumes.
+    """
+
+    #: Run the search. When False, models train with their library defaults.
     enabled: bool = True
     #: What a trial optimizes, scored on the tuning split. "tstr_macro_f1"
     #: (default): macro-F1 of a fixed XGBoost trained on the synthetic rows
@@ -399,10 +459,12 @@ class HPOConfig:
     objective: str = "tstr_macro_f1"
     #: XGBoost seeds averaged per TSTR score.
     tstr_seeds: int = 3
+    #: Sanity screens a trial must pass to be chosen (see HPOConstraintsConfig).
     constraints: HPOConstraintsConfig = dataclasses.field(default_factory=HPOConstraintsConfig)
     #: Trials and wall-clock seconds per study, for models not listed in the
     #: per-model budgets below.
     n_trials: int = 10
+    #: None = no time limit.
     timeout_seconds: int | None = 300
     #: Trials per model (keys: synthcity plugin names, ``tabpfgen_standard``,
     #: ``tabpfgen_custom``). 0 skips the search; the model keeps its defaults.
@@ -420,6 +482,7 @@ class HPOConfig:
     #: Trials that finish before pruning starts, and intermediate scores a
     #: trial reports before it can be pruned (1: from its first check on).
     pruner_startup_trials: int = 5
+    #: See above.
     pruner_warmup_steps: int = 1
     #: Metrics of the "synthcity_composite" objective, oriented to "higher is
     #: better" and averaged. Unused by the TSTR objectives.
@@ -449,6 +512,11 @@ class HPOConfig:
 
 @dataclasses.dataclass
 class GenerationConfig:
+    """Which generators run, how many rows they produce, and their HPO."""
+
+    #: Synthetic rows produced per model (before ``match_class_prior``
+    #: resampling, which keeps the size). Matching the real train size makes
+    #: utility and privacy scores easier to compare with the real data.
     n_samples: int = 200
     #: Times each model is fitted and sampled, with seeds seed, seed+1, ...
     #: Replicate r > 0 is saved as "<model>__rep<r>". With 2 or more, the
@@ -458,10 +526,16 @@ class GenerationConfig:
     #: Base artifact root. Runtime stage paths are versioned under
     #: ``<output_dir>/<data.version or 'unversioned'>/<experiment-id>/``.
     output_dir: str = "output/dataset/synthetic_data"
+    #: Retrain and overwrite models whose synthetic CSV already exists in this
+    #: experiment (False reuses them, so a rerun only fills in what is missing).
     force_retrain: bool = False
+    #: synthcity generators (see SynthcityModelsConfig).
     synthcity: SynthcityModelsConfig = dataclasses.field(default_factory=SynthcityModelsConfig)
+    #: TabPFN generators (see TabPFNConfig).
     tabpfn: TabPFNConfig = dataclasses.field(default_factory=TabPFNConfig)
+    #: TabPFGen generators (see TabPFGenConfig).
     tabpfgen: TabPFGenConfig = dataclasses.field(default_factory=TabPFGenConfig)
+    #: Hyperparameter search (see HPOConfig).
     hpo: HPOConfig = dataclasses.field(default_factory=HPOConfig)
     #: Resample every synthetic dataset (and every HPO candidate) to the real
     #: train class shares of a categorical target, keeping its size. Without
@@ -483,17 +557,31 @@ class FrameworkSelectionConfig:
     (utility/privacy/... groupings) when both are given.
     """
 
+    #: Run this framework's metrics at all.
     enabled: bool = True
+    #: Metric types to run: any of "utility", "privacy", "fairness" (None =
+    #: all). synthcity has no fairness metrics.
     categories: list | None = None
+    #: Exact metric names to run (None = all in the selected categories); see
+    #: synthdata/evaluation/catalog.py for the names.
     metrics: list | None = None
 
 
 @dataclasses.dataclass
 class LogDisparityConfig:
+    """Log-disparity fairness metric: how much each protected subgroup's
+    target distribution differs between real and synthetic data."""
+
     #: Defaults to data.protected_columns if left empty.
     protected_columns: list = dataclasses.field(default_factory=list)
+    #: Readable labels for target values in the report, ``{value: label}``.
     target_map: dict | None = None
+    #: Readable labels per protected column, aligned with
+    #: ``protected_columns`` (null entries keep the raw values).
     protected_map: list | None = None
+    #: Bin edges per protected column, aligned with ``protected_columns``
+    #: (null = use the values as groups); needed for continuous columns
+    #: such as age, e.g. ``[null, [0, 18, 30, 45, 60, 200]]``.
     protected_bins: list | None = None
 
 
@@ -511,6 +599,8 @@ class AnonymeterConfig:
 
     #: Attack targets per attack (capped at the control-set size).
     n_attacks: int = 500
+    #: "multivariate" (predicates over several columns; realistic for wide
+    #: data) or "univariate" (one column at a time).
     singling_out_mode: str = "multivariate"
     #: Columns per multivariate singling-out predicate.
     singling_out_n_cols: int = 3
@@ -534,6 +624,7 @@ class PrivacyAttacksConfig:
     #: membership check scores each patient by their closest encounter, so a
     #: frequent attender counts once; "row": every row is an individual.
     unit: str = "patient"
+    #: Anonymeter attack settings (see AnonymeterConfig).
     anonymeter: AnonymeterConfig = dataclasses.field(default_factory=AnonymeterConfig)
 
 
@@ -557,6 +648,7 @@ class BinaryTargetConfig:
     :func:`synthdata.evaluation.syntheval_eval.build_binary_target_series`).
     """
 
+    #: Required (and only used) when ``evaluation.class_averaging`` is "binary".
     enabled: bool = False
     #: Column to collapse; defaults to data.target_column if left None.
     column: str | None = None
@@ -595,7 +687,9 @@ class PrivacyGateConfig:
     for an actual data release or challenge submission.
     """
 
+    #: Check every model against ``thresholds``.
     enabled: bool = True
+    #: ``{metric column: {"bound": "max"|"min", "value": float}}`` (see above).
     thresholds: dict = dataclasses.field(
         default_factory=lambda: {
             # syntheval metrics (exact result-column names -- see catalog.py /
@@ -621,9 +715,13 @@ class SynthEvalExecutionConfig:
     dataset width; the remaining fields constrain that estimate.
     """
 
+    #: Models evaluated in parallel: "auto" or a fixed number.
     model_workers: str | int = "auto"
+    #: Upper limit on parallel models in automatic mode.
     max_model_workers: int = 8
+    #: CPU threads each model's process may use.
     cores_per_model: int = 4
+    #: RAM (GiB) kept free for the system and the main process.
     memory_reserve_gib: float = 16.0
     #: Optional fixed estimate; automatic mode derives one from feature width when None.
     memory_per_model_gib: float | None = None
@@ -650,8 +748,14 @@ class EvaluationConfig:
     #: "marginals" (each column sampled independently: no joint structure).
     #: They are never recommended. Empty list = no baselines.
     baselines: list = dataclasses.field(default_factory=lambda: ["train_copy", "marginals"])
+    #: Target value SynthEval's fairness metrics treat as the positive outcome.
+    #: Used only when the target itself has two classes.
     positive_class: Any = 1
 
+    #: Metric selection per framework (see FrameworkSelectionConfig):
+    #: synthcity's metrics, SynthEval's metrics, and this project's own
+    #: ("custom": holdout TSTR, Anonymeter, holdout distances, log disparity,
+    #: equalized odds / equal opportunity).
     synthcity: FrameworkSelectionConfig = dataclasses.field(
         default_factory=FrameworkSelectionConfig
     )
@@ -662,7 +766,9 @@ class EvaluationConfig:
 
     #: "linear" (min-max scale + sum) or "summation" (SynthEval's built-in strategy).
     ranking_strategy: str = "linear"
+    #: Log-disparity fairness metric settings (see LogDisparityConfig).
     log_disparity: LogDisparityConfig = dataclasses.field(default_factory=LogDisparityConfig)
+    #: Save SynthEval's own figures for each model next to its results.
     save_per_model_syntheval_plots: bool = True
     #: How SynthEval metrics that need exactly 2 target classes (auroc_diff
     #: and the subgroup gap metrics) run when the target has 3+ classes:
@@ -672,6 +778,7 @@ class EvaluationConfig:
     #: collapse, which must then be enabled. A 2-class target runs them
     #: directly and ignores this setting.
     class_averaging: str = "ovr_macro"
+    #: Binary collapse of the target (see BinaryTargetConfig).
     binary_target: BinaryTargetConfig = dataclasses.field(default_factory=BinaryTargetConfig)
     #: XGBoost seeds averaged for the holdout TSTR scores (fit on each
     #: synthetic dataset, score on the test split; see
@@ -679,6 +786,7 @@ class EvaluationConfig:
     tstr_seeds: int = 3
     #: Anonymeter attacks and holdout-referenced DCR/NNDR (custom privacy).
     privacy_attacks: PrivacyAttacksConfig = dataclasses.field(default_factory=PrivacyAttacksConfig)
+    #: CPU and memory limits for parallel evaluation (see SynthEvalExecutionConfig).
     syntheval_execution: SynthEvalExecutionConfig = dataclasses.field(
         default_factory=SynthEvalExecutionConfig
     )
@@ -694,6 +802,7 @@ class EvaluationConfig:
     rank_weights: dict = dataclasses.field(
         default_factory=lambda: {"utility": 1.0, "privacy": 1.0, "fairness": 1.0}
     )
+    #: Absolute pass/fail privacy thresholds (see PrivacyGateConfig).
     privacy_gate: PrivacyGateConfig = dataclasses.field(default_factory=PrivacyGateConfig)
     #: Whether to generate a human-readable Markdown evaluation report
     #: (report.md, alongside combined_evaluation.csv) summarizing the ranked
@@ -722,7 +831,9 @@ class PlotsConfig:
             "evaluation",
         ]
     )
+    #: Resolution of raster figures.
     dpi: int = 150
+    #: File formats written for every figure, e.g. ["png", "pdf"].
     formats: list = dataclasses.field(default_factory=lambda: ["png"])
 
 
@@ -761,10 +872,13 @@ class ExperimentConfig:
 class Config:
     #: Short dataset/run name, used to build default paths (data/<name>, output/<name>/...).
     name: str = "dataset"
+    #: Master random seed (split, imputation, generators, metrics). Seed
+    #: replicates use seed, seed+1, ... (``generation.n_replicates``).
     seed: int = 42
     #: "auto" | "cpu" | "cuda" | "mps"
     device: str = "auto"
 
+    #: One section per pipeline stage; see each class for its options.
     data: DataConfig = dataclasses.field(default_factory=DataConfig)
     imputation: ImputationConfig = dataclasses.field(default_factory=ImputationConfig)
     generation: GenerationConfig = dataclasses.field(default_factory=GenerationConfig)

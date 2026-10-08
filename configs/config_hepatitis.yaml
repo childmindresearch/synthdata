@@ -1,70 +1,55 @@
-# Hepatitis example. All paths are relative to the repository root.
+# Hepatitis example: a small public dataset (UCI id 46) that runs on a CPU.
+# All paths are relative to the repository root.
+#
+# This file lists the options worth reviewing for every run. Anything left out
+# uses its default; synthdata/config.py documents every option and default.
 
 name: hepatitis
-seed: 42
-device: auto
+seed: 42 # Split, imputation, generators and metrics all derive from this.
+device: auto # auto | cpu | cuda | mps
 
 experiment:
   tag: test
-  id: 0.1 # Set to resume or extend a specific experiment.
+  id: 0.1 # Reusing an id resumes that experiment; null makes a new one per run.
 
 data:
   # Source and schema
   source: uci
   uci_id: 46
-  path: null # Required for csv/parquet sources.
-  version: "1.0" # Use a new value when the source data changes.
+  version: "1.0" # Use a new value whenever the source data changes.
   variable_schema_path: data/hepatitis/hepatitis_variable_schema.csv
+  data_dir: data/hepatitis # Cached download, splits and imputed data.
 
   # Modeling columns
   target_column: target
   raw_target_column: CLASS
-  # Column roles (see config_loris.yaml). UCI Hepatitis has no linkable
+  # Source normalization (dataset quirks): uppercase names, 1/2 codes to 0/1.
+  uppercase_columns: true
+  remap_binary_one_two: true
+  # Column roles (see config_sim.yaml). UCI Hepatitis has no linkable
   # identifiers beyond age and sex; the liver biopsy result is the secret.
+  # Every row is a different patient, so there is no patient_id_column.
   quasi_identifier_columns: [AGE, SEX]
   sensitive_columns: [HISTOLOGY]
   protected_columns: [SEX, AGE]
-  drop_columns: []
-  drop_rows_missing_target: false
 
-  # Source normalization and split
-  uppercase_columns: true
-  remap_binary_one_two: true
-  outlier_zscore_threshold: null
-  outlier_columns: []
-  # Patient-level shares; the split stratifies on stratify_columns (target by default).
+  # 60/20/20 split: train fits the imputer and HPO candidates, tuning scores
+  # them, holdout is touched only by evaluation. Stratified on the target.
   train_fraction: 0.6
   tuning_fraction: 0.2
   holdout_fraction: 0.2
 
-  # Local derived-data storage
-  data_dir: data/hepatitis
-  raw_cache_subdir: raw
-
 imputation:
-  enabled: true
-  method: refidiff
-  device: auto
-  cache: true
-  validation_margin: 0.2
-  round_to_int_default: true
+  # Fitted on train minus tuning for HPO, then refitted on all of train.
+  method: missforest # missforest | simple (median/mode) | tabimpute | refidiff
+  round_to_int_default: true # Round imputed values unless round_rules says otherwise.
   round_rules: { BILIRUBIN: 2, ALBUMIN: 1 }
-
-  # Used only by method: refidiff.
-  refidiff:
-    hidden_dim: 32
-    epochs: 10001
-    early_stopping_patience: 500
-    batch_size: 8192
-    num_steps: 50
-    num_trials: 10
-    denoiser: auto
-    checkpoint_every: 1000
 
 generation:
   output_dir: output/hepatitis/synthetic_data
   n_samples: 200
-  force_retrain: false
+  # Seed replicates per model; 2+ gives every score a 95% interval.
+  n_replicates: 1
 
   synthcity:
     enabled: true
@@ -78,14 +63,17 @@ generation:
   tabpfgen:
     enabled: true
     variants: [standard, custom]
-    standard_params: {}
-    custom_params: { n_sgld_steps: 1000, sgld_noise_scale: 0.1 }
 
   # Resample synthetic data to the real train class shares.
   match_class_prior: true
 
   hpo:
     enabled: true
+    # Objective scored on the tuning split: tstr_macro_f1 (fixed XGBoost
+    # trained on synthetic, tested on real) or tstr_macro_auprc.
+    objective: tstr_macro_f1
+    # Lenient sanity screens; a trial that fails one can't be chosen as best.
+    constraints: { copy_margin: 0.02, min_category_coverage: 0.9, max_out_of_range: 0.01 }
     n_trials: 10
     timeout_seconds: 600
     # Training length searched per model, [low, high, step]: shortened from the
@@ -94,30 +82,16 @@ generation:
       { ctgan: [100, 300, 100], adsgan: [100, 300, 100], pategan: [1, 5, 1],
         tabpfgen_standard: [100, 500, 100], tabpfgen_custom: [100, 500, 100] }
     pruner: median
-    # Objective scored on the tuning split: tstr_macro_f1 (fixed XGBoost
-    # trained on synthetic, tested on real), tstr_macro_auprc, or the older
-    # synthcity_composite (uses metric_config below, privacy included).
-    objective: tstr_macro_f1
-    tstr_seeds: 3
-    # Lenient sanity screens; a trial that fails one can't be chosen as best.
-    constraints: { copy_margin: 0.02, min_category_coverage: 0.9, max_out_of_range: 0.01 }
-    metric_config:
-      stats: [prdc, alpha_precision, wasserstein_dist, inv_kl_divergence]
-      sanity: [nearest_syn_neighbor_distance]
-      performance: [xgb]
-      privacy: [identifiability_score]
-    storage: null
-    best_params_path: null
-    final_n_iter_override: null
 
 evaluation:
   output_dir: output/hepatitis/evaluation
-  models: null # Null evaluates every generated model.
-  positive_class: 1
-  ranking_strategy: linear
-  generate_report: true
-  save_per_model_syntheval_plots: true
+  positive_class: 1 # Used only if the target is naturally binary.
+  # Fixed reference rows scored next to the generators: real train rows
+  # (utility ceiling, privacy floor) and independent column marginals.
+  baselines: [train_copy, marginals]
 
+  # Metric selection per framework: categories (utility/privacy/fairness) or
+  # exact metric names; null runs everything.
   synthcity: { enabled: true, categories: null, metrics: null }
   syntheval: { enabled: true, categories: null, metrics: null }
   custom: { enabled: true, categories: null, metrics: null }
@@ -128,26 +102,12 @@ evaluation:
     protected_map: [{ 0: male, 1: female }, null]
     protected_bins: [null, [7, 18, 30, 45, 60, 78]]
 
-  # Metrics that need two target classes (AUROC difference, subgroup gaps) on a
-  # 3+ class target: ovr_macro = once per class vs the rest, averaged with equal
-  # weight (per-class values in ovr_per_class.csv); binary = once on the
-  # binary_target collapse below, which must then be enabled.
-  class_averaging: ovr_macro
-  # XGBoost seeds averaged for holdout TSTR (fit on synthetic, score on test).
-  tstr_seeds: 3
-  # Used only for targets with more than two classes.
-  binary_target:
-    { enabled: false, column: null, positive_classes: [], negative_classes: [] }
-
-  syntheval_execution:
-    model_workers: auto
-    max_model_workers: 8
-    cores_per_model: 4
-    memory_reserve_gib: 16
-    memory_per_model_gib: null
-
+  # Overall rank = weighted geometric mean of the utility, privacy and
+  # fairness ranks.
   rank_weights: { utility: 1.0, privacy: 1.0, fairness: 1.0 }
-  # Starting thresholds only; obtain privacy/compliance review before release.
+  # Absolute privacy floor checked on raw values; failing models are flagged,
+  # never recommended. Starting thresholds only: get a privacy/compliance
+  # review before any release.
   privacy_gate:
     enabled: true
     thresholds:
@@ -161,6 +121,3 @@ evaluation:
 
 plots:
   output_dir: output/hepatitis/plots
-  sections: [data, imputation, generation, hpo, evaluation]
-  dpi: 150
-  formats: [png]
