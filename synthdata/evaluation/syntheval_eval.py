@@ -196,11 +196,23 @@ _METRICS_ON_PROTECTED_COLUMNS = frozenset(
     {"statistical_parity", "equal_opportunity", "equalized_odds"}
 )
 
+#: SynthEval metrics that infer the sensitive columns. With no sensitive
+#: columns att_discl returns NaN instead of failing, so it is skipped.
+_METRICS_ON_SENSITIVE_COLUMNS = frozenset({"att_discl"})
+
 #: SynthEval metrics that draw from joblib worker processes; see _in_process_joblib.
 _METRICS_WITH_PROCESS_RANDOMNESS = frozenset({"nnaa"})
 
 
-def _evaluate_seeded(se, synthetic_frame, analysis_configs, preset: dict, seed: int, model_name):
+def _evaluate_seeded(
+    se,
+    synthetic_frame,
+    analysis_configs,
+    preset: dict,
+    seed: int,
+    model_name,
+    empty_roles: frozenset = frozenset(),
+):
     """Run each preset metric on its own, from the same seeded random state.
 
     SynthEval's MIA, attribute disclosure, NNAA and fairness metrics draw
@@ -211,9 +223,23 @@ def _evaluate_seeded(se, synthetic_frame, analysis_configs, preset: dict, seed: 
     SynthEval itself does; their names are returned for the checkpoint.
     ``analysis_configs`` maps "protected" and "sensitive" to the
     ``AnalysisConfig`` each metric reads (see _METRICS_ON_PROTECTED_COLUMNS).
+    A metric that reads a role listed in ``empty_roles`` (no columns declared)
+    is skipped with a log line rather than run or reported as failed.
     """
     parts, failed = [], []
     for method, params in preset.items():
+        role = (
+            "protected"
+            if method in _METRICS_ON_PROTECTED_COLUMNS
+            else "sensitive"
+            if method in _METRICS_ON_SENSITIVE_COLUMNS
+            else None
+        )
+        if role in empty_roles:
+            logger.info(
+                "[syntheval] %s: skipping %s, no %s columns declared", model_name, method, role
+            )
+            continue
         analysis_config = analysis_configs[
             "protected" if method in _METRICS_ON_PROTECTED_COLUMNS else "sensitive"
         ]
@@ -324,7 +350,20 @@ def _model_worker(
         )
         preset = json.loads(Path(preset_path).read_text())
         result, failed_metrics = _evaluate_seeded(
-            se, synthetic_frame, analysis_configs, preset, seed, model_name
+            se,
+            synthetic_frame,
+            analysis_configs,
+            preset,
+            seed,
+            model_name,
+            empty_roles=frozenset(
+                role
+                for role, columns in (
+                    ("sensitive", sensitive_columns),
+                    ("protected", protected_columns),
+                )
+                if not columns
+            ),
         )
         if result is None:
             raise RuntimeError("SynthEval returned no normalized metric results")
