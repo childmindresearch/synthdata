@@ -188,10 +188,10 @@ class _RandomSynthEval:
 
 
 class TestEvaluateSeeded:
-    def _run(self, preset, seed=7, se=None):
+    def _run(self, preset, seed=7, se=None, empty_roles=frozenset()):
         configs = {"sensitive": "S", "protected": "P"}
         result, failed = _evaluate_seeded(
-            se or _RandomSynthEval(), None, configs, preset, seed, "m"
+            se or _RandomSynthEval(), None, configs, preset, seed, "m", empty_roles=empty_roles
         )
         return dict(zip(result["metric"], result["val"], strict=True)), failed
 
@@ -206,6 +206,14 @@ class TestEvaluateSeeded:
             "equalized_odds": "P",
             "mia": "S",
         }
+
+    def test_metrics_for_an_undeclared_role_are_skipped_not_failed(self):
+        preset = {"att_discl": {}, "statistical_parity": {}, "mia": {}}
+        no_sensitive, failed = self._run(preset, empty_roles=frozenset({"sensitive"}))
+        assert set(no_sensitive) == {"statistical_parity", "mia"}
+        assert failed == []
+        no_protected, _ = self._run(preset, empty_roles=frozenset({"protected"}))
+        assert set(no_protected) == {"att_discl", "mia"}
 
     def test_same_seed_gives_same_scores(self):
         preset = {"mia": {}, "att_discl": {}}

@@ -91,11 +91,15 @@ The synthcity epochs are CPU-bound at this width (GPU near idle, about 560% CPU)
 | synthcity `sensitive_features` (data_leakage, distinct l-diversity) | sensitive | data_leakage predicts each sensitive column from all other columns; l-diversity counts distinct sensitive values per cluster. |
 | synthcity k-anonymization, k-map, delta-presence | every non-sensitive column | Deviation: synthcity has no quasi-identifier argument and treats every non-sensitive column as one, a stronger adversary than the declared QIs. |
 | synthcity `fairness_column` | first protected column | Used only by synthcity's augmentation benchmark. |
-| SynthEval att_discl | sensitive | Each metric gets its own `AnalysisConfig`; the attacker knows every other column, not only the QIs (stronger than the QI model). |
-| SynthEval statistical_parity, equal_opportunity, equalized_odds | protected | statistical_parity uses only binary protected columns, as upstream. |
+| SynthEval att_discl | sensitive | Each metric gets its own `AnalysisConfig`; the attacker knows every other column, not only the QIs (stronger than the QI model). Skipped with a log line when no sensitive columns are declared, because SynthEval would return NaN. |
+| SynthEval statistical_parity, equal_opportunity, equalized_odds | protected | statistical_parity uses only binary protected columns, as upstream. Skipped when no protected columns are declared. |
 | log disparity | protected (`evaluation.log_disparity.protected_columns` overrides) | |
 | imputation benchmark | none of the three | Role columns are never masked or scored, as sensitive columns were before. |
-| quasi-identifiers | recorded in the dataset manifest | No current metric takes them; the planned Anonymeter linkability and inference attacks (step 8, PR 6) will use them as the attacker's auxiliary columns. |
+| Anonymeter linkability | quasi-identifier and sensitive | Links the QI half of a record to its sensitive half. Needs both roles; without them only singling out runs. |
+| Anonymeter inference | quasi-identifier and sensitive | Infers each sensitive column from the QIs, with the holdout split as the control. This is the only metric that models the declared QI attacker. |
+| Anonymeter singling out | none (every column) | |
+
+Two attacker models are in play. synthcity's data_leakage and SynthEval's att_discl assume an attacker who knows every column except the one being inferred, and they have no holdout control, so they cannot separate leakage from a generator that simply learned the population. Anonymeter inference assumes an attacker who knows only the declared quasi-identifiers and compares against the holdout, so it measures leakage beyond generalization. Read the first group as a worst-case screen and Anonymeter as the evidence for the declared threat model. synthcity's k-anonymization and l-diversity are KMeans clustering proxies computed on the synthetic table, not exact equivalence classes over the QIs, and say little about re-identifying real patients. Patching the libraries to accept quasi-identifiers was considered and rejected: Anonymeter already covers that attack with a control, and the patch would be a large fork deviation to maintain.
 
 ## synthcity metrics
 
