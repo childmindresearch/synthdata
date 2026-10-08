@@ -366,8 +366,40 @@ class TabPFGenConfig:
 
 
 @dataclasses.dataclass
+class HPOConstraintsConfig:
+    """Lenient sanity screens for HPO trials, passed to Optuna as constraints.
+
+    A trial that fails a screen keeps its objective value but is marked
+    infeasible, so it can't be chosen as best and the sampler learns to avoid
+    its region (constrained TPE). ``null`` turns a screen off.
+    """
+
+    #: Copies: the share of synthetic rows that exactly match a search-train
+    #: row may exceed the same share for the real tuning rows by at most this.
+    copy_margin: float | None = 0.02
+    #: Mode collapse: for every categorical column, the share of its train
+    #: categories with at least 1% frequency that the synthetic data contains.
+    #: Every target class must also be present.
+    min_category_coverage: float | None = 0.9
+    #: Implausible values: the share of numeric values outside the train
+    #: [min, max] range may exceed the same share for the real tuning rows by
+    #: at most this.
+    max_out_of_range: float | None = 0.01
+
+
+@dataclasses.dataclass
 class HPOConfig:
     enabled: bool = True
+    #: What a trial optimizes, scored on the tuning split. "tstr_macro_f1"
+    #: (default): macro-F1 of a fixed XGBoost trained on the synthetic rows
+    #: (train on synthetic, test on real), averaged over ``tstr_seeds`` seeds.
+    #: "tstr_macro_auprc": the same classifier's macro AUPRC (threshold-free).
+    #: Both are logged on every trial either way. "synthcity_composite": the
+    #: older average of ``metric_config``, which puts privacy in the objective.
+    objective: str = "tstr_macro_f1"
+    #: XGBoost seeds averaged per TSTR score.
+    tstr_seeds: int = 3
+    constraints: HPOConstraintsConfig = dataclasses.field(default_factory=HPOConstraintsConfig)
     n_trials: int = 10
     timeout_seconds: int | None = 300
     #: Hard cap on generator training iterations during search (speed/quality tradeoff).
@@ -376,7 +408,8 @@ class HPOConfig:
     model_iter_caps: dict = dataclasses.field(default_factory=lambda: {"pategan": 50})
     #: Cap on TabPFGen custom variant's SGLD step count during search.
     sgld_step_cap: int = 500
-    #: Composite objective: metrics oriented to "higher is better" and averaged.
+    #: Metrics of the "synthcity_composite" objective, oriented to "higher is
+    #: better" and averaged. Unused by the TSTR objectives.
     metric_config: dict = dataclasses.field(
         default_factory=lambda: {
             "stats": [
@@ -417,6 +450,11 @@ class GenerationConfig:
     tabpfn: TabPFNConfig = dataclasses.field(default_factory=TabPFNConfig)
     tabpfgen: TabPFGenConfig = dataclasses.field(default_factory=TabPFGenConfig)
     hpo: HPOConfig = dataclasses.field(default_factory=HPOConfig)
+    #: Resample every synthetic dataset (and every HPO candidate) to the real
+    #: train class shares of a categorical target, keeping its size. Without
+    #: it, a generator that over-produces minority classes raises macro-F1
+    #: without being more faithful.
+    match_class_prior: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +748,7 @@ _NESTED_DATACLASSES = {
     (GenerationConfig, "tabpfn"): TabPFNConfig,
     (GenerationConfig, "tabpfgen"): TabPFGenConfig,
     (GenerationConfig, "hpo"): HPOConfig,
+    (HPOConfig, "constraints"): HPOConstraintsConfig,
     (EvaluationConfig, "synthcity"): FrameworkSelectionConfig,
     (EvaluationConfig, "syntheval"): FrameworkSelectionConfig,
     (EvaluationConfig, "custom"): FrameworkSelectionConfig,
@@ -771,6 +810,7 @@ def _validate_split(cfg: Config) -> None:
             "generation.hpo.enabled needs a tuning split to score candidates on; set "
             "data.tuning_fraction above 0 (for example 0.2)"
         )
+    _validate_hpo(cfg.generation.hpo)
     if data.stratify_bins is not None:
         columns = (
             data.stratify_columns if data.stratify_columns is not None else [data.target_column]
@@ -782,6 +822,30 @@ def _validate_split(cfg: Config) -> None:
                 raise ValueError(
                     f"data.stratify_bins entries must be strictly increasing edges, got {edges!r}"
                 )
+
+
+HPO_OBJECTIVES = ("tstr_macro_f1", "tstr_macro_auprc", "synthcity_composite")
+
+
+def _validate_hpo(hpo: HPOConfig) -> None:
+    if hpo.objective not in HPO_OBJECTIVES:
+        raise ValueError(
+            f"generation.hpo.objective must be one of {list(HPO_OBJECTIVES)}, got {hpo.objective!r}"
+        )
+    if (
+        isinstance(hpo.tstr_seeds, bool)
+        or not isinstance(hpo.tstr_seeds, int)
+        or hpo.tstr_seeds < 1
+    ):
+        raise ValueError(
+            f"generation.hpo.tstr_seeds must be a positive integer, got {hpo.tstr_seeds!r}"
+        )
+    for field in dataclasses.fields(HPOConstraintsConfig):
+        value = getattr(hpo.constraints, field.name)
+        if value is not None and not 0 <= value <= 1:
+            raise ValueError(
+                f"generation.hpo.constraints.{field.name} must be between 0 and 1 or null, got {value!r}"
+            )
 
 
 def _validate_column_roles(data: DataConfig) -> None:
