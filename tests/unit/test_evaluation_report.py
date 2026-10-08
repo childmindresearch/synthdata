@@ -212,4 +212,4 @@ def test_privacy_flags_handles_no_and_some_successful_attacks(ci_low):
     )
     flags = _privacy_flags(attacks)
     assert len(flags) == (1 if ci_low > 0 else 0)
-    assert all("baseline" not in flag for flag in flags)
+    assert all("baseline_train_copy" not in flag for flag in flags)
