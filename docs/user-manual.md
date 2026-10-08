@@ -56,9 +56,27 @@ git submodule update --init --recursive   # our pinned forks of synthcity and Sy
 uv sync --extra tabpfn
 ```
 
-- `--extra tabpfn` installs the TabPFN generators. They call the TabPFN service, so create a file named `.env` in the repository root containing `TABPFN_TOKEN=<your token>`. If you do not have a token, set `generation.tabpfn.enabled: false` and skip the extra.
+- `--extra tabpfn` installs the TabPFN generators. They run locally, but the model weights download only after your Prior Labs account has accepted the weights' license, so create a file named `.env` in the repository root containing `TABPFN_TOKEN=<your API key>` (see [TabPFN model license](#tabpfn-model-license)). If you do not have a key, set `generation.tabpfn.enabled: false` and skip the extra.
 - On Linux x86-64, PyTorch is installed with CUDA 12.8 support, so an NVIDIA GPU is used automatically. `device: auto` picks the GPU when there is one.
 - Run every command from the repository root. Relative paths in the config are resolved from the folder you run the command in.
+
+### TabPFN model license
+
+The `tabpfn` Python package and the TabPFN model weights are licensed separately. The weights come under a Prior Labs non-commercial license per model version, which you accept once per account on the Licenses tab at [ux.priorlabs.ai](https://ux.priorlabs.ai); your API key from the same site goes in `TABPFN_TOKEN`. The pipeline loads the version set in `generation.tabpfn.model_version` (default `v3`). TabPFN-3 License v1.0 (24 March 2026) and TabPFN-3.5 License v1.0 (9 September 2026) have the same terms. This summary is not legal advice; the license text governs.
+
+Who it affects: anyone who runs `tabpfn_*` or `tabpfgen_*` generators, or uses their outputs. The terms cover outputs, so they apply to every synthetic table those generators write, including the labels TabPFN assigns.
+
+| Term | What it means here |
+| --- | --- |
+| Non-commercial use only (sections 1c, 2a, 2b) | Testing, evaluation and research not tied to commercial gain, on public or private data. No production systems, revenue-generating work, client deliverables or commercial decision-making. |
+| Outputs (2d) | Synthetic data from TabPFN may be used only for non-commercial purposes, and not to train a model that rivals TabPFN. Prior Labs claims no ownership of outputs. |
+| Releasing synthetic data | Before sharing TabPFN-generated data outside your team, for example as a non-commercial research release, make sure the release terms keep recipients to non-commercial use. A release under terms that allow commercial reuse (such as CC BY or CC0) conflicts with 2d; release synthetic data from the other generators instead, or get a commercial license. |
+| Who accepts (preamble) | You accept as a professional. Accept on behalf of your employer only if you are authorized to bind it; otherwise ask whoever handles licensing there. |
+| Data protection (2e, 4a) | Inputs and outputs must comply with GDPR, the EU AI Act and similar rules, with safeguards suited to the data. Clinical data needs the usual approvals regardless of the model. |
+| Weights (3, 4) | This repository does not ship weights. Copying them to others requires the license text and Prior Labs' attribution notice; hosting the model as a service needs a commercial license. |
+| Revocation (7b, 7d) | Prior Labs can end the license by notice, after which the model and its copies must be deleted. The generation log records which weights each run used (`[tabpfn] using model weights ...`). |
+
+Commercial use needs a separate license from Prior Labs (sales@priorlabs.ai).
 
 Check the install with the fast test suite:
 
@@ -427,6 +445,7 @@ Use a fresh experiment id for new work, and do not edit a config between stages 
 | Stratified split error about NaN in the target | Set `data.drop_rows_missing_target: true`. |
 | `No imputed data found. Run synthdata-impute ... first.` | Run stage 2 first, with the same config and `data.version`. |
 | TabPFN authentication errors | Add `TABPFN_TOKEN` to `.env` in the repository root, or set `generation.tabpfn.enabled: false`. |
+| `TabPFNLicenseError: ... one-time license acceptance` | Your key is fine but your account has not accepted the license for the weights in `generation.tabpfn.model_version`. Accept it on the Licenses tab at ux.priorlabs.ai ([TabPFN model license](#tabpfn-model-license)), or switch to a version you have accepted. |
 | Float overflow or NaN errors in TabPFN or imputation | A column has sentinel codes (999) or corrupt extremes. List it in `data.outlier_columns` with `outlier_zscore_threshold`. |
 | A model is missing from the evaluation | Its generation failed; check the `synthdata-generate` log. Rerun with the same experiment id to retry only the missing models. |
 | HPO finishes far below `n_trials` | The timeout was reached first. Raise `timeout_seconds_per_model` or shorten `epoch_ranges`. |
