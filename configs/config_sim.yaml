@@ -66,17 +66,17 @@ generation:
 
   synthcity:
     enabled: true
-    # Bayesian network and DDPM do not scale reliably to this dataset width.
-    names: [ctgan, tvae, adsgan, pategan, rtvae, arf]
+    # Bayesian network does not scale reliably to this dataset width.
+    names: [ctgan, tvae, adsgan, pategan, rtvae, ddpm, arf]
 
   tabpfn:
     enabled: true
     variants: [standard, custom]
     data_variants: [raw, imputed]
 
+  # Off: TabPFGen outputs near-copies of training rows (docs/verification.md).
   tabpfgen:
-    enabled: true
-    variants: [standard, custom]
+    enabled: false
 
   # Resample synthetic data to the real train class shares.
   match_class_prior: true
@@ -93,24 +93,24 @@ generation:
     timeout_seconds: 14400
     # Per-model budgets from a GPU profiling run on sim 1.2 (search-train
     # 12600 rows x 682 columns, RTX 5070 Ti, 2026-10-08). One synthcity epoch
-    # takes about 19-21 s at this width (26 s per PATE-GAN iteration);
-    # TabPFGen takes about 35 s per 1000 SGLD steps. Trials: about 10 random
-    # start-up trials plus 10 per tuned dimension, capped for run time.
+    # takes about 19-21 s at this width (26 s per PATE-GAN iteration).
+    # Trials: about 10 random start-up trials plus 10 per tuned dimension,
+    # capped for run time.
     # Timeout = trials x mean trial time x 1.5.
+    # DDPM is not profiled yet and uses n_trials and timeout_seconds above.
     # ARF (CPU only) is a provisional budget from one default fit (30 trees)
     # at this width on a 4-core cloud machine, 2026-10-08: about 28 min;
     # the search goes up to 100 trees. Re-profile on the run machine.
     n_trials_per_model:
-      { ctgan: 40, tvae: 40, adsgan: 40, rtvae: 40, pategan: 40,
-        tabpfgen_standard: 25, tabpfgen_custom: 25, arf: 25 }
+      { ctgan: 40, tvae: 40, adsgan: 40, rtvae: 40, pategan: 40, arf: 25 }
     timeout_seconds_per_model:
       { ctgan: 108000, tvae: 103000, adsgan: 100000, rtvae: 111000, pategan: 28000,
-        tabpfgen_standard: 1400, tabpfgen_custom: 1200, arf: 112000 }
+        arf: 112000 }
     # Training length is searched, [low, high, step]. The libraries' ranges
     # (100-1000 epochs; PATE-GAN 1-500) would take 3+ hours per trial here.
     epoch_ranges:
       { ctgan: [25, 150, 25], tvae: [25, 150, 25], adsgan: [25, 150, 25],
-        rtvae: [25, 150, 25], pategan: [5, 30, 5] }
+        rtvae: [25, 150, 25], pategan: [5, 30, 5], ddpm: [100, 1000, 100] }
     # Median pruning on synthcity's early-stopping metric (CTGAN, ADS-GAN).
     pruner: median
 
