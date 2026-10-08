@@ -11,14 +11,16 @@ from __future__ import annotations
 
 import json
 import math
+import re
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from synthdata.data import load_dataset, load_imputed_splits
+from synthdata.generation.hpo import SCREENS
 
-from .conftest import FIXTURE_CSV, new_run
+from .conftest import FIXTURE_CSV
 
 pytestmark = pytest.mark.integration
 
@@ -26,7 +28,8 @@ FEATURES = ["AGE", "SEX", "SITE", "SMOKER", "BMI", "LAB_A", "LAB_B", "SEVERITY",
 COLUMNS = [*FEATURES, "target"]
 CATEGORICAL = ["SEX", "SITE", "SMOKER", "SEVERITY", "DIAGNOSIS", "target"]
 NUMERIC = ["AGE", "BMI", "LAB_A", "LAB_B"]
-MODELS = ["bayesian_network", "bayesian_network_hpo", "ctgan", "ctgan_hpo"]
+HPO_MODELS = ["bayesian_network", "ctgan"]
+MODELS = sorted([*HPO_MODELS, *(f"{m}_hpo" for m in HPO_MODELS)])
 BASELINES = ["baseline_marginals", "baseline_train_copy"]
 
 
@@ -211,15 +214,50 @@ def test_hpo_uses_an_imputer_fitted_without_tuning_rows(dataset):
 def test_hpo_studies_ran_and_recorded_best_params(pipeline_run):
     optuna = pytest.importorskip("optuna")
     best = json.loads((pipeline_run.generation_dir / "hpo_best_params.json").read_text())
-    assert set(best["synthcity"]) == {"bayesian_network", "ctgan"}
+    assert set(best["synthcity"]) == set(HPO_MODELS)
     storage = f"sqlite:///{pipeline_run.generation_dir / 'optuna_studies.db'}"
-    for model in ("bayesian_network", "ctgan"):
+    for model in HPO_MODELS:
         study = optuna.load_study(study_name=f"hpo_{model}", storage=storage)
         complete = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
         assert len(complete) == pipeline_run.cfg.generation.hpo.n_trials, model
         assert all(math.isfinite(t.value) for t in complete), model
         # Training length is searched like any other hyperparameter and kept.
         assert study.best_params == best["synthcity"][model], model
+
+
+def _hpo_studies(run, models=HPO_MODELS):
+    optuna = pytest.importorskip("optuna")
+    storage = f"sqlite:///{run.generation_dir / 'optuna_studies.db'}"
+    return optuna, {
+        model: optuna.load_study(study_name=f"hpo_{model}", storage=storage) for model in models
+    }
+
+
+def test_hpo_trials_score_tstr_on_tuning_rows_and_record_screens(pipeline_run):
+    optuna, studies = _hpo_studies(pipeline_run)
+    for model, study in studies.items():
+        for trial in study.trials:
+            if trial.state != optuna.trial.TrialState.COMPLETE:
+                continue
+            attrs = trial.user_attrs
+            # The objective is TSTR macro-F1; the other scores are logged next to it.
+            assert trial.value == pytest.approx(attrs["tstr_macro_f1"]), model
+            for key in ("tstr_macro_auprc", "tstr_balanced_accuracy", "trtr_macro_f1"):
+                assert 0 <= attrs[key] <= 1, (model, key)
+            assert sorted(attrs["tstr_per_class_f1"]) == ["0", "1"], model
+            # Every sanity screen is passed to Optuna as a constraint.
+            assert len(attrs["constraints"]) == len(SCREENS), model
+            assert set(attrs["screens"]) == set(SCREENS), model
+
+
+def test_hpo_searches_epochs_in_range_and_reports_to_the_pruner(pipeline_run):
+    optuna, studies = _hpo_studies(pipeline_run)
+    low, high, step = pipeline_run.cfg.generation.hpo.epoch_ranges["ctgan"]
+    ctgan = studies["ctgan"].trials
+    epochs = {t.params["n_iter"] for t in ctgan}
+    assert epochs <= set(range(low, high + 1, step)), epochs
+    # CTGAN's early-stopping metric is reported to Optuna's median pruner.
+    assert all(t.intermediate_values for t in ctgan), [t.number for t in ctgan]
 
 
 def test_experiment_manifest_records_each_stage(pipeline_run):
@@ -255,6 +293,16 @@ BOUNDED_METRICS = {
     ("syntheval", "privacy", "hit_rate"): (0, 1),
     ("syntheval", "utility", "nnaa"): (0, 1),
     ("custom", "fairness", "log_disparity_share_significant"): (0, 1),
+    ("custom", "utility", "tstr_macro_f1"): (0, 1),
+    ("custom", "utility", "tstr_balanced_accuracy"): (0, 1),
+    ("custom", "utility", "tstr_macro_auprc"): (0, 1),
+    ("custom", "privacy", "anonymeter_singling_out_risk"): (0, 1),
+    ("custom", "privacy", "anonymeter_linkability_risk"): (0, 1),
+    ("custom", "privacy", "anonymeter_inference_risk"): (0, 1),
+    ("custom", "privacy", "dcr_closer_to_train_share"): (0, 1),
+    ("custom", "privacy", "distance_mia_auc"): (0, 1),
+    ("custom", "privacy", "dcr_holdout_ratio"): (0, math.inf),
+    ("custom", "privacy", "nndr_holdout_ratio"): (0, math.inf),
 }
 
 
@@ -380,6 +428,37 @@ def test_report_covers_every_model(pipeline_run):
         assert model in report
 
 
+def test_privacy_attacks_table_has_every_attack_with_an_interval(pipeline_run):
+    table = pd.read_csv(pipeline_run.evaluation_dir / "privacy_attacks.csv")
+    assert set(table["model"]) == set(MODELS + BASELINES)
+    sensitive = pipeline_run.cfg.data.sensitive_columns
+    for model, rows in table.groupby("model"):
+        assert set(rows["attack"]) == {"singling_out", "linkability", "inference"}, model
+        assert set(rows.loc[rows["attack"] == "inference", "secret"]) == set(sensitive), model
+        assert (rows["ci_low"] <= rows["risk"]).all() and (rows["risk"] <= rows["ci_high"]).all()
+
+
+def test_report_has_its_seven_sections_and_working_links(pipeline_run):
+    report_path = pipeline_run.evaluation_dir / "report.md"
+    report = report_path.read_text()
+    headings = [line for line in report.splitlines() if line.startswith("## ")]
+    assert headings == [
+        "## 1. At a glance",
+        "## 2. Ranking",
+        "## 3. Utility",
+        "## 4. Privacy evidence",
+        "## 5. Fairness",
+        "## 6. Data and preparation",
+        "## 7. File index",
+    ]
+    # Every embedded plot and linked file resolves (no privacy gate left).
+    targets = re.findall(r"\]\(([^)#\s]+)\)", report)
+    assert targets
+    broken = [t for t in targets if "://" not in t and not (report_path.parent / t).exists()]
+    assert not broken, broken
+    assert "privacy gate" not in report.lower()
+
+
 # ---------------------------------------------------------------------------
 # Plots and housekeeping
 # ---------------------------------------------------------------------------
@@ -403,53 +482,38 @@ def test_nothing_is_written_outside_the_configured_roots(pipeline_run):
     assert list(pipeline_run.cwd.iterdir()) == []
 
 
-#: BMI and LAB_A (about 10% missing) treated as mostly missing, to exercise the CART fill.
-INDICATOR_ONLY = {
-    "imputation": {"missing_indicators": {"indicator_only_fraction": 0.08}},
-    "generation": {"synthcity": {"names": ["bayesian_network"]}, "hpo": {"enabled": False}},
-}
-
-
-def _indicator_only_run(tmp_path_factory, name, data_path=None):
-    run = new_run(tmp_path_factory, name, overrides=INDICATOR_ONLY, data_path=data_path)
-    run.run("imputation")
-    run.run("generation")
-    return run
-
-
-@pytest.fixture(scope="module")
-def indicator_only_run(tmp_path_factory):
-    return _indicator_only_run(tmp_path_factory, "indicator_only")
-
-
 def test_indicator_only_columns_are_filled_in_recorded_rows_only(indicator_only_run, source):
     dataset = load_dataset(indicator_only_run.cfg)
     sparse = dataset.indicator_only_values.columns.tolist()
     assert sorted(sparse) == ["BMI", "LAB_A"]
-    synthetic = indicator_only_run.synthetic()["bayesian_network"]
+    synthetic = indicator_only_run.synthetic()["arf"]
     assert not set(sparse) & set(synthetic.columns), "values are never generated directly"
     released_dir = indicator_only_run.generation_dir / "released"
-    released = pd.read_csv(released_dir / "bayesian_network.csv")
+    released = pd.read_csv(released_dir / "arf.csv")
     for column in sparse:
         recorded = synthetic[f"{column}__missing"] == 0
         assert released.loc[recorded, column].notna().all(), column
         assert released.loc[~recorded, column].isna().all(), column
         observed = source[column].dropna()
         assert released[column].min() >= observed.min(), column
-    report = pd.read_csv(released_dir / "bayesian_network_recorded_values.csv")
+    report = pd.read_csv(released_dir / "arf_recorded_values.csv")
     assert sorted(report["column"]) == sorted(sparse)
 
 
-def test_holdout_rows_do_not_influence_the_cart_fill(indicator_only_run, tmp_path_factory):
-    test_rows = load_dataset(indicator_only_run.cfg).test_df.index
-    source = pd.read_csv(FIXTURE_CSV)
-    for column in ("BMI", "LAB_A", "LAB_B"):
-        source.loc[test_rows, column] = source.loc[test_rows, column] + 25.0
-    data_path = tmp_path_factory.mktemp("cart_canary") / "clinic_perturbed.csv"
-    source.to_csv(data_path, index=False)
-    canary = _indicator_only_run(tmp_path_factory, "cart_canary_run", data_path=data_path)
-    for name in ("bayesian_network.csv", "bayesian_network_recorded_values.csv"):
+def test_holdout_rows_do_not_influence_the_cart_fill(indicator_only_run, cart_canary_run):
+    for name in ("arf.csv", "arf_recorded_values.csv"):
         pd.testing.assert_frame_equal(
             pd.read_csv(indicator_only_run.generation_dir / "released" / name),
-            pd.read_csv(canary.generation_dir / "released" / name),
+            pd.read_csv(cart_canary_run.generation_dir / "released" / name),
         )
+
+
+def test_arf_and_its_search_run_with_delta_held_at_arfpys_default(indicator_only_run):
+    assert sorted(indicator_only_run.synthetic()) == ["arf", "arf_hpo"]
+    # synthcity searches delta over 0-50 but arfpy only accepts 0-0.5, so it is
+    # held at 0 instead of searched; every trial must then complete.
+    optuna, studies = _hpo_studies(indicator_only_run, ["arf"])
+    trials = studies["arf"].trials
+    assert len(trials) == indicator_only_run.cfg.generation.hpo.n_trials
+    assert all(t.state == optuna.trial.TrialState.COMPLETE for t in trials)
+    assert all("delta" not in t.params for t in trials)

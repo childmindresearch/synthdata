@@ -16,6 +16,7 @@ of these orderings failing, without needing exact reference values.
 from __future__ import annotations
 
 import copy as copy_module
+import dataclasses
 
 import numpy as np
 import pandas as pd
@@ -30,8 +31,8 @@ N_ROWS = 120
 
 
 @pytest.fixture(scope="module")
-def known_answer_run(pipeline_run, tmp_path_factory) -> tuple[pd.DataFrame, dict]:
-    cfg = copy_module.deepcopy(pipeline_run.cfg)
+def known_answer_run(imputed_run, tmp_path_factory) -> tuple[pd.DataFrame, dict]:
+    cfg = copy_module.deepcopy(imputed_run.cfg)
     cfg.evaluation.output_dir = str(tmp_path_factory.mktemp("known_answers"))
     cfg.evaluation.generate_report = False
     cfg.evaluation.save_per_model_syntheval_plots = False
@@ -68,8 +69,8 @@ def known_answers(known_answer_run) -> pd.DataFrame:
 
 
 @pytest.fixture(scope="module")
-def train_size(pipeline_run) -> int:
-    return len(load_dataset(pipeline_run.cfg).train_df)
+def train_size(imputed_run) -> int:
+    return len(load_dataset(imputed_run.cfg).train_df)
 
 
 def _metric(combined: pd.DataFrame, metric: str) -> pd.Series:
@@ -152,3 +153,60 @@ def test_ranking_summary_pools_seed_replicates(known_answer_run):
     # Two seeds give a wide interval (t = 12.7 at one degree of freedom), so
     # only check that the copy beats every shuffle replicate.
     assert (utility[["shuffle", "shuffle__rep1"]] < summary.loc["copy", "utility_mean"]).all()
+
+
+def test_class_metrics_track_the_target_signal(known_answers):
+    # Holdout TSTR (XGBoost fit on each dataset, scored on the real test split).
+    # Prior matching keeps the shuffle's macro-F1 well above zero, so only
+    # its order is checked; balanced accuracy has a fixed chance level.
+    f1 = _metric(known_answers, "tstr_macro_f1")
+    assert f1["copy"] > f1["shuffle"]
+    balanced = _metric(known_answers, "tstr_balanced_accuracy")
+    assert balanced["copy"] > balanced["shuffle"]
+    assert abs(balanced["shuffle"] - 0.5) <= 0.2
+
+
+def test_holdout_distances_flag_the_copy_as_closer_to_train(known_answers):
+    # The share is taken against a train sample as large as the test split
+    # (0.5 = no memorization). Copies of sampled rows sit at distance 0, so
+    # the copy lands well above 0.5; a shuffle has no such pull.
+    closer = _metric(known_answers, "dcr_closer_to_train_share")
+    assert closer["copy"] - closer["shuffle"] >= 0.15
+    assert abs(closer["shuffle"] - 0.5) <= 0.15
+    auc = _metric(known_answers, "distance_mia_auc")
+    assert auc["copy"] > auc["shuffle"]
+    ratio = _metric(known_answers, "dcr_holdout_ratio")
+    assert ratio["copy"] == pytest.approx(0.0, abs=1e-9)
+
+
+@pytest.fixture(scope="module")
+def roleless_run(imputed_run, tmp_path_factory) -> pd.DataFrame:
+    """The copy scored with no sensitive or protected columns declared."""
+    cfg = copy_module.deepcopy(imputed_run.cfg)
+    cfg.evaluation.output_dir = str(tmp_path_factory.mktemp("no_roles"))
+    cfg.evaluation.generate_report = False
+    cfg.evaluation.baselines = []
+    cfg.evaluation.synthcity.enabled = False
+    cfg.evaluation.log_disparity.protected_columns = []
+    cfg.evaluation.log_disparity.protected_map = []
+    cfg.evaluation.log_disparity.protected_bins = []
+    cfg.data.sensitive_columns = []
+    cfg.data.protected_columns = []
+    dataset = dataclasses.replace(
+        load_imputed_splits(load_dataset(imputed_run.cfg)),
+        sensitive_columns=[],
+        protected_columns=[],
+    )
+    real = dataset.train_imputed_df.reset_index(drop=True)
+    return run_evaluation(cfg, dataset, {"copy": real.sample(n=N_ROWS, random_state=0)})[0]
+
+
+def test_role_metrics_are_skipped_when_their_role_is_empty(roleless_run):
+    metrics = set(roleless_run.columns.get_level_values("metric"))
+    # SynthEval's attribute disclosure needs sensitive columns and its
+    # fairness metrics need protected ones; both are left out, not NaN.
+    assert "att_discl_risk" not in metrics
+    assert not {"statistical_parity", "equalized_odds", "equal_opportunity"} & metrics
+    # Anonymeter falls back to singling out, which needs no roles.
+    assert np.isfinite(_metric(roleless_run, "anonymeter_singling_out_risk")["copy"])
+    assert "mia_recall" in metrics

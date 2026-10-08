@@ -68,8 +68,10 @@ jobs:
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
       - run: uv sync
       # Runs the real impute -> generate -> evaluate -> plot CLIs on the
-      # committed fixture (tests/integration). RefiDiff imputation needs
-      # catboost, which lives in the `refidiff` extra next to CUDA-only
-      # packages, so it is added on its own here.
+      # committed fixture (tests/integration). The independent pipeline runs
+      # execute side by side on the runner's cores (see RUNS in
+      # tests/integration/conftest.py). RefiDiff imputation needs catboost,
+      # which lives in the `refidiff` extra next to CUDA-only packages, so it
+      # is added on its own here.
       - name: Run end-to-end tests on the fixture dataset
-        run: uv run --with catboost pytest tests/integration -m "integration and not slow and not network" --durations=10
+        run: uv run --with catboost==1.2.10 pytest tests/integration -m "integration and not slow and not network" --durations=10

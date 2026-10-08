@@ -45,7 +45,10 @@ data:
 
 imputation:
   enabled: true
-  method: simple # median/mode keeps CI fast
+  # MissForest, the default; small forests keep CI fast. The indicator-only
+  # run in the tests switches to median/mode, so both imputers are covered.
+  method: missforest
+  missforest: { n_estimators: 10, max_iter: 3 }
   device: cpu
   cache: true
   validation_margin: 0.2
@@ -83,8 +86,10 @@ generation:
     enabled: true
     n_trials: 2
     timeout_seconds: 300
-    # Short training so the fixture stays fast (libraries search 100-1000 epochs).
-    epoch_ranges: { ctgan: [10, 20, 10] }
+    # Short training so the fixture stays fast (libraries search 100-1000
+    # epochs), but long enough for CTGAN to report its early-stopping metric
+    # (every 50 epochs) to the median pruner.
+    epoch_ranges: { ctgan: [50, 100, 50] }
     # Objective scored on the tuning split: tstr_macro_f1 (fixed XGBoost
     # trained on synthetic, tested on real), tstr_macro_auprc, or the older
     # synthcity_composite (uses metric_config below, privacy included).
@@ -127,9 +132,10 @@ evaluation:
   binary_target:
     { enabled: false, column: null, positive_classes: [], negative_classes: [] }
 
+  # Two worker processes: faster, and exercises the parallel scheduler.
   syntheval_execution:
-    model_workers: 1
-    max_model_workers: 1
+    model_workers: 2
+    max_model_workers: 2
     cores_per_model: 1
     memory_reserve_gib: 1
     memory_per_model_gib: 1
