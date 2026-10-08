@@ -72,7 +72,7 @@ def run_generation(
     if cfg.generation.hpo.enabled and dataset.tuning_index.empty:
         raise RuntimeError(
             "generation.hpo.enabled needs a tuning split to score candidates on; set "
-            "data.tuning_size above 0"
+            "data.tuning_fraction above 0"
         )
 
     gen_cfg = cfg.generation

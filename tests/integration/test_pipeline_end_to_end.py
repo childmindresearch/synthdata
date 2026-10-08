@@ -58,12 +58,11 @@ def test_split_is_disjoint_complete_and_stratified(dataset, pipeline_run, source
     train, test = dataset.train_df, dataset.test_df
     assert set(train.index).isdisjoint(test.index)
     assert sorted([*train.index, *test.index]) == list(range(len(dataset.full_df)))
-    # train_size is a share of patients; rows follow within a few visits.
+    # Fractions are row shares built from whole patients; train includes tuning.
     n_patients = source["patient_id"].nunique()
-    assert dataset.n_patients["train"] == int(cfg.data.train_size * n_patients)
     assert dataset.n_patients["train"] + dataset.n_patients["test"] == n_patients
-    assert abs(len(train) / len(dataset.full_df) - cfg.data.train_size) <= 0.05
-    # Stratified on each patient's target; row-level balance stays close.
+    assert abs(len(test) / len(dataset.full_df) - cfg.data.holdout_fraction) <= 0.03
+    # Stratified on the row-level target; balance stays close.
     assert abs(train["target"].mean() - test["target"].mean()) <= 0.05
 
 
@@ -91,8 +90,8 @@ def test_tuning_split_is_a_patient_disjoint_part_of_train(dataset, source, pipel
     tuning_patients = set(source.loc[tuning.index, "patient_id"])
     assert tuning_patients.isdisjoint(source.loc[search.index, "patient_id"])
     assert tuning_patients.isdisjoint(source.loc[dataset.test_df.index, "patient_id"])
-    share = len(tuning_patients) / dataset.n_patients["train"]
-    assert abs(share - pipeline_run.cfg.data.tuning_size) <= 0.02
+    share = len(tuning) / len(dataset.full_df)
+    assert abs(share - pipeline_run.cfg.data.tuning_fraction) <= 0.03
 
 
 # ---------------------------------------------------------------------------

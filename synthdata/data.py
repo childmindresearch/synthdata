@@ -20,9 +20,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedGroupKFold
 
-from synthdata.config import Config
+from synthdata.config import Config, split_fold_count
 from synthdata.utils import ensure_dir, get_logger, git_commit
 
 logger = get_logger(__name__)
@@ -94,7 +94,7 @@ class Dataset:
     patient_id_column: str | None = None
     n_patients: dict = dataclasses.field(default_factory=dict)
     #: Labels of the ``train_df`` rows held out as the tuning split (see
-    #: ``DataConfig.tuning_size``). Empty when no tuning split was requested.
+    #: ``DataConfig.tuning_fraction``). Empty when no tuning split was requested.
     tuning_index: pd.Index = dataclasses.field(default_factory=lambda: pd.Index([]))
 
     #: Numeric model-space frames populated once imputation has run
@@ -768,24 +768,56 @@ def mask_outliers_as_missing(df: pd.DataFrame, columns: list, threshold: float) 
 # ---------------------------------------------------------------------------
 
 
+def stratification_key(
+    df: pd.DataFrame,
+    columns: list,
+    bins: list | None,
+    groups: pd.Series,
+    min_groups: int,
+) -> pd.Series:
+    """Joint stratum label per row, with sparse strata merged into the first column's.
+
+    Each column is binned by its edges (if any) into left-closed intervals,
+    missing values become their own ``"missing"`` level, and the levels are
+    joined into one label. A joint stratum holding fewer than ``min_groups``
+    distinct ``groups`` (patients) cannot be spread over the folds, so its
+    rows fall back to the label of ``columns[0]`` alone.
+    """
+    bins = bins if bins is not None else [None] * len(columns)
+    parts = []
+    for column, edges in zip(columns, bins, strict=True):
+        values = df[column]
+        if edges is not None:
+            values = pd.cut(values, [-np.inf, *edges, np.inf], right=False)
+        parts.append(values.astype("string").fillna("missing").astype(str))
+    first = parts[0]
+    key = first
+    for part in parts[1:]:
+        key = key + "|" + part
+    patients_per_key = groups.groupby(key).nunique()
+    sparse = key.isin(patients_per_key.index[patients_per_key < min_groups])
+    return key.where(~sparse, first)
+
+
 def split_by_patient(
     df: pd.DataFrame,
     patient_ids: pd.Series | None,
-    target_column: str,
-    train_size: float,
+    fractions: tuple[float, float, float],
     seed: int,
-    stratify: bool,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split ``df`` into train/test so that no patient appears on both sides.
+    strata: pd.Series | None,
+) -> tuple[pd.Index, pd.Index, pd.Index]:
+    """Split rows into train/tuning/holdout so that no patient spans two splits.
 
-    Whole patients are assigned with :func:`sklearn.model_selection.train_test_split`
-    over the unique ``patient_ids``, so ``train_size`` is a share of patients.
-    When ``stratify`` is set, each patient is stratified by their most frequent
-    target value (ties broken by the smallest value). With ``patient_ids=None``
-    every row is its own patient, which reproduces a plain stratified row split.
-    Both frames keep ``df``'s index labels and row order.
+    Uses :class:`sklearn.model_selection.StratifiedGroupKFold` with k folds,
+    where k is the smallest fold count that turns ``fractions`` (train,
+    tuning, holdout shares) into whole folds; the first folds become the
+    holdout, the next ones tuning and the rest train. Folds balance rows
+    (encounters), not patient counts. Whole patients stay
+    together while the row-level ``strata`` labels stay as balanced as the
+    groups allow. With ``patient_ids=None`` every row is its own patient.
+    Returns the three row-index sets in ``df`` order.
     """
-    groups = pd.Series(df.index, index=df.index) if patient_ids is None else patient_ids
+    groups = pd.Series(np.arange(len(df)), index=df.index) if patient_ids is None else patient_ids
     if not groups.index.equals(df.index):
         raise ValueError("patient_ids must be aligned to the rows of df")
     if groups.isna().any():
@@ -793,24 +825,50 @@ def split_by_patient(
             f"data.patient_id_column has {int(groups.isna().sum())} missing value(s); "
             "every row needs a patient identifier"
         )
-    patient_labels = None
-    if stratify:
-        patient_labels = (
-            df[target_column].groupby(groups, sort=True).agg(lambda values: values.mode().iloc[0])
+    n_folds = split_fold_count(fractions)
+    if groups.nunique() < n_folds:
+        raise ValueError(f"the split needs at least {n_folds} patients, got {groups.nunique()}")
+    labels = np.zeros(len(df), dtype=int) if strata is None else strata.to_numpy()
+    folds = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    fold_of_row = np.empty(len(df), dtype=int)
+    for fold, (_, rows) in enumerate(folds.split(np.zeros(len(df)), labels, groups.astype(str))):
+        fold_of_row[rows] = fold
+    n_holdout = round(fractions[2] * n_folds)
+    n_tuning = round(fractions[1] * n_folds)
+    holdout = fold_of_row < n_holdout
+    tuning = (fold_of_row >= n_holdout) & (fold_of_row < n_holdout + n_tuning)
+    train = ~(holdout | tuning)
+    return df.index[train], df.index[tuning], df.index[holdout]
+
+
+def split_balance_report(
+    strata_frame: pd.DataFrame, splits: dict[str, pd.Index], groups: pd.Series
+) -> pd.DataFrame:
+    """Rows, patients and the share of each stratify-column level per split."""
+    records = []
+    for split, index in splits.items():
+        for column in strata_frame.columns:
+            counts = strata_frame.loc[index, column].value_counts()
+            for level, n_rows in counts.items():
+                records.append(
+                    {
+                        "split": split,
+                        "column": column,
+                        "level": level,
+                        "n_rows": int(n_rows),
+                        "share": float(n_rows / max(len(index), 1)),
+                    }
+                )
+        records.append(
+            {
+                "split": split,
+                "column": "(all)",
+                "level": f"{groups.loc[index].nunique()} patients",
+                "n_rows": int(len(index)),
+                "share": 1.0,
+            }
         )
-        unique_patients = patient_labels.index.to_numpy()
-        labels = patient_labels.to_numpy()
-    else:
-        unique_patients = np.sort(groups.unique())
-        labels = None
-    train_patients, _ = train_test_split(
-        unique_patients,
-        train_size=train_size,
-        random_state=seed,
-        stratify=labels,
-    )
-    in_train = groups.isin(set(train_patients))
-    return df.loc[in_train], df.loc[~in_train]
+    return pd.DataFrame.from_records(records)
 
 
 def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
@@ -848,6 +906,13 @@ def write_dataset_manifest(cfg: Config, dataset: Dataset) -> None:
         "tuning_split_fingerprint": dataframe_fingerprint(dataset.tuning_df),
         "patient_id_column": dataset.patient_id_column,
         "n_patients": dataset.n_patients,
+        "split_fractions": {
+            "train": cfg.data.train_fraction,
+            "tuning": cfg.data.tuning_fraction,
+            "holdout": cfg.data.holdout_fraction,
+        },
+        "stratify_columns": cfg.data.stratify_columns,
+        "stratify_bins": cfg.data.stratify_bins,
         "seed": cfg.seed,
         "last_loaded_at": datetime.now(UTC).isoformat(),
         "git_commit": git_commit(),
@@ -988,26 +1053,39 @@ def load_dataset(cfg: Config) -> Dataset:
     if missing_sensitive:
         raise KeyError(f"sensitive_columns not found in data: {missing_sensitive}")
 
-    train_df, test_df = split_by_patient(
-        df,
-        patient_ids,
-        target_column,
-        train_size=cfg.data.train_size,
-        seed=cfg.seed,
-        stratify=cfg.data.stratify,
+    fractions = (cfg.data.train_fraction, cfg.data.tuning_fraction, cfg.data.holdout_fraction)
+    groups = (
+        patient_ids if patient_ids is not None else pd.Series(np.arange(len(df)), index=df.index)
     )
-    tuning_index = pd.Index([])
-    if cfg.data.tuning_size > 0:
-        # The same patient-disjoint split again, inside train.
-        _, tuning_df = split_by_patient(
-            train_df,
-            patient_ids.loc[train_df.index] if patient_ids is not None else None,
-            target_column,
-            train_size=1 - cfg.data.tuning_size,
-            seed=cfg.seed,
-            stratify=cfg.data.stratify,
+    if cfg.data.stratify_columns is not None:
+        stratify_columns = list(cfg.data.stratify_columns)
+    else:
+        # A continuous target has no classes to balance.
+        stratify_columns = [target_column] if target_is_categorical else []
+    missing_strata = [c for c in stratify_columns if c not in df.columns]
+    if missing_strata:
+        raise KeyError(f"data.stratify_columns not found in data: {missing_strata}")
+    strata = None
+    strata_frame = pd.DataFrame(index=df.index)
+    if stratify_columns:
+        bins = cfg.data.stratify_bins or [None] * len(stratify_columns)
+        for column, edges in zip(stratify_columns, bins, strict=True):
+            strata_frame[column] = stratification_key(df, [column], [edges], groups, 0)
+        strata = stratification_key(
+            df, stratify_columns, bins, groups, min_groups=split_fold_count(fractions)
         )
-        tuning_index = tuning_df.index
+    train_only, tuning_index, holdout_index = split_by_patient(
+        df, patient_ids, fractions, seed=cfg.seed, strata=strata
+    )
+    # train_df keeps the tuning rows: HPO searches on train_df minus tuning,
+    # final models refit on all of it.
+    train_df = df.loc[~df.index.isin(holdout_index)]
+    test_df = df.loc[holdout_index]
+    split_report = split_balance_report(
+        strata_frame,
+        {"train": train_only, "tuning": tuning_index, "holdout": holdout_index},
+        groups,
+    )
     if patient_ids is not None:
         n_patients = {
             "train": int(patient_ids.loc[train_df.index].nunique()),
@@ -1041,6 +1119,7 @@ def load_dataset(cfg: Config) -> Dataset:
     df.to_csv(paths["full"], index=False)
     train_df.to_csv(paths["train"], index=False)
     test_df.to_csv(paths["test"], index=False)
+    split_report.to_csv(data_dir / "split_report.csv", index=False)
 
     write_dataset_manifest(cfg, dataset)
 
