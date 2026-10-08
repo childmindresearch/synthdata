@@ -195,3 +195,21 @@ class TestSaveEvaluationReport:
         assert path.exists()
         assert path.name == "report.md"
         assert path.read_text().startswith("# Evaluation report")
+
+
+@pytest.mark.parametrize("ci_low", [0.0, 0.2])
+def test_privacy_flags_handles_no_and_some_successful_attacks(ci_low):
+    from synthdata.evaluation.report import _privacy_flags
+
+    attacks = pd.DataFrame(
+        {
+            "model": ["ctgan", "baseline_train_copy"],
+            "attack": ["linkability", "linkability"],
+            "secret": ["", ""],
+            "ci_low": [ci_low, 0.5],
+            "reliable": [True, True],
+        }
+    )
+    flags = _privacy_flags(attacks)
+    assert len(flags) == (1 if ci_low > 0 else 0)
+    assert all("baseline" not in flag for flag in flags)
