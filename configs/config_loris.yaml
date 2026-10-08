@@ -13,7 +13,7 @@ experiment:
   id: "2.11" # Reusing an id resumes that experiment; null makes a new one per run.
 
 data:
-  # Source and schema (LORIS data 2.11, transformed to match the competition data)
+  # Source and schema (LORIS data 2.11, transformed to match the simulated data's schema)
   source: csv
   path: data/loris/loris_v2_664_features_us_id.csv
   version: "2.11" # Use a new value whenever the source data changes.

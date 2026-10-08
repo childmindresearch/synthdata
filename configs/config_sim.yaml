@@ -1,4 +1,4 @@
-# Simulated competition-shaped data (sim 1.2), used to profile and test the
+# Simulated clinical data (sim 1.2), used to profile and test the
 # pipeline before LORIS runs. Paths are relative to the repository root; the
 # data files live only on the owner's machine (data/ is git-ignored).
 #

@@ -3,7 +3,7 @@
 SynthData is a config-driven pipeline for tabular-data imputation, synthetic data generation, evaluation, and plots. It is designed to run on **your own local CSV or Parquet data**.
 
 > [!NOTE]
-> The example configurations cover the public UCI Hepatitis dataset (small, runs on a CPU), a simulated competition-shaped dataset, and LORIS. The simulated and LORIS data are not distributed with the repository; they are used to test the pipeline at a larger scale. Configure your own dataset rather than relying on them.
+> The example configurations cover the public UCI Hepatitis dataset (small, runs on a CPU), a simulated clinical dataset, and LORIS. The simulated and LORIS data are not distributed with the repository; they are used to test the pipeline at a larger scale. Configure your own dataset rather than relying on them.
 
 ## Quick start
 
