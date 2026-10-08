@@ -76,7 +76,7 @@ Who it affects: anyone who runs `tabpfn_*` or `tabpfgen_*` generators, or uses t
 | Weights (3, 4) | This repository does not ship weights. Copying them to others requires the license text and Prior Labs' attribution notice; hosting the model as a service needs a commercial license. |
 | Revocation (7b, 7d) | Prior Labs can end the license by notice, after which the model and its copies must be deleted. The generation log records which weights each run used (`[tabpfn] using model weights ...`). |
 
-Commercial use needs a separate license from Prior Labs (sales@priorlabs.ai).
+Commercial use needs a separate license from Prior Labs.
 
 Check the install with the fast test suite:
 
