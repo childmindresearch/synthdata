@@ -27,6 +27,14 @@ HPO_EXCLUDED_CHOICES: dict[str, dict[str, frozenset]] = {
 }
 
 
+#: Hyperparameters held at a fixed value instead of searched. synthcity's ARF
+#: space searches ``delta`` over the integers 0-50, but arfpy asserts
+#: ``0 <= delta <= 0.5`` (stop once the discriminator's OOB accuracy is below
+#: 0.5 + delta), so every draw above 0 crashes the trial; and the plugin types
+#: it ``int``, so a float range would be truncated to 0 anyway. 0 is the
+#: default of arfpy and of the reference R package (Watson et al. 2023).
+HPO_FIXED_PARAMS: dict[str, dict[str, object]] = {"arf": {"delta": 0}}
+
 #: Searched epochs for plugins that take ``n_iter`` but leave it out of their
 #: own search space: ADS-GAN gets CTGAN's range (the same conditional GAN
 #: family); its default of 10000 epochs with early stopping is far too long
@@ -74,9 +82,9 @@ class _SearchSpaceTrial:
 
     synthcity's ``sample_hyperparameters_optuna`` reads the plugin's own search
     space and calls ``trial.suggest_*`` per parameter. This proxy drops
-    excluded categorical choices and replaces the ``n_iter`` range with
-    ``epochs`` when given, and keeps the rest of the space as synthcity
-    defines it.
+    excluded categorical choices, returns ``fixed`` values without searching
+    them, replaces the ``n_iter`` range with ``epochs`` when given, and keeps
+    the rest of the space as synthcity defines it.
     """
 
     def __init__(
@@ -84,16 +92,22 @@ class _SearchSpaceTrial:
         trial: optuna.Trial,
         excluded: dict[str, frozenset] | None = None,
         epochs: tuple[int, int, int] | None = None,
+        fixed: dict[str, object] | None = None,
     ):
         self._trial = trial
         self._excluded = excluded or {}
         self._epochs = epochs
+        self._fixed = fixed or {}
 
     def suggest_categorical(self, name, choices):
+        if name in self._fixed:
+            return self._fixed[name]
         drop = self._excluded.get(name, frozenset())
         return self._trial.suggest_categorical(name, [c for c in choices if c not in drop])
 
     def suggest_int(self, name, low, high, step=1, log=False):
+        if name in self._fixed:
+            return self._fixed[name]
         if name == "n_iter" and self._epochs is not None:
             low, high, step = self._epochs
         return self._trial.suggest_int(name, low, high, step=step, log=log)
@@ -203,7 +217,9 @@ def build_synthcity_objective(
     def objective(trial: optuna.Trial) -> float:
         # Training length is searched, not capped: the plugin's own n_iter
         # range unless hpo.epoch_ranges (or EPOCH_RANGE_DEFAULTS) sets one.
-        proxy = _SearchSpaceTrial(trial, HPO_EXCLUDED_CHOICES.get(name), epochs)
+        proxy = _SearchSpaceTrial(
+            trial, HPO_EXCLUDED_CHOICES.get(name), epochs, HPO_FIXED_PARAMS.get(name)
+        )
         params = plugin_cls.sample_hyperparameters_optuna(proxy)
         if epochs is not None and "n_iter" not in params:
             params["n_iter"] = proxy.suggest_int("n_iter", *epochs)

@@ -379,6 +379,7 @@ class SynthcityModelsConfig:
             "pategan",
             "rtvae",
             "ddpm",
+            "arf",
         ]
     )
 

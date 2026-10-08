@@ -16,7 +16,7 @@ from .conftest import new_run, run_full_pipeline
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
-SYNTHCITY = ["ctgan", "tvae", "adsgan", "bayesian_network", "pategan", "rtvae", "ddpm"]
+SYNTHCITY = ["ctgan", "tvae", "adsgan", "bayesian_network", "pategan", "rtvae", "ddpm", "arf"]
 TABPFN = [
     "tabpfn_standard",
     "tabpfn_custom",

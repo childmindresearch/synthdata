@@ -67,7 +67,7 @@ generation:
   synthcity:
     enabled: true
     # Bayesian network does not scale reliably to this dataset width.
-    names: [ctgan, tvae, adsgan, pategan, rtvae, ddpm]
+    names: [ctgan, tvae, adsgan, pategan, rtvae, ddpm, arf]
 
   tabpfn:
     enabled: true
@@ -98,10 +98,14 @@ generation:
     # capped for run time.
     # Timeout = trials x mean trial time x 1.5.
     # DDPM is not profiled yet and uses n_trials and timeout_seconds above.
+    # ARF (CPU only) is a provisional budget from one default fit (30 trees)
+    # at this width on a 4-core cloud machine, 2026-10-08: about 28 min;
+    # the search goes up to 100 trees. Re-profile on the run machine.
     n_trials_per_model:
-      { ctgan: 40, tvae: 40, adsgan: 40, rtvae: 40, pategan: 40 }
+      { ctgan: 40, tvae: 40, adsgan: 40, rtvae: 40, pategan: 40, arf: 25 }
     timeout_seconds_per_model:
-      { ctgan: 108000, tvae: 103000, adsgan: 100000, rtvae: 111000, pategan: 28000 }
+      { ctgan: 108000, tvae: 103000, adsgan: 100000, rtvae: 111000, pategan: 28000,
+        arf: 112000 }
     # Training length is searched, [low, high, step]. The libraries' ranges
     # (100-1000 epochs; PATE-GAN 1-500) would take 3+ hours per trial here.
     epoch_ranges:
