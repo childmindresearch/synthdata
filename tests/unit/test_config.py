@@ -96,7 +96,9 @@ class TestFromDict:
         assert cfg.imputation.refidiff.catboost_warmup_iterations == 1000
         assert cfg.imputation.benchmark.enabled
 
-    @pytest.mark.parametrize("config_name", ["config_hepatitis.yaml", "config_loris.yaml"])
+    @pytest.mark.parametrize(
+        "config_name", ["config_hepatitis.yaml", "config_loris.yaml", "config_sim.yaml"]
+    )
     def test_shipped_hpo_profiles_exclude_domias(self, config_name):
         root = Path(__file__).parents[2]
         cfg = load_config(root / "configs" / config_name)
@@ -162,6 +164,42 @@ class TestValidate:
         cfg = self._base_valid()
         cfg.data.source = "json"
         with pytest.raises(ValueError, match="data.source"):
+            _validate(cfg)
+
+    def test_sensitive_columns_without_protected_columns_fail_as_the_old_meaning(self):
+        cfg = self._base_valid()
+        cfg.data.sensitive_columns = ["Sex", "Age"]
+        with pytest.raises(ValueError, match="protected_columns"):
+            _validate(cfg)
+        cfg.data.protected_columns = []
+        _validate(cfg)  # declared: sensitive_columns now means the secrets
+
+    def test_column_roles_may_overlap_except_quasi_identifier_and_sensitive(self):
+        cfg = self._base_valid()
+        cfg.data.quasi_identifier_columns = ["Age", "Sex"]
+        cfg.data.sensitive_columns = ["Diagnosis"]
+        cfg.data.protected_columns = ["Sex", "Diagnosis"]
+        _validate(cfg)  # should not raise
+        cfg.data.sensitive_columns = ["Diagnosis", "Age"]
+        with pytest.raises(ValueError, match=r"\['Age'\] cannot be both"):
+            _validate(cfg)
+
+    @pytest.mark.parametrize(
+        "key", ["quasi_identifier_columns", "sensitive_columns", "protected_columns"]
+    )
+    def test_column_roles_exclude_target_and_patient_id(self, key):
+        cfg = self._base_valid()
+        cfg.data.protected_columns = []
+        cfg.data.patient_id_column = "pid"
+        for reserved in ("target", "pid"):
+            setattr(cfg.data, key, [reserved])
+            with pytest.raises(ValueError, match=f"data.{key} must not contain"):
+                _validate(cfg)
+
+    def test_column_role_lists_reject_duplicates(self):
+        cfg = self._base_valid()
+        cfg.data.quasi_identifier_columns = ["Age", "Age"]
+        with pytest.raises(ValueError, match="more than once"):
             _validate(cfg)
 
     def test_patient_id_column_cannot_be_the_target(self):

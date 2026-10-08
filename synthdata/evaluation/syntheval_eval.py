@@ -188,11 +188,18 @@ def _in_process_joblib():
             os.environ["LOKY_MAX_CPU_COUNT"] = previous
 
 
+#: SynthEval reads one ``sensitive_vars`` list for two roles: the fairness
+#: metrics group by it, and attribute disclosure tries to infer it. These
+#: metrics get the protected columns; every other metric gets the sensitive ones.
+_METRICS_ON_PROTECTED_COLUMNS = frozenset(
+    {"statistical_parity", "equal_opportunity", "equalized_odds"}
+)
+
 #: SynthEval metrics that draw from joblib worker processes; see _in_process_joblib.
 _METRICS_WITH_PROCESS_RANDOMNESS = frozenset({"nnaa"})
 
 
-def _evaluate_seeded(se, synthetic_frame, analysis_config, preset: dict, seed: int, model_name):
+def _evaluate_seeded(se, synthetic_frame, analysis_configs, preset: dict, seed: int, model_name):
     """Run each preset metric on its own, from the same seeded random state.
 
     SynthEval's MIA, attribute disclosure, NNAA and fairness metrics draw
@@ -201,9 +208,14 @@ def _evaluate_seeded(se, synthetic_frame, analysis_config, preset: dict, seed: i
     function of the inputs and ``seed`` alone, independent of which other
     metrics are selected. Metrics that fail are logged and omitted, as
     SynthEval itself does; their names are returned for the checkpoint.
+    ``analysis_configs`` maps "protected" and "sensitive" to the
+    ``AnalysisConfig`` each metric reads (see _METRICS_ON_PROTECTED_COLUMNS).
     """
     parts, failed = [], []
     for method, params in preset.items():
+        analysis_config = analysis_configs[
+            "protected" if method in _METRICS_ON_PROTECTED_COLUMNS else "sensitive"
+        ]
         np.random.seed(seed)
         random.seed(seed)
         if method in _METRICS_WITH_PROCESS_RANDOMNESS:
@@ -239,6 +251,7 @@ def _model_worker(
     cat_cols: list,
     target_column: str,
     sensitive_columns: list,
+    protected_columns: list,
     preset_path: str,
     checkpoint_root: str,
     pass_name: str,
@@ -280,12 +293,18 @@ def _model_worker(
     try:
         from syntheval import AnalysisConfig, SynthEval
 
-        analysis_config = AnalysisConfig(
-            dataset=real_frame,
-            target_vars=target_column,
-            confounder_vars=None,
-            sensitive_vars=sensitive_columns,
-        )
+        analysis_configs = {
+            role: AnalysisConfig(
+                dataset=real_frame,
+                target_vars=target_column,
+                confounder_vars=None,
+                sensitive_vars=columns,
+            )
+            for role, columns in (
+                ("sensitive", sensitive_columns),
+                ("protected", protected_columns),
+            )
+        }
         plot_dir = None
         if plots_output_dir is not None:
             # Resolve before changing the worker's directory. SynthEval writes
@@ -304,7 +323,7 @@ def _model_worker(
         )
         preset = json.loads(Path(preset_path).read_text())
         result, failed_metrics = _evaluate_seeded(
-            se, synthetic_frame, analysis_config, preset, seed, model_name
+            se, synthetic_frame, analysis_configs, preset, seed, model_name
         )
         if result is None:
             raise RuntimeError("SynthEval returned no normalized metric results")
@@ -535,6 +554,7 @@ def _evaluation_context_fingerprint(
         "dataset_version": dataset.version,
         "target_column": dataset.target_column,
         "sensitive_columns": dataset.sensitive_columns,
+        "protected_columns": dataset.protected_columns,
         "categorical_columns": dataset.all_categorical_columns,
         "train": _frame_fingerprint(dataset.train_imputed_df),
         "holdout": _frame_fingerprint(dataset.test_imputed_df),
@@ -621,6 +641,7 @@ def _run_resumable_syntheval(
                     dataset.all_categorical_columns,
                     dataset.target_column,
                     dataset.sensitive_columns,
+                    dataset.protected_columns,
                     str(preset_path.resolve()),
                     str(checkpoint_root),
                     pass_name,

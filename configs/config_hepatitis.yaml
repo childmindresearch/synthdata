@@ -19,7 +19,11 @@ data:
   # Modeling columns
   target_column: target
   raw_target_column: CLASS
-  sensitive_columns: [AGE, SEX]
+  # Column roles (see config_loris.yaml). UCI Hepatitis has no linkable
+  # identifiers beyond age and sex; the liver biopsy result is the secret.
+  quasi_identifier_columns: [AGE, SEX]
+  sensitive_columns: [HISTOLOGY]
+  protected_columns: [SEX, AGE]
   drop_columns: []
   drop_rows_missing_target: false
 

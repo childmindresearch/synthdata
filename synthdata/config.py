@@ -46,8 +46,19 @@ class DataConfig:
     #: If the source data uses a different name for the target column, set this
     #: to have it renamed to `target_column` on load (e.g. UCI's "CLASS" -> "target").
     raw_target_column: str | None = None
-    #: Columns treated as protected/sensitive attributes for fairness evaluation.
+    #: Column roles in statistical disclosure control terms. Quasi-identifiers
+    #: are public, linkable attributes an attacker may already know (age,
+    #: sex, region). Sensitive columns are the secrets an attacker tries to
+    #: infer (a diagnosis, income); privacy metrics that infer attributes
+    #: target these. Protected columns define the groups fairness metrics
+    #: compare. A column may be both a quasi-identifier and protected, or
+    #: sensitive and protected, but never a quasi-identifier and sensitive.
+    #: Set protected_columns (even to []) whenever sensitive_columns is set,
+    #: so a config written for the old meaning of sensitive_columns (the
+    #: fairness groups) fails instead of silently changing meaning.
+    quasi_identifier_columns: list = dataclasses.field(default_factory=list)
     sensitive_columns: list = dataclasses.field(default_factory=list)
+    protected_columns: list | None = None
     #: Columns to drop entirely before any modeling (e.g. free-text/ID columns).
     drop_columns: list = dataclasses.field(default_factory=list)
     #: Column identifying the patient (or other independent unit) each row
@@ -369,7 +380,7 @@ class FrameworkSelectionConfig:
 
 @dataclasses.dataclass
 class LogDisparityConfig:
-    #: Defaults to data.sensitive_columns if left empty.
+    #: Defaults to data.protected_columns if left empty.
     protected_columns: list = dataclasses.field(default_factory=list)
     target_map: dict | None = None
     protected_map: list | None = None
@@ -712,6 +723,38 @@ def _validate_split(cfg: Config) -> None:
                 )
 
 
+def _validate_column_roles(data: DataConfig) -> None:
+    if data.sensitive_columns and data.protected_columns is None:
+        raise ValueError(
+            "data.sensitive_columns now lists the secret columns an attacker tries to infer "
+            "(for example a diagnosis), not the fairness groups. Move fairness groups such as "
+            "sex or age to data.protected_columns and public, linkable attributes to "
+            "data.quasi_identifier_columns, then set data.protected_columns (even to []) to "
+            "confirm the new meaning"
+        )
+    roles = {
+        "quasi_identifier_columns": list(data.quasi_identifier_columns),
+        "sensitive_columns": list(data.sensitive_columns),
+        "protected_columns": list(data.protected_columns or []),
+    }
+    for key, columns in roles.items():
+        duplicates = sorted({c for c in columns if columns.count(c) > 1})
+        if duplicates:
+            raise ValueError(f"data.{key} lists {duplicates} more than once")
+        for reserved, label in (
+            (data.target_column, "the target column"),
+            (data.patient_id_column, "the patient ID column"),
+        ):
+            if reserved is not None and reserved in columns:
+                raise ValueError(f"data.{key} must not contain {label} ({reserved!r})")
+    overlap = sorted(set(roles["quasi_identifier_columns"]) & set(roles["sensitive_columns"]))
+    if overlap:
+        raise ValueError(
+            f"{overlap} cannot be both a quasi-identifier (known to an attacker) and sensitive "
+            "(what an attacker tries to infer); keep each in one of the two lists"
+        )
+
+
 def _validate(cfg: Config) -> None:
     if cfg.data.source not in ("uci", "csv", "parquet"):
         raise ValueError(f"data.source must be 'uci', 'csv', or 'parquet', got {cfg.data.source!r}")
@@ -721,12 +764,9 @@ def _validate(cfg: Config) -> None:
         raise ValueError("data.path is required when data.source == 'csv'/'parquet'")
     if not cfg.data.target_column:
         raise ValueError("data.target_column must be set")
-    patient_id_column = cfg.data.patient_id_column
-    if patient_id_column is not None:
-        if patient_id_column == cfg.data.target_column:
-            raise ValueError("data.patient_id_column must not be the target column")
-        if patient_id_column in cfg.data.sensitive_columns:
-            raise ValueError("data.patient_id_column must not be a sensitive column")
+    if cfg.data.patient_id_column == cfg.data.target_column:
+        raise ValueError("data.patient_id_column must not be the target column")
+    _validate_column_roles(cfg.data)
     _validate_split(cfg)
     if cfg.device not in ("auto", "cpu", "cuda", "mps"):
         raise ValueError(f"device must be one of auto/cpu/cuda/mps, got {cfg.device!r}")

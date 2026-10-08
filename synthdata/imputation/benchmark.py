@@ -1,7 +1,8 @@
 """Append-only, train-only masked-cell validation and HPO for RefiDiff.
 
 This module never writes ordinary ``*_imputed.csv`` cache files. It hides only
-originally observed, non-sensitive feature cells in ``Dataset.train_df``, then
+originally observed feature cells outside the column roles (quasi-identifier,
+sensitive and protected columns) in ``Dataset.train_df``, then
 scores a candidate solely on those held-out cells. Every mask and candidate
 result is persisted under a study directory so interrupted Optuna studies can
 resume without regenerating masks or overwriting prior evidence.
@@ -61,7 +62,8 @@ def _study_identity(cfg: Config, dataset: Dataset) -> dict:
         "schema_sha256": dataset.variable_schema_fingerprint,
         "feature_columns": dataset.feature_columns,
         "categorical_columns": dataset.categorical_columns,
-        "sensitive_columns_excluded": dataset.sensitive_columns,
+        # Key name kept so studies started before the column roles split still resume.
+        "sensitive_columns_excluded": dataset.role_columns,
         "seed": cfg.seed,
         "mask_fraction": cfg.imputation.benchmark.mask_fraction,
         "n_masks": cfg.imputation.benchmark.n_masks,
@@ -131,18 +133,18 @@ def _sampling_weights(
 def create_artificial_mask(
     df: pd.DataFrame,
     feature_columns: list,
-    sensitive_columns: list,
+    excluded_columns: list,
     fraction: float,
     mechanism: str,
     seed: int,
 ) -> dict[str, list[int]]:
-    """Select observed, non-sensitive feature rows to hide without replacement."""
+    """Select observed rows of non-excluded features to hide without replacement."""
     if mechanism not in {"mcar", "mar", "mnar"}:
         raise ValueError(f"Unknown artificial masking mechanism: {mechanism!r}")
     rng = np.random.default_rng(seed)
     mask: dict[str, list[int]] = {}
     for column in feature_columns:
-        if column in sensitive_columns:
+        if column in excluded_columns:
             continue
         eligible_rows = np.flatnonzero(df[column].notna().to_numpy())
         n_mask = _mask_count(len(eligible_rows), fraction)
@@ -156,15 +158,14 @@ def create_artificial_mask(
 
 def resolve_score_columns(dataset: Dataset, configured_columns: list | None) -> list:
     """Validate the score panel while retaining all features as imputer context."""
-    allowed = [
-        column for column in dataset.feature_columns if column not in dataset.sensitive_columns
-    ]
+    allowed = [column for column in dataset.feature_columns if column not in dataset.role_columns]
     if configured_columns is None:
         return allowed
     unknown = sorted(set(configured_columns) - set(allowed))
     if unknown:
         raise ValueError(
-            "imputation.benchmark.score_columns must contain non-sensitive feature columns only; "
+            "imputation.benchmark.score_columns must not contain quasi-identifier, sensitive or "
+            "protected columns; "
             f"invalid entries: {unknown}"
         )
     return list(configured_columns)
@@ -289,7 +290,7 @@ def run_refidiff_benchmark(cfg: Config, dataset: Dataset, study_id: str | None =
             mask = create_artificial_mask(
                 dataset.train_df,
                 score_columns,
-                dataset.sensitive_columns,
+                dataset.role_columns,
                 benchmark_cfg.mask_fraction,
                 mechanism,
                 seed,

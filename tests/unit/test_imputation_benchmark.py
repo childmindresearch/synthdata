@@ -34,7 +34,7 @@ def test_artificial_mask_is_deterministic_and_only_hides_observed_non_sensitive_
     kwargs = {
         "df": benchmark_frame,
         "feature_columns": ["numeric", "category", "sensitive"],
-        "sensitive_columns": ["sensitive"],
+        "excluded_columns": ["sensitive"],
         "fraction": 0.3,
         "mechanism": mechanism,
         "seed": 17,
@@ -107,13 +107,16 @@ def test_benchmark_study_directory_rejects_path_traversal(make_config):
         benchmark_study_dir(cfg, "../outside")
 
 
-def test_score_panel_excludes_sensitive_columns(make_dataset):
+@pytest.mark.parametrize(
+    "role", ["quasi_identifier_columns", "sensitive_columns", "protected_columns"]
+)
+def test_score_panel_excludes_role_columns(make_dataset, role):
     dataset = make_dataset()
     excluded = dataset.feature_columns[0]
-    dataset.sensitive_columns = [excluded]
+    setattr(dataset, role, [excluded])
 
     assert resolve_score_columns(dataset, None) == [
         column for column in dataset.feature_columns if column != excluded
     ]
-    with pytest.raises(ValueError, match="non-sensitive feature"):
+    with pytest.raises(ValueError, match="must not contain quasi-identifier"):
         resolve_score_columns(dataset, [excluded])

@@ -18,9 +18,11 @@ data:
   variable_schema_path: "{fixtures}/clinic_schema.csv"
 
   target_column: target
-  # On this pipeline version sensitive columns drive both attribute-disclosure
-  # (privacy) and SynthEval fairness, which needs a binary column (SEX).
-  sensitive_columns: [SEX, DIAGNOSIS]
+  # Attribute disclosure tries to infer DIAGNOSIS from the rest; SynthEval's
+  # fairness metrics group by SEX (statistical parity needs a binary column).
+  quasi_identifier_columns: [AGE, SEX, SITE]
+  sensitive_columns: [DIAGNOSIS]
+  protected_columns: [SEX, AGE]
   # The fixture carries repeat encounters per patient: split by patient, then
   # drop the identifier before modeling.
   patient_id_column: patient_id

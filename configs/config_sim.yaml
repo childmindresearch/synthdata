@@ -1,33 +1,37 @@
-# LORIS/HBN dataset configuration. Paths are relative to the repository root.
-# Copy this file and update the data section for a new dataset.
+# Simulated competition-shaped data (sim 1.2), used to profile and test the
+# pipeline before LORIS runs. Paths are relative to the repository root; the
+# data files live only on the owner's machine (data/ is git-ignored).
 
-name: loris
+name: sim
 seed: 42
 device: auto
 
 experiment:
-  tag: loris_v2
-  id: "2.11"
+  tag: sim_v1
+  id: "1.2"
 
 data:
-  # Source and schema (LORIS data 2.11, transformed to match the competition data)
+  # Source and schema (simulated data 1.2). The CSV's first two columns are
+  # identifiers that the schema leaves out: research_subject_id (one per
+  # patient) and encounter_number (one per row).
   source: csv
-  path: data/loris/loris_v2_664_features_us_id.csv
-  version: "2.11"
-  variable_schema_path: data/loris/loris_v2_variable_schema_us.csv
+  path: data/simulated/sim_v1.2.csv
+  version: "1.2"
+  variable_schema_path: data/simulated/sim_v1.2_variable_schema.csv
 
   # Modeling columns
-  target_column: CGAS_class # 0 severe, 1 moderate, 2 typical
-  patient_id_column: patient_id # Split by patient, then dropped before modeling.
+  target_column: readmission_group
+  patient_id_column: research_subject_id # Split by patient, then dropped before modeling.
   # Column roles. Quasi-identifiers are public, linkable attributes an
   # attacker may know; sensitive columns are the secrets privacy metrics try
   # to infer; protected columns are the fairness groups. QIs and sensitive
   # columns must not overlap; neither may hold the target or patient ID.
-  quasi_identifier_columns: [Age, Sex, region, PreInt_Demos_Fam__Child_Ethnicity]
-  sensitive_columns: [Income, PreInt_TxHx__suicide, Diagnosis_Cat__Anxiety_Disorders]
-  protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Ethnicity]
+  # A small representative set while the final lists are being chosen.
+  quasi_identifier_columns: [age_reg, birth_year, gender, region, Ethnicity]
+  sensitive_columns: [Income, Anxiety disorder]
+  protected_columns: [gender, age_reg, Ethnicity]
   drop_rows_missing_target: true
-  drop_columns: []
+  drop_columns: [encounter_number]
 
   # Source normalization and split
   uppercase_columns: false
@@ -40,11 +44,11 @@ data:
   train_fraction: 0.6
   tuning_fraction: 0.2
   holdout_fraction: 0.2
-  stratify_columns: [CGAS_class, Sex, Age]
+  stratify_columns: [readmission_group, gender, age_reg]
   stratify_bins: [null, null, [30, 60]]
 
   # Local derived-data storage
-  data_dir: data/loris
+  data_dir: data/simulated
   raw_cache_subdir: raw
 
 imputation:
@@ -67,7 +71,7 @@ imputation:
     catboost_warmup_iterations: 1000
   benchmark:
     enabled: false
-    output_dir: output/loris/imputation
+    output_dir: output/sim/imputation
     mask_fraction: 0.3
     n_masks: 3
     mechanisms: [mcar]
@@ -82,7 +86,7 @@ imputation:
       early_stopping_patience: [100, 250]
 
 generation:
-  output_dir: output/loris/synthetic_data
+  output_dir: output/sim/synthetic_data
   n_samples: 2500
   force_retrain: false
 
@@ -119,7 +123,7 @@ generation:
     final_n_iter_override: null
 
 evaluation:
-  output_dir: output/loris/evaluation
+  output_dir: output/sim/evaluation
   models: null
   positive_class: 0 # Used only if the target is naturally binary.
   ranking_strategy: linear
@@ -131,17 +135,17 @@ evaluation:
   custom: { enabled: true, categories: null, metrics: null }
 
   log_disparity:
-    protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Ethnicity]
-    target_map: { 0: severe, 1: moderate, 2: typical }
+    protected_columns: [gender, age_reg, Ethnicity]
+    target_map: null
     protected_map: [null, null, null]
     protected_bins: [null, [0, 18, 30, 45, 60, 200], null]
 
-  # Separate binary SynthEval pass: severe/moderate versus typical.
+  # Separate binary SynthEval pass; off until the target's classes are fixed.
   binary_target:
-    enabled: true
+    enabled: false
     column: null
-    positive_classes: [0, 1]
-    negative_classes: [2]
+    positive_classes: []
+    negative_classes: []
 
   # Resource cap for resumable per-model SynthEval processes.
   syntheval_execution:
@@ -164,7 +168,7 @@ evaluation:
       privacy.k-map.score: { bound: min, value: 5.0 }
 
 plots:
-  output_dir: output/loris/plots
+  output_dir: output/sim/plots
   sections: [data, imputation, generation, hpo, evaluation]
   dpi: 150
   formats: [png]
