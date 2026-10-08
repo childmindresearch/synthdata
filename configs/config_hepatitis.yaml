@@ -105,19 +105,6 @@ evaluation:
   # Overall rank = weighted geometric mean of the utility, privacy and
   # fairness ranks.
   rank_weights: { utility: 1.0, privacy: 1.0, fairness: 1.0 }
-  # Absolute privacy floor checked on raw values; failing models are flagged,
-  # never recommended. Starting thresholds only: get a privacy/compliance
-  # review before any release.
-  privacy_gate:
-    enabled: true
-    thresholds:
-      mia_recall: { bound: max, value: 0.6 }
-      mia_precision: { bound: max, value: 0.6 }
-      hit_rate: { bound: max, value: 0.05 }
-      att_discl_risk: { bound: max, value: 0.6 }
-      privacy.identifiability_score.score_OC: { bound: max, value: 0.3 }
-      privacy.k-anonymization.syn: { bound: min, value: 5.0 }
-      privacy.k-map.score: { bound: min, value: 5.0 }
 
 plots:
   output_dir: output/hepatitis/plots

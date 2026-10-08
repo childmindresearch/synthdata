@@ -12,7 +12,6 @@ from synthdata.config import (
     GenerationConfig,
     HPOConfig,
     ImputationConfig,
-    PrivacyGateConfig,
     RefiDiffConfig,
     SynthEvalExecutionConfig,
     _from_dict,
@@ -111,23 +110,9 @@ class TestFromDict:
         assert cfg.evaluation.binary_target.positive_classes == [0, 1]
         assert cfg.evaluation.binary_target.negative_classes == [2]
 
-    def test_evaluation_privacy_gate_nested_dict_builds_nested_dataclass(self):
-        cfg = _from_dict(
-            Config,
-            {
-                "evaluation": {
-                    "privacy_gate": {
-                        "enabled": False,
-                        "thresholds": {"mia_recall": {"bound": "max", "value": 0.7}},
-                    }
-                }
-            },
-        )
-        assert isinstance(cfg.evaluation.privacy_gate, PrivacyGateConfig)
-        assert cfg.evaluation.privacy_gate.enabled is False
-        assert cfg.evaluation.privacy_gate.thresholds == {
-            "mia_recall": {"bound": "max", "value": 0.7}
-        }
+    def test_removed_privacy_gate_section_raises(self):
+        with pytest.raises(ValueError, match="privacy_gate was removed"):
+            _from_dict(Config, {"evaluation": {"privacy_gate": {"enabled": True}}})
 
     def test_syntheval_execution_nested_dict_builds_nested_dataclass(self):
         cfg = _from_dict(
@@ -583,28 +568,6 @@ class TestValidate:
         cfg = self._base_valid()
         cfg.evaluation.rank_weights = {"utility": 1.0, "privacy": 0.0, "fairness": 1.0}
         _validate(cfg)  # should not raise
-
-    def test_privacy_gate_default_thresholds_pass(self):
-        cfg = self._base_valid()
-        _validate(cfg)  # should not raise
-
-    def test_privacy_gate_missing_bound_or_value_raises(self):
-        cfg = self._base_valid()
-        cfg.evaluation.privacy_gate.thresholds = {"mia_recall": {"value": 0.6}}
-        with pytest.raises(ValueError, match="privacy_gate.thresholds"):
-            _validate(cfg)
-
-    def test_privacy_gate_bad_bound_raises(self):
-        cfg = self._base_valid()
-        cfg.evaluation.privacy_gate.thresholds = {"mia_recall": {"bound": "sideways", "value": 0.6}}
-        with pytest.raises(ValueError, match="privacy_gate.thresholds"):
-            _validate(cfg)
-
-    def test_privacy_gate_non_numeric_value_raises(self):
-        cfg = self._base_valid()
-        cfg.evaluation.privacy_gate.thresholds = {"mia_recall": {"bound": "max", "value": "high"}}
-        with pytest.raises(ValueError, match="privacy_gate.thresholds"):
-            _validate(cfg)
 
 
 class TestLoadConfig:

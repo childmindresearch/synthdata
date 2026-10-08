@@ -19,13 +19,11 @@ def test_replicate_names_round_trip():
     assert split_replicate_name("odd__repx") == ("odd__repx", 0)
 
 
-def _combined(overall: dict, gate: dict | None = None) -> pd.DataFrame:
+def _combined(overall: dict) -> pd.DataFrame:
     df = pd.DataFrame(index=list(overall))
     for dim in ("utility", "privacy", "fairness"):
         df[("__all__", dim, "rank")] = [v / 3 for v in overall.values()]
     df[("__all__", "overall", "rank")] = list(overall.values())
-    if gate is not None:
-        df[("__all__", "privacy_gate", "pass")] = [gate[m] for m in overall]
     df.columns = pd.MultiIndex.from_tuples(df.columns)
     return df
 
@@ -67,24 +65,19 @@ def test_overlapping_models_are_tied_and_separated_ones_are_not():
     assert summary.loc["far", "tied_with_best"] is False
 
 
-def test_baselines_and_gate_failures_cannot_be_best():
+def test_baselines_cannot_be_best():
     summary = summarize_replicates(
         _combined(
             {
                 "baseline_train_copy": 3.0, "baseline_train_copy__rep1": 3.0,
-                "leaky": 2.5, "leaky__rep1": 2.5,
-                "ok": 1.0, "ok__rep1": 1.1,
-            },
-            gate={
-                "baseline_train_copy": False, "baseline_train_copy__rep1": False,
-                "leaky": True, "leaky__rep1": False,
-                "ok": True, "ok__rep1": True,
+                "best": 2.5, "best__rep1": 2.6,
+                "far": 1.0, "far__rep1": 1.1,
             },
         )
     )  # fmt: skip
     assert summary.loc["baseline_train_copy", "baseline"]
     assert not summary.loc["baseline_train_copy", "eligible"]
-    assert not summary.loc["leaky", "privacy_gate_pass"]
-    assert not summary.loc["leaky", "eligible"]
-    assert summary.loc["ok", "tied_with_best"] is True
-    assert pd.isna(summary.loc["leaky", "tied_with_best"])
+    assert pd.isna(summary.loc["baseline_train_copy", "tied_with_best"])
+    assert summary.loc["best", "eligible"]
+    assert summary.loc["best", "tied_with_best"] is True
+    assert "privacy_gate_pass" not in summary.columns

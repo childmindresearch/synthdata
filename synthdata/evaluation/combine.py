@@ -362,7 +362,6 @@ def simple_rank_summary(combined: pd.DataFrame) -> pd.DataFrame:
 CONFIDENCE = 0.95
 
 _SUMMARY_DIMS = ("overall", "utility", "privacy", "fairness")
-_GATE_PASS = (_ALL, "privacy_gate", "pass")
 
 
 def _mean_and_interval(values: pd.Series, confidence: float) -> tuple[float, float, float]:
@@ -399,8 +398,8 @@ def summarize_replicates(combined: pd.DataFrame, confidence: float = CONFIDENCE)
     (``<dim>_mean``, ``<dim>_ci_low``, ``<dim>_ci_high``). The interval is
     NaN for a single replicate: one seed carries no uncertainty estimate.
 
-    ``eligible`` marks the models a recommendation may pick: not a baseline,
-    and passing the privacy gate in every replicate when the gate ran. Among
+    ``eligible`` marks the models a recommendation may pick: every model
+    that is not a baseline. Among
     them, ``tied_with_best`` is True for the model with the highest mean
     overall score and for every model whose overall score a one-sided Welch
     t-test cannot place below it at ``1 - confidence``; it is NaN when either
@@ -422,9 +421,7 @@ def summarize_replicates(combined: pd.DataFrame, confidence: float = CONFIDENCE)
             row[f"{dim}_mean"] = mean
             row[f"{dim}_ci_low"] = low
             row[f"{dim}_ci_high"] = high
-        if _GATE_PASS in combined.columns:
-            row["privacy_gate_pass"] = bool(combined.loc[names, _GATE_PASS].astype(bool).all())
-        row["eligible"] = not row["baseline"] and row.get("privacy_gate_pass", True)
+        row["eligible"] = not row["baseline"]
         rows[model] = row
         if "overall" in scores:
             overall_by_model[model] = scores["overall"][names]

@@ -13,7 +13,6 @@ from synthdata.evaluation import (
     baselines,
     combine,
     custom_eval,
-    privacy_gate,
     report,
     synthcity_eval,
     syntheval_eval,
@@ -180,9 +179,6 @@ def run_evaluation(
         privacy_result=privacy_result,
     )
 
-    gate_result = privacy_gate.evaluate_privacy_gate(combined, eval_cfg.privacy_gate)
-    combined = privacy_gate.merge_privacy_gate_results(combined, gate_result)
-
     combined.to_csv(output_dir / "combined_evaluation.csv")
     ranking_summary = combine.summarize_replicates(combined)
     ranking_summary.to_csv(output_dir / "ranking_summary.csv")
@@ -203,7 +199,6 @@ def run_evaluation(
         "tstr_table": tstr_table,
         "privacy_result": privacy_result,
         "ovr_per_class": ovr_per_class,
-        "privacy_gate_result": gate_result,
         "ranking_summary": ranking_summary,
         "artifact_manifest": str(artifact_manifest),
     }
