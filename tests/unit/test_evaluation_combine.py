@@ -373,3 +373,24 @@ class TestBuildCombinedTable:
             synthcity_results, None, None, {}, model_names=["model_a", "model_b"]
         )
         assert combined.index[0] == "model_a"
+
+
+class TestTstrColumns:
+    def test_tstr_scores_form_a_custom_utility_group(self):
+        from synthdata.evaluation.tstr import TSTRScores
+
+        def scores(f1):
+            return TSTRScores(macro_f1=f1, macro_auprc=f1, balanced_accuracy=f1, per_class_f1={})
+
+        combined = build_combined_table(
+            {},
+            None,
+            None,
+            {},
+            ["good", "bad"],
+            tstr_result={"scores": {"good": scores(0.8), "bad": scores(0.2)}},
+        )
+        assert combined.loc["good", ("custom", "utility", "tstr_macro_f1")] == 0.8
+        assert combined.loc["good", ("custom", "utility", "rank")] == 1.0
+        assert combined.loc["bad", ("custom", "utility", "rank")] == 0.0
+        assert list(combined.index) == ["good", "bad"]

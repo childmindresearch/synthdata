@@ -117,6 +117,13 @@ evaluation:
     protected_map: [null, null]
     protected_bins: [null, [18, 40, 60, 80]]
 
+  # Metrics that need two target classes (AUROC difference, subgroup gaps) on a
+  # 3+ class target: ovr_macro = once per class vs the rest, averaged with equal
+  # weight (per-class values in ovr_per_class.csv); binary = once on the
+  # binary_target collapse below, which must then be enabled.
+  class_averaging: ovr_macro
+  # XGBoost seeds averaged for holdout TSTR (fit on synthetic, score on test).
+  tstr_seeds: 3
   binary_target:
     { enabled: false, column: null, positive_classes: [], negative_classes: [] }
 

@@ -156,6 +156,23 @@ class TestBuildEvaluationReport:
         text = build_evaluation_report(cfg, dataset, combined, extras, experiment=_FakeExperiment())
         assert "20260101T000000Z_test" in text
 
+    def test_class_level_section_shows_tstr_and_per_class_values(self, make_config, make_dataset):
+        cfg = make_config()
+        dataset = make_dataset()
+        combined = _combined_table()
+        tstr = pd.DataFrame(
+            {"tstr_macro_f1": [0.4, 0.6], "f1_rare": [0.0, 0.5]},
+            index=pd.Index(["model_a", "trtr (real train)"], name="model"),
+        )
+        ovr = pd.DataFrame(
+            {("auroc_diff", "0"): [0.1], ("auroc_diff", "1"): [0.3]}, index=["model_a"]
+        )
+        extras = {"selected_datasets": {}, "tstr_table": tstr, "ovr_per_class": ovr}
+        text = build_evaluation_report(cfg, dataset, combined, extras)
+        assert "## Class-level utility (imbalance-aware)" in text
+        assert "trtr (real train)" in text
+        assert "auroc_diff [1]" in text
+
 
 class TestSaveEvaluationReport:
     def test_writes_report_to_evaluation_output_dir(self, make_config, make_dataset):

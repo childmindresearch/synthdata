@@ -576,6 +576,9 @@ class SynthEvalExecutionConfig:
     memory_per_model_gib: float | None = None
 
 
+#: Values of ``evaluation.class_averaging``.
+CLASS_AVERAGING = ("ovr_macro", "binary")
+
 #: Reference rows ``evaluation.baselines`` may name; built by
 #: synthdata.evaluation.baselines.
 EVALUATION_BASELINES = ("train_copy", "marginals")
@@ -608,7 +611,19 @@ class EvaluationConfig:
     ranking_strategy: str = "linear"
     log_disparity: LogDisparityConfig = dataclasses.field(default_factory=LogDisparityConfig)
     save_per_model_syntheval_plots: bool = True
+    #: How SynthEval metrics that need exactly 2 target classes (auroc_diff
+    #: and the subgroup gap metrics) run when the target has 3+ classes:
+    #: "ovr_macro" runs them once per class (that class vs the rest) and
+    #: averages with equal weight per class, keeping the per-class values in
+    #: ovr_per_class.csv; "binary" runs them once on the ``binary_target``
+    #: collapse, which must then be enabled. A 2-class target runs them
+    #: directly and ignores this setting.
+    class_averaging: str = "ovr_macro"
     binary_target: BinaryTargetConfig = dataclasses.field(default_factory=BinaryTargetConfig)
+    #: XGBoost seeds averaged for the holdout TSTR scores (fit on each
+    #: synthetic dataset, score on the test split; see
+    #: synthdata.evaluation.tstr). Needs a categorical target.
+    tstr_seeds: int = 3
     syntheval_execution: SynthEvalExecutionConfig = dataclasses.field(
         default_factory=SynthEvalExecutionConfig
     )
@@ -1055,6 +1070,20 @@ def _validate(cfg: Config) -> None:
                 f"data.ordinal_column_categories[{col!r}] must be a list of unique values, "
                 f"got {categories!r}"
             )
+    if cfg.evaluation.class_averaging not in CLASS_AVERAGING:
+        raise ValueError(
+            f"evaluation.class_averaging must be one of {list(CLASS_AVERAGING)}, "
+            f"got {cfg.evaluation.class_averaging!r}"
+        )
+    if (cfg.evaluation.class_averaging == "binary") != cfg.evaluation.binary_target.enabled:
+        raise ValueError(
+            "evaluation.binary_target.enabled must be true exactly when "
+            "evaluation.class_averaging is 'binary' (the collapse replaces one-vs-rest "
+            f"averaging); got class_averaging={cfg.evaluation.class_averaging!r}, "
+            f"binary_target.enabled={cfg.evaluation.binary_target.enabled}"
+        )
+    if cfg.evaluation.tstr_seeds < 1:
+        raise ValueError(f"evaluation.tstr_seeds must be >= 1, got {cfg.evaluation.tstr_seeds}")
     if cfg.evaluation.binary_target.enabled:
         bt = cfg.evaluation.binary_target
         if not bt.positive_classes or not bt.negative_classes:

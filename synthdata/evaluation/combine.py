@@ -17,6 +17,7 @@ from synthdata.evaluation.catalog import (
     LOG_DISPARITY_METRICS,
     SYNTHCITY_CATEGORY_TO_TYPE,
     SYNTHCITY_UNRANKED_SUBMETRICS,
+    TSTR_METRICS,
     is_custom_syntheval_metric,
     is_redundant_synthcity_submetric,
 )
@@ -146,6 +147,25 @@ def _log_disparity_frames(
     return raw, oriented
 
 
+def _tstr_frames(
+    tstr_result: dict | None, model_names: list
+) -> "tuple[pd.DataFrame, pd.DataFrame]":
+    """Holdout TSTR macro scores as custom utility columns (all higher-is-better)."""
+    scores = (tstr_result or {}).get("scores") or {}
+    if not scores:
+        empty = pd.DataFrame(index=model_names)
+        return empty, empty
+    raw = pd.DataFrame(
+        {
+            "tstr_macro_f1": {m: s.macro_f1 for m, s in scores.items()},
+            "tstr_balanced_accuracy": {m: s.balanced_accuracy for m, s in scores.items()},
+            "tstr_macro_auprc": {m: s.macro_auprc for m, s in scores.items()},
+        }
+    ).reindex(index=model_names, columns=list(TSTR_METRICS))
+    raw.columns = pd.MultiIndex.from_tuples([("custom", "utility", c) for c in raw.columns])
+    return raw, raw.copy()
+
+
 def _minmax_scale(col: pd.Series) -> pd.Series:
     """Per-column min-max scaling; NaN-safe (ties -> 0.5, NaNs preserved)."""
     valid = col.dropna()
@@ -179,8 +199,12 @@ def build_combined_table(
     log_disparity_reports: dict[str, dict],
     model_names: list,
     rank_weights: dict | None = None,
+    tstr_result: dict | None = None,
 ) -> pd.DataFrame:
     """Build the single combined, ranked, multi-index evaluation table.
+
+    ``tstr_result`` (from :func:`synthdata.evaluation.custom_eval.run_tstr_evaluation`)
+    adds the holdout TSTR macro scores as a ``("custom", "utility")`` group.
 
     Ranking scheme -- a hierarchical *mean-of-means*, not a flat sum, so a
     framework/type with many metric columns (e.g. synthcity's ~7-column
@@ -210,9 +234,12 @@ def build_combined_table(
         syntheval_benchmark_results, syntheval_benchmark_ranks, model_names
     )
     ld_raw, ld_oriented = _log_disparity_frames(log_disparity_reports, model_names)
+    ts_raw, ts_oriented = _tstr_frames(tstr_result, model_names)
 
-    raw_parts = [df for df in (sc_raw, se_raw, ld_raw) if not df.empty]
-    oriented_parts = [df for df in (sc_oriented, se_oriented, ld_oriented) if not df.empty]
+    raw_parts = [df for df in (sc_raw, se_raw, ld_raw, ts_raw) if not df.empty]
+    oriented_parts = [
+        df for df in (sc_oriented, se_oriented, ld_oriented, ts_oriented) if not df.empty
+    ]
 
     if not raw_parts:
         raise ValueError("No evaluation results to combine: check evaluation config selection")

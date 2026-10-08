@@ -116,7 +116,26 @@ def run_evaluation(
         seed=cfg.seed,
     )
 
-    if eval_cfg.binary_target.enabled:
+    ovr_per_class = None
+    n_classes = dataset.train_imputed_df[dataset.target_column].nunique()
+    if eval_cfg.class_averaging == "ovr_macro" and dataset.target_is_categorical and n_classes > 2:
+        ovr_results, ovr_ranks, ovr_per_class = syntheval_eval.run_ovr_macro_syntheval_evaluation(
+            selected_datasets,
+            dataset,
+            eval_cfg.syntheval,
+            preset_dir=output_dir,
+            ranking_strategy=eval_cfg.ranking_strategy,
+            output_folder=output_dir / "syntheval_benchmark",
+            execution_cfg=eval_cfg.syntheval_execution,
+            seed=cfg.seed,
+        )
+        benchmark_results, benchmark_ranks = syntheval_eval.merge_binary_target_results(
+            benchmark_results, benchmark_ranks, ovr_results, ovr_ranks
+        )
+        if ovr_per_class is not None and not ovr_per_class.empty:
+            ovr_per_class.to_csv(output_dir / "ovr_per_class.csv")
+
+    if eval_cfg.class_averaging == "binary" and eval_cfg.binary_target.enabled:
         binary_results, binary_ranks = syntheval_eval.run_binary_target_syntheval_evaluation(
             selected_datasets,
             dataset,
@@ -136,6 +155,13 @@ def run_evaluation(
         selected_datasets, dataset, eval_cfg.log_disparity, eval_cfg.custom
     )
 
+    tstr_result = custom_eval.run_tstr_evaluation(
+        selected_datasets, dataset, eval_cfg.custom, eval_cfg.tstr_seeds, cfg.seed
+    )
+    tstr_table = custom_eval.build_tstr_table(tstr_result)
+    if not tstr_table.empty:
+        tstr_table.to_csv(output_dir / "tstr_holdout.csv")
+
     combined = combine.build_combined_table(
         synthcity_results,
         benchmark_results,
@@ -143,6 +169,7 @@ def run_evaluation(
         log_disparity_reports,
         model_names,
         rank_weights=eval_cfg.rank_weights,
+        tstr_result=tstr_result,
     )
 
     gate_result = privacy_gate.evaluate_privacy_gate(combined, eval_cfg.privacy_gate)
@@ -165,6 +192,8 @@ def run_evaluation(
         "syntheval_benchmark_results": benchmark_results,
         "syntheval_benchmark_ranks": benchmark_ranks,
         "log_disparity_reports": log_disparity_reports,
+        "tstr_table": tstr_table,
+        "ovr_per_class": ovr_per_class,
         "privacy_gate_result": gate_result,
         "ranking_summary": ranking_summary,
         "artifact_manifest": str(artifact_manifest),

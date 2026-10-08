@@ -133,7 +133,10 @@ SYNTHEVAL_PRESET = {
     "auroc_diff": {"model": "log_reg", "num_boots": 1},
     "cls_acc": {
         "cls_models": ["rf", "adaboost", "svm", "logreg"],
-        "F1_type": "micro",
+        # Macro: each class counts equally, so a minority class the
+        # synthetic data fails on is not hidden by the majority (micro F1
+        # equals accuracy for a single-label target).
+        "F1_type": "macro",
         "k_folds": 5,
         "full_output": False,
     },
@@ -226,7 +229,16 @@ LOG_DISPARITY_METRICS = {
     "log_disparity_share_significant": True,
 }
 
+#: Holdout TSTR scores (fit the fixed XGBoost on a synthetic dataset, score
+#: on the test split; synthdata.evaluation.tstr), all higher-is-better.
+#: Per-class F1 is reported next to them but not ranked.
+TSTR_METRICS = ("tstr_macro_f1", "tstr_balanced_accuracy", "tstr_macro_auprc")
+
+#: Name of the holdout TSTR evaluator in ``evaluation.custom`` selection.
+TSTR_NAME = "tstr"
+
 CUSTOM_METRIC_TYPE = {
+    TSTR_NAME: "utility",
     **{name: "fairness" for name in LOG_DISPARITY_METRICS},
     **{name: "fairness" for name in SYNTHEVAL_CUSTOM_FAIRNESS_KEYS},
 }

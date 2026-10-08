@@ -25,12 +25,14 @@ from synthdata.evaluation.syntheval_eval import (
     _load_syntheval_cache,
     _save_syntheval_cache,
     _shutdown_nested_joblib_executor,
+    average_ovr_results,
     build_binary_preset,
     build_binary_target_series,
     build_preset,
     extract_metric_types,
     merge_binary_target_results,
     resolve_model_workers,
+    run_ovr_macro_syntheval_evaluation,
 )
 
 pytestmark = pytest.mark.unit
@@ -462,3 +464,76 @@ class TestCheckpointPaths:
         finally:
             os.chdir(previous_dir)
         assert result_path.exists()
+
+
+def _pass_frames(values: dict, oriented: dict, index=("m1", "m2")):
+    """One fake binary-only pass: SynthEval-shaped results and oriented ranks."""
+    results = pd.DataFrame(index=list(index))
+    for metric, (value, error) in values.items():
+        results[(metric, "value")] = value
+        results[(metric, "error")] = error
+        results[(metric, "type")] = "utility"
+    results.columns = pd.MultiIndex.from_tuples(results.columns)
+    results["rank"] = 0.0
+    ranks = pd.DataFrame(oriented, index=list(index))
+    ranks["rank"] = 0.0
+    return results, ranks
+
+
+class TestAverageOvrResults:
+    def test_macro_average_weighs_every_class_equally(self):
+        per_class = {
+            0: _pass_frames({"auroc_diff": ([0.1, 0.3], [0.03, 0.04])}, {"auroc_diff": [0.9, 0.7]}),
+            1: _pass_frames({"auroc_diff": ([0.5, 0.1], [0.0, 0.0])}, {"auroc_diff": [0.5, 0.9]}),
+        }
+        results, ranks, table = average_ovr_results(
+            {c: r for c, (r, _) in per_class.items()}, {c: k for c, (_, k) in per_class.items()}
+        )
+        assert results[("auroc_diff", "value")].tolist() == pytest.approx([0.3, 0.2])
+        assert results[("auroc_diff", "error")].tolist() == pytest.approx([0.015, 0.02])
+        assert results[("auroc_diff", "type")].tolist() == ["utility", "utility"]
+        assert ranks["auroc_diff"].tolist() == pytest.approx([0.7, 0.8])
+        assert "rank" not in ranks.columns
+        # Per-class values stay visible next to the average.
+        assert table[("auroc_diff", "0")].tolist() == [0.1, 0.3]
+        assert table[("auroc_diff", "1")].tolist() == [0.5, 0.1]
+
+
+class TestRunOvrMacro:
+    def test_each_class_is_positive_once_against_the_rest(self, make_dataset, monkeypatch):
+        df = pd.DataFrame({"x": range(30), "target": [0, 1, 2] * 10})
+        dataset = make_dataset(df=df)
+        dataset.train_imputed_df = dataset.train_df
+        calls = []
+
+        def fake_pass(synthetic, ds, preset, column, positive, negative, pass_name, *rest):
+            calls.append((column, positive, negative, pass_name))
+            return _pass_frames({"auroc_diff": ([0.1], [0.0])}, {"auroc_diff": [0.9]}, ("m1",))
+
+        monkeypatch.setattr(
+            "synthdata.evaluation.syntheval_eval._run_collapsed_target_pass", fake_pass
+        )
+        results, _, table = run_ovr_macro_syntheval_evaluation(
+            {"m1": dataset.train_df}, dataset, FrameworkSelectionConfig(), "unused"
+        )
+        assert calls == [
+            ("target", [0], [1, 2], "ovr_0"),
+            ("target", [1], [0, 2], "ovr_1"),
+            ("target", [2], [0, 1], "ovr_2"),
+        ]
+        assert results[("auroc_diff", "value")].tolist() == pytest.approx([0.1])
+        assert list(table.columns.get_level_values("class")) == ["0", "1", "2"]
+
+    def test_no_binary_only_metric_selected_skips(self, make_dataset):
+        dataset = make_dataset(df=pd.DataFrame({"x": range(9), "target": [0, 1, 2] * 3}))
+        dataset.train_imputed_df = dataset.train_df
+        selection = FrameworkSelectionConfig(metrics=["cls_acc"])
+        assert run_ovr_macro_syntheval_evaluation({}, dataset, selection, "unused") == (
+            None,
+            None,
+            None,
+        )
+
+
+def test_cls_acc_reports_macro_f1():
+    assert SYNTHEVAL_PRESET["cls_acc"]["F1_type"] == "macro"

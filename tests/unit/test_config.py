@@ -470,12 +470,14 @@ class TestValidate:
 
     def test_binary_target_enabled_without_classes_raises(self):
         cfg = self._base_valid()
+        cfg.evaluation.class_averaging = "binary"
         cfg.evaluation.binary_target.enabled = True
         with pytest.raises(ValueError, match="binary_target"):
             _validate(cfg)
 
     def test_binary_target_enabled_with_only_positive_raises(self):
         cfg = self._base_valid()
+        cfg.evaluation.class_averaging = "binary"
         cfg.evaluation.binary_target.enabled = True
         cfg.evaluation.binary_target.positive_classes = [0, 1]
         with pytest.raises(ValueError, match="binary_target"):
@@ -483,6 +485,7 @@ class TestValidate:
 
     def test_binary_target_overlapping_classes_raises(self):
         cfg = self._base_valid()
+        cfg.evaluation.class_averaging = "binary"
         cfg.evaluation.binary_target.enabled = True
         cfg.evaluation.binary_target.positive_classes = [0, 1]
         cfg.evaluation.binary_target.negative_classes = [1, 2]
@@ -491,10 +494,42 @@ class TestValidate:
 
     def test_binary_target_valid_config_passes(self):
         cfg = self._base_valid()
+        cfg.evaluation.class_averaging = "binary"
         cfg.evaluation.binary_target.enabled = True
         cfg.evaluation.binary_target.positive_classes = [0, 1]
         cfg.evaluation.binary_target.negative_classes = [2]
         _validate(cfg)  # should not raise
+
+    def test_class_averaging_defaults_to_ovr_macro(self):
+        cfg = self._base_valid()
+        assert cfg.evaluation.class_averaging == "ovr_macro"
+        _validate(cfg)
+
+    def test_unknown_class_averaging_raises(self):
+        cfg = self._base_valid()
+        cfg.evaluation.class_averaging = "micro"
+        with pytest.raises(ValueError, match="class_averaging"):
+            _validate(cfg)
+
+    def test_binary_averaging_without_the_collapse_raises(self):
+        cfg = self._base_valid()
+        cfg.evaluation.class_averaging = "binary"
+        with pytest.raises(ValueError, match="class_averaging"):
+            _validate(cfg)
+
+    def test_collapse_with_ovr_macro_averaging_raises(self):
+        cfg = self._base_valid()
+        cfg.evaluation.binary_target.enabled = True
+        cfg.evaluation.binary_target.positive_classes = [0, 1]
+        cfg.evaluation.binary_target.negative_classes = [2]
+        with pytest.raises(ValueError, match="class_averaging"):
+            _validate(cfg)
+
+    def test_zero_tstr_seeds_raise(self):
+        cfg = self._base_valid()
+        cfg.evaluation.tstr_seeds = 0
+        with pytest.raises(ValueError, match="tstr_seeds"):
+            _validate(cfg)
 
     @pytest.mark.parametrize("value", [0, -1, 1.5])
     def test_non_positive_replicates_raise(self, value):
