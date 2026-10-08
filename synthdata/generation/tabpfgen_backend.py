@@ -10,6 +10,7 @@ import numpy as np
 import optuna
 import pandas as pd
 import torch
+from sklearn.neighbors import NearestNeighbors
 from tabpfgen import TabPFGen
 
 from synthdata.data import decode_label_encoded_columns, label_encode_non_numeric_columns
@@ -17,6 +18,9 @@ from synthdata.generation.hpo import TrialScore, score_candidate
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
+
+#: SGLD steps searched per trial, as (low, high, step); hpo.epoch_ranges overrides it.
+SGLD_STEP_RANGE = (100, 2000, 100)
 
 
 class TabPFGenSGLDLabels(TabPFGen):
@@ -66,8 +70,9 @@ class TabPFGenSGLDLabels(TabPFGen):
         # SGLD may drift samples across class boundaries, so this reflects final
         # positions rather than initialization assignments.
         x_synth_np = x_synth.detach().cpu().numpy()
-        sq_dists = np.sum((x_synth_np[:, None, :] - x_scaled[None, :, :]) ** 2, axis=-1)
-        nn_indices = np.argmin(sq_dists, axis=1)
+        # scikit-learn's search; a broadcast distance matrix needs
+        # n_synth x n_train x n_features floats (about 200 GB on the sim data).
+        nn_indices = NearestNeighbors(n_neighbors=1).fit(x_scaled).kneighbors(x_synth_np)[1][:, 0]
         y_synth_drifted = y_train[nn_indices]
 
         n_relabelled = int((y_synth_drifted != y_synth.cpu().numpy()).sum())
@@ -191,7 +196,7 @@ def build_tabpfgen_standard_objective(
     categorical_columns: list,
     target_column: str,
     n_samples: int,
-    sgld_step_cap: int,
+    sgld_steps: tuple[int, int, int],
     eval_fn: Callable[[pd.DataFrame], TrialScore],
 ):
     """Optuna objective searching TabPFGen's SGLD hyperparameters (standard variant)."""
@@ -206,7 +211,8 @@ def build_tabpfgen_standard_objective(
     y_label = train_imputed_df[target_column].values
 
     def objective(trial: optuna.Trial) -> float:
-        n_steps = min(trial.suggest_int("n_sgld_steps", 100, 2000, step=100), sgld_step_cap)
+        low, high, step = sgld_steps
+        n_steps = trial.suggest_int("n_sgld_steps", low, high, step=step)
         step_size = trial.suggest_float("sgld_step_size", 0.001, 0.1, log=True)
         noise_scale = trial.suggest_float("sgld_noise_scale", 0.001, 0.5, log=True)
         try:
@@ -236,7 +242,7 @@ def build_tabpfgen_custom_objective(
     categorical_columns: list,
     target_column: str,
     n_samples: int,
-    sgld_step_cap: int,
+    sgld_steps: tuple[int, int, int],
     eval_fn: Callable[[pd.DataFrame], TrialScore],
     seed: int = 42,
 ):
@@ -251,7 +257,8 @@ def build_tabpfgen_custom_objective(
     proportions = train_imputed_df[target_column].value_counts(normalize=True)
 
     def objective(trial: optuna.Trial) -> float:
-        n_steps = min(trial.suggest_int("n_sgld_steps", 100, 2000, step=100), sgld_step_cap)
+        low, high, step = sgld_steps
+        n_steps = trial.suggest_int("n_sgld_steps", low, high, step=step)
         step_size = trial.suggest_float("sgld_step_size", 0.001, 0.1, log=True)
         noise_scale = trial.suggest_float("sgld_noise_scale", 0.001, 0.5, log=True)
         try:

@@ -454,6 +454,31 @@ def cleanup_hpo_generator_checkpoints(
     return len(to_delete)
 
 
+def model_budget(hpo_cfg: HPOConfig, model: str) -> tuple[int, int | None]:
+    """``(n_trials, timeout_seconds)`` for ``model``'s study, per-model values first."""
+    return (
+        hpo_cfg.n_trials_per_model.get(model, hpo_cfg.n_trials),
+        hpo_cfg.timeout_seconds_per_model.get(model, hpo_cfg.timeout_seconds),
+    )
+
+
+def epoch_range(
+    hpo_cfg: HPOConfig, model: str, default: tuple | None
+) -> tuple[int, int, int] | None:
+    """Searched training length ``(low, high, step)``: the config's, else ``default``."""
+    bounds = hpo_cfg.epoch_ranges.get(model, default)
+    return tuple(bounds) if bounds is not None else None
+
+
+def make_pruner(hpo_cfg: HPOConfig) -> optuna.pruners.BasePruner:
+    if hpo_cfg.pruner == "median":
+        return optuna.pruners.MedianPruner(
+            n_startup_trials=hpo_cfg.pruner_startup_trials,
+            n_warmup_steps=hpo_cfg.pruner_warmup_steps,
+        )
+    return optuna.pruners.NopPruner()
+
+
 def create_study(
     study_name: str, hpo_cfg: HPOConfig, output_dir: str | Path, seed: int
 ) -> optuna.Study:
@@ -468,6 +493,9 @@ def create_study(
         # Constrained TPE (Watanabe & Hutter, 2023): infeasible trials keep
         # their true value and teach the sampler where screens fail.
         sampler=sampler,
+        # Pruning stops weak trials during training, from the intermediate
+        # scores an objective reports (see synthcity_backend.PruningPatienceMetric).
+        pruner=make_pruner(hpo_cfg),
         storage=storage,
         load_if_exists=True,
     )
@@ -479,15 +507,17 @@ def run_study(
     hpo_cfg: HPOConfig,
     output_dir: str | Path,
     seed: int,
-    drop_keys: tuple = ("n_iter",),
+    drop_keys: tuple = (),
     checkpoint_workspace: str | Path | None = None,
     checkpoint_plugin: str | None = None,
+    model: str | None = None,
 ) -> dict:
     """Run (or resume, via SQLite storage) an Optuna study; return best params.
 
-    ``drop_keys`` are removed from the returned best-params dict: e.g. ``n_iter``
-    is capped during search for speed, so the searched value is unreliable and
-    generation should fall back to the plugin's own default instead.
+    The trial count and timeout come from ``model_budget`` for ``model``
+    (default: ``study_name`` without its ``hpo_`` prefix); 0 trials skips the
+    search and returns ``{}``. Pruned trials count towards the trial budget.
+    ``drop_keys`` are removed from the returned best-params dict.
 
     When both checkpoint arguments are provided, synthcity HPO studies with no
     running trial retain only their best and latest generator caches. Studies
@@ -497,22 +527,28 @@ def run_study(
     if (checkpoint_workspace is None) != (checkpoint_plugin is None):
         raise ValueError("checkpoint_workspace and checkpoint_plugin must be provided together")
 
+    n_trials, timeout = model_budget(hpo_cfg, model or study_name.removeprefix("hpo_"))
+    if n_trials == 0:
+        logger.info("[%s] hyperparameter search skipped (0 trials); using defaults", study_name)
+        return {}
     study = create_study(study_name, hpo_cfg, output_dir, seed)
-    n_done = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
-    n_remaining = max(hpo_cfg.n_trials - n_done, 0)
+    finished = (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)
+    n_done = len([t for t in study.trials if t.state in finished])
+    n_remaining = max(n_trials - n_done, 0)
     if n_remaining > 0:
         logger.info(
             "[%s] starting hyperparameter optimization: %d trial(s) remaining "
-            "(%d already completed, target=%d)",
+            "(%d already finished, target=%d, timeout=%ss)",
             study_name,
             n_remaining,
             n_done,
-            hpo_cfg.n_trials,
+            n_trials,
+            timeout,
         )
         study.optimize(
             objective_fn,
             n_trials=n_remaining,
-            timeout=hpo_cfg.timeout_seconds,
+            timeout=timeout,
             # A crashed fit or a non-finite score marks the trial failed.
             catch=(ValueError, RuntimeError),
             show_progress_bar=False,

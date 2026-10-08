@@ -218,10 +218,8 @@ def test_hpo_studies_ran_and_recorded_best_params(pipeline_run):
         complete = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
         assert len(complete) == pipeline_run.cfg.generation.hpo.n_trials, model
         assert all(math.isfinite(t.value) for t in complete), model
-        # n_iter is capped by hpo.n_iter_cap during the search and replaced by
-        # final_n_iter_override for the refit, so it is not carried over.
-        searched = {k: v for k, v in study.best_params.items() if k != "n_iter"}
-        assert searched == best["synthcity"][model], model
+        # Training length is searched like any other hyperparameter and kept.
+        assert study.best_params == best["synthcity"][model], model
 
 
 def test_experiment_manifest_records_each_stage(pipeline_run):

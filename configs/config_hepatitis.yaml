@@ -88,9 +88,12 @@ generation:
     enabled: true
     n_trials: 10
     timeout_seconds: 600
-    n_iter_cap: 300
-    model_iter_caps: { pategan: 5 }
-    sgld_step_cap: 500
+    # Training length searched per model, [low, high, step]: shortened from the
+    # libraries' ranges to keep this small CPU demo quick.
+    epoch_ranges:
+      { ctgan: [100, 300, 100], adsgan: [100, 300, 100], pategan: [1, 5, 1],
+        tabpfgen_standard: [100, 500, 100], tabpfgen_custom: [100, 500, 100] }
+    pruner: median
     # Objective scored on the tuning split: tstr_macro_f1 (fixed XGBoost
     # trained on synthetic, tested on real), tstr_macro_auprc, or the older
     # synthcity_composite (uses metric_config below, privacy included).

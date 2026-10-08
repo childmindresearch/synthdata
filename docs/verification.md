@@ -25,11 +25,11 @@ IDs such as SC-05 or SE-12 refer to the evaluation audit of 2026-10-07. Referenc
 
 | Generator | Reference | Status | Notes |
 | --- | --- | --- | --- |
-| ctgan | Xu et al. 2019; synthcity plugin | Verified | Unmodified plugin; HPO over synthcity's own search space. |
+| ctgan | Xu et al. 2019; synthcity plugin | Verified | Unmodified plugin; HPO over synthcity's own search space, epochs (`n_iter`, 100-1000) included. Optuna's MedianPruner reads synthcity's own early-stopping metric (MLP detection, every 50 epochs) through the plugin's `patience_metric` argument. |
 | tvae | Xu et al. 2019; synthcity plugin | Verified | Unmodified plugin. |
 | rtvae | Akrami et al. 2020; synthcity plugin | Verified | Unmodified plugin. |
-| adsgan | Yoon et al. 2020; synthcity plugin | Verified | Unmodified plugin. |
-| pategan | Jordon et al. 2019; synthcity plugin | Deviation | Unmodified plugin, but HPO caps its iterations (`model_iter_caps: {pategan: 5}` for hepatitis, 30 for LORIS) because each iteration trains a teacher ensemble. Its differential-privacy budget is the plugin default (epsilon 1); the pipeline does not report the privacy actually spent. |
+| adsgan | Yoon et al. 2020; synthcity plugin | Deviation | Unmodified plugin, but synthcity's search space leaves out `n_iter` (default 10000 with early stopping), so HPO searches CTGAN's range, 100-1000 epochs (`EPOCH_RANGE_DEFAULTS`). Pruned like ctgan. |
+| pategan | Jordon et al. 2019; synthcity plugin | Deviation | Unmodified plugin, but configs narrow its searched iterations (`hpo.epoch_ranges.pategan`) from synthcity's 1-500 because each iteration trains a teacher ensemble; see the profiling table in the HPO budgets section. Not pruned (no per-iteration hook). Its differential-privacy budget is the plugin default (epsilon 1); the pipeline does not report the privacy actually spent. |
 | ddpm | Kotelnikov et al. 2023 (TabDDPM); synthcity plugin | Verified | Unmodified plugin; fork fixes only a device error when the benchmark serialises it. |
 | bayesian_network | synthcity plugin on pgmpy | Deviation | HPO searches `tree_search` structure learning only: pgmpy's PC and hill climbing are not deterministic even with every seed fixed, which broke reproducibility. |
 | marginals baseline | synthcity `marginal_distributions` | Verified | Independent per-column sampling; a reference row that is never recommended. |
@@ -60,6 +60,25 @@ IDs such as SC-05 or SE-12 refer to the evaluation audit of 2026-10-07. Referenc
 | TRTR ceiling (logged) | same classifier on real search-train rows | Verified | Logged once per run and stored on every trial as `trtr_macro_f1` / `trtr_macro_auprc`. |
 | class-prior matching | none (sanity rule) | Deviation | Every candidate and every saved synthetic dataset is resampled to the real train class shares, keeping its size (without replacement while a class has enough rows). Stops a generator from raising macro-F1 by rebalancing classes. A class the generator never produced cannot be added; the screens reject such trials. |
 | screens as constraints | Optuna `TPESampler(constraints_func=...)`; Watanabe & Hutter, IJCAI 2023 | Verified | Copies (exact-match rate vs search-train at most the tuning rows' rate + 0.02), every target class present, coverage of train categories with at least 1% frequency at least 0.9 per categorical column, numeric values outside the train range at most 1 point above the tuning rows' share (fresh real rows fall outside too, about 2/n per column). Infeasible trials keep their value but can't be best; crashed trials are marked failed. If no trial is feasible the model keeps its default settings. |
+
+### HPO budgets
+
+Training length is a searched hyperparameter (synthcity's own `n_iter` range, or `hpo.epoch_ranges`), not a hard cap, so the tuned model is refitted with the epochs it was scored with. Optuna's `MedianPruner` (`hpo.pruner: median`) stops a CTGAN or ADS-GAN trial whose early-stopping score (synthcity's MLP detection, checked every 50 epochs) falls below the median of earlier trials at the same check; TVAE, RTVAE, PATE-GAN and TabPFGen have no per-epoch hook and run to the end. Pruned trials count towards a model's trial budget.
+
+Budgets come from one timed trial per model (fit on search-train, generate 2500 rows, score on tuning) on sim 1.2 with an RTX 5070 Ti, 2026-10-08. Imputation was median/mode for the timing only; it does not change fit time.
+
+| Model | Timed fit | Time per epoch | Configured range | Trials | Timeout |
+| --- | --- | --- | --- | --- | --- |
+| ctgan | 50 epochs, 1028 s | 20.5 s | 25-150 epochs | 40 | 30 h |
+| tvae | 50 epochs, 983 s | 19.6 s | 25-150 epochs | 40 | 28.6 h |
+| adsgan | 50 epochs, 953 s | 19.0 s | 25-150 epochs | 40 | 27.8 h |
+| rtvae | 50 epochs, 1056 s | 21.1 s | 25-150 epochs | 40 | 30.8 h |
+| pategan | 10 iterations, 267 s | 26.3 s | 5-30 iterations | 40 | 7.8 h |
+| tabpfgen_standard | 1000 SGLD steps, 35 s | | 100-2000 steps | 25 | 23 min |
+| tabpfgen_custom | 1000 SGLD steps, 31 s | | 100-2000 steps | 25 | 20 min |
+| tabpfn_standard | | | nothing to tune | 0 | |
+
+The synthcity epochs are CPU-bound at this width (GPU near idle, about 560% CPU): their per-column output activations and losses run in Python loops. Larger batch sizes, which the search space includes, shorten an epoch.
 
 ## Column roles
 
