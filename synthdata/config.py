@@ -445,6 +445,11 @@ class HPOConstraintsConfig:
     #: [min, max] range may exceed the same share for the real tuning rows by
     #: at most this.
     max_out_of_range: float | None = 0.01
+    #: Class shortfall (with ``generation.match_class_prior``): the total
+    #: variation distance between the candidate's class shares and the
+    #: search-train shares may be at most this. Candidates are drawn to those
+    #: shares, so a gap means a class fell short of its quota.
+    max_class_share_gap: float | None = 0.02
 
 
 @dataclasses.dataclass
@@ -522,9 +527,9 @@ class HPOConfig:
 class GenerationConfig:
     """Which generators run, how many rows they produce, and their HPO."""
 
-    #: Synthetic rows produced per model (before ``match_class_prior``
-    #: resampling, which keeps the size). Matching the real train size makes
-    #: utility and privacy scores easier to compare with the real data.
+    #: Synthetic rows produced per model (fewer if ``match_class_prior`` leaves
+    #: a class short). Matching the real train size makes utility and privacy
+    #: scores easier to compare with the real data.
     n_samples: int = 200
     #: Times each model is fitted and sampled, with seeds seed, seed+1, ...
     #: Replicate r > 0 is saved as "<model>__rep<r>". With 2 or more, the
@@ -545,10 +550,14 @@ class GenerationConfig:
     tabpfgen: TabPFGenConfig = dataclasses.field(default_factory=TabPFGenConfig)
     #: Hyperparameter search (see HPOConfig).
     hpo: HPOConfig = dataclasses.field(default_factory=HPOConfig)
-    #: Resample every synthetic dataset (and every HPO candidate) to the real
-    #: train class shares of a categorical target, keeping its size. Without
-    #: it, a generator that over-produces minority classes raises macro-F1
-    #: without being more faithful.
+    #: Draw every synthetic dataset (and every HPO candidate) to the real train
+    #: class shares of a categorical target: each class gets its share of
+    #: ``n_samples`` rows, by conditional sampling where the model conditions
+    #: on the label (ddpm) and rejection sampling otherwise, as SDV's
+    #: conditional sampling does. Rows are never repeated; a class still short
+    #: after 10 batches stays short and is recorded in ``diagnostics/class_sampling.csv``.
+    #: Without it, a generator that over-produces minority classes raises
+    #: macro-F1 without being more faithful.
     match_class_prior: bool = True
 
 

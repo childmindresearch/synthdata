@@ -9,6 +9,7 @@ import pandas as pd
 import torch
 
 from synthdata.config import HPOConfig
+from synthdata.generation import class_quota
 from synthdata.generation.hpo import TrialScore, epoch_range, score_candidate
 from synthdata.utils import get_logger
 
@@ -162,7 +163,16 @@ def fit_generate(
     workspace: str | None = None,
     device: str | None = None,
     classification: bool = False,
+    class_prior: pd.Series | None = None,
 ) -> pd.DataFrame:
+    """Fit plugin ``name`` on ``train_loader`` and generate ``n_samples`` rows.
+
+    With ``class_prior`` (class shares of the fit data), rows are drawn per
+    class to those shares (see :mod:`synthdata.generation.class_quota`):
+    ddpm on a categorical target is given the labels, other plugins are
+    rejection-sampled. The :class:`ClassSamplingReport` is attached as
+    ``df.attrs["class_sampling"]``.
+    """
     from synthcity.plugins import Plugins
 
     plugin_kwargs = dict(params)
@@ -181,7 +191,30 @@ def fit_generate(
 
     model = Plugins().get(name, **plugin_kwargs)
     model.fit(train_loader)
-    return model.generate(count=n_samples, random_state=random_state).dataframe()
+    if class_prior is None:
+        return model.generate(count=n_samples, random_state=random_state).dataframe()
+
+    target = train_loader.target_column
+    encoder = (model._data_encoders or {}).get(target)
+
+    def sample(count, seed, labels):
+        kwargs = {}
+        if labels is not None:
+            # The plugin conditions on its label-encoded target (Plugin.fit
+            # encodes it); generate() decodes the output again.
+            kwargs["cond"] = encoder.transform(labels) if encoder is not None else labels
+        return model.generate(count=count, random_state=seed, **kwargs).dataframe()
+
+    df, report = class_quota.sample_to_quota(
+        sample,
+        target,
+        class_prior,
+        n_samples,
+        random_state,
+        conditional=bool(plugin_kwargs.get("is_classification")),
+    )
+    df.attrs["class_sampling"] = report
+    return df
 
 
 def build_synthcity_objective(
@@ -194,6 +227,7 @@ def build_synthcity_objective(
     workspace: str | None = None,
     device: str = "cpu",
     classification: bool = False,
+    class_prior: pd.Series | None = None,
 ):
     """Build an Optuna objective for a synthcity plugin's native hyperparameter space.
 
@@ -201,7 +235,8 @@ def build_synthcity_objective(
     (training length included, see ``hpo.epoch_ranges``), forces CPU for
     MPS (which lacks the float64 support synthcity's metrics need internally)
     but otherwise uses ``device``, fits the plugin on ``train_loader`` and
-    scores ``n_samples`` generated rows with ``eval_fn``.
+    scores ``n_samples`` generated rows with ``eval_fn``, drawn to the
+    ``class_prior`` class shares when given.
     ``eval_fn`` compares against the tuning split, so the search never sees
     the test split.
     """
@@ -238,6 +273,7 @@ def build_synthcity_objective(
             seed,
             workspace=workspace,
             classification=classification,
+            class_prior=class_prior,
         )
         return score_candidate(trial, eval_fn, synthetic)
 

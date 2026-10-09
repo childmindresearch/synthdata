@@ -84,7 +84,7 @@ generation:
     # trained on synthetic, tested on real) or tstr_macro_auprc.
     objective: tstr_macro_f1
     # Lenient sanity screens; a trial that fails one can't be chosen as best.
-    constraints: { copy_margin: 0.02, min_category_coverage: 0.9, max_out_of_range: 0.01 }
+    constraints: { copy_margin: 0.02, min_category_coverage: 0.9, max_out_of_range: 0.01, max_class_share_gap: 0.02 }
     # Budget for models not listed per model below.
     n_trials: 50
     timeout_seconds: 14400

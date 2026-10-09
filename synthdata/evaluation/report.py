@@ -678,6 +678,11 @@ def _file_index_section(paths: _Paths, links: _Links, report_path: Path) -> str:
     )
     for name in ("hpo_best_params.json", "optuna_studies.db"):
         add(paths.generation / name)
+    add(
+        paths.generation / "diagnostics" / "class_sampling.csv",
+        "Rows wanted and kept per class and model, and each model's own class shares "
+        "(`generation.match_class_prior`).",
+    )
     if paths.manifest is not None:
         add(paths.manifest)
         add(paths.manifest.parent / "config_snapshot.json")

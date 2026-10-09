@@ -11,6 +11,7 @@ from synthdata.config import HPOConfig, HPOConstraintsConfig
 from synthdata.generation.hpo import (
     SCREENS,
     TrialScore,
+    _trial_constraints,
     build_hpo_eval_fn,
     default_best_params_path,
     default_storage_url,
@@ -166,6 +167,28 @@ def test_tstr_objective_scores_tuning_and_logs_the_ceiling():
     assert len(good.constraints) == len(SCREENS)
 
 
+def test_class_share_gap_screen_fails_a_candidate_left_short_of_a_class():
+    train, tuning = _real(seed=0), _real(seed=1)
+    cfg = HPOConfig(tstr_seeds=1)
+    short = train.drop(train.index[train.target == 2][::2])
+    gap = SCREENS.index("class_share_gap")
+
+    matched = build_hpo_eval_fn(train, tuning, "target", ["color"], ["color"], True, [], cfg, 0)
+    assert matched(train).constraints[gap] == pytest.approx(-0.02)
+    assert matched(short).constraints[gap] > 0
+    unmatched = build_hpo_eval_fn(
+        train, tuning, "target", ["color"], ["color"], True, [], cfg, 0, match_prior=False
+    )
+    assert unmatched(short).constraints[gap] == -1.0
+
+
+def test_trials_stored_before_a_screen_was_added_stay_comparable():
+    trial = optuna.trial.create_trial(
+        value=0.5, user_attrs={"constraints": [-1.0, -1.0, -1.0, -1.0]}
+    )
+    assert _trial_constraints(trial) == [-1.0] * 4 + [0.0] * (len(SCREENS) - 4)
+
+
 def test_auprc_objective_is_a_config_switch():
     train, tuning = _real(seed=0), _real(seed=1)
     cfg = HPOConfig(objective="tstr_macro_auprc", tstr_seeds=1)
@@ -183,7 +206,8 @@ def test_tstr_objective_needs_a_categorical_target():
 
 def test_best_params_come_from_feasible_trials_only(tmp_path):
     # Trial 0 scores highest but fails a screen; trial 2 is the best feasible one.
-    outcomes = [(0.9, [1.0, -1.0, -1.0, -1.0]), (0.5, [-1.0] * 4), (0.7, [-1.0] * 4)]
+    feasible = [-1.0] * len(SCREENS)
+    outcomes = [(0.9, [1.0] + feasible[1:]), (0.5, feasible), (0.7, feasible)]
 
     def objective(trial):
         trial.suggest_float("p", 0, 1)

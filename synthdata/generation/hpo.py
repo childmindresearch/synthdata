@@ -28,7 +28,7 @@ import optuna
 import pandas as pd
 
 from synthdata.config import HPOConfig, HPOConstraintsConfig
-from synthdata.evaluation.tstr import match_class_prior, tstr_scores
+from synthdata.evaluation.tstr import tstr_scores
 from synthdata.utils import ensure_dir, get_logger, load_json, save_json
 
 logger = get_logger(__name__)
@@ -96,7 +96,7 @@ def build_synthetic_eval_fn(
 
 
 #: Constraint order stored on every trial; a value above 0 marks it infeasible.
-SCREENS = ("copies", "missing_classes", "category_coverage", "out_of_range")
+SCREENS = ("copies", "missing_classes", "category_coverage", "out_of_range", "class_share_gap")
 
 #: Categories rarer than this in train are not required in the synthetic data.
 MIN_CATEGORY_FREQUENCY = 0.01
@@ -168,6 +168,7 @@ def screen_violations(
     - ``out_of_range``: share of numeric values outside the search-train
       range, minus that share for the real tuning rows (fresh real rows fall
       outside too, about 2/n per column), minus ``max_out_of_range``.
+    - ``class_share_gap`` is set by :func:`build_hpo_eval_fn`, not here.
 
     A screen turned off in the config reports -1.
     """
@@ -217,6 +218,16 @@ def screen_violations(
     return violations
 
 
+def class_share_gap(labels: pd.Series, prior: pd.Series) -> float:
+    """Total variation distance between the class shares of ``labels`` and ``prior``."""
+    shares = labels.value_counts(normalize=True)
+    classes = prior.index.union(shares.index)
+    return float(
+        (shares.reindex(classes, fill_value=0) - prior.reindex(classes, fill_value=0)).abs().sum()
+        / 2
+    )
+
+
 def build_hpo_eval_fn(
     search_train_df: pd.DataFrame,
     tuning_df: pd.DataFrame,
@@ -233,9 +244,10 @@ def build_hpo_eval_fn(
     """Build a ``synthetic_df -> TrialScore`` function scored on the tuning split.
 
     Candidates are fitted on ``search_train_df`` and never see the tuning or
-    test rows. Before scoring, a candidate with a categorical target is
-    resampled to the search-train class shares (``match_prior``), the same
-    rule generation applies to every released dataset. The TSTR scores of the
+    test rows. With ``match_prior``, candidates are drawn to the search-train
+    class shares (see :mod:`synthdata.generation.class_quota`), and the
+    ``class_share_gap`` screen fails one whose shares still miss them by more
+    than ``max_class_share_gap`` because a class fell short. The TSTR scores of the
     same classifier trained on the real search-train rows (TRTR) are the
     ceiling, logged on every trial.
     """
@@ -276,7 +288,6 @@ def build_hpo_eval_fn(
     )
 
     def eval_fn(synthetic_df: pd.DataFrame) -> TrialScore:
-        # Class presence is screened before resampling, which can't create a class.
         violations = screen_violations(
             synthetic_df,
             search_train_df,
@@ -287,10 +298,13 @@ def build_hpo_eval_fn(
         )
         if not target_is_categorical:
             violations["missing_classes"] = -1.0
+        elif match_prior and hpo_cfg.constraints.max_class_share_gap is not None:
+            violations["class_share_gap"] = (
+                class_share_gap(synthetic_df[target_column], prior)
+                - hpo_cfg.constraints.max_class_share_gap
+            )
         attrs = {"screens": violations}
         if target_is_categorical:
-            if match_prior:
-                synthetic_df = match_class_prior(synthetic_df, target_column, prior, seed)
             scores = _tstr(synthetic_df)
             attrs |= {
                 "tstr_macro_f1": scores.macro_f1,
@@ -324,7 +338,9 @@ def score_candidate(
 
 def _trial_constraints(trial: optuna.trial.FrozenTrial) -> list:
     # Trials stopped before scoring have no screens; they are never "best".
-    return trial.user_attrs.get("constraints", [0.0] * len(SCREENS))
+    # Trials stored before a screen was added get 0 (feasible) for it.
+    constraints = list(trial.user_attrs.get("constraints", []))
+    return constraints + [0.0] * (len(SCREENS) - len(constraints))
 
 
 def default_storage_url(output_dir: str | Path) -> str:
