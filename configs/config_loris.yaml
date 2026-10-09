@@ -58,7 +58,7 @@ generation:
   output_dir: output/loris/synthetic_data
   n_samples: 2500
   # Seed replicates per model; 2+ gives every score a 95% interval.
-  n_replicates: 1
+  n_replicates: 3 # The run you report needs intervals; HPO runs once, only final fits repeat.
 
   synthcity:
     enabled: true
