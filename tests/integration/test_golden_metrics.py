@@ -13,7 +13,9 @@ between CPUs and library builds, hence the tolerances. Torch-trained
 generators and metrics (CTGAN, synthcity's MLP and OneClass embedding) differ
 far more between CPU and CUDA or between operating systems, so each platform
 and device keeps its own reference; on one without a reference the test is
-skipped until one is recorded.
+skipped until one is recorded. The canonical reference is Linux with an NVIDIA
+GPU (``baseline_run_linux_cuda.csv``), where the pipeline is meant to run;
+``baseline_run_linux_cpu.csv`` is kept for machines without a GPU.
 
     uv run --with catboost==1.2.10 pytest tests/integration -m regression
 

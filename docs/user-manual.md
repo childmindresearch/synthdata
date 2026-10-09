@@ -444,7 +444,7 @@ After updating dependencies or the synthcity and SynthEval submodules, run the g
 uv run --with catboost==1.2.10 pytest tests/integration -m regression
 ```
 
-Each operating system and device (CPU or CUDA) keeps its own reference, because torch-trained generators and metrics give different numbers on each; on a machine without one the test is skipped, so record one on a known-good commit with `SYNTHDATA_UPDATE_GOLDEN=1` in front of the same command. If a later change is intended, rewrite the reference the same way and commit it with the change. To compare two runs on your own data, put their `combined_evaluation.csv` files side by side.
+Each operating system and device (CPU or CUDA) keeps its own reference, because torch-trained generators and metrics give different numbers on each. The repository keeps two: Linux with an NVIDIA GPU (the canonical one) and Linux CPU. On a machine without a reference the test is skipped, so record one on a known-good commit with `SYNTHDATA_UPDATE_GOLDEN=1` in front of the same command. If a later change is intended, rewrite the reference the same way and commit it with the change. To compare two runs on your own data, put their `combined_evaluation.csv` files side by side.
 
 ## 12. Setting up your own dataset
 
