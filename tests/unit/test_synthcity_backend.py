@@ -6,6 +6,7 @@ import pytest
 from synthdata.generation.synthcity_backend import (
     HPO_EXCLUDED_CHOICES,
     HPO_FIXED_PARAMS,
+    HPO_PARAM_RANGES,
     _SearchSpaceTrial,
     get_plugin_class,
 )
@@ -22,7 +23,10 @@ def _sampled(name: str, n_trials: int) -> list[dict]:
         sampled.append(
             plugin_cls.sample_hyperparameters_optuna(
                 _SearchSpaceTrial(
-                    trial, HPO_EXCLUDED_CHOICES.get(name), fixed=HPO_FIXED_PARAMS.get(name)
+                    trial,
+                    HPO_EXCLUDED_CHOICES.get(name),
+                    fixed=HPO_FIXED_PARAMS.get(name),
+                    ranges=HPO_PARAM_RANGES.get(name),
                 )
             )
         )
@@ -50,7 +54,9 @@ def test_arf_search_holds_delta_at_zero_and_fits():
 
     sampled = _sampled("arf", 20)
     assert {params["delta"] for params in sampled} == {0}
-    assert len({params["num_trees"] for params in sampled}) > 1
+    assert {params["early_stop"] for params in sampled} == {True}
+    trees = {params["num_trees"] for params in sampled}
+    assert len(trees) > 1 and trees <= {10, 20, 30, 40, 50}
 
     rng = np.random.default_rng(0)
     df = pd.DataFrame({"x": rng.normal(size=60), "c": rng.integers(0, 3, 60)})
@@ -62,6 +68,21 @@ def test_arf_search_holds_delta_at_zero_and_fits():
     # A declared-continuous column with few distinct values stays continuous.
     syn = fit_generate("arf", params, loader, 30, random_state=1, discrete_columns=["y"])
     assert syn.shape == (30, 3)
+
+
+def test_pategan_search_holds_gan_epochs_per_round():
+    pytest.importorskip("synthcity.plugins")
+    sampled = _sampled("pategan", 10)
+    assert {params["generator_n_iter"] for params in sampled} == {10}
+
+
+def test_ranges_narrow_an_integer_search():
+    study = optuna.create_study(sampler=optuna.samplers.RandomSampler(seed=0))
+    values = set()
+    for _ in range(20):
+        proxy = _SearchSpaceTrial(study.ask(), ranges={"k": (10, 30, 10)})
+        values.add(proxy.suggest_int("k", 10, 100, 10))
+    assert values <= {10, 20, 30} and len(values) > 1
 
 
 def test_fixed_params_skip_the_search():

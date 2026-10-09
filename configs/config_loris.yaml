@@ -89,26 +89,30 @@ generation:
     n_trials: 50
     timeout_seconds: 14400
     # Per-model budgets measured on the simulated data (configs/config_sim.yaml);
-    # re-profile on LORIS. From a GPU profiling run on sim 1.2 (search-train
-    # 12600 rows x 682 columns, RTX 5070 Ti, 2026-10-08). One synthcity epoch
-    # takes about 19-21 s at this width (26 s per PATE-GAN iteration).
+    # re-profile on LORIS. Per-model budgets from scripts/profile_hpo.py on sim 1.2
+    # (search-train 12597 rows x 682 columns), Linux box with an RTX PRO 5000
+    # and 24 CPUs, four model groups running at once, 2026-10-09. Seconds per
+    # epoch: CTGAN 30 (17-42 by batch size), TVAE 16, ADS-GAN 18, RTVAE 19,
+    # DDPM 3.1 (1.6-4.6), PATE-GAN 7-30 per GAN epoch.
     # Trials: about 10 random start-up trials plus 10 per tuned dimension,
     # capped for run time.
-    # Timeout = trials x mean trial time x 1.5.
-    # DDPM is not profiled yet and uses n_trials and timeout_seconds above.
-    # ARF (CPU only) is a provisional budget from one default fit (30 trees)
-    # at this width on a 4-core cloud machine, 2026-10-08: about 28 min;
-    # the search goes up to 100 trees. Re-profile on the run machine.
+    # Timeout = trials x (seconds per epoch x middle of the epoch range) x 1.5.
+    # PATE-GAN: each iteration trains the GAN for 10 epochs (generator_n_iter
+    # is held there, see HPO_FIXED_PARAMS), so 2-10 iterations are 20-100
+    # epochs; estimated, not yet timed with that fix.
+    # ARF (CPU only): early stopping held on and trees capped at 50; budget is
+    # provisional from one default fit (30 trees, about 28 min on a 4-core
+    # cloud machine, 2026-10-08) until re-timed.
     n_trials_per_model:
-      { ctgan: 40, tvae: 40, adsgan: 40, rtvae: 40, pategan: 40, arf: 25 }
+      { ctgan: 40, tvae: 40, adsgan: 40, rtvae: 40, pategan: 40, ddpm: 40, arf: 25 }
     timeout_seconds_per_model:
-      { ctgan: 108000, tvae: 103000, adsgan: 100000, rtvae: 111000, pategan: 28000,
-        arf: 112000 }
+      { ctgan: 155000, tvae: 85000, adsgan: 95500, rtvae: 99000, pategan: 67000,
+        ddpm: 103000, arf: 62000 }
     # Training length is searched, [low, high, step]. The libraries' ranges
     # (100-1000 epochs; PATE-GAN 1-500) would take 3+ hours per trial here.
     epoch_ranges:
       { ctgan: [25, 150, 25], tvae: [25, 150, 25], adsgan: [25, 150, 25],
-        rtvae: [25, 150, 25], pategan: [5, 30, 5], ddpm: [100, 1000, 100] }
+        rtvae: [25, 150, 25], pategan: [2, 10, 2], ddpm: [100, 1000, 100] }
     # Median pruning on synthcity's early-stopping metric (CTGAN, ADS-GAN).
     pruner: median
 
