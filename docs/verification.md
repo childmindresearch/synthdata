@@ -7,7 +7,7 @@ Every generator and metric the pipeline runs, checked against its paper or upstr
 - **Deviation**: differs from the reference on purpose; the reason is given.
 - **Open**: a known upstream problem we have not fixed; the impact on results is stated so you can judge how much to trust the number.
 
-IDs such as SC-05 or SE-12 refer to the evaluation audit of 2026-10-07. Reference tests live in `tests/unit/test_synthcity_reference_metrics.py`, `tests/unit/test_syntheval_reference_metrics.py` and `tests/unit/test_log_disparity_metrics.py`; the end-to-end ordering checks ("copy of train" vs "column shuffle") are in `tests/integration/test_metric_known_answers.py`.
+IDs such as SC-05 or SE-12 refer to the evaluation audit of 2026-10-07. Reference tests live in `tests/unit/test_synthcity_reference_metrics.py`, `tests/unit/test_syntheval_reference_metrics.py` and `tests/unit/test_log_disparity_metrics.py`; the end-to-end ordering checks ("copy of train" vs "column shuffle") are in `tests/integration/test_metric_known_answers.py`. Two checks keep this table true over time: every evaluation run tests that the two baselines land where they must on the real data (`checks.csv`, [user manual](user-manual.md#output-checks)), and the opt-in golden test (`pytest tests/integration -m regression`) flags any metric whose value on the fixture moves after a dependency or submodule bump.
 
 ## Versions checked
 
