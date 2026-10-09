@@ -1,7 +1,8 @@
 """Missing data imputation pipeline.
 
 Public API: :func:`run_imputation`, :func:`build_validation_report`,
-:func:`apply_rounding`, :func:`validate_imputed_column`.
+:func:`save_validation_report`, :func:`apply_rounding`,
+:func:`validate_imputed_column`.
 
 Two backends are available via ``imputation.method`` in the config:
 
@@ -18,6 +19,7 @@ from synthdata.imputation.pipeline import (
     apply_rounding,
     build_validation_report,
     run_imputation,
+    save_validation_report,
     validate_imputed_column,
 )
 
@@ -26,5 +28,6 @@ __all__ = [
     "build_validation_report",
     "run_imputation",
     "run_refidiff_benchmark",
+    "save_validation_report",
     "validate_imputed_column",
 ]

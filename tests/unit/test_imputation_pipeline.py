@@ -6,9 +6,9 @@ import logging
 import pandas as pd
 import pytest
 
+from synthdata.data import IMPUTATION_CACHE_KEY_FILENAME as _CACHE_KEY_FILENAME
 from synthdata.data import load_imputed_splits
 from synthdata.imputation.pipeline import (
-    _CACHE_KEY_FILENAME,
     _cache_key_payload,
     _cache_key_record,
     _load_cached_key,
@@ -227,7 +227,7 @@ class TestRunImputationCaching:
         )
         run_imputation(cfg, dataset)
         assert mock_impute.call_count == CALLS_PER_RUN
-        assert (dataset.data_dir / _CACHE_KEY_FILENAME).exists()
+        assert dataset.paths()["imputation_cache_key"].exists()
 
     def test_second_run_with_unchanged_config_reuses_cache(self, make_config, make_dataset, mocker):
         cfg = make_config()
@@ -315,6 +315,66 @@ class TestRunImputationCaching:
             side_effect=_fill_zero,
         )
         run_imputation(cfg, dataset)
-        (dataset.data_dir / _CACHE_KEY_FILENAME).write_text("{not valid json")
+        dataset.paths()["imputation_cache_key"].write_text("{not valid json")
         run_imputation(cfg, dataset)
         assert mock_impute.call_count == 2 * CALLS_PER_RUN
+
+
+class TestOutputLayout:
+    def test_imputed_csvs_go_to_the_final_run_folder(self, make_config, make_dataset, mocker):
+        cfg = make_config()
+        dataset = make_dataset()
+        mocker.patch(
+            "synthdata.imputation.tabimpute_backend.impute_dataframe", side_effect=_fill_zero
+        )
+        run_imputation(cfg, dataset)
+        final = dataset.data_dir / "imputation_final"
+        for name in ("full_imputed.csv", "train_imputed.csv", "test_imputed.csv"):
+            assert (final / name).exists(), name
+            assert not (dataset.data_dir / name).exists(), name
+        assert (final / _CACHE_KEY_FILENAME).exists()
+
+    def test_cache_in_the_old_flat_layout_is_moved_and_reused(
+        self, make_config, make_dataset, mocker
+    ):
+        cfg = make_config()
+        dataset = make_dataset()
+        mock_impute = mocker.patch(
+            "synthdata.imputation.tabimpute_backend.impute_dataframe", side_effect=_fill_zero
+        )
+        run_imputation(cfg, dataset)
+        final = dataset.data_dir / "imputation_final"
+        for path in list(final.iterdir()):
+            path.replace(dataset.data_dir / path.name)
+        final.rmdir()
+
+        reloaded = load_imputed_splits(make_dataset(name=dataset.name))
+        assert reloaded.train_imputed_df is not None
+        assert (final / "train_imputed.csv").exists()
+        assert not (dataset.data_dir / "train_imputed.csv").exists()
+        run_imputation(cfg, dataset)
+        assert mock_impute.call_count == CALLS_PER_RUN  # moved cache was reused
+
+    def test_validation_report_is_saved_and_only_summarised(
+        self, make_config, make_dataset, mocker, caplog
+    ):
+        from synthdata.experiment import imputation_output_dir
+        from synthdata.imputation import save_validation_report
+
+        cfg = make_config()
+        dataset = make_dataset()
+        mocker.patch(
+            "synthdata.imputation.tabimpute_backend.impute_dataframe", side_effect=_fill_zero
+        )
+        run_imputation(cfg, dataset)
+        pipeline_logger = logging.getLogger("synthdata.imputation.pipeline")
+        pipeline_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level("INFO"):
+                report = save_validation_report(cfg, dataset)
+        finally:
+            pipeline_logger.removeHandler(caplog.handler)
+        path = imputation_output_dir(cfg) / "imputation_validation_report.csv"
+        assert pd.read_csv(path)["column"].tolist() == report["column"].tolist()
+        assert "Full report:" in caplog.text
+        assert "obs_mean" not in caplog.text  # the table itself is not logged

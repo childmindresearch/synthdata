@@ -29,6 +29,20 @@ from synthdata.utils import ensure_dir, get_logger, git_commit
 logger = get_logger(__name__)
 
 IMPUTATION_CACHE_KEY_FILENAME = ".imputation_cache_key.json"
+#: Subfolders of ``data_dir`` for the two imputation runs (see :meth:`Dataset.paths`).
+IMPUTATION_INITIAL_DIRNAME = "imputation_initial"
+IMPUTATION_FINAL_DIRNAME = "imputation_final"
+#: Pre-subfolder cache files at the top of ``data_dir`` -> their key in :meth:`Dataset.paths`.
+_LEGACY_IMPUTATION_FILES = {
+    "search_imputed.csv": "search_imputed",
+    "full_imputed.csv": "full_imputed",
+    "train_imputed.csv": "train_imputed",
+    "test_imputed.csv": "test_imputed",
+    "full_imputed_decoded.csv": "full_imputed_decoded",
+    "train_imputed_decoded.csv": "train_imputed_decoded",
+    "test_imputed_decoded.csv": "test_imputed_decoded",
+    IMPUTATION_CACHE_KEY_FILENAME: "imputation_cache_key",
+}
 
 
 def dataframe_fingerprint(df: pd.DataFrame) -> str:
@@ -222,18 +236,29 @@ class Dataset:
         return self.categorical_columns
 
     def paths(self) -> dict:
+        """Where this dataset's CSVs live under :attr:`data_dir`.
+
+        The split CSVs sit at the top. Each imputation run gets its own folder:
+        ``imputation_initial/`` holds phase 1 (imputer fitted on the train rows
+        outside the tuning split, only written when HPO runs) and
+        ``imputation_final/`` holds phase 2 (imputer refitted on all train rows,
+        used by the final models and the holdout).
+        """
         d = self.data_dir
+        initial = d / IMPUTATION_INITIAL_DIRNAME
+        final = d / IMPUTATION_FINAL_DIRNAME
         return {
             "full": d / "full.csv",
             "train": d / "train.csv",
             "test": d / "test.csv",
-            "full_imputed": d / "full_imputed.csv",
-            "train_imputed": d / "train_imputed.csv",
-            "test_imputed": d / "test_imputed.csv",
-            "search_imputed": d / "search_imputed.csv",
-            "full_imputed_decoded": d / "full_imputed_decoded.csv",
-            "train_imputed_decoded": d / "train_imputed_decoded.csv",
-            "test_imputed_decoded": d / "test_imputed_decoded.csv",
+            "search_imputed": initial / "train_imputed.csv",
+            "full_imputed": final / "full_imputed.csv",
+            "train_imputed": final / "train_imputed.csv",
+            "test_imputed": final / "test_imputed.csv",
+            "full_imputed_decoded": final / "full_imputed_decoded.csv",
+            "train_imputed_decoded": final / "train_imputed_decoded.csv",
+            "test_imputed_decoded": final / "test_imputed_decoded.csv",
+            "imputation_cache_key": final / IMPUTATION_CACHE_KEY_FILENAME,
         }
 
     def attach_decoded_imputed_splits(self) -> None:
@@ -1272,8 +1297,34 @@ def load_dataset(cfg: Config) -> Dataset:
     return dataset
 
 
+def migrate_legacy_imputation_layout(dataset: Dataset) -> None:
+    """Move imputed CSVs cached before the per-run folders into those folders.
+
+    Earlier versions wrote every imputed CSV at the top of ``data_dir``. Moving
+    them (only where the new location is still empty) keeps an expensive cache
+    usable; the usual provenance checks then decide whether it is still valid.
+    """
+    paths = dataset.paths()
+    moved = []
+    for name, key in _LEGACY_IMPUTATION_FILES.items():
+        legacy, target = dataset.data_dir / name, paths[key]
+        if legacy.is_file() and not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            legacy.replace(target)
+            moved.append(name)
+    if moved:
+        logger.info(
+            "Moved imputed data cached in the old layout under %s into %s/ and %s/: %s",
+            dataset.data_dir,
+            IMPUTATION_INITIAL_DIRNAME,
+            IMPUTATION_FINAL_DIRNAME,
+            moved,
+        )
+
+
 def load_imputed_splits(dataset: Dataset) -> Dataset:
     """Attach imputed CSVs only when their source and split provenance still matches."""
+    migrate_legacy_imputation_layout(dataset)
     paths = dataset.paths()
     imputed_paths = {
         "full": paths["full_imputed"],
@@ -1283,7 +1334,7 @@ def load_imputed_splits(dataset: Dataset) -> Dataset:
     if not all(path.exists() for path in imputed_paths.values()):
         return dataset
 
-    provenance_path = dataset.data_dir / IMPUTATION_CACHE_KEY_FILENAME
+    provenance_path = paths["imputation_cache_key"]
     if not provenance_path.exists():
         logger.warning(
             "Ignoring imputed CSVs under %s because provenance file %s is missing; "

@@ -111,6 +111,9 @@ class _Paths:
             self.dataset_plots = self.plots / dataset_version_scope(cfg) / "dataset"
         data_dir = getattr(dataset, "data_dir", None)
         self.data = Path(data_dir) if data_dir else None
+        self.imputation = (
+            Path(cfg.generation.output_dir).parent / "imputation" / dataset_version_scope(cfg)
+        )
         manifest = getattr(experiment, "manifest_path", None)
         self.manifest = Path(manifest) if manifest else None
 
@@ -620,12 +623,14 @@ def _data_section(paths: _Paths, links: _Links) -> str:
     lines += links.plots(paths.dataset_plots / "imputation") or [
         "_Not rendered yet: run `synthdata-plot` with the `imputation` section._"
     ]
-    if paths.data is not None:
-        lines += [
-            "",
-            "Drift of each column between observed and imputed values: "
-            f"{links.maybe(paths.data / 'imputation_drift.csv')}",
-        ]
+    lines += [
+        "",
+        "Plausibility of each column's imputed values: "
+        f"{links.maybe(paths.imputation / 'imputation_validation_report.csv')}",
+        "",
+        "Drift of each column between the HPO-phase and final imputation: "
+        f"{links.maybe(paths.imputation / 'imputation_drift.csv')}",
+    ]
     lines += ["", "### Hyperparameter search", ""]
     lines.append(
         f"Best parameters per model: {links.maybe(paths.generation / 'hpo_best_params.json')}"
@@ -650,7 +655,8 @@ _FILE_DESCRIPTIONS = {
     "privacy_attacks.csv": "Every Anonymeter attack with interval and success rates.",
     "checks.csv": "Output sanity checks: pass or warn per model, with value and limit.",
     "split_report.csv": "Rows, patients and class balance of each split.",
-    "imputation_drift.csv": "Observed vs imputed distribution drift per column.",
+    "imputation_drift.csv": "Per-column drift between the HPO-phase and final imputation.",
+    "imputation_validation_report.csv": "Per-column check that imputed values are plausible.",
     "hpo_best_params.json": "Best hyperparameters found per model.",
     "optuna_studies.db": "Optuna studies (open with optuna-dashboard).",
     "manifest.json": "What each stage of this experiment ran and produced.",
@@ -658,8 +664,8 @@ _FILE_DESCRIPTIONS = {
     "full.csv": "Full dataset after cleaning.",
     "train.csv": "Training split (before imputation).",
     "test.csv": "Held-out test split (before imputation).",
-    "train_imputed.csv": "Training split after imputation (what generators learn from).",
-    "test_imputed.csv": "Test split after imputation (what evaluation scores against).",
+    "train_imputed.csv": "Training split after the final imputation (what generators learn from).",
+    "test_imputed.csv": "Test split after the final imputation (what evaluation scores against).",
 }
 
 
@@ -701,17 +707,13 @@ def _file_index_section(paths: _Paths, links: _Links, report_path: Path) -> str:
     if paths.manifest is not None:
         add(paths.manifest)
         add(paths.manifest.parent / "config_snapshot.json")
+    for name in ("imputation_validation_report.csv", "imputation_drift.csv"):
+        add(paths.imputation / name)
     if paths.data is not None:
-        for name in (
-            "split_report.csv",
-            "imputation_drift.csv",
-            "full.csv",
-            "train.csv",
-            "test.csv",
-            "train_imputed.csv",
-            "test_imputed.csv",
-        ):
+        for name in ("split_report.csv", "full.csv", "train.csv", "test.csv"):
             add(paths.data / name)
+        for name in ("train_imputed.csv", "test_imputed.csv"):
+            add(paths.data / "imputation_final" / name)
     add(paths.plots, "All plots of this experiment.")
     add(paths.dataset_plots, "Data and imputation plots (shared by every experiment).")
     return "\n".join(lines)
