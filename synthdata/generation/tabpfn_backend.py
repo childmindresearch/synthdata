@@ -254,11 +254,14 @@ def generate_tabpfn_standard(
 
     experiment, model_unsupervised = _make_experiment()
     logger.info(
-        "[tabpfn] standard experiment.run train_shape=%s n_samples=%d "
-        "categorical_columns=%s categorical_indices=%s target=%r target_kind=%s "
-        "schema_fingerprint=%s",
-        x.shape,
+        "[tabpfn] standard: %d rows x %d columns (%d categorical) -> %d synthetic rows",
+        *x.shape,
+        len(categorical_indices),
         n_samples,
+    )
+    logger.debug(
+        "[tabpfn] standard categorical_columns=%s categorical_indices=%s target=%r "
+        "target_kind=%s schema_fingerprint=%s",
         list(categorical_columns),
         categorical_indices,
         target_column,
@@ -326,11 +329,14 @@ def generate_tabpfn_custom(
 
     experiment, model_unsupervised = _make_experiment()
     logger.info(
-        "[tabpfn] custom experiment.run train_shape=%s n_samples=%d "
-        "categorical_columns=%s categorical_indices=%s target=%r target_kind=%s "
-        "schema_fingerprint=%s",
-        train_array.shape,
+        "[tabpfn] custom: %d rows x %d columns (%d categorical) -> %d synthetic rows",
+        *train_array.shape,
+        len(categorical_indices),
         n_samples,
+    )
+    logger.debug(
+        "[tabpfn] custom categorical_columns=%s categorical_indices=%s target=%r "
+        "target_kind=%s schema_fingerprint=%s",
         modeled_categorical_columns,
         categorical_indices,
         target_column,

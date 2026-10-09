@@ -130,7 +130,7 @@ def run_generation(
         )
 
     def _cached_or_build(name, build_fn):
-        """Load or build every replicate of ``name``; ``build_fn(seed)`` makes one.
+        """Load or build every replicate of ``name``; ``build_fn(seed, count)`` makes one.
 
         Replicate ``r`` is saved as ``replicate_name(name, r)`` and generated
         with seed ``cfg.seed + r`` (replicate 0 keeps the plain name and the
@@ -203,7 +203,7 @@ def run_generation(
         )
         # Backends without a seed argument draw from the global RNGs.
         set_global_seed(replicate_seed)
-        result = build_fn(replicate_seed)
+        result = build_fn(replicate_seed, n_samples)
         df, extra = result if isinstance(result, tuple) else (result, None)
         if match_prior and dataset.target_column in df:
             report = df.attrs.get("class_sampling")
@@ -212,7 +212,7 @@ def run_generation(
                 # (rejection sampling) until every class has its quota.
                 def sample(count, round_seed, labels):
                     set_global_seed(round_seed)
-                    more = build_fn(round_seed)
+                    more = build_fn(round_seed, count)
                     return more[0] if isinstance(more, tuple) else more
 
                 df, report = class_quota.sample_to_quota(
@@ -282,11 +282,11 @@ def run_generation(
         for name in gen_cfg.synthcity.names:
             _cached_or_build(
                 name,
-                lambda seed, name=name: sc.fit_generate(
+                lambda seed, count, name=name: sc.fit_generate(
                     name,
                     {},
                     train_loader,
-                    n_samples,
+                    count,
                     seed,
                     workspace=output_dir / "synthcity_workspace",
                     device=device,
@@ -327,11 +327,11 @@ def run_generation(
 
                 _cached_or_build(
                     f"{name}_hpo",
-                    lambda seed, name=name, params=params: sc.fit_generate(
+                    lambda seed, count, name=name, params=params: sc.fit_generate(
                         name,
                         params,
                         train_loader,
-                        n_samples,
+                        count,
                         seed,
                         workspace=output_dir / "synthcity_workspace",
                         device=device,
@@ -359,27 +359,31 @@ def run_generation(
             if "standard" in gen_cfg.tabpfn.variants:
                 _cached_or_build(
                     f"tabpfn_standard{suffix}",
-                    lambda seed, train_df_variant=train_df_variant: tpfn.generate_tabpfn_standard(
-                        train_df_variant,
-                        dataset.feature_columns,
-                        dataset.categorical_columns,
-                        dataset.target_column,
-                        n_samples,
-                        target_is_categorical=dataset.target_is_categorical,
-                        variable_schema_fingerprint=dataset.variable_schema_fingerprint,
-                        seed=seed,
+                    lambda seed, count, train_df_variant=train_df_variant: (
+                        tpfn.generate_tabpfn_standard(
+                            train_df_variant,
+                            dataset.feature_columns,
+                            dataset.categorical_columns,
+                            dataset.target_column,
+                            count,
+                            target_is_categorical=dataset.target_is_categorical,
+                            variable_schema_fingerprint=dataset.variable_schema_fingerprint,
+                            seed=seed,
+                        )
                     ),
                 )
             if "custom" in gen_cfg.tabpfn.variants:
                 _cached_or_build(
                     f"tabpfn_custom{suffix}",
-                    lambda seed, train_df_variant=train_df_variant: tpfn.generate_tabpfn_custom(
-                        train_df_variant,
-                        dataset.categorical_columns,
-                        dataset.target_column,
-                        n_samples,
-                        target_is_categorical=dataset.target_is_categorical,
-                        variable_schema_fingerprint=dataset.variable_schema_fingerprint,
+                    lambda seed, count, train_df_variant=train_df_variant: (
+                        tpfn.generate_tabpfn_custom(
+                            train_df_variant,
+                            dataset.categorical_columns,
+                            dataset.target_column,
+                            count,
+                            target_is_categorical=dataset.target_is_categorical,
+                            variable_schema_fingerprint=dataset.variable_schema_fingerprint,
+                        )
                     ),
                 )
 
@@ -394,12 +398,12 @@ def run_generation(
         if "standard" in gen_cfg.tabpfgen.variants:
             _cached_or_build(
                 "tabpfgen_standard",
-                lambda seed: tpfgen.generate_tabpfgen_standard(
+                lambda seed, count: tpfgen.generate_tabpfgen_standard(
                     dataset.train_imputed_df,
                     dataset.feature_columns,
                     dataset.categorical_columns,
                     dataset.target_column,
-                    n_samples,
+                    count,
                     tabpfgen_params=gen_cfg.tabpfgen.standard_params,
                 ),
             )
@@ -432,12 +436,12 @@ def run_generation(
 
                 _cached_or_build(
                     "tabpfgen_standard_hpo",
-                    lambda seed, params=params: tpfgen.generate_tabpfgen_standard(
+                    lambda seed, count, params=params: tpfgen.generate_tabpfgen_standard(
                         dataset.train_imputed_df,
                         dataset.feature_columns,
                         dataset.categorical_columns,
                         dataset.target_column,
-                        n_samples,
+                        count,
                         tabpfgen_params=params,
                         relabel_with_classifier=True,
                     ),
@@ -446,12 +450,12 @@ def run_generation(
         if "custom" in gen_cfg.tabpfgen.variants:
             _cached_or_build(
                 "tabpfgen_custom",
-                lambda seed: tpfgen.generate_tabpfgen_custom(
+                lambda seed, count: tpfgen.generate_tabpfgen_custom(
                     dataset.train_imputed_df,
                     dataset.feature_columns,
                     dataset.categorical_columns,
                     dataset.target_column,
-                    n_samples,
+                    count,
                     seed=seed,
                     sgld_params=gen_cfg.tabpfgen.custom_params,
                 ),
@@ -481,12 +485,12 @@ def run_generation(
 
                 _cached_or_build(
                     "tabpfgen_custom_hpo",
-                    lambda seed, params=params: tpfgen.generate_tabpfgen_custom(
+                    lambda seed, count, params=params: tpfgen.generate_tabpfgen_custom(
                         dataset.train_imputed_df,
                         dataset.feature_columns,
                         dataset.categorical_columns,
                         dataset.target_column,
-                        n_samples,
+                        count,
                         seed=seed,
                         sgld_params=params,
                     ),
