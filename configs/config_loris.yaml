@@ -93,23 +93,26 @@ generation:
     # (search-train 12597 rows x 682 columns), Linux box with an RTX PRO 5000
     # and 24 CPUs, four model groups running at once, 2026-10-09. Seconds per
     # epoch: CTGAN 30 (17-42 by batch size), TVAE 16, ADS-GAN 18, RTVAE 19,
-    # DDPM 3.1 (1.6-4.6), PATE-GAN 7-30 per GAN epoch.
+    # DDPM 3.1 (1.6-4.6); PATE-GAN 54 per iteration (10 GAN epochs),
+    # re-timed 2026-10-09 with generator_n_iter held at 10.
     # Trials: about 10 random start-up trials plus 10 per tuned dimension,
     # capped for run time.
     # Timeout = trials x (seconds per epoch x middle of the epoch range) x 1.5.
     # PATE-GAN: each iteration trains the GAN for 10 epochs (generator_n_iter
-    # is held there, see HPO_FIXED_PARAMS), so 2-10 iterations are 20-100
-    # epochs; estimated, not yet timed with that fix.
-    # ARF (CPU only): early stopping held on and trees capped at 50; budget is
-    # provisional from one default fit (30 trees, about 28 min on a 4-core
-    # cloud machine, 2026-10-08) until re-timed.
+    # is held there, see HPO_FIXED_PARAMS); it searches 2-10 iterations.
+    # ARF (CPU only, single core): early stopping held on and trees capped at
+    # 50; budget is provisional from one default fit (30 trees, about 28 min
+    # on a 4-core cloud machine, 2026-10-08) until re-timed with the fork's
+    # bounded-leaf fix.
     n_trials_per_model:
       { ctgan: 40, tvae: 40, adsgan: 40, rtvae: 40, pategan: 40, ddpm: 40, arf: 25 }
     timeout_seconds_per_model:
-      { ctgan: 155000, tvae: 85000, adsgan: 95500, rtvae: 99000, pategan: 67000,
+      { ctgan: 155000, tvae: 85000, adsgan: 95500, rtvae: 99000, pategan: 19500,
         ddpm: 103000, arf: 62000 }
     # Training length is searched, [low, high, step]. The libraries' ranges
     # (100-1000 epochs; PATE-GAN 1-500) would take 3+ hours per trial here.
+    # The top also caps the untuned default model, which would otherwise
+    # train for the library default (CTGAN 2000, ADS-GAN 10000 epochs).
     epoch_ranges:
       { ctgan: [25, 150, 25], tvae: [25, 150, 25], adsgan: [25, 150, 25],
         rtvae: [25, 150, 25], pategan: [2, 10, 2], ddpm: [100, 1000, 100] }

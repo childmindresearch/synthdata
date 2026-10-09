@@ -84,8 +84,12 @@ def system_info(dataset, device: str) -> dict:
     }
 
 
-def default_length(name: str) -> int | None:
-    """The plugin's own training length: what the untuned (default) model trains for."""
+def default_length(name: str, hpo_cfg) -> int | None:
+    """What the untuned (default) model trains for: the plugin's own length,
+    capped at the top of the searched range (``sc.untuned_params``)."""
+    capped = sc.untuned_params(name, hpo_cfg).get("n_iter")
+    if capped is not None:
+        return capped
     params = inspect.signature(sc.get_plugin_class(name).__init__).parameters
     return next((params[k].default for k in LENGTH_PARAMS if k in params), None)
 
@@ -129,14 +133,14 @@ def _recording_errors(objective):
     return wrapped
 
 
-def summarize(trials: pd.DataFrame, peak_gb: dict) -> pd.DataFrame:
+def summarize(trials: pd.DataFrame, peak_gb: dict, default_lengths: dict) -> pd.DataFrame:
     rows = []
     for name, group in trials.groupby("model", sort=False):
         done = group[group["state"] == "COMPLETE"]
         per_unit = (
             (done["seconds"] / done["length"]).mean() if done["length"].notna().any() else None
         )
-        length = default_length(name)
+        length = default_lengths.get(name)
         rows.append(
             {
                 "model": name,
@@ -183,6 +187,8 @@ def main() -> None:
     hpo_cfg.pruner = None  # every trial runs to its pinned length
     hpo_cfg.storage = f"sqlite:///{out / 'optuna_profile.db'}"
     models = args.models or cfg.generation.synthcity.names
+    # Read before the profiling trials' training length is pinned below.
+    default_lengths = {name: default_length(name, hpo_cfg) for name in models}
     for name in models:
         hpo_cfg.n_trials_per_model[name] = args.trials
         hpo_cfg.timeout_seconds_per_model[name] = None
@@ -275,7 +281,7 @@ def main() -> None:
             rows.extend(trial_rows(name, study))
             trials = pd.DataFrame(rows)
             trials.to_csv(out / "trials.csv", index=False)
-            summarize(trials, peak_gb).to_csv(out / "summary.csv", index=False)
+            summarize(trials, peak_gb, default_lengths).to_csv(out / "summary.csv", index=False)
     finally:
         if sampler is not None:
             sampler.terminate()

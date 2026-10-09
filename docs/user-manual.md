@@ -282,7 +282,7 @@ Each model's search stops at its trial count or its time limit, whichever comes 
 | `hpo.n_trials`, `hpo.timeout_seconds` | Defaults for models not listed below |
 | `hpo.n_trials_per_model` | Trials per model, e.g. `{ctgan: 40, arf: 25}`; `0` skips the search for that model |
 | `hpo.timeout_seconds_per_model` | Seconds per model |
-| `hpo.epoch_ranges` | Training length searched, as `[low, high, step]`, e.g. `{ctgan: [25, 150, 25]}` |
+| `hpo.epoch_ranges` | Training length searched, as `[low, high, step]`, e.g. `{ctgan: [25, 150, 25]}`. The top also caps the untuned default model when the library default is longer |
 | `hpo.pruner: median` | Stops a CTGAN or ADS-GAN trial early when its intermediate score is below the median of earlier trials |
 
 A good way to set budgets for a new dataset:
@@ -293,7 +293,7 @@ A good way to set budgets for a new dataset:
    uv run python -m scripts.profile_hpo --config configs/<your_config>.yaml --impute
    ```
 
-   This runs two real HPO trials per synthcity model in your config (fit on search-train, generate, score on tuning) with training fixed at 50 epochs (PATE-GAN 10 iterations, DDPM 100 epochs), and nothing else. Re-running the same command resumes. It writes timings only, no data rows, to `output/<name>/profile/`. Its `summary.csv` gives, per model, the time per epoch (or per tree for ARF), the peak GPU memory, and `default_fit_h_est`, the time the untuned default model will take at the library's full length (CTGAN trains 2000 epochs by default).
+   This runs two real HPO trials per synthcity model in your config (fit on search-train, generate, score on tuning) with training fixed at 50 epochs (PATE-GAN 6 iterations, DDPM 100 epochs), and nothing else. Re-running the same command resumes. It writes timings only, no data rows, to `output/<name>/profile/`. Its `summary.csv` gives, per model, the time per epoch (or per tree for ARF), the peak GPU memory, and `default_fit_h_est`, the time the untuned default model will take (the library's length, capped at the top of `hpo.epoch_ranges`).
 2. Time per trial: time per epoch × the middle of the model's `hpo.epoch_ranges` (for CTGAN 25-150, 87.5 epochs).
 3. Choose trials: about 10 plus 10 per hyperparameter the model tunes, capped by how long you can wait.
 4. Set the timeout to trials × time per trial × 1.5, so one slow model cannot eat into another's budget.

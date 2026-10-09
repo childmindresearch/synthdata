@@ -59,6 +59,27 @@ HPO_PARAM_RANGES: dict[str, dict[str, tuple[int, int, int]]] = {
 EPOCH_RANGE_DEFAULTS: dict[str, tuple[int, int, int]] = {"adsgan": (100, 1000, 100)}
 
 
+def untuned_params(name: str, hpo_cfg) -> dict:
+    """Params of the untuned (default) model: the library's, with training
+    length capped at the top of the searched range.
+
+    Library defaults can be far longer than anything the search tries (ADS-GAN
+    10000 epochs, about 50 h on the 682-column sim data; CTGAN 2000). Capping
+    them at ``hpo.epoch_ranges`` (or ``EPOCH_RANGE_DEFAULTS``) keeps the
+    default model comparable with the tuned one and its fit time bounded. A
+    library default already below the cap is kept.
+    """
+    if not plugin_accepts(name, "n_iter"):
+        return {}
+    from synthdata.generation.hpo import epoch_range
+
+    bounds = epoch_range(hpo_cfg, name, EPOCH_RANGE_DEFAULTS.get(name))
+    default = inspect.signature(get_plugin_class(name).__init__).parameters.get("n_iter")
+    if bounds is None or default is None or default.default is inspect.Parameter.empty:
+        return {}
+    return {"n_iter": bounds[1]} if bounds[1] < default.default else {}
+
+
 def _pruning_patience_metric_class():
     from synthcity.metrics.weighted_metrics import WeightedMetrics
 
