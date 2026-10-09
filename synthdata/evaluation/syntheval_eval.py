@@ -36,7 +36,7 @@ _RANK_COLUMNS = {"rank", "u_rank", "p_rank", "f_rank"}
 #: written by the old code are recomputed instead of reused (v4: Hellinger
 #: bins, eps-identifiability, fairness and NNAA fixes; v5: integer targets
 #: typed categorical on Windows, so classification and fairness metrics run;
-#: v6: q_mse and mi_diff fixes from the known-answer checks).
+#: v6: q_mse, mi_diff and statistical parity fixes from the known-answer checks).
 _CHECKPOINT_SCHEMA_VERSION = 6
 
 #: SynthEval tags every result row it returns with a ``dim`` of "u", "p" or "f"

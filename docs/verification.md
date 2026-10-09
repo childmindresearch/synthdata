@@ -142,7 +142,7 @@ Scored against the train split (members), except performance and DOMIAS, which u
 | nnaa | Yale et al. 2020 | Fixed (SE-04) | Normalised score was 1-AA, so a copy of train (AA = 0) scored best; now 1-2\|AA-0.5\|. Formula of AA itself verified. |
 | priv_loss_nnaa | Yale et al. 2020 | Verified | Holdout AA minus train AA. |
 | avg_nndr, priv_loss_nndr | Yale et al. 2020 | Verified | Higher NNDR is more private, as SynthEval orients it. |
-| statistical_parity | demographic parity difference (fairlearn) | Fixed (SE-03) | Signed gaps were averaged across protected attributes and could cancel; now absolute. Computed on a classifier trained and tested on synthetic data only, with unshuffled folds (SE-14, Open). |
+| statistical_parity | demographic parity difference (fairlearn) | Fixed (SE-03) | Signed gaps were averaged across protected attributes and could cancel; now absolute. A fold without one of the protected groups made the whole metric NaN (seen on a small, imbalanced protected column); such folds are now skipped, as equal opportunity and equalized odds already did (KA-06). Computed on a classifier trained and tested on synthetic data only, with unshuffled folds (SE-14, Open). |
 | equal_opportunity (fork) | Hardt et al. 2016 | Fixed (SE-03) | Same cancellation fix. |
 | equalized_odds (fork) | Hardt et al. 2016 | Deviation | Mean of the absolute TPR and FPR gaps (fairlearn `agg="mean"`); fairlearn's default reports the larger of the two. |
 | p_mse | Snoke et al. 2018 | Open (SE-12) | Formula verified; nominal codes enter the logistic model as numbers, which understates pMSE. |
