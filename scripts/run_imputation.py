@@ -10,7 +10,7 @@ import argparse
 from synthdata.config import load_config
 from synthdata.data import load_dataset
 from synthdata.experiment import dataset_plots_dir
-from synthdata.imputation import build_validation_report, run_imputation
+from synthdata.imputation import run_imputation, save_validation_report
 from synthdata.utils import get_logger, set_global_seed
 
 logger = get_logger("run_imputation")
@@ -41,9 +41,7 @@ def main() -> None:
 
     validation_df = None
     if cfg.imputation.enabled:
-        validation_df = build_validation_report(cfg, dataset)
-        if len(validation_df):
-            logger.info("Imputation validation report:\n%s", validation_df.to_string(index=False))
+        validation_df = save_validation_report(cfg, dataset)
 
     if args.plot:
         from synthdata.plotting.data_plots import save_data_plots
@@ -56,7 +54,7 @@ def main() -> None:
 
     logger.info(
         "Done. Imputed data cached under %s (dataset version=%s)",
-        dataset.data_dir,
+        dataset.paths()["full_imputed"].parent,
         dataset.version or "unversioned",
     )
 

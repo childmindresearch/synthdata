@@ -71,6 +71,18 @@ def dataset_plots_dir(cfg: Config) -> Path:
     return ensure_dir(Path(cfg.plots.output_dir) / dataset_version_scope(cfg) / "dataset")
 
 
+def imputation_output_dir(cfg: Config) -> Path:
+    """Return the version-scoped folder for imputation reports.
+
+    ``output/<dataset>/imputation/data_v_<version>/``, next to the stage folders
+    of ``generation.output_dir``. The imputed data itself stays under
+    ``data.data_dir`` (see :meth:`synthdata.data.Dataset.paths`).
+    """
+    return ensure_dir(
+        Path(cfg.generation.output_dir).parent / "imputation" / dataset_version_scope(cfg)
+    )
+
+
 def _experiments_root(cfg: Config) -> Path:
     return Path(cfg.generation.output_dir).parent / "experiments" / dataset_version_scope(cfg)
 

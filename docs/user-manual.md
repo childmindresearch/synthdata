@@ -38,7 +38,7 @@ The pipeline runs as four commands, in this order:
 
 | Command | What it does | Main outputs |
 | --- | --- | --- |
-| `synthdata-impute` | Loads the data, splits it by patient into train, tuning and holdout, fills missing values | Split and imputed CSVs under `data_dir` |
+| `synthdata-impute` | Loads the data, splits it by patient into train, tuning and holdout, fills missing values | Split CSVs under `data_dir`, each imputation run in its own subfolder, validation and drift reports under `output/<name>/imputation/` |
 | `synthdata-generate` | Tunes and trains each generator, writes synthetic datasets | One CSV per model under `generation.output_dir` |
 | `synthdata-evaluate` | Scores every synthetic dataset on the holdout, ranks them | `combined_evaluation.csv`, `report.md` |
 | `synthdata-plot` | Draws every figure and rewrites `report.md` with them embedded | PNG/HTML figures under `plots.output_dir` |
@@ -214,10 +214,10 @@ Most generators cannot handle missing values, so `synthdata-impute` fills them. 
 
 The imputer is fitted twice:
 
-1. On search-train only, then used to fill search-train and tuning. HPO uses these.
-2. On all of train, then used to fill train and the holdout. The final models and evaluation use these.
+1. On search-train only, then used to fill search-train and tuning. HPO uses these. Written to `imputation_initial/` (only when HPO is on).
+2. On all of train, then used to fill train and the holdout. The final models and evaluation use these. Written to `imputation_final/`.
 
-In both cases the rows being scored never influence how values are filled. `imputation_drift.csv` compares the two fills of the cells both phases imputed; a column above `drift_warn_threshold` gets a warning, which usually means the column has very few observed values.
+In both cases the rows being scored never influence how values are filled. `imputation_drift.csv` (in `output/<name>/imputation/data_v_<version>/`) compares the two fills of the cells both phases imputed; a column above `drift_warn_threshold` gets a warning, which usually means the column has very few observed values.
 
 ### Rounding
 
@@ -233,7 +233,20 @@ Whether a value is missing often carries information (a test that was not ordere
 
 ### Caching
 
-Imputed CSVs are cached in `data_dir/data_v_<version>/`. They are reused only if the data, split and imputation settings are unchanged; changing any of them refits the imputer. Set `imputation.cache: false` to always refit.
+Each imputation run is cached in its own folder:
+
+```
+data/<name>/data_v_<version>/
+  full.csv, train.csv, test.csv, split_report.csv   the split, before imputation
+  imputation_initial/train_imputed.csv              phase 1: search-train and tuning rows
+  imputation_final/                                 phase 2: full_, train_ and test_imputed.csv
+                                                    (+ *_decoded.csv with ordinal labels)
+output/<name>/imputation/data_v_<version>/
+  imputation_validation_report.csv                  per column: are imputed values inside the observed range or categories?
+  imputation_drift.csv                              per column: how much the two phases' fills differ
+```
+
+`synthdata-impute` prints a one-line summary of the validation report (how many imputed values are plausible, and which columns are not) and saves the full table. Caches from older versions, with every imputed CSV directly in `data_v_<version>/`, are moved into these folders automatically the next time a stage loads them. The cached CSVs are reused only if the data, split and imputation settings are unchanged; changing any of them refits the imputer. Set `imputation.cache: false` to always refit.
 
 ## 7. Stage 3: generation and hyperparameter search
 
@@ -421,7 +434,8 @@ How to interpret it:
 Outputs are organized by dataset version and experiment:
 
 ```
-data/<name>/data_v_<version>/                               splits, imputed data, split_report.csv
+data/<name>/data_v_<version>/                               splits, split_report.csv, imputation_initial/, imputation_final/
+output/<name>/imputation/data_v_<version>/                  imputation validation and drift reports
 output/<name>/synthetic_data/data_v_<version>/exp_v_<id>/   synthetic data, HPO
 output/<name>/evaluation/data_v_<version>/exp_v_<id>/       metrics, report.md
 output/<name>/plots/data_v_<version>/exp_v_<id>/            figures
@@ -461,7 +475,7 @@ If the change was intended, rewrite the reference with `SYNTHDATA_UPDATE_GOLDEN=
 3. **Set the target and patient ID.** `data.target_column` and, if a person can have several rows, `data.patient_id_column`. Add `drop_rows_missing_target: true` if some targets are missing.
 4. **Assign column roles** ([section 5](#column-roles)). Decide with someone who knows the data what an attacker could plausibly know (quasi-identifiers) and what must stay secret (sensitive).
 5. **Choose stratification.** Target first, then the most important protected columns, with bins for continuous ones.
-6. **Run `synthdata-impute --plot`** and check `split_report.csv`, the missingness plot and `imputation_drift.csv`.
+6. **Run `synthdata-impute --plot`** and check `split_report.csv`, the missingness plot, the validation summary it prints and `imputation_drift.csv`.
 7. **Do a quick generation run** with HPO off and two or three fast models (`tvae`, `arf`) to check everything works end to end.
 8. **Profile and set HPO budgets** ([section 7](#setting-hpo-budgets)), then run the full search under a new experiment id.
 9. **Set `n_replicates` to 3 or more** for the run whose results you will report.

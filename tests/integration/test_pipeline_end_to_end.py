@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -204,9 +205,12 @@ def test_missing_indicators_and_released_copies(pipeline_run, dataset):
             assert released.loc[~flagged, column].notna().all(), (name, column)
 
 
-def test_hpo_uses_an_imputer_fitted_without_tuning_rows(dataset):
+def test_hpo_uses_an_imputer_fitted_without_tuning_rows(pipeline_run, dataset):
     assert dataset.search_imputed_df is not None
-    drift = pd.read_csv(dataset.data_dir / "imputation_drift.csv")
+    assert (dataset.data_dir / "imputation_initial" / "train_imputed.csv").exists()
+    assert (dataset.data_dir / "imputation_final" / "train_imputed.csv").exists()
+    imputation_dir = Path(pipeline_run.cfg.generation.output_dir).parent / "imputation"
+    drift = pd.read_csv(imputation_dir / dataset.data_dir.name / "imputation_drift.csv")
     assert set(drift["column"]) <= set(FEATURES)
     assert (drift["drift"] >= 0).all()
 

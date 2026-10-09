@@ -18,18 +18,19 @@ import pandas as pd
 
 from synthdata.config import Config
 from synthdata.data import (
-    IMPUTATION_CACHE_KEY_FILENAME,
     Dataset,
     dataframe_fingerprint,
     load_imputed_splits,
+    migrate_legacy_imputation_layout,
 )
+from synthdata.experiment import imputation_output_dir
 from synthdata.utils import ensure_dir, get_logger, resolve_device
 
 logger = get_logger(__name__)
 
-#: Sidecar filename (under ``dataset.data_dir``) recording the config fields that
-#: determined the currently-cached imputed CSVs -- see :func:`_cache_key_record`.
-_CACHE_KEY_FILENAME = IMPUTATION_CACHE_KEY_FILENAME
+#: File name of the imputation reports under :func:`imputation_output_dir`.
+VALIDATION_REPORT_FILENAME = "imputation_validation_report.csv"
+DRIFT_REPORT_FILENAME = "imputation_drift.csv"
 
 
 def _persist_decoded_imputed_splits(dataset: Dataset) -> None:
@@ -51,7 +52,7 @@ def _persist_decoded_imputed_splits(dataset: Dataset) -> None:
     logger.info(
         "Wrote ordinal-decoded imputed splits under %s (model-space caches remain in "
         "full_imputed.csv/train_imputed.csv/test_imputed.csv)",
-        dataset.data_dir,
+        paths["full_imputed_decoded"].parent,
     )
 
 
@@ -345,18 +346,24 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
     The imputer learns from the train split only and then fills test (see
     :func:`_impute_splits`), so held-out rows never influence train values.
 
-    Caches to ``full_imputed.csv``/``train_imputed.csv``/``test_imputed.csv`` under
-    ``cfg.data.data_dir``; reused on subsequent runs unless ``cfg.imputation.cache``
+    Caches the phase-2 fill to ``full_imputed.csv``/``train_imputed.csv``/
+    ``test_imputed.csv`` under ``<data_dir>/imputation_final/`` and, when HPO runs,
+    the phase-1 fill to ``<data_dir>/imputation_initial/train_imputed.csv`` (see
+    :meth:`Dataset.paths`); reused on subsequent runs unless ``cfg.imputation.cache``
     is False. Reuse also requires the cache-key sidecar file
-    ``.imputation_cache_key.json``, also under ``data_dir``) to match a fresh
+    (``imputation_final/.imputation_cache_key.json``) to match a fresh
     hash of the current config's imputation-relevant fields and exact
     source/split fingerprints (see :func:`_cache_key_payload`) -- so editing
     e.g. ``nominal_columns``/``ordinal_columns`` or refreshing the source and
     rerunning correctly retrains instead of silently reusing stale imputed
     CSVs from before the change.
     """
+    migrate_legacy_imputation_layout(dataset)
+    legacy_drift = dataset.data_dir / DRIFT_REPORT_FILENAME
+    if legacy_drift.is_file():
+        legacy_drift.replace(imputation_output_dir(cfg) / DRIFT_REPORT_FILENAME)
     paths = dataset.paths()
-    cache_key_path = dataset.data_dir / _CACHE_KEY_FILENAME
+    cache_key_path = paths["imputation_cache_key"]
     cache_record = _cache_key_record(cfg, dataset)
     current_key = cache_record["cache_key"]
     cached_key = _load_cached_key(cache_key_path)
@@ -446,11 +453,12 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
         if search_imputed is not None:
             _report_drift(cfg, dataset, search_imputed, train_imputed)
 
-    ensure_dir(dataset.data_dir)
+    ensure_dir(paths["full_imputed"].parent)
     full_imputed.to_csv(paths["full_imputed"], index=False)
     train_imputed.to_csv(paths["train_imputed"], index=False)
     test_imputed.to_csv(paths["test_imputed"], index=False)
     if search_imputed is not None:
+        ensure_dir(paths["search_imputed"].parent)
         search_imputed.to_csv(paths["search_imputed"], index=False)
     else:
         paths["search_imputed"].unlink(missing_ok=True)
@@ -476,17 +484,17 @@ def _report_drift(
 ) -> None:
     """Write ``imputation_drift.csv`` and warn about columns above the threshold."""
     drift = imputation_drift(dataset, search_imputed, train_imputed)
-    ensure_dir(dataset.data_dir)
-    drift.to_csv(dataset.data_dir / "imputation_drift.csv", index=False)
+    drift_path = imputation_output_dir(cfg) / DRIFT_REPORT_FILENAME
+    drift.to_csv(drift_path, index=False)
     high = drift[drift["drift"] > cfg.imputation.drift_warn_threshold]
     if not high.empty:
         logger.warning(
             "Imputed values differ between the HPO fit and the final fit by more than %.2f "
-            "in %d column(s): %s. Hyperparameters were tuned on the first fit's data; see "
-            "imputation_drift.csv",
+            "in %d column(s): %s. Hyperparameters were tuned on the first fit's data; see %s",
             cfg.imputation.drift_warn_threshold,
             len(high),
             high.sort_values("drift", ascending=False)["column"].head(10).tolist(),
+            drift_path,
         )
 
 
@@ -523,3 +531,36 @@ def build_validation_report(cfg: Config, dataset: Dataset) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def save_validation_report(cfg: Config, dataset: Dataset) -> pd.DataFrame:
+    """Write :func:`build_validation_report` to a CSV and log a short summary.
+
+    The full table goes to ``imputation_validation_report.csv`` under
+    :func:`~synthdata.experiment.imputation_output_dir`; the log gets only the
+    totals and the columns whose imputed values fall outside the observed
+    range or category set.
+    """
+    report = build_validation_report(cfg, dataset)
+    path = imputation_output_dir(cfg) / VALIDATION_REPORT_FILENAME
+    report.to_csv(path, index=False)
+    if report.empty:
+        logger.info("Imputation validation: no feature had missing values. Report: %s", path)
+        return report
+    failing = report[~report["all_valid"]]
+    logger.info(
+        "Imputation validation: %d imputed cell(s) across %d column(s); %d of those cells "
+        "(%.1f%%) are within the observed range or category set; %d column(s) have "
+        "implausible values%s. Full report: %s",
+        int(report["n_imputed"].sum()),
+        len(report),
+        int(report["n_valid"].sum()),
+        100 * report["n_valid"].sum() / max(int(report["n_imputed"].sum()), 1),
+        len(failing),
+        f" ({', '.join(failing['column'].astype(str).head(10))}"
+        f"{', ...' if len(failing) > 10 else ''})"
+        if len(failing)
+        else "",
+        path,
+    )
+    return report
