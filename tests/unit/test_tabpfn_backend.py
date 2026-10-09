@@ -134,7 +134,7 @@ def test_set_model_version_selects_the_weights_new_models_load():
     try:
         tabpfn_backend.set_model_version("v3")
         assert settings.tabpfn.model_version == ModelVersion.V3
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="uv sync --extra tabpfn"):
             tabpfn_backend.set_model_version("v9")
     finally:
         settings.tabpfn.model_version = before
