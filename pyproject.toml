@@ -170,6 +170,7 @@ markers = [
     "cache: tests exercising file/SQLite caching and resumability logic",
     "integration: multi-module orchestration tests; tests/integration runs the real CLIs end to end on a fixture",
     "slow: full-size training (every generator, TabPFN, GPU); not run in CI",
+    "regression: golden run, compares the fixture's metrics to tests/integration/fixtures/golden; opt-in, not run in CI",
     "network: requires a live external/hosted API (e.g. hosted TabPFN); skipped in CI",
 ]
 
