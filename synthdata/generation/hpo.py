@@ -268,16 +268,22 @@ def build_hpo_eval_fn(
     seeds = [seed + i for i in range(hpo_cfg.tstr_seeds)]
 
     def _tstr(fit_df):
-        return tstr_scores(fit_df, tuning_df, target_column, nominal_columns, classes, seeds)
+        return tstr_scores(
+            fit_df, tuning_df, target_column, nominal_columns, classes, seeds, weighted=True
+        )
 
     trtr = None
     if target_is_categorical:
         trtr = _tstr(search_train_df)
         logger.info(
             "HPO ceiling (fixed XGBoost trained on real search-train rows, scored on tuning): "
-            "macro-F1=%.4f macro-AUPRC=%.4f",
+            "macro-F1=%.4f macro-AUPRC=%.4f balanced-accuracy=%.4f; class-weighted fit: "
+            "macro-F1=%.4f balanced-accuracy=%.4f",
             trtr.macro_f1,
             trtr.macro_auprc,
+            trtr.balanced_accuracy,
+            trtr.weighted_macro_f1,
+            trtr.weighted_balanced_accuracy,
         )
     composite_fn = (
         None
@@ -318,9 +324,15 @@ def build_hpo_eval_fn(
                 "tstr_macro_f1": scores.macro_f1,
                 "tstr_macro_auprc": scores.macro_auprc,
                 "tstr_balanced_accuracy": scores.balanced_accuracy,
+                "tstr_weighted_macro_f1": scores.weighted_macro_f1,
+                "tstr_weighted_balanced_accuracy": scores.weighted_balanced_accuracy,
                 "tstr_per_class_f1": scores.per_class_f1,
+                "tstr_seed_sd": scores.seed_sd,
                 "trtr_macro_f1": trtr.macro_f1,
                 "trtr_macro_auprc": trtr.macro_auprc,
+                "trtr_balanced_accuracy": trtr.balanced_accuracy,
+                "trtr_weighted_macro_f1": trtr.weighted_macro_f1,
+                "trtr_weighted_balanced_accuracy": trtr.weighted_balanced_accuracy,
             }
         value = attrs[hpo_cfg.objective] if tstr else composite_fn(synthetic_df)
         if not np.isfinite(value):
