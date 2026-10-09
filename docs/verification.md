@@ -83,6 +83,20 @@ Budgets come from `scripts/profile_hpo.py` on sim 1.2 (search-train 12597 x 682)
 
 PATE-GAN's `generator_n_iter` (GAN epochs per teacher round, searched 1-100 by synthcity) is held at the plugin default of 10, and ARF's `early_stop` is held on (arfpy and R `arf` default) with trees capped at 50 (`HPO_FIXED_PARAMS`, `HPO_PARAM_RANGES`): one PATE-GAN draw of 91 epochs per round took 7.5 h. The untuned default models train for the top of `hpo.epoch_ranges` when the library default is longer (`untuned_params`): ADS-GAN's 10000 epochs would take about 50 h here, CTGAN's 2000 about 16 h. ARF runs on one core: arfpy's density estimation is single-threaded pandas. Both DDPM profiling trials (100 epochs) failed the category-coverage screen; longer trials are expected to pass. The GPU stayed under 3 GB per model and about 10% busy, so several studies can share one GPU.
 
+LORIS 2.11 (search-train 2125 x 1090) on the same machine and settings, 2026-10-09 (`configs/config_loris.yaml`; MissForest imputation 48 min):
+
+| Model | Timed trials | Time per epoch | Trials | Timeout |
+| --- | --- | --- | --- | --- |
+| ctgan | 2 x 50 epochs, 685 s | 13.7 s | 40 | 20 h |
+| tvae | 2 x 50 epochs, 254-799 s | 10.5 s | 40 | 15.4 h |
+| adsgan | 2 x 50 epochs, 378-540 s | 9.2 s | 40 | 13.5 h |
+| rtvae | 2 x 50 epochs, 520-643 s | 11.6 s | 40 | 16.9 h |
+| pategan | 2 x 6 iterations, 397-868 s | 105 s per iteration | 40 | 10.6 h |
+| ddpm | 2 x 100 epochs, 271-944 s | 6.1 s (2.7-9.4 s by batch size) | 40 | 55.7 h |
+| arf | 20 and 30 trees, 892-1336 s | 45 s per tree | 25 | 13.9 h |
+
+DDPM is slower per epoch here than on the sim data despite a sixth of the rows (about 1 s per step at batch 256), probably because of its wider one-hot encoding; not profiled further. Five of the fourteen LORIS profiling trials (TVAE and DDPM both, one RTVAE) failed the category-coverage screen.
+
 The synthcity epochs are CPU-bound at this width (GPU near idle, about 560% CPU): their per-column output activations and losses run in Python loops. Larger batch sizes, which the search space includes, shorten an epoch.
 
 ## Column types
