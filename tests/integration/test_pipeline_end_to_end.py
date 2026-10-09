@@ -438,6 +438,19 @@ def test_privacy_attacks_table_has_every_attack_with_an_interval(pipeline_run):
         assert (rows["ci_low"] <= rows["risk"]).all() and (rows["risk"] <= rows["ci_high"]).all()
 
 
+def test_output_checks_ran_and_the_baselines_sit_where_they_must(pipeline_run):
+    table = pd.read_csv(pipeline_run.evaluation_dir / "checks.csv")
+    assert set(table.loc[table["model"].isin(MODELS), "model"]) == set(MODELS)
+    baseline_rows = table[table["model"].isin(BASELINES)]
+    assert set(baseline_rows["check"]) == {
+        "train_copy_has_the_lowest_privacy",
+        "train_copy_beats_marginals_on_utility",
+        "train_copy_beats_marginals_on_tstr",
+    }
+    assert (baseline_rows["status"] == "pass").all(), baseline_rows
+    assert "**Output checks**" in (pipeline_run.evaluation_dir / "report.md").read_text()
+
+
 def test_report_has_its_seven_sections_and_working_links(pipeline_run):
     report_path = pipeline_run.evaluation_dir / "report.md"
     report = report_path.read_text()

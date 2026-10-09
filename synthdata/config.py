@@ -775,6 +775,13 @@ class EvaluationConfig:
     #: ``synthdata-plot`` rewrites it once the plots exist.
     generate_report: bool = True
 
+    #: Sanity checks on every run, written to checks.csv and listed in the
+    #: report (synthdata/evaluation/checks.py): synthetic rows that copy train
+    #: rows, invented categories, out-of-range values, class shares, and the two
+    #: baselines landing where they must. Warnings only; run
+    #: ``synthdata-evaluate --strict-checks`` to fail on any warning.
+    run_checks: bool = True
+
 
 # ---------------------------------------------------------------------------
 # Plots
