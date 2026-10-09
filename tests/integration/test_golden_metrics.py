@@ -3,14 +3,17 @@
 The other integration tests check properties (ranges, orderings, no leakage),
 which survive a change that quietly moves every number. This test compares
 every raw metric of the baseline run (see ``RUNS`` in ``conftest.py``) to
-``fixtures/golden/baseline_run.csv`` within a tolerance, so a dependency bump or a
+``fixtures/golden/baseline_run_<platform>_<device>.csv`` within a tolerance, so a dependency bump or a
 refactor that changes what a metric returns shows up as a list of drifted
 metrics.
 
 Opt-in (marker ``regression``): run it before a release and after updating
 dependencies or the submodules, not in the fast CI. Numbers differ a little
-between CPUs and library builds, hence the tolerances; the baselines involve
-no generator training, so theirs are tight.
+between CPUs and library builds, hence the tolerances. Torch-trained
+generators and metrics (CTGAN, synthcity's MLP and OneClass embedding) differ
+far more between CPU and CUDA or between operating systems, so each platform
+and device keeps its own reference; on one without a reference the test is
+skipped until one is recorded.
 
     uv run --with catboost==1.2.10 pytest tests/integration -m regression
 
@@ -21,6 +24,7 @@ with ``SYNTHDATA_UPDATE_GOLDEN=1`` and commit it with the change.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +33,16 @@ import pytest
 
 pytestmark = [pytest.mark.integration, pytest.mark.regression]
 
-REFERENCE = Path(__file__).parent / "fixtures" / "golden" / "baseline_run.csv"
+
+def _device() -> str:
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+REFERENCE = (
+    Path(__file__).parent / "fixtures" / "golden" / f"baseline_run_{sys.platform}_{_device()}.csv"
+)
 
 #: (absolute, relative) tolerance: |now - ref| <= atol + rtol * |ref|.
 BASELINE_TOLERANCE = (0.02, 0.05)
@@ -48,6 +61,11 @@ def test_metrics_match_the_golden_run(pipeline_run):
         REFERENCE.parent.mkdir(parents=True, exist_ok=True)
         now.to_csv(REFERENCE, float_format="%.6g")
         pytest.skip(f"reference rewritten: {REFERENCE}")
+    if not REFERENCE.exists():
+        pytest.skip(
+            f"no golden reference for this platform yet ({REFERENCE.name}); record one with "
+            "SYNTHDATA_UPDATE_GOLDEN=1 on a known-good commit"
+        )
     reference = pd.read_csv(REFERENCE, index_col=0)
 
     assert list(now.index) == list(reference.index), "models differ from the golden run"

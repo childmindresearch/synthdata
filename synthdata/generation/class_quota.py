@@ -169,7 +169,10 @@ def sample_to_quota(
                 kept[cls].append(rows)
                 have[cls] += len(rows)
         if rounds > 1 and len(batch) == 0 and not conditional:
-            logger.warning("a batch repeated earlier rows only; the backend may ignore its seed")
+            logger.warning(
+                "a batch repeated earlier rows only: the generator has collapsed onto a few "
+                "rows (or ignores its seed), so the missing classes cannot be drawn"
+            )
             break
 
     filled = {c: int(have[c]) for c in quota.index}
