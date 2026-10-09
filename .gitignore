@@ -221,3 +221,6 @@ __marimo__/
 
 # Copilot
 .github/**/*.md
+
+# SynthEval writes its metric settings here when run verbosely.
+SE_metrics_config.json
