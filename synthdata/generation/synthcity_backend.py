@@ -164,8 +164,14 @@ def fit_generate(
     device: str | None = None,
     classification: bool = False,
     class_prior: pd.Series | None = None,
+    *,
+    discrete_columns: list,
 ) -> pd.DataFrame:
     """Fit plugin ``name`` on ``train_loader`` and generate ``n_samples`` rows.
+
+    ``discrete_columns`` (the schema's categorical columns, target included when
+    categorical) are the only columns synthcity treats as discrete; without it
+    synthcity would guess from each column's number of distinct values.
 
     With ``class_prior`` (class shares of the fit data), rows are drawn per
     class to those shares (see :mod:`synthdata.generation.class_quota`):
@@ -174,6 +180,7 @@ def fit_generate(
     ``df.attrs["class_sampling"]``.
     """
     from synthcity.plugins import Plugins
+    from synthcity.utils.dataframe import declared_discrete_columns
 
     plugin_kwargs = dict(params)
     # TabDDPM conditions on the class label for classification; synthcity's
@@ -189,7 +196,18 @@ def fit_generate(
     if device is not None and "device" not in plugin_kwargs and plugin_accepts(name, "device"):
         plugin_kwargs["device"] = torch.device(device)
 
-    model = Plugins().get(name, **plugin_kwargs)
+    with declared_discrete_columns(discrete_columns):
+        return _fit_generate(
+            Plugins().get(name, **plugin_kwargs),
+            train_loader,
+            n_samples,
+            random_state,
+            class_prior,
+            conditional=bool(plugin_kwargs.get("is_classification")),
+        )
+
+
+def _fit_generate(model, train_loader, n_samples, random_state, class_prior, conditional):
     model.fit(train_loader)
     if class_prior is None:
         return model.generate(count=n_samples, random_state=random_state).dataframe()
@@ -211,7 +229,7 @@ def fit_generate(
         class_prior,
         n_samples,
         random_state,
-        conditional=bool(plugin_kwargs.get("is_classification")),
+        conditional=conditional,
     )
     df.attrs["class_sampling"] = report
     return df
@@ -228,6 +246,8 @@ def build_synthcity_objective(
     device: str = "cpu",
     classification: bool = False,
     class_prior: pd.Series | None = None,
+    *,
+    discrete_columns: list,
 ):
     """Build an Optuna objective for a synthcity plugin's native hyperparameter space.
 
@@ -274,6 +294,7 @@ def build_synthcity_objective(
             workspace=workspace,
             classification=classification,
             class_prior=class_prior,
+            discrete_columns=discrete_columns,
         )
         return score_candidate(trial, eval_fn, synthetic)
 

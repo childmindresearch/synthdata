@@ -127,7 +127,11 @@ def generate_tabpfgen_standard(
     if relabel_with_classifier:
         from tabpfn import TabPFNClassifier
 
-        clf = TabPFNClassifier()
+        clf = TabPFNClassifier(
+            categorical_features_indices=[
+                feature_columns.index(c) for c in categorical_columns if c in feature_columns
+            ]
+        )
         clf.fit(x_train, y_train)
         target_values = clf.predict(synthetic_encoded.to_numpy(dtype=float))
     else:
@@ -223,7 +227,11 @@ def build_tabpfgen_standard_objective(
                 X_train=x_feat, y_train=y_label, n_samples=n_samples, balance_classes=True
             )
             syn_encoded = pd.DataFrame(x_s, columns=feature_columns)
-            clf = TabPFNClassifier()
+            clf = TabPFNClassifier(
+                categorical_features_indices=[
+                    feature_columns.index(c) for c in categorical_columns if c in feature_columns
+                ]
+            )
             clf.fit(x_feat, y_label)
             target_values = clf.predict(syn_encoded.to_numpy(dtype=float))
             syn = decode_label_encoded_columns(syn_encoded, category_maps)

@@ -75,7 +75,7 @@ METRICS = {
 def _run(captured):
     train, test, synthetic = _frames()
     result = synthcity_eval.run_synthcity_metrics(
-        synthetic, test, train, "target", [], METRICS, workspace=None
+        synthetic, test, train, "target", [], METRICS, workspace=None, discrete_columns=["target"]
     )
     on_train, on_held_out = captured
     return train, test, synthetic, result, on_train, on_held_out
@@ -134,7 +134,14 @@ def test_failed_metrics_are_logged(monkeypatch, caplog):
     try:
         with caplog.at_level("WARNING"):
             synthcity_eval.run_synthcity_metrics(
-                synthetic, test, train, "target", [], METRICS, workspace=None
+                synthetic,
+                test,
+                train,
+                "target",
+                [],
+                METRICS,
+                workspace=None,
+                discrete_columns=["target"],
             )
     finally:
         synthcity_eval.logger.removeHandler(caplog.handler)

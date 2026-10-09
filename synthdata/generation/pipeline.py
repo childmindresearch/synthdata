@@ -292,6 +292,7 @@ def run_generation(
                     device=device,
                     classification=dataset.target_is_categorical,
                     class_prior=class_prior,
+                    discrete_columns=dataset.all_categorical_columns,
                 ),
             )
 
@@ -308,6 +309,7 @@ def run_generation(
                         device=device,
                         classification=dataset.target_is_categorical,
                         class_prior=search_prior,
+                        discrete_columns=dataset.all_categorical_columns,
                     )
                     params = hpo_mod.run_study(
                         f"hpo_{name}",
@@ -337,6 +339,7 @@ def run_generation(
                         device=device,
                         classification=dataset.target_is_categorical,
                         class_prior=class_prior,
+                        discrete_columns=dataset.all_categorical_columns,
                     ),
                 )
 

@@ -56,7 +56,11 @@ def test_arf_search_holds_delta_at_zero_and_fits():
     df = pd.DataFrame({"x": rng.normal(size=60), "c": rng.integers(0, 3, 60)})
     df["y"] = (df["x"] > 0).astype(int)
     params = sampled[0] | {"num_trees": 10, "max_iters": 1, "verbose": False}
-    syn = fit_generate("arf", params, make_loader(df, "y", []), 30, random_state=1)
+    loader = make_loader(df, "y", [])
+    syn = fit_generate("arf", params, loader, 30, random_state=1, discrete_columns=["c", "y"])
+    assert syn.shape == (30, 3)
+    # A declared-continuous column with few distinct values stays continuous.
+    syn = fit_generate("arf", params, loader, 30, random_state=1, discrete_columns=["y"])
     assert syn.shape == (30, 3)
 
 
@@ -100,7 +104,7 @@ def _objective_params(name: str, hpo_cfg) -> dict:
         return "synthetic"
 
     objective = sc.build_synthcity_objective(
-        name, None, hpo_cfg, 0, lambda df: None, 10, device="cpu"
+        name, None, hpo_cfg, 0, lambda df: None, 10, device="cpu", discrete_columns=[]
     )
     trial = optuna.create_study().ask()
     with (
@@ -166,7 +170,7 @@ def test_fit_generate_seeds_training_not_only_sampling(mocker):
     from synthdata.generation import synthcity_backend as sc
 
     get = mocker.patch.object(Plugins, "get")
-    sc.fit_generate("ctgan", {}, mocker.Mock(), 5, random_state=11)
+    sc.fit_generate("ctgan", {}, mocker.Mock(), 5, random_state=11, discrete_columns=[])
     _, kwargs = get.call_args
     assert kwargs["random_state"] == 11
 
@@ -177,10 +181,69 @@ def test_fit_generate_conditions_ddpm_on_a_categorical_target(mocker):
     from synthdata.generation import synthcity_backend as sc
 
     get = mocker.patch.object(Plugins, "get")
-    sc.fit_generate("ddpm", {}, mocker.Mock(), 5, classification=True)
+    sc.fit_generate("ddpm", {}, mocker.Mock(), 5, classification=True, discrete_columns=[])
     assert get.call_args.kwargs["is_classification"] is True
-    sc.fit_generate("ddpm", {}, mocker.Mock(), 5)
+    sc.fit_generate("ddpm", {}, mocker.Mock(), 5, discrete_columns=[])
     assert "is_classification" not in get.call_args.kwargs
     # Plugins without the argument never receive it.
-    sc.fit_generate("ctgan", {}, mocker.Mock(), 5, classification=True)
+    sc.fit_generate("ctgan", {}, mocker.Mock(), 5, classification=True, discrete_columns=[])
     assert "is_classification" not in get.call_args.kwargs
+
+
+def test_fit_generate_uses_the_declared_column_types(mocker):
+    """synthcity sees the schema's types, not its own distinct-value guess."""
+    import pandas as pd
+    from synthcity.plugins import Plugins
+    from synthcity.utils.dataframe import discrete_columns
+
+    from synthdata.generation import synthcity_backend as sc
+
+    df = pd.DataFrame({"few": [0.5, 1.5] * 10, "code": range(20), "y": [0, 1] * 10})
+    seen = {}
+
+    def fit(loader):
+        seen["discrete"] = discrete_columns(df)
+
+    model = mocker.Mock()
+    model.fit.side_effect = fit
+    mocker.patch.object(Plugins, "get", return_value=model)
+    sc.fit_generate("ctgan", {}, mocker.Mock(), 5, discrete_columns=["code", "y"])
+    assert seen["discrete"] == ["code", "y"]
+    # Outside the call synthcity falls back to its own guess.
+    assert discrete_columns(df) == ["few", "y"]
+
+
+def test_ddpm_searches_the_reference_mlp_size():
+    pytest.importorskip("synthcity.plugins")
+    from synthcity.plugins import Plugins
+
+    from synthdata.generation.synthcity_backend import get_plugin_class
+
+    names = {d.name for d in get_plugin_class("ddpm").hyperparameter_space()}
+    assert {"n_layers_hidden", "n_units_hidden"} <= names
+    plugin = Plugins().get("ddpm", n_layers_hidden=4, n_units_hidden=512, n_iter=1)
+    assert plugin.model.model_params == {
+        "n_layers_hidden": 4,
+        "n_units_hidden": 512,
+        "dropout": 0.0,
+    }
+
+
+def test_ddpm_slice_normalizer_keeps_small_slices_finite():
+    """TabDDPM's per-feature log-normalizer must not cancel to -inf with many features."""
+    import torch
+    from synthcity.plugins.core.models.tabular_ddpm.utils import sliced_logsumexp
+
+    x = torch.zeros(1, 2000)
+    x[:, -2:] = -30.0  # the last feature's two classes are far below the running total
+    slices = torch.arange(0, 2001, 2)
+    out = sliced_logsumexp(x, slices)
+    expected = torch.cat(
+        [
+            torch.logsumexp(x[:, a:b], 1, keepdim=True).expand(-1, b - a)
+            for a, b in zip(slices[:-1], slices[1:], strict=True)
+        ],
+        dim=1,
+    )
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, expected, atol=1e-5)
