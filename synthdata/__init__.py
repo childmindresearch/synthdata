@@ -32,6 +32,11 @@ from synthdata.config import Config, load_config
 
 load_dotenv()
 
+# TabPFN sends anonymous usage events (dataset row and column counts, library
+# versions, GPU type) to Prior Labs unless told not to. This pipeline runs on
+# sensitive clinical data, so it stays off unless .env sets it to 0.
+os.environ.setdefault("TABPFN_DISABLE_TELEMETRY", "1")
+
 
 def _preload_system_nvrtc() -> object | None:
     """Make the system CUDA NVRTC linker name visible to KeOps on ARM64.
