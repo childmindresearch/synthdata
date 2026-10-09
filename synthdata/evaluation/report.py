@@ -126,6 +126,7 @@ def _load_extras(evaluation_dir: Path, combined: pd.DataFrame, extras: dict) -> 
         "tstr_table": ("tstr_holdout.csv", {"index_col": 0}),
         "ovr_per_class": ("ovr_per_class.csv", {"index_col": 0, "header": [0, 1]}),
         "privacy_attacks": ("privacy_attacks.csv", {}),
+        "checks": ("checks.csv", {}),
     }
     for key, (name, kwargs) in readers.items():
         path = evaluation_dir / name
@@ -290,6 +291,19 @@ def _glance_section(cfg, dataset, combined, extras, model_names, experiment) -> 
     for model in missing.index[missing > 0]:
         cautions.append(f"`{model}`: {int(missing[model])} metric(s) missing (failed or skipped).")
     cautions += _privacy_flags(extras.get("privacy_attacks"))
+    checks = extras.get("checks")
+    if checks is not None and not checks.empty:
+        warned = checks[checks["status"] == "warn"]
+        lines += [
+            "",
+            f"**Output checks**: {len(checks) - len(warned)} passed, {len(warned)} "
+            "warning(s) (`checks.csv`).",
+        ]
+        cautions += [
+            f"Check `{row.check}` on `{row.model}`: {_fmt_metric(row.value)} "
+            f"(limit {_fmt_metric(row.limit)})" + (f"; {row.detail}" if row.detail else "") + "."
+            for row in warned.itertuples()
+        ]
     if cautions:
         lines += ["", "**Read with care**", ""] + [f"- {c}" for c in cautions]
     return "\n".join(lines)
@@ -634,6 +648,7 @@ _FILE_DESCRIPTIONS = {
     "tstr_holdout.csv": "Holdout train-on-synthetic, test-on-real scores, per class.",
     "ovr_per_class.csv": "Two-class SynthEval metrics per class (one vs rest).",
     "privacy_attacks.csv": "Every Anonymeter attack with interval and success rates.",
+    "checks.csv": "Output sanity checks: pass or warn per model, with value and limit.",
     "split_report.csv": "Rows, patients and class balance of each split.",
     "imputation_drift.csv": "Observed vs imputed distribution drift per column.",
     "hpo_best_params.json": "Best hyperparameters found per model.",
