@@ -59,6 +59,7 @@ uv sync --extra tabpfn
 - `--extra tabpfn` installs the TabPFN generators. They run locally, but the model weights download only after your Prior Labs account has accepted the weights' license, so create a file named `.env` in the repository root containing `TABPFN_TOKEN=<your API key>` (see [TabPFN model license](#tabpfn-model-license)). If you do not have a key, set `generation.tabpfn.enabled: false` and skip the extra.
 - On Linux x86-64, PyTorch is installed with CUDA 12.8 support, so an NVIDIA GPU is used automatically. `device: auto` picks the GPU when there is one.
 - Run every command from the repository root. Relative paths in the config are resolved from the folder you run the command in.
+- If you will commit to the repository, run `uv run pre-commit install` once. Besides formatting, it refuses to commit any data file (CSV, Parquet, Excel and similar) outside the test fixture and `configs/schemas/`, so patient data cannot reach git by accident. CI runs the same check.
 
 ### TabPFN model license
 
@@ -326,6 +327,24 @@ Two fixed reference datasets are scored next to the generators, so every run has
 
 A useful generator beats `baseline_marginals` on utility and stays well above `baseline_train_copy` on privacy.
 
+### Output checks
+
+Every evaluation also checks that its output looks the way it must, and writes the result to `checks.csv` (one row per check and model, `pass` or `warn`, with the value and the limit). The report counts them at the top and lists every warning under "Read with care".
+
+| Check | Warns when |
+| --- | --- |
+| `columns_match` | The synthetic data lacks a training column or has an extra one. |
+| `exact_copies_of_train_rows` | More synthetic rows repeat a training row than real holdout rows do, by more than 2 points. Copied rows are real patients. |
+| `unseen_categories` | Over 1% of categorical cells hold a value that never occurs in train. |
+| `out_of_train_range` | Over 1% of continuous cells lie outside the training minimum and maximum. |
+| `class_shares_match_train` | A class's share differs from train by more than 2 points (only with `generation.match_class_prior`). |
+| `train_copy_has_the_lowest_privacy` | Some model scores lower on privacy than the copy of the real rows. |
+| `train_copy_beats_marginals_on_utility`, `..._on_tstr` | The copy of the real rows does not beat independently sampled columns on utility or holdout TSTR. |
+
+The limits match the HPO screens, so a model the search picked should pass the first five unless its final training drifted. The last three test the metrics rather than the generators: the two baselines have known places, and a baseline in the wrong place means a metric is broken (or, for TSTR, that the target carries no signal in this data). Investigate before trusting the ranking.
+
+Checks never stop the run. Add `--strict-checks` to `synthdata-evaluate` to exit with an error when any check warns (useful in scripts), or set `evaluation.run_checks: false` to skip them.
+
 ### Metric families
 
 Metrics come from three sources, each switched on in `evaluation.synthcity`, `evaluation.syntheval` and `evaluation.custom`. Each takes `categories` (any of `utility`, `privacy`, `fairness`) or an exact list of `metrics`; `null` runs everything. Metric names are listed in [`synthdata/evaluation/catalog.py`](../synthdata/evaluation/catalog.py).
@@ -381,7 +400,7 @@ Evaluation can process several models in parallel. `evaluation.syntheval_executi
 
 `report.md` sits in the evaluation folder and is the one page to read after a run. Every table and figure it mentions is linked. Its seven sections:
 
-1. **At a glance.** Dataset, experiment, seed, the recommended model and its overall score, how it compares with the two baselines, and a "Read with care" list of warnings (for example, a single seed, or an Anonymeter attack whose 95% interval is above 0).
+1. **At a glance.** Dataset, experiment, seed, the recommended model and its overall score, how it compares with the two baselines, the [output checks](#output-checks) count, and a "Read with care" list of warnings (for example, a single seed, a failed output check, or an Anonymeter attack whose 95% interval is above 0).
 2. **Ranking.** One row per model with overall, utility, privacy and fairness scores (with intervals and "tied with best" when there are replicates), followed by how the scores were built and the trade-off plots.
 3. **Utility.** Real versus synthetic distribution plots per model, and the holdout TSTR table against the real-data ceiling.
 4. **Privacy evidence.** The attack and distance results next to the baselines, with how to read each column.
@@ -417,6 +436,14 @@ output/<name>/experiments/data_v_<version>/exp_v_<id>/      manifest.json, confi
 
 Use a fresh experiment id for new work, and do not edit a config between stages of the same experiment.
 
+After updating dependencies or the synthcity and SynthEval submodules, run the golden test. It reruns the integration fixture and compares every metric with a stored reference, listing any metric that moved beyond its tolerance:
+
+```bash
+uv run --with catboost==1.2.10 pytest tests/integration -m regression
+```
+
+If the change was intended, rewrite the reference with `SYNTHDATA_UPDATE_GOLDEN=1` in front of the same command and commit it with the change. To compare two runs on your own data, put their `combined_evaluation.csv` files side by side.
+
 ## 12. Setting up your own dataset
 
 1. **Copy a config.** Start from `configs/config_sim.yaml` for multi-visit clinical data, or `config_hepatitis.yaml` for small one-row-per-person data. Change `name`, all `output_dir` and `data_dir` paths, `data.source`, `data.path` and `data.version`.
@@ -438,6 +465,19 @@ Use a fresh experiment id for new work, and do not edit a config between stages 
 7. **Do a quick generation run** with HPO off and two or three fast models (`tvae`, `arf`) to check everything works end to end.
 8. **Profile and set HPO budgets** ([section 7](#setting-hpo-budgets)), then run the full search under a new experiment id.
 9. **Set `n_replicates` to 3 or more** for the run whose results you will report.
+
+When the data loads, the pipeline warns about any feature column that looks like a direct identifier: a name such as `mrn`, `dob`, `zip` or `patient_id`, or a categorical or text column that is unique on almost every row. A generator can copy such values into synthetic rows. Drop them with `data.drop_columns` (and put the patient ID in `data.patient_id_column`) unless you mean to model them.
+
+### What is safe to share
+
+| Location | Holds | Share? |
+| --- | --- | --- |
+| `data/<name>/` | Real rows: splits, imputed data | Never. Treat it like the source data. |
+| `output/<name>/synthetic_data/.../released/` | Synthetic rows with missing values put back | This is the release candidate, after you have read the privacy section of the report. |
+| Other files in `synthetic_data/` | The scored synthetic rows, HPO studies, sampling diagnostics | Within the project team. |
+| `output/<name>/evaluation/`, `plots/` and `report.md` | Aggregate metrics, but also real-data distributions in the plots (including extreme values) and subgroup counts in the fairness tables, some of them small | Within the project team. Review before showing outside it: a small subgroup count or an outlier in a plot can identify a patient. |
+
+All training runs locally: the pipeline downloads the TabPFN weights and, for `data.source: uci`, the UCI data, and uploads nothing. TabPFN's own usage reporting (row and column counts, library versions) is switched off by default; set `TABPFN_DISABLE_TELEMETRY=0` in `.env` to allow it.
 
 ## 13. Troubleshooting
 
@@ -462,13 +502,16 @@ Use a fresh experiment id for new work, and do not edit a config between stages 
 | Evaluation is killed or the machine runs out of memory | Lower `evaluation.syntheval_execution.model_workers` or raise `memory_per_model_gib`. |
 | Warning that singling out stopped short | Anonymeter could not find enough unique predicates within `singling_out_max_attempts`; the risk may be underestimated. Raise the limit if time allows. |
 | Report says a figure is "not rendered yet" | Run `synthdata-plot` with the same config (and `--experiment-id` if needed). |
+| `... feature column(s) look like direct identifiers` | See [Setting up your own dataset](#12-setting-up-your-own-dataset): drop the column, or ignore the warning if you meant to model it (for example, a ZIP code declared as a quasi-identifier). |
+| `[checks] ...` warnings, or "Check ... on ..." in the report | See [Output checks](#output-checks). A generator check points at that model; a baseline check means a metric is not working on this data. |
+| `git commit` fails with "Data files must not be committed" | The pre-commit hook found a data file in your commit. Unstage it (`git restore --staged <file>`) and keep data under `data/` or outside the repository. |
 | Results changed unexpectedly between runs | The data, `data.version` or config changed and the cache was refreshed, or a different experiment id was picked up. Compare `config_snapshot.json` and `manifest.json`. |
 
 To run the tests after changing code:
 
 ```bash
 uv run pytest tests/unit                                            # fast
-uv run --with catboost pytest tests/integration -m "integration and not slow"   # full pipeline on a small fixture, a few minutes
+uv run --with catboost pytest tests/integration -m "integration and not slow and not regression"   # full pipeline on a small fixture, a few minutes
 ```
 
 ## 14. Glossary
