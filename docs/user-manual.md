@@ -165,7 +165,7 @@ Privacy and fairness metrics need to know what each column means. Three lists in
 
 | Role | Meaning | Used by | Example |
 | --- | --- | --- | --- |
-| `quasi_identifier_columns` | Public attributes an attacker could already know and use to link a record to a person | Anonymeter linkability and inference attacks (as attacker knowledge); both need at least one quasi-identifier and one sensitive column | age, sex, region |
+| `quasi_identifier_columns` | Public attributes an attacker could already know and use to link a record to a person | Anonymeter linkability (linked to the rest of the record) and inference attacks (as attacker knowledge); inference needs at least one quasi-identifier and one sensitive column | age, sex, region |
 | `sensitive_columns` | Secrets an attacker would try to learn | Anonymeter inference attacks (as targets); synthcity data_leakage and distinct l-diversity; SynthEval att_discl | a diagnosis, income |
 | `protected_columns` | Groups whose fair treatment you want to check | Fairness metrics | sex, ethnicity, age band |
 

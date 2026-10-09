@@ -254,7 +254,8 @@ def anonymeter_risks(
     """Run Anonymeter's attacks on one synthetic dataset.
 
     Singling out uses every column; linkability links the quasi-identifier
-    half of a record to its sensitive half; inference guesses each sensitive
+    part of a record to the rest of it (every other column); inference
+    guesses each sensitive
     column from the quasi-identifiers. An attack whose columns are not
     configured is skipped. Singling out takes ``seed``; linkability and
     inference sample their targets with numpy's global generator, so it is
@@ -293,14 +294,19 @@ def anonymeter_risks(
         singling_out.evaluate(mode=anonymeter_cfg.singling_out_mode)
         risks.append(_risk(singling_out, "singling_out", None, level))
 
-        if quasi_identifiers and secrets:
+        # The second half is the rest of the record, not only the sensitive
+        # columns: one low-cardinality secret ties every record, and an exact
+        # copy of the training rows then scored a linkability risk of 0.01
+        # (known-answer check; 0.996 with the rest of the record).
+        rest = [c for c in columns if c not in set(quasi_identifiers)]
+        if quasi_identifiers and rest:
             np.random.seed(seed)
             linkability = LinkabilityEvaluator(
                 ori=ori,
                 syn=synthetic,
                 control=control,
                 n_attacks=n_attacks,
-                aux_cols=(list(quasi_identifiers), list(secrets)),
+                aux_cols=(list(quasi_identifiers), rest),
                 n_neighbors=anonymeter_cfg.linkability_n_neighbors,
             )
             linkability.evaluate(n_jobs=1)

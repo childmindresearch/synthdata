@@ -119,7 +119,11 @@ def test_joint_structure_metrics_prefer_the_copy(known_answers):
     corr = _metric(known_answers, "corr_mat_diff")
     assert corr["copy"] < corr["shuffle"]
     detection = _metric(known_answers, "detection.detection_xgb.mean")
-    assert detection["copy"] < detection["shuffle"]
+    assert detection["shuffle"] > 0.5
+    # Cross-validation splits each copied row from its real twin, so the
+    # classifier learns the twin's opposite label (raw AUC near 0). Detection
+    # is reported two-sided, so copies count as detectable, not as perfect.
+    assert detection["copy"] > 0.9
 
 
 def test_train_on_synthetic_utility_tracks_the_target_signal(known_answers):
