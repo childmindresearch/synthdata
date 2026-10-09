@@ -103,15 +103,14 @@ generation:
     # Timeout = trials x (seconds per epoch x middle of the epoch range) x 1.5.
     # PATE-GAN: each iteration trains the GAN for 10 epochs (generator_n_iter
     # is held there, see HPO_FIXED_PARAMS); it searches 2-10 iterations.
-    # ARF (CPU only, single core): early stopping held on and trees capped at
-    # 50; budget is provisional from one default fit (30 trees, about 28 min
-    # on a 4-core cloud machine, 2026-10-08) until re-timed with the fork's
-    # bounded-leaf fix.
+    # ARF (CPU only, single core): early stopping held on, 10-50 trees;
+    # 37 s per tree with the fork's bounded-leaf fix (2 trials, 263-1316 s,
+    # 2026-10-09).
     n_trials_per_model:
       { ctgan: 40, tvae: 40, adsgan: 40, rtvae: 40, pategan: 40, ddpm: 40, arf: 25 }
     timeout_seconds_per_model:
       { ctgan: 155000, tvae: 85000, adsgan: 95500, rtvae: 99000, pategan: 19500,
-        ddpm: 103000, arf: 62000 }
+        ddpm: 103000, arf: 42000 }
     # Training length is searched, [low, high, step]. The libraries' ranges
     # (100-1000 epochs; PATE-GAN 1-500) would take 3+ hours per trial here.
     # The top also caps the untuned default model, which would otherwise
