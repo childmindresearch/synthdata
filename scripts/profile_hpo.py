@@ -108,9 +108,24 @@ def trial_rows(name: str, study) -> list[dict]:
                 "batch_size": t.params.get("batch_size"),
                 "value": t.value,
                 "params": json.dumps(t.params, default=str),
+                "error": t.user_attrs.get("error"),
             }
         )
     return rows
+
+
+def _recording_errors(objective):
+    """Store a failed trial's exception (type and message) so trials.csv shows why."""
+
+    def wrapped(trial):
+        try:
+            return objective(trial)
+        except Exception as exc:
+            trial.set_user_attr("error", f"{type(exc).__name__}: {exc}"[:500])
+            logger.exception("[%s] trial %d failed", trial.study.study_name, trial.number)
+            raise
+
+    return wrapped
 
 
 def summarize(trials: pd.DataFrame, peak_gb: dict) -> pd.DataFrame:
@@ -247,7 +262,9 @@ def main() -> None:
                 ),
             )
             try:
-                hpo_mod.run_study(f"hpo_{name}", objective, hpo_cfg, out, cfg.seed)
+                hpo_mod.run_study(
+                    f"hpo_{name}", _recording_errors(objective), hpo_cfg, out, cfg.seed
+                )
             except Exception:  # keep profiling the other models
                 logger.exception("[%s] study failed", name)
             if torch.cuda.is_available():
