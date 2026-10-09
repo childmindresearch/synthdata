@@ -23,4 +23,15 @@ repos:
       - id: check-added-large-files
         args: [--maxkb=1024]
 
+  # The pipeline runs on sensitive clinical data: refuse to commit any data
+  # file except the synthetic test fixture and public-data schemas.
+  - repo: local
+    hooks:
+      - id: no-data-files
+        name: no data files outside tests/integration/fixtures and configs/schemas
+        entry: Data files must not be committed (they may hold patient data). Keep them under data/ or outside the repository.
+        language: fail
+        files: '\.(csv|tsv|parquet|feather|xlsx?|pkl|pickle|sav|dta|sas7bdat)$'
+        exclude: '^(tests/integration/fixtures/|configs/schemas/)'
+
 exclude: ^submodules/
