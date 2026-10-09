@@ -132,15 +132,17 @@ evaluation:
   binary_target:
     { enabled: false, column: null, positive_classes: [], negative_classes: [] }
 
-  # Two worker processes: faster, and exercises the parallel scheduler.
-  syntheval_execution:
-    model_workers: 2
-    max_model_workers: 2
-    cores_per_model: 1
-    memory_reserve_gib: 1
-    memory_per_model_gib: 1
 
   rank_weights: { utility: 1.0, privacy: 1.0, fairness: 1.0 }
+
+# Two worker processes, one thread each: faster, and exercises the parallel
+# scheduler in generation and evaluation.
+compute:
+  workers: 2
+  max_workers: 2
+  cores_per_worker: 1
+  memory_reserve_gib: 1
+  memory_per_worker_gib: 1
 
 plots:
   output_dir: "{root}/output/clinic/plots"

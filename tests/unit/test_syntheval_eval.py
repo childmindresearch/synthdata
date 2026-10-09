@@ -13,7 +13,7 @@ import pandas as pd
 import pytest
 from syntheval.syntheval import aggregate_benchmark_results
 
-from synthdata.config import FrameworkSelectionConfig, SynthEvalExecutionConfig
+from synthdata.config import FrameworkSelectionConfig
 from synthdata.evaluation.catalog import FAIRNESS_METRICS_WITH_POSITIVE_CLASS, SYNTHEVAL_PRESET
 from synthdata.evaluation.syntheval_eval import (
     BINARY_ONLY_METRICS,
@@ -31,7 +31,6 @@ from synthdata.evaluation.syntheval_eval import (
     build_preset,
     extract_metric_types,
     merge_binary_target_results,
-    resolve_model_workers,
     run_ovr_macro_syntheval_evaluation,
 )
 
@@ -419,43 +418,6 @@ class TestSaveLoadSynthevalCache:
         _save_syntheval_cache(results, ranks, tmp_path, "main", key)
         meta = json.loads((tmp_path / "main_cache_meta.json").read_text())
         assert meta["cache_key"] == key
-
-
-class TestResolveModelWorkers:
-    def test_explicit_limit_obeys_model_and_max_bounds(self):
-        cfg = SynthEvalExecutionConfig(model_workers=10, max_model_workers=4)
-        assert resolve_model_workers(cfg, n_models=3, n_columns=10) == 3
-
-    def test_auto_uses_memory_and_cpu_bounds(self, monkeypatch):
-        cfg = SynthEvalExecutionConfig(
-            model_workers="auto",
-            max_model_workers=8,
-            cores_per_model=4,
-            memory_reserve_gib=16,
-        )
-        monkeypatch.setattr("synthdata.evaluation.syntheval_eval.os.cpu_count", lambda: 24)
-        monkeypatch.setattr(
-            "synthdata.evaluation.syntheval_eval._available_memory_gib", lambda: 118.0
-        )
-        assert resolve_model_workers(cfg, n_models=18, n_columns=1038) == 6
-
-    def test_auto_does_not_read_total_memory_after_available_memory(self, monkeypatch):
-        cfg = SynthEvalExecutionConfig(
-            model_workers="auto",
-            max_model_workers=8,
-            cores_per_model=4,
-            memory_reserve_gib=16,
-        )
-        monkeypatch.setattr("synthdata.evaluation.syntheval_eval.os.cpu_count", lambda: 24)
-        monkeypatch.setattr(
-            "synthdata.evaluation.syntheval_eval._available_memory_gib", lambda: 118.0
-        )
-        monkeypatch.setattr(
-            "synthdata.evaluation.syntheval_eval.Path.read_text",
-            lambda _path: pytest.fail("worker resolution must not read MemTotal"),
-        )
-
-        assert resolve_model_workers(cfg, n_models=18, n_columns=1038) == 6
 
 
 class TestCheckpointPaths:

@@ -6,7 +6,6 @@ synthetic datasets using a custom preset (built from
 import dataclasses
 import hashlib
 import json
-import multiprocessing
 import os
 import random
 import re
@@ -20,6 +19,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from synthdata.compute import run_per_model
 from synthdata.data import Dataset
 from synthdata.evaluation.catalog import (
     FAIRNESS_METRICS_WITH_POSITIVE_CLASS,
@@ -75,45 +75,6 @@ def _frame_fingerprint(frame: pd.DataFrame) -> str:
 def _checkpoint_model_id(model_name: str) -> str:
     """Stable path-safe model id while retaining the original name in metadata."""
     return hashlib.sha256(model_name.encode()).hexdigest()[:16]
-
-
-def _available_memory_gib() -> float | None:
-    """Return Linux MemAvailable in GiB, or None where it cannot be observed."""
-    try:
-        lines = Path("/proc/meminfo").read_text().splitlines()
-    except OSError:
-        return None
-    for line in lines:
-        if line.startswith("MemAvailable:"):
-            return int(line.split()[1]) / 1024**2
-    return None
-
-
-def resolve_model_workers(execution_cfg, *, n_models: int, n_columns: int) -> int:
-    """Resolve a memory- and CPU-bounded number of concurrent model processes.
-
-    The Linux ``MemAvailable`` value is already the kernel's estimate of
-    immediately allocatable memory. It is therefore the only host-memory
-    value used for auto-sizing: ``MemTotal`` can describe a smaller container
-    or runner limit than the available-memory probe supplied by callers/tests,
-    making worker selection depend on an unrelated second system read.
-    """
-    if not n_models:
-        return 0
-    requested = execution_cfg.model_workers
-    if requested != "auto":
-        return min(requested, execution_cfg.max_model_workers, n_models)
-
-    cpu_count = os.cpu_count() or 1
-    cpu_bound = max(1, cpu_count // execution_cfg.cores_per_model)
-    per_model_gib = execution_cfg.memory_per_model_gib or max(6.0, 0.0135 * n_columns)
-    available_gib = _available_memory_gib()
-    if available_gib is None:
-        memory_bound = 1
-    else:
-        budget_gib = max(0.0, available_gib - execution_cfg.memory_reserve_gib)
-        memory_bound = max(1, int(budget_gib // per_model_gib))
-    return max(1, min(n_models, execution_cfg.max_model_workers, cpu_bound, memory_bound))
 
 
 def _checkpoint_paths(
@@ -648,34 +609,20 @@ def _run_resumable_syntheval(
             results[model_name] = cached
 
     if pending:
-        workers = resolve_model_workers(
-            execution_cfg,
-            n_models=len(pending),
-            n_columns=dataset.train_imputed_df.shape[1],
-        )
         logger.info(
-            "[syntheval] %s scheduling %d missing model(s) with %d disposable worker(s) "
+            "[syntheval] %s scheduling %d missing model(s) "
             "(train=%s, holdout=%s, features=%d, plots=%s)",
             pass_name,
             len(pending),
-            workers,
             dataset.train_imputed_df.shape,
             dataset.test_imputed_df.shape if dataset.test_imputed_df is not None else None,
             dataset.train_imputed_df.shape[1],
             plots_enabled,
         )
-        context = multiprocessing.get_context("spawn")
-        active: dict[str, multiprocessing.Process] = {}
-        pending_iter = iter(pending)
-
-        def start_next() -> bool:
-            try:
-                model_name, frame, model_fingerprint = next(pending_iter)
-            except StopIteration:
-                return False
-            process = context.Process(
-                target=_model_worker,
-                args=(
+        run_per_model(
+            _model_worker,
+            {
+                model_name: (
                     model_name,
                     frame,
                     dataset.train_imputed_df,
@@ -690,70 +637,48 @@ def _run_resumable_syntheval(
                     context_fingerprint,
                     model_fingerprint,
                     str(plots_output_dir) if plots_output_dir else None,
-                    execution_cfg.cores_per_model,
+                    execution_cfg.cores_per_worker,
                     seed,
-                ),
-                name=f"syntheval-{pass_name}-{model_name}",
-            )
-            process.start()
-            active[model_name] = process
-            logger.info(
-                "[syntheval] %s started model=%s pid=%s", pass_name, model_name, process.pid
-            )
-            return True
-
-        for _ in range(workers):
-            if not start_next():
-                break
-
-        failures = []
-        while active:
-            completed = []
-            for model_name, process in active.items():
-                if process.is_alive():
-                    continue
-                process.join()
-                completed.append((model_name, process.exitcode))
-            if not completed:
-                time.sleep(0.1)
-                continue
-            for model_name, exitcode in completed:
-                del active[model_name]
-                model_fingerprint = _frame_fingerprint(synthetic_datasets[model_name])
-                cached = _valid_checkpoint(
-                    checkpoint_root,
-                    pass_name,
-                    model_name,
-                    context_fingerprint,
-                    model_fingerprint,
-                    plots_enabled,
                 )
-                if exitcode == 0 and cached is not None:
-                    results[model_name] = cached
-                    logger.info("[syntheval] %s completed model=%s", pass_name, model_name)
-                else:
-                    _, status_path, _ = _checkpoint_paths(checkpoint_root, pass_name, model_name)
-                    _atomic_json(
-                        status_path,
-                        {
-                            "schema_version": _CHECKPOINT_SCHEMA_VERSION,
-                            "state": "failed",
-                            "model_name": model_name,
-                            "context_fingerprint": context_fingerprint,
-                            "model_fingerprint": model_fingerprint,
-                            "exit_code": exitcode,
-                            "failed_at": time.time(),
-                            "failure_reason": "worker exited without a valid succeeded checkpoint",
-                        },
-                    )
-                    failures.append(f"{model_name} (exit={exitcode}, status={status_path})")
-                    logger.error(
-                        "[syntheval] %s model=%s exited %s without a valid checkpoint",
-                        pass_name,
-                        model_name,
-                        exitcode,
-                    )
-                start_next()
+                for model_name, frame, model_fingerprint in pending
+            },
+            execution_cfg,
+            n_columns=dataset.train_imputed_df.shape[1],
+            label=f"syntheval {pass_name}",
+            # Even one at a time, each model gets its own process: its exit
+            # releases native and allocator high-water memory.
+            isolate=True,
+        )
+
+        # A model counts only once its checkpoint validates, whatever its
+        # process reported.
+        failures = []
+        for model_name, _, model_fingerprint in pending:
+            cached = _valid_checkpoint(
+                checkpoint_root,
+                pass_name,
+                model_name,
+                context_fingerprint,
+                model_fingerprint,
+                plots_enabled,
+            )
+            if cached is not None:
+                results[model_name] = cached
+                continue
+            _, status_path, _ = _checkpoint_paths(checkpoint_root, pass_name, model_name)
+            _atomic_json(
+                status_path,
+                {
+                    "schema_version": _CHECKPOINT_SCHEMA_VERSION,
+                    "state": "failed",
+                    "model_name": model_name,
+                    "context_fingerprint": context_fingerprint,
+                    "model_fingerprint": model_fingerprint,
+                    "failed_at": time.time(),
+                    "failure_reason": "worker exited without a valid succeeded checkpoint",
+                },
+            )
+            failures.append(f"{model_name} (status={status_path})")
         if failures:
             raise RuntimeError(
                 f"SynthEval {pass_name} failed for {len(failures)} model(s): {', '.join(failures)}. "
@@ -848,9 +773,9 @@ def run_syntheval_evaluation(
         return cached
 
     if execution_cfg is None:
-        from synthdata.config import SynthEvalExecutionConfig
+        from synthdata.config import ComputeConfig
 
-        execution_cfg = SynthEvalExecutionConfig()
+        execution_cfg = ComputeConfig()
     benchmark_results, benchmark_ranks = _run_resumable_syntheval(
         synthetic_datasets,
         dataset,
@@ -999,9 +924,9 @@ def _run_collapsed_target_pass(
         return cached
 
     if execution_cfg is None:
-        from synthdata.config import SynthEvalExecutionConfig
+        from synthdata.config import ComputeConfig
 
-        execution_cfg = SynthEvalExecutionConfig()
+        execution_cfg = ComputeConfig()
     logger.info(
         "[syntheval] %s pass: scheduling %d datasets across %d metric(s) "
         "(column %r collapsed to binary: positive=%s, negative=%s)",

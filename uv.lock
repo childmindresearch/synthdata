@@ -5571,6 +5571,7 @@ source = { editable = "." }
 dependencies = [
     { name = "altair" },
     { name = "anonymeter" },
+    { name = "filelock" },
     { name = "jupyter" },
     { name = "marimo" },
     { name = "matplotlib" },
@@ -5639,6 +5640,7 @@ requires-dist = [
     { name = "anonymeter", specifier = ">=1.1.0" },
     { name = "catboost", marker = "extra == 'refidiff'" },
     { name = "causal-conv1d", marker = "extra == 'refidiff'", specifier = "==1.6.2.post1" },
+    { name = "filelock" },
     { name = "flair", marker = "extra == 'presidio'" },
     { name = "jupyter" },
     { name = "mamba-ssm", marker = "extra == 'refidiff'", specifier = "==2.3.1" },

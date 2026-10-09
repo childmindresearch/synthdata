@@ -88,6 +88,7 @@ def run_evaluation(
         seed=cfg.seed,
         workspace=output_dir / "synthcity_workspace",
         discrete_columns=dataset.all_categorical_columns,
+        compute_cfg=cfg.compute,
     )
 
     # Native SynthEval diagnostics can only be created during SynthEval's
@@ -110,7 +111,7 @@ def run_evaluation(
         output_folder=output_dir / "syntheval_benchmark",
         plots_output_dir=plots_output_dir,
         positive_class=eval_cfg.positive_class,
-        execution_cfg=eval_cfg.syntheval_execution,
+        execution_cfg=cfg.compute,
         seed=cfg.seed,
     )
 
@@ -124,7 +125,7 @@ def run_evaluation(
             preset_dir=output_dir,
             ranking_strategy=eval_cfg.ranking_strategy,
             output_folder=output_dir / "syntheval_benchmark",
-            execution_cfg=eval_cfg.syntheval_execution,
+            execution_cfg=cfg.compute,
             seed=cfg.seed,
         )
         benchmark_results, benchmark_ranks = syntheval_eval.merge_binary_target_results(
@@ -142,7 +143,7 @@ def run_evaluation(
             preset_dir=output_dir,
             ranking_strategy=eval_cfg.ranking_strategy,
             output_folder=output_dir / "syntheval_benchmark",
-            execution_cfg=eval_cfg.syntheval_execution,
+            execution_cfg=cfg.compute,
             seed=cfg.seed,
         )
         benchmark_results, benchmark_ranks = syntheval_eval.merge_binary_target_results(
@@ -154,14 +155,24 @@ def run_evaluation(
     )
 
     tstr_result = custom_eval.run_tstr_evaluation(
-        selected_datasets, dataset, eval_cfg.custom, eval_cfg.tstr_seeds, cfg.seed
+        selected_datasets,
+        dataset,
+        eval_cfg.custom,
+        eval_cfg.tstr_seeds,
+        cfg.seed,
+        compute_cfg=cfg.compute,
     )
     tstr_table = custom_eval.build_tstr_table(tstr_result)
     if not tstr_table.empty:
         tstr_table.to_csv(output_dir / "tstr_holdout.csv")
 
     privacy_result = custom_eval.run_privacy_evaluation(
-        selected_datasets, dataset, eval_cfg.custom, eval_cfg.privacy_attacks, cfg.seed
+        selected_datasets,
+        dataset,
+        eval_cfg.custom,
+        eval_cfg.privacy_attacks,
+        cfg.seed,
+        compute_cfg=cfg.compute,
     )
     privacy_attacks_table = (privacy_result or {}).get("attacks")
     if privacy_attacks_table is not None and not privacy_attacks_table.empty:

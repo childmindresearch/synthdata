@@ -54,9 +54,9 @@ OVERRIDES = {
         },
     },
     "evaluation": {
-        "syntheval_execution": {"model_workers": "auto", "max_model_workers": 4},
         "save_per_model_syntheval_plots": True,
     },
+    "compute": {"workers": "auto", "max_workers": 4},
 }
 
 

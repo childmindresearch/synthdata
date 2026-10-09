@@ -27,6 +27,7 @@ dependencies = [
     "ucimlrepo",
     "optuna",
     "anonymeter>=1.1.0",
+    "filelock",
     "torch>=2.7.1",
     "torchvision>=0.22.1",
 ]
@@ -37,6 +38,7 @@ synthdata-impute = "scripts.run_imputation:main"
 synthdata-generate = "scripts.run_generation:main"
 synthdata-evaluate = "scripts.run_evaluation:main"
 synthdata-plot = "scripts.run_plots:main"
+synthdata-run = "scripts.run_pipeline:main"
 
 [project.optional-dependencies]
 presidio = [

@@ -19,6 +19,8 @@ the generator never saw and use the held-out test split.
 
 import pandas as pd
 
+from synthdata.compute import run_per_model
+from synthdata.config import ComputeConfig
 from synthdata.evaluation.catalog import (
     SYNTHCITY_CATEGORY_TO_TYPE,
     SYNTHCITY_METRIC_CONFIG,
@@ -181,34 +183,75 @@ def run_synthcity_evaluation(
     workspace: str | None = None,
     *,
     discrete_columns: list,
+    compute_cfg=None,
 ) -> dict[str, pd.DataFrame]:
     """Run synthcity Metrics on every cached synthetic dataset.
 
     Returns ``{model_name: DataFrame}`` where each DataFrame is indexed by
     metric key (e.g. ``"stats.wasserstein_dist.joint"``) with at least
     ``mean``/``direction`` columns, as returned by ``Metrics.evaluate``.
+    Models are scored in parallel processes per ``compute_cfg`` (one at a
+    time when None).
     """
     metric_config = resolve_metric_config(selection_cfg)
     if not metric_config:
         logger.info("[synthcity] no metrics selected; skipping")
         return {}
 
-    results = {}
-    for name, syn_df in synthetic_datasets.items():
-        logger.info("[synthcity] evaluating %s", name)
-        try:
-            results[name] = run_synthcity_metrics(
+    run = run_per_model(
+        _evaluate_one,
+        {
+            name: (
+                name,
                 syn_df,
                 test_df,
                 train_df,
                 target_column,
                 sensitive_features,
                 metric_config,
-                random_state=seed,
-                workspace=workspace,
-                discrete_columns=discrete_columns,
+                seed,
+                workspace,
+                discrete_columns,
             )
-        except Exception as exc:  # noqa: BLE001 -- one model's failure must not stop the rest
-            logger.warning("[synthcity] evaluation failed for %s: %r", name, exc)
-            results[name] = pd.DataFrame({"error": [str(exc)], "error_type": [type(exc).__name__]})
-    return results
+            for name, syn_df in synthetic_datasets.items()
+        },
+        compute_cfg or ComputeConfig(workers=1),
+        n_columns=train_df.shape[1],
+        label="synthcity",
+    )
+    results = run.results
+    for name, error in run.failures.items():
+        # A killed process; failures inside a model are already caught.
+        results[name] = pd.DataFrame({"error": [error], "error_type": ["WorkerError"]})
+    return {name: results[name] for name in synthetic_datasets}
+
+
+def _evaluate_one(
+    name,
+    syn_df,
+    test_df,
+    train_df,
+    target_column,
+    sensitive_features,
+    metric_config,
+    seed,
+    workspace,
+    discrete_columns,
+) -> pd.DataFrame:
+    """synthcity metrics for one model; a failure becomes an error row."""
+    logger.info("[synthcity] evaluating %s", name)
+    try:
+        return run_synthcity_metrics(
+            syn_df,
+            test_df,
+            train_df,
+            target_column,
+            sensitive_features,
+            metric_config,
+            random_state=seed,
+            workspace=workspace,
+            discrete_columns=discrete_columns,
+        )
+    except Exception as exc:  # noqa: BLE001 -- one model's failure must not stop the rest
+        logger.warning("[synthcity] evaluation failed for %s: %r", name, exc)
+        return pd.DataFrame({"error": [str(exc)], "error_type": [type(exc).__name__]})

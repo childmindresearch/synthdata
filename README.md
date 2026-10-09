@@ -29,9 +29,15 @@ uv run synthdata-evaluate --config path/to/your-config.yaml --plot
 uv run synthdata-plot     --config path/to/your-config.yaml
 ```
 
+Or run all four in one go with a log file, in the background on a remote machine (see [Long runs and remote machines](docs/user-manual.md#long-runs-and-remote-machines)):
+
+```bash
+uv run synthdata-run --config path/to/your-config.yaml --detach
+```
+
 ## Your dataset configuration
 
-One YAML file drives every stage. Its sections (`data`, `imputation`, `generation`, `evaluation`, `plots`, `experiment`) follow the pipeline order. The example files list only the options worth reviewing for each run: data source and column roles, the patient-level split, imputation method, generators and their HPO budgets, metric selection and ranking weights. Every option left out takes its default. [`synthdata/config.py`](synthdata/config.py) is the full reference: every option there has its default and an explanation, and an unknown or misspelled key stops the run with the list of valid keys.
+One YAML file drives every stage. Its sections (`data`, `imputation`, `generation`, `evaluation`, `compute`, `plots`, `experiment`) follow the pipeline order. The example files list only the options worth reviewing for each run: data source and column roles, the patient-level split, imputation method, generators and their HPO budgets, metric selection and ranking weights. Every option left out takes its default. [`synthdata/config.py`](synthdata/config.py) is the full reference: every option there has its default and an explanation, and an unknown or misspelled key stops the run with the list of valid keys.
 
 The settings to check first for a new dataset:
 
