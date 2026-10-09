@@ -26,6 +26,7 @@ from pathlib import Path
 import numpy as np
 import optuna
 import pandas as pd
+from filelock import FileLock
 
 from synthdata.config import HPOConfig, HPOConstraintsConfig
 from synthdata.evaluation.tstr import tstr_scores
@@ -515,10 +516,19 @@ def make_pruner(hpo_cfg: HPOConfig) -> optuna.pruners.BasePruner:
     return optuna.pruners.NopPruner()
 
 
+def create_storage(hpo_cfg: HPOConfig, output_dir: str | Path) -> optuna.storages.BaseStorage:
+    """The study storage; SQLite waits up to a minute for a lock held by another process."""
+    url = hpo_cfg.storage or default_storage_url(output_dir)
+    if url.startswith("sqlite"):
+        # Models tuned in parallel processes write to one file.
+        return optuna.storages.RDBStorage(url, engine_kwargs={"connect_args": {"timeout": 60}})
+    return optuna.storages.get_storage(url)
+
+
 def create_study(
     study_name: str, hpo_cfg: HPOConfig, output_dir: str | Path, seed: int
 ) -> optuna.Study:
-    storage = hpo_cfg.storage or default_storage_url(output_dir)
+    storage = create_storage(hpo_cfg, output_dir)
     with warnings.catch_warnings():
         # constraints_func is marked experimental but stable since Optuna 3.0.
         warnings.simplefilter("ignore", optuna.exceptions.ExperimentalWarning)
@@ -640,5 +650,10 @@ class BestParamsCache:
         return model_name in self._data.get(family, {})
 
     def set(self, family: str, model_name: str, params: dict) -> None:
-        self._data.setdefault(family, {})[model_name] = params
-        save_json(self.path, self._data)
+        # Models tuned in parallel processes share this file: re-read it under
+        # a lock so one model's write never drops another's.
+        ensure_dir(self.path.parent)
+        with FileLock(f"{self.path}.lock"):
+            self._data = load_json(self.path, default={})
+            self._data.setdefault(family, {})[model_name] = params
+            save_json(self.path, self._data)

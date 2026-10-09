@@ -202,7 +202,9 @@ class RunSpec:
 #: sum. Each test asks for its run by fixture name (``<name>_run``).
 RUNS: dict[str, RunSpec] = {
     "baseline": RunSpec(plots=True),
-    "rerun": RunSpec(),
+    # One model at a time, so the identical-data and identical-metric checks
+    # against "baseline" (two worker processes) also cover parallel runs.
+    "rerun": RunSpec(overrides={"compute": {"workers": 1}}),
     "holdout_canary": RunSpec(IMPUTE_AND_GENERATE, perturb_holdout=True),
     "indicator_only": RunSpec(IMPUTE_AND_GENERATE, INDICATOR_ONLY),
     "cart_canary": RunSpec(IMPUTE_AND_GENERATE, INDICATOR_ONLY, perturb_holdout=True),

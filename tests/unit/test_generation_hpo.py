@@ -10,6 +10,7 @@ import pytest
 from synthdata.config import HPOConfig, HPOConstraintsConfig
 from synthdata.generation.hpo import (
     SCREENS,
+    BestParamsCache,
     TrialScore,
     _trial_constraints,
     build_hpo_eval_fn,
@@ -301,3 +302,14 @@ def test_pruner_off_and_removed_cap_keys():
         _validate_hpo(HPOConfig(n_trials_per_model={"ctgan": -1}))
     with pytest.raises(ValueError, match="epoch_ranges"):
         _from_dict(HPOConfig, {"n_iter_cap": 100})
+
+
+def test_best_params_cache_keeps_writes_from_other_instances(tmp_path):
+    # Models tuned in parallel processes each hold their own cache object.
+    path = tmp_path / "hpo_best_params.json"
+    first, second = BestParamsCache(path), BestParamsCache(path)
+    first.set("synthcity", "ctgan", {"n_iter": 50})
+    second.set("synthcity", "tvae", {"n_iter": 75})
+    reread = BestParamsCache(path)
+    assert reread.get("synthcity", "ctgan") == {"n_iter": 50}
+    assert reread.get("synthcity", "tvae") == {"n_iter": 75}

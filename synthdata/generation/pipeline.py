@@ -7,10 +7,13 @@ cached to CSV under ``generation.output_dir`` (skip regeneration unless
 JSON file (see :class:`synthdata.generation.hpo.BestParamsCache`).
 """
 
+import copy
 from collections.abc import Callable
 
 import pandas as pd
+from filelock import FileLock
 
+from synthdata.compute import resolve_workers, run_per_model
 from synthdata.config import Config
 from synthdata.data import Dataset, remask_synthetic
 from synthdata.generation import cart_fill, class_quota
@@ -50,6 +53,61 @@ def needs_imputed_data(gen_cfg) -> bool:
     )
 
 
+def _synthcity_worker(cfg: Config, dataset: Dataset, name: str, device: str):
+    """Run one synthcity model's whole chain (in its own process).
+
+    Returns the model's synthetic datasets and the names this run generated
+    (not loaded from cache), which the parent plots.
+    """
+    sub = copy.deepcopy(cfg)
+    sub.device = device
+    sub.compute.workers = 1
+    sub.generation.synthcity.names = [name]
+    sub.generation.tabpfn.enabled = False
+    sub.generation.tabpfgen.enabled = False
+    generated = []
+    datasets = run_generation(sub, dataset, plot_callback=lambda n, df, extra: generated.append(n))
+    return datasets, generated
+
+
+def _run_synthcity_workers(cfg: Config, dataset: Dataset, device: str) -> dict:
+    """Train every synthcity model in its own process (see synthdata.compute).
+
+    Each model runs exactly the chain the sequential loop would run (its
+    seeds do not depend on the other models), so the outputs match a
+    sequential run with the same thread count. Models with the longest HPO
+    timeout start first. With several GPUs, models go round-robin across them.
+    """
+    gen_cfg = cfg.generation
+    names = list(gen_cfg.synthcity.names)
+    if gen_cfg.hpo.enabled:
+        names.sort(key=lambda n: hpo_mod.model_budget(gen_cfg.hpo, n)[1] or 0, reverse=True)
+        # Create the Optuna tables once, so parallel studies never race to.
+        hpo_mod.create_storage(gen_cfg.hpo, ensure_dir(gen_cfg.output_dir))
+    n_gpus = 0
+    if device == "cuda":
+        import torch
+
+        n_gpus = torch.cuda.device_count()
+    run = run_per_model(
+        _synthcity_worker,
+        {
+            name: (cfg, dataset, name, f"cuda:{i % n_gpus}" if n_gpus > 1 else device)
+            for i, name in enumerate(names)
+        },
+        cfg.compute,
+        n_columns=len(dataset.train_df.columns),
+        label="generation",
+    )
+    if run.failures:
+        # Finished models are cached, so a rerun only redoes the failed ones.
+        raise RuntimeError(
+            f"synthcity generation failed for {sorted(run.failures)}: "
+            + "; ".join(f"{n}: {e}" for n, e in run.failures.items())
+        )
+    return run.results
+
+
 def run_generation(
     cfg: Config,
     dataset: Dataset,
@@ -82,6 +140,14 @@ def run_generation(
     seed = cfg.seed
     device = resolve_device(cfg.device)
 
+    # With more than one compute worker, every synthcity model runs in its
+    # own process first; the loop below then only collects their results.
+    worker_results = {}
+    names = gen_cfg.synthcity.names if gen_cfg.synthcity.enabled else []
+    n_columns = len(dataset.train_df.columns)
+    if names and resolve_workers(cfg.compute, n_models=len(names), n_columns=n_columns) > 1:
+        worker_results = _run_synthcity_workers(cfg, dataset, device)
+
     best_params_path = gen_cfg.hpo.best_params_path or hpo_mod.default_best_params_path(output_dir)
     best_params = hpo_mod.BestParamsCache(best_params_path)
 
@@ -104,11 +170,13 @@ def run_generation(
     def _record_class_sampling(name, report):
         """Keep each model's quotas, rows kept and raw class shares in class_sampling.csv."""
         rows = report.to_frame(name)
-        if class_sampling_path.exists():
-            previous = pd.read_csv(class_sampling_path)
-            rows = pd.concat([previous[previous["model"] != name], rows], ignore_index=True)
         ensure_dir(class_sampling_path.parent)
-        rows.to_csv(class_sampling_path, index=False)
+        # Models generated in parallel processes share this file.
+        with FileLock(f"{class_sampling_path}.lock"):
+            if class_sampling_path.exists():
+                previous = pd.read_csv(class_sampling_path)
+                rows = pd.concat([previous[previous["model"] != name], rows], ignore_index=True)
+            rows.to_csv(class_sampling_path, index=False)
 
     # Hyperparameter search fits candidates on train minus tuning and scores
     # them on tuning. Final models (default and tuned) are fitted on all of
@@ -236,22 +304,26 @@ def run_generation(
                 name,
                 base,
             )
-        if plot_callback is not None:
-            try:
-                plot_callback(name, df, extra)
-            except (ValueError, TypeError, OSError, RuntimeError) as exc:
-                # Plotting must never break generation: skip just this
-                # figure, but persist the skip to the experiment manifest so
-                # it's visible from the output directory, not just the console.
-                logger.warning("[%s] plot callback failed: %s", name, exc)
-                if experiment is not None:
-                    experiment.record(
-                        "generation_plot_failed",
-                        model=name,
-                        error=str(exc),
-                        error_type=type(exc).__name__,
-                    )
+        _plot(name, df, extra)
         return df
+
+    def _plot(name, df, extra):
+        if plot_callback is None:
+            return
+        try:
+            plot_callback(name, df, extra)
+        except (ValueError, TypeError, OSError, RuntimeError) as exc:
+            # Plotting must never break generation: skip just this
+            # figure, but persist the skip to the experiment manifest so
+            # it's visible from the output directory, not just the console.
+            logger.warning("[%s] plot callback failed: %s", name, exc)
+            if experiment is not None:
+                experiment.record(
+                    "generation_plot_failed",
+                    model=name,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
 
     # ------------------------------------------------------------------
     # synthcity models
@@ -280,6 +352,12 @@ def run_generation(
         )
 
         for name in gen_cfg.synthcity.names:
+            if name in worker_results:
+                datasets, generated = worker_results[name]
+                synthetic_datasets.update(datasets)
+                for generated_name in generated:
+                    _plot(generated_name, datasets[generated_name], None)
+                continue
             _cached_or_build(
                 name,
                 lambda seed, count, name=name: sc.fit_generate(

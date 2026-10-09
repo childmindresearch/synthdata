@@ -9,6 +9,17 @@ name: sim
 seed: 42 # Split, imputation, generators and metrics all derive from this.
 device: auto # auto | cpu | cuda | mps
 
+# Models processed at once, in generation (one process per synthcity model:
+# its search, final fit and replicates) and in evaluation (one process per
+# synthetic dataset). auto = CPU cores // cores_per_worker, capped by free
+# memory and max_workers: 6 on a 24-core, 125 GB machine.
+compute:
+  workers: auto
+  max_workers: 8
+  cores_per_worker: 4
+  memory_reserve_gib: 16
+  memory_per_worker_gib: 14
+
 experiment:
   tag: sim_v1
   id: "1.2" # Reusing an id resumes that experiment; null makes a new one per run.
@@ -152,13 +163,6 @@ evaluation:
     unit: patient
     anonymeter: { n_attacks: 500 }
 
-  # Parallel per-model evaluation, sized to the machine.
-  syntheval_execution:
-    model_workers: 6
-    max_model_workers: 6
-    cores_per_model: 4
-    memory_reserve_gib: 16
-    memory_per_model_gib: 14
 
   # Overall rank = weighted geometric mean of the utility, privacy and
   # fairness ranks.

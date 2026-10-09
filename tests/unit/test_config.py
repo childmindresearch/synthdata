@@ -7,13 +7,13 @@ import yaml
 
 from synthdata.config import (
     BinaryTargetConfig,
+    ComputeConfig,
     Config,
     DataConfig,
     GenerationConfig,
     HPOConfig,
     ImputationConfig,
     RefiDiffConfig,
-    SynthEvalExecutionConfig,
     _from_dict,
     _validate,
     load_config,
@@ -114,13 +114,13 @@ class TestFromDict:
         with pytest.raises(ValueError, match="privacy_gate was removed"):
             _from_dict(Config, {"evaluation": {"privacy_gate": {"enabled": True}}})
 
-    def test_syntheval_execution_nested_dict_builds_nested_dataclass(self):
+    def test_compute_nested_dict_builds_nested_dataclass(self):
         cfg = _from_dict(
             Config,
-            {"evaluation": {"syntheval_execution": {"model_workers": 3}}},
+            {"compute": {"workers": 3}},
         )
-        assert isinstance(cfg.evaluation.syntheval_execution, SynthEvalExecutionConfig)
-        assert cfg.evaluation.syntheval_execution.model_workers == 3
+        assert isinstance(cfg.compute, ComputeConfig)
+        assert cfg.compute.workers == 3
 
 
 class TestValidate:
@@ -284,30 +284,34 @@ class TestValidate:
             _validate(cfg)
 
     @pytest.mark.parametrize("workers", [0, -1, "many", 1.5])
-    def test_invalid_syntheval_model_workers_raise(self, workers):
+    def test_invalid_compute_workers_raise(self, workers):
         cfg = self._base_valid()
-        cfg.evaluation.syntheval_execution.model_workers = workers
-        with pytest.raises(ValueError, match="syntheval_execution.model_workers"):
+        cfg.compute.workers = workers
+        with pytest.raises(ValueError, match="compute.workers"):
             _validate(cfg)
 
-    def test_valid_explicit_syntheval_model_workers_pass(self):
+    def test_valid_explicit_compute_workers_pass(self):
         cfg = self._base_valid()
-        cfg.evaluation.syntheval_execution.model_workers = 3
+        cfg.compute.workers = 3
         _validate(cfg)
 
-    @pytest.mark.parametrize("field", ["max_model_workers", "cores_per_model"])
-    def test_non_positive_syntheval_integer_bounds_raise(self, field):
+    @pytest.mark.parametrize("field", ["max_workers", "cores_per_worker"])
+    def test_non_positive_compute_integer_bounds_raise(self, field):
         cfg = self._base_valid()
-        setattr(cfg.evaluation.syntheval_execution, field, 0)
+        setattr(cfg.compute, field, 0)
         with pytest.raises(ValueError, match=field):
             _validate(cfg)
 
-    @pytest.mark.parametrize("field", ["memory_reserve_gib", "memory_per_model_gib"])
-    def test_non_positive_syntheval_memory_bounds_raise(self, field):
+    @pytest.mark.parametrize("field", ["memory_reserve_gib", "memory_per_worker_gib"])
+    def test_non_positive_compute_memory_bounds_raise(self, field):
         cfg = self._base_valid()
-        setattr(cfg.evaluation.syntheval_execution, field, 0)
+        setattr(cfg.compute, field, 0)
         with pytest.raises(ValueError, match=field):
             _validate(cfg)
+
+    def test_old_syntheval_execution_section_points_to_compute(self):
+        with pytest.raises(ValueError, match="top-level compute section"):
+            _from_dict(Config, {"evaluation": {"syntheval_execution": {"model_workers": 3}}})
 
     def test_bad_tabpfn_data_variant_raises(self):
         cfg = self._base_valid()

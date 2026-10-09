@@ -139,6 +139,7 @@ The settings you will most often change, by section:
 | `generation.n_replicates` | Times each model is retrained with a new seed | `1`, or `3` for confidence intervals |
 | `generation.synthcity.names` | Which synthcity generators run | `[ctgan, tvae, arf]` |
 | `generation.hpo.*` | Hyperparameter search budgets | see [section 7](#7-stage-3-generation-and-hyperparameter-search) |
+| `compute.workers`, `compute.cores_per_worker` | How many models generation and evaluation process at once, and the CPU threads each gets | `auto`, `4`; see [Using the machine's cores](#using-the-machines-cores) |
 | `evaluation.baselines` | Reference rows scored next to the models | `[train_copy, marginals]` |
 | `evaluation.rank_weights` | How much utility, privacy and fairness count in the overall rank | `{utility: 1, privacy: 2, fairness: 1}` |
 
@@ -147,6 +148,21 @@ The three example configs are templates, not defaults for your data:
 - [`config_hepatitis.yaml`](../configs/config_hepatitis.yaml): small, one row per patient, CPU-friendly.
 - [`config_sim.yaml`](../configs/config_sim.yaml): a wide (680-column), multi-visit, three-class dataset with profiled GPU budgets. Start here for real clinical data.
 - [`config_loris.yaml`](../configs/config_loris.yaml): the LORIS dataset, which shows the `binary_target` option for a multi-class target.
+
+### Using the machine's cores
+
+Generation and evaluation both process several models at once, each in its own process. One top-level section decides how many:
+
+```yaml
+compute:
+  workers: auto            # models at once; 1 = one at a time
+  max_workers: 8           # upper limit for auto
+  cores_per_worker: 4      # CPU threads each model's process may use
+  memory_reserve_gib: 16   # RAM kept free for everything else
+  memory_per_worker_gib: 14  # RAM one model needs; leave out to estimate from the column count
+```
+
+With `workers: auto`, the count is the CPU cores divided by `cores_per_worker`, then lowered to fit free memory, `max_workers` and the number of models. A 24-core machine with 125 GB runs 6 models at once. Each model sets its own seeds, so the results are the same as running one model at a time with the same `cores_per_worker`; the integration tests check this byte for byte. Changing `cores_per_worker` can change results in the last digits on the CPU, because the order of floating-point sums depends on the thread count, so keep it fixed across runs you compare.
 
 ## 5. Stage 1: load and split the data
 
@@ -275,6 +291,10 @@ Synthcity models are chosen with `generation.synthcity.names`. TabPFN runs when 
 - `generation.n_samples` is the number of synthetic rows per model. Setting it close to the real train size makes utility and privacy scores easier to compare with the real data.
 - `generation.match_class_prior: true` gives every synthetic dataset the class shares of the real train data. Each class gets its share of `n_samples` rows (with 2500 rows and shares 70/20/10%, that is 1750/500/250). DDPM is given those labels and generates them directly. Every other model is sampled again until each class has its rows, at most 10 batches in all. Each later batch asks for about 1.5 times the rows the shortest class is expected to need, not a full `n_samples`; TabPFN and TabPFGen refit for every batch, so one extra batch costs them a full run. Rows are never repeated to fill a class. A class still short after the last batch stays short, so the dataset can have fewer than `n_samples` rows. `diagnostics/class_sampling.csv` in the generation folder lists, per model and class, the rows wanted (`quota`), the rows kept (`filled`), the class share of the model's first batch (`raw_share`) and the batches drawn. A `raw_share` far from the train share means the model gets the class balance wrong on its own. Without this setting, a generator that produces too many minority-class rows can look better on macro-F1 without being more faithful.
 - `generation.n_replicates` retrains every model that many times with seeds `seed`, `seed+1`, and so on. Replicate r > 0 is saved as `<model>__rep<r>`. With 2 or more, the report gives every score a 95% confidence interval and says which models cannot be told apart from the best. HPO runs only once per model.
+
+### Training models in parallel
+
+The synthcity models are trained side by side, each in its own process that runs the model's whole chain: the untuned fit, its hyperparameter search, the tuned fit and every replicate. The top-level `compute` section sets how many run at once (see [Using the machine's cores](#using-the-machines-cores)). Models with the longest search budget start first, so the stage takes about as long as the slowest model rather than the sum of all of them. With two or more GPUs, models are spread across them; each synthcity model used under 3 GB of GPU memory in profiling, so several share one GPU easily. If one model fails, the others still finish and are cached, and rerunning with the same experiment id redoes only the failed one. Within a model, HPO trials still run one at a time, because running them in parallel would make the search depend on timing. TabPFN and TabPFGen run after the synthcity models, in the main process.
 
 ### How the hyperparameter search works
 
@@ -405,7 +425,7 @@ With replicates, each score is the mean over seeds with a 95% confidence interva
 
 ### Running on large data
 
-Evaluation can process several models in parallel. `evaluation.syntheval_execution` controls how many (`model_workers`, `"auto"` by default), how many CPU cores each uses, and how much memory to keep free. Lower `model_workers` or raise `memory_per_model_gib` if the machine runs out of memory.
+Evaluation scores several synthetic datasets at once, each in its own process, using the same `compute` section as generation (see [Using the machine's cores](#using-the-machines-cores)). This covers the SynthEval, synthcity, holdout TSTR and privacy-attack metrics; log-disparity is quick and runs in the main process. A model whose process fails or is killed is reported and the others still finish. SynthEval keeps a checkpoint per model, so a rerun with the same experiment id scores only the models that are missing.
 
 ## 9. Stage 5: plots and the report
 
@@ -515,7 +535,7 @@ All training runs locally: the pipeline downloads the TabPFN weights and, for `d
 | HPO finishes far below `n_trials` | The timeout was reached first. Raise `timeout_seconds_per_model` or shorten `epoch_ranges`. |
 | Every HPO trial is infeasible | The generator copies rows, drops categories or produces out-of-range values. Look at the trial table in `optuna_studies.db`; a longer training range often helps. |
 | Bayesian network or DDPM is extremely slow | Expected on wide data; remove them from `synthcity.names` for hundreds of columns. |
-| Evaluation is killed or the machine runs out of memory | Lower `evaluation.syntheval_execution.model_workers` or raise `memory_per_model_gib`. |
+| Generation or evaluation is killed, the machine runs out of memory, or the GPU runs out of memory | Lower `compute.workers` (or `max_workers`), or raise `compute.memory_per_worker_gib`. |
 | Warning that singling out stopped short | Anonymeter could not find enough unique predicates within `singling_out_max_attempts`; the risk may be underestimated. Raise the limit if time allows. |
 | Report says a figure is "not rendered yet" | Run `synthdata-plot` with the same config (and `--experiment-id` if needed). |
 | `... feature column(s) look like direct identifiers` | See [Setting up your own dataset](#12-setting-up-your-own-dataset): drop the column, or ignore the warning if you meant to model it (for example, a ZIP code declared as a quasi-identifier). |

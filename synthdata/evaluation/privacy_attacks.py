@@ -24,6 +24,8 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score
 from sklearn.neighbors import NearestNeighbors
 
+from synthdata.compute import run_per_model
+from synthdata.config import ComputeConfig
 from synthdata.data import Dataset
 from synthdata.utils import get_logger
 
@@ -351,6 +353,7 @@ def run_privacy_attack_evaluation(
     run_anonymeter: bool,
     run_distances: bool,
     seed: int,
+    compute_cfg=None,
 ) -> dict:
     """Score every synthetic dataset with the selected privacy evaluators.
 
@@ -387,37 +390,78 @@ def run_privacy_attack_evaluation(
                 "sensitive columns; running singling out only"
             )
 
-    scores, attack_rows = {}, []
-    for name, syn_df in synthetic_datasets.items():
-        row = {}
-        try:
-            if run_distances:
-                row.update(
-                    holdout_distance_scores(
-                        train,
-                        holdout,
-                        syn_df,
-                        categorical,
-                        train_patients,
-                        holdout_patients,
-                        seed,
-                    )
-                )
-            if run_anonymeter:
-                risks = anonymeter_risks(
-                    ori,
-                    syn_df,
-                    control,
-                    categorical,
-                    dataset.quasi_identifier_columns,
-                    dataset.sensitive_columns,
-                    attacks_cfg.anonymeter,
-                    seed,
-                )
-                row.update(summarize_anonymeter(risks))
-                attack_rows += [{"model": name, **dataclasses.asdict(r)} for r in risks]
-        except Exception as exc:  # noqa: BLE001 -- one bad dataset must not stop the rest
-            logger.warning("[custom] privacy attacks failed for %s: %s", name, exc)
-            continue
-        scores[name] = row
+    else:
+        ori = control = None
+
+    # Models are scored in parallel processes per compute_cfg; a failed one
+    # is logged there and left out.
+    run = run_per_model(
+        _score_one,
+        {
+            name: (
+                name,
+                syn_df,
+                train,
+                holdout,
+                categorical,
+                train_patients,
+                holdout_patients,
+                ori,
+                control,
+                dataset.quasi_identifier_columns,
+                dataset.sensitive_columns,
+                attacks_cfg.anonymeter,
+                run_anonymeter,
+                run_distances,
+                seed,
+            )
+            for name, syn_df in synthetic_datasets.items()
+        },
+        compute_cfg or ComputeConfig(workers=1),
+        n_columns=train.shape[1],
+        label="privacy attacks",
+    )
+    scores = {name: row for name, (row, _) in run.results.items()}
+    attack_rows = [r for _, (_, rows) in run.results.items() for r in rows]
     return {"scores": scores, "attacks": pd.DataFrame(attack_rows), "unit": unit}
+
+
+def _score_one(
+    name,
+    syn_df,
+    train,
+    holdout,
+    categorical,
+    train_patients,
+    holdout_patients,
+    ori,
+    control,
+    quasi_identifier_columns,
+    sensitive_columns,
+    anonymeter_cfg,
+    run_anonymeter,
+    run_distances,
+    seed,
+) -> tuple[dict, list]:
+    """Privacy scores and Anonymeter attack rows for one synthetic dataset."""
+    row, attack_rows = {}, []
+    if run_distances:
+        row.update(
+            holdout_distance_scores(
+                train, holdout, syn_df, categorical, train_patients, holdout_patients, seed
+            )
+        )
+    if run_anonymeter:
+        risks = anonymeter_risks(
+            ori,
+            syn_df,
+            control,
+            categorical,
+            quasi_identifier_columns,
+            sensitive_columns,
+            anonymeter_cfg,
+            seed,
+        )
+        row.update(summarize_anonymeter(risks))
+        attack_rows = [{"model": name, **dataclasses.asdict(r)} for r in risks]
+    return row, attack_rows

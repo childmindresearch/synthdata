@@ -678,24 +678,27 @@ class BinaryTargetConfig:
 
 
 @dataclasses.dataclass
-class SynthEvalExecutionConfig:
-    """Resource policy for resumable per-model SynthEval evaluation.
+class ComputeConfig:
+    """How many models run at once, in generation and in evaluation.
 
-    ``model_workers`` may be ``"auto"`` or an explicit positive integer.
-    Automatic mode derives a safe bound from CPU count, available memory, and
-    dataset width; the remaining fields constrain that estimate.
+    Generation trains each synthcity model (untuned fit, HPO study, tuned fit,
+    every replicate) in its own process; evaluation scores each synthetic
+    dataset in its own process. Each model seeds itself, so results match a
+    one-at-a-time run with the same threads per model. ``workers: "auto"``
+    uses CPU cores // ``cores_per_worker``, capped by free memory, by
+    ``max_workers`` and by the number of models.
     """
 
-    #: Models evaluated in parallel: "auto" or a fixed number.
-    model_workers: str | int = "auto"
-    #: Upper limit on parallel models in automatic mode.
-    max_model_workers: int = 8
-    #: CPU threads each model's process may use.
-    cores_per_model: int = 4
+    #: Models processed at once: "auto" or a fixed number (1 = one at a time).
+    workers: str | int = "auto"
+    #: Upper limit on ``workers``.
+    max_workers: int = 8
+    #: CPU threads each model's process may use (torch, OpenMP, BLAS, joblib).
+    cores_per_worker: int = 4
     #: RAM (GiB) kept free for the system and the main process.
     memory_reserve_gib: float = 16.0
-    #: Optional fixed estimate; automatic mode derives one from feature width when None.
-    memory_per_model_gib: float | None = None
+    #: RAM (GiB) one model's process needs; None estimates it from the column count.
+    memory_per_worker_gib: float | None = None
 
 
 #: Values of ``evaluation.class_averaging``.
@@ -757,10 +760,6 @@ class EvaluationConfig:
     tstr_seeds: int = 3
     #: Anonymeter attacks and holdout-referenced DCR/NNDR (custom privacy).
     privacy_attacks: PrivacyAttacksConfig = dataclasses.field(default_factory=PrivacyAttacksConfig)
-    #: CPU and memory limits for parallel evaluation (see SynthEvalExecutionConfig).
-    syntheval_execution: SynthEvalExecutionConfig = dataclasses.field(
-        default_factory=SynthEvalExecutionConfig
-    )
 
     #: Per-"type" (utility/privacy/fairness) weight applied when rolling up
     #: type-level ranks into the overall rank, a weighted geometric mean (see
@@ -856,6 +855,8 @@ class Config:
     imputation: ImputationConfig = dataclasses.field(default_factory=ImputationConfig)
     generation: GenerationConfig = dataclasses.field(default_factory=GenerationConfig)
     evaluation: EvaluationConfig = dataclasses.field(default_factory=EvaluationConfig)
+    #: Parallel models in generation and evaluation (see ComputeConfig).
+    compute: ComputeConfig = dataclasses.field(default_factory=ComputeConfig)
     plots: PlotsConfig = dataclasses.field(default_factory=PlotsConfig)
     experiment: ExperimentConfig = dataclasses.field(default_factory=ExperimentConfig)
 
@@ -877,6 +878,13 @@ def _from_dict(cls, data: dict | None):
             raise ValueError(f"data.{key} was replaced by {_REMOVED_DATA_KEYS[key]}")
         if cls is HPOConfig and key in _REMOVED_HPO_KEYS:
             raise ValueError(f"generation.hpo.{key} was replaced by {_REMOVED_HPO_KEYS[key]}")
+        if cls is EvaluationConfig and key == "syntheval_execution":
+            raise ValueError(
+                "evaluation.syntheval_execution was replaced by the top-level compute section "
+                "(model_workers -> workers, max_model_workers -> max_workers, cores_per_model -> "
+                "cores_per_worker, memory_per_model_gib -> memory_per_worker_gib), which "
+                "generation uses too"
+            )
         if cls is EvaluationConfig and key == "privacy_gate":
             raise ValueError(
                 "evaluation.privacy_gate was removed: fixed thresholds cannot certify privacy. "
@@ -902,6 +910,7 @@ _NESTED_DATACLASSES = {
     (Config, "generation"): GenerationConfig,
     (Config, "evaluation"): EvaluationConfig,
     (Config, "plots"): PlotsConfig,
+    (Config, "compute"): ComputeConfig,
     (Config, "experiment"): ExperimentConfig,
     (ImputationConfig, "refidiff"): RefiDiffConfig,
     (ImputationConfig, "missforest"): MissForestConfig,
@@ -918,7 +927,6 @@ _NESTED_DATACLASSES = {
     (EvaluationConfig, "custom"): FrameworkSelectionConfig,
     (EvaluationConfig, "log_disparity"): LogDisparityConfig,
     (EvaluationConfig, "binary_target"): BinaryTargetConfig,
-    (EvaluationConfig, "syntheval_execution"): SynthEvalExecutionConfig,
     (EvaluationConfig, "privacy_attacks"): PrivacyAttacksConfig,
     (PrivacyAttacksConfig, "anonymeter"): AnonymeterConfig,
 }
@@ -1189,27 +1197,20 @@ def _validate(cfg: Config) -> None:
             "evaluation.ranking_strategy must be 'linear' or 'summation', "
             f"got {cfg.evaluation.ranking_strategy!r}"
         )
-    execution = cfg.evaluation.syntheval_execution
-    if execution.model_workers != "auto" and (
-        not isinstance(execution.model_workers, int) or execution.model_workers < 1
-    ):
+    compute = cfg.compute
+    if compute.workers != "auto" and (not isinstance(compute.workers, int) or compute.workers < 1):
         raise ValueError(
-            "evaluation.syntheval_execution.model_workers must be 'auto' or a positive integer, "
-            f"got {execution.model_workers!r}"
+            f"compute.workers must be 'auto' or a positive integer, got {compute.workers!r}"
         )
-    for field_name in ("max_model_workers", "cores_per_model"):
-        value = getattr(execution, field_name)
+    for field_name in ("max_workers", "cores_per_worker"):
+        value = getattr(compute, field_name)
         if not isinstance(value, int) or value < 1:
-            raise ValueError(
-                f"evaluation.syntheval_execution.{field_name} must be a positive integer, "
-                f"got {value!r}"
-            )
-    for field_name in ("memory_reserve_gib", "memory_per_model_gib"):
-        value = getattr(execution, field_name)
+            raise ValueError(f"compute.{field_name} must be a positive integer, got {value!r}")
+    for field_name in ("memory_reserve_gib", "memory_per_worker_gib"):
+        value = getattr(compute, field_name)
         if value is not None and (not isinstance(value, (int, float)) or value <= 0):
             raise ValueError(
-                f"evaluation.syntheval_execution.{field_name} must be a positive number or None, "
-                f"got {value!r}"
+                f"compute.{field_name} must be a positive number or None, got {value!r}"
             )
     bad_data_variants = set(cfg.generation.tabpfn.data_variants) - {"raw", "imputed"}
     if bad_data_variants:

@@ -13,6 +13,8 @@ F1) that the libraries' own classifier metrics do not.
 
 import pandas as pd
 
+from synthdata.compute import run_per_model
+from synthdata.config import ComputeConfig
 from synthdata.data import Dataset
 from synthdata.evaluation.catalog import LOG_DISPARITY_METRICS, TSTR_NAME, resolve_selection
 from synthdata.evaluation.privacy_attacks import (
@@ -122,6 +124,7 @@ def run_tstr_evaluation(
     selection_cfg,
     n_seeds: int,
     seed: int,
+    compute_cfg=None,
 ) -> dict:
     """Holdout TSTR: fit the fixed XGBoost on each dataset, score on the test split.
 
@@ -148,23 +151,33 @@ def run_tstr_evaluation(
     classes = sorted(train_df[target].dropna().unique().tolist(), key=str)
     seeds = [seed + i for i in range(n_seeds)]
 
-    def _score(fit_df):
-        return tstr_scores(fit_df, test_df, target, dataset.nominal_columns, classes, seeds)
-
-    trtr = _score(train_df)
+    trtr = tstr_scores(train_df, test_df, target, dataset.nominal_columns, classes, seeds)
     logger.info(
         "[custom] holdout TRTR ceiling: macro-F1=%.4f balanced-accuracy=%.4f macro-AUPRC=%.4f",
         trtr.macro_f1,
         trtr.balanced_accuracy,
         trtr.macro_auprc,
     )
-    scores = {}
-    for name, syn_df in synthetic_datasets.items():
-        try:
-            scores[name] = _score(syn_df[train_df.columns])
-        except Exception as exc:  # noqa: BLE001 -- one bad dataset must not stop the rest
-            logger.warning("[custom] holdout TSTR failed for %s: %s", name, exc)
-    return {"scores": scores, "trtr": trtr, "classes": [str(c) for c in classes]}
+    # Models are scored in parallel processes per compute_cfg; a failed one
+    # is logged there and left out.
+    run = run_per_model(
+        tstr_scores,
+        {
+            name: (
+                syn_df[train_df.columns],
+                test_df,
+                target,
+                dataset.nominal_columns,
+                classes,
+                seeds,
+            )
+            for name, syn_df in synthetic_datasets.items()
+        },
+        compute_cfg or ComputeConfig(workers=1),
+        n_columns=train_df.shape[1],
+        label="holdout TSTR",
+    )
+    return {"scores": run.results, "trtr": trtr, "classes": [str(c) for c in classes]}
 
 
 def build_tstr_table(tstr_result: dict) -> pd.DataFrame:
@@ -194,6 +207,7 @@ def run_privacy_evaluation(
     selection_cfg,
     attacks_cfg,
     seed: int,
+    compute_cfg=None,
 ) -> dict:
     """Anonymeter attacks and holdout-referenced DCR/NNDR, as selected in
     ``evaluation.custom`` (see synthdata.evaluation.privacy_attacks)."""
@@ -204,4 +218,5 @@ def run_privacy_evaluation(
         run_anonymeter=_selected(selection_cfg, ANONYMETER_NAME),
         run_distances=_selected(selection_cfg, HOLDOUT_DISTANCE_NAME),
         seed=seed,
+        compute_cfg=compute_cfg,
     )
