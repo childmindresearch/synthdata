@@ -109,7 +109,10 @@ SYNTHCITY_REDUNDANT_SUBMETRIC_SUFFIXES = ("_naive",)
 #: collapsed generator scores best on them. ``delta_coverage_beta_OC`` is about
 #: 0.5 for a perfect generator by construction and reaches 1 only for a copy.
 #: PRDC coverage, Anonymeter and the holdout distance metrics measure the same
-#: properties correctly and stay ranked.
+#: properties correctly and stay ranked. data_leakage (linear, mlp) and
+#: DomiasMIA_prior accuracy score a copy like a fresh draw; the augmentation
+#: scores barely move even for a generator collapsed onto one row. Their xgb
+#: and AUC siblings separate a copy and stay ranked.
 SYNTHCITY_UNRANKED_SUBMETRICS = frozenset(
     {
         "performance.feat_rank_distance.pvalue",
@@ -120,6 +123,12 @@ SYNTHCITY_UNRANKED_SUBMETRICS = frozenset(
         "privacy.distinct l-diversity.gt",
         "privacy.distinct l-diversity.syn",
         "stats.alpha_precision.delta_coverage_beta_OC",
+        "attack.data_leakage_linear.mean",
+        "attack.data_leakage_mlp.mean",
+        "privacy.DomiasMIA_prior.accuracy",
+        "performance.linear_model_augmentation.aug_ood",
+        "performance.mlp_augmentation.aug_ood",
+        "performance.xgb_augmentation.aug_ood",
     }
 )
 

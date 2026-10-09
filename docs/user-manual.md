@@ -386,7 +386,7 @@ With `evaluation.privacy_attacks.unit: patient` (the default), each patient coun
 2. Metrics are averaged within each source, then across sources, into a utility, a privacy and a fairness score between 0 and 1.
 3. The overall score is the weighted geometric mean of the three, with weights from `evaluation.rank_weights`. A near-zero score on one dimension cannot be made up by the others.
 
-A few reported metrics are left out of the ranking because they cannot tell a copy of the training data from a fresh draw (synthcity's k-anonymization, k-map, distinct l-diversity, delta-presence and alpha-precision coverage) or only qualify another score (the feat_rank_distance p-value). They still appear in `combined_evaluation.csv`; [verification.md](verification.md) says why.
+A few reported metrics are left out of the ranking because they cannot tell a copy of the training data from a fresh draw (synthcity's k-anonymization, k-map, distinct l-diversity, delta-presence, alpha-precision coverage, data_leakage linear and mlp, DomiasMIA accuracy, and the augmentation scores) or only qualify another score (the feat_rank_distance p-value). They still appear in `combined_evaluation.csv`; [verification.md](verification.md) says why.
 
 With replicates, each score is the mean over seeds with a 95% confidence interval, and a model is "tied with best" when a one-sided Welch t-test cannot place its overall score below the best model's.
 
