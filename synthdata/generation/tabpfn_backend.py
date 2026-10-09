@@ -172,7 +172,19 @@ def set_model_version(version: str) -> None:
     from tabpfn.constants import ModelVersion
     from tabpfn.settings import settings
 
-    settings.tabpfn.model_version = ModelVersion(version)
+    try:
+        model_version = ModelVersion(version)
+    except ValueError:
+        from importlib.metadata import version as package_version
+
+        known = ", ".join(v.value for v in ModelVersion)
+        raise ValueError(
+            f"generation.tabpfn.model_version={version!r} is not available in the "
+            f"installed tabpfn {package_version('tabpfn')} (it knows: {known}). "
+            "If the environment is older than uv.lock, run `uv sync --extra tabpfn`; "
+            "otherwise pick one of the listed versions."
+        ) from None
+    settings.tabpfn.model_version = model_version
     logger.info("[tabpfn] using model weights %s", version)
 
 
