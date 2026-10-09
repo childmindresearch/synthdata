@@ -140,6 +140,21 @@ class TestStatisticalParity:
 
         assert result["statistical_parity"] == pytest.approx(0.1)
 
+    def test_a_fold_without_one_group_is_skipped_not_nan(self):
+        rng = np.random.default_rng(0)
+        real = pd.DataFrame(
+            {"x": rng.normal(size=200), "sex": np.tile([0, 1], 100), "label": np.tile([0, 1], 100)}
+        )
+        synthetic = real.assign(sex=0)
+        synthetic.loc[:2, "sex"] = 1  # three rows: unshuffled folds 2-5 have none
+        config = AnalysisConfig(dataset=real, target_vars="label", sensitive_vars=["sex"])
+
+        result = StatisticalParity(
+            real, synthetic, analysis_target=config, do_preprocessing=False
+        ).evaluate(folds=5)
+
+        assert np.isfinite(result["statistical_parity"])
+
 
 class TestNearestNeighbourAdversarialAccuracy:
     @pytest.mark.parametrize(("accuracy", "expected"), [(0.0, 0.0), (0.5, 1.0), (0.75, 0.5)])

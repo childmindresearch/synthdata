@@ -166,7 +166,7 @@ Privacy and fairness metrics need to know what each column means. Three lists in
 
 | Role | Meaning | Used by | Example |
 | --- | --- | --- | --- |
-| `quasi_identifier_columns` | Public attributes an attacker could already know and use to link a record to a person | Anonymeter linkability and inference attacks (as attacker knowledge); both need at least one quasi-identifier and one sensitive column | age, sex, region |
+| `quasi_identifier_columns` | Public attributes an attacker could already know and use to link a record to a person | Anonymeter linkability (linked to the rest of the record) and inference attacks (as attacker knowledge); inference needs at least one quasi-identifier and one sensitive column | age, sex, region |
 | `sensitive_columns` | Secrets an attacker would try to learn | Anonymeter inference attacks (as targets); synthcity data_leakage and distinct l-diversity; SynthEval att_discl | a diagnosis, income |
 | `protected_columns` | Groups whose fair treatment you want to check | Fairness metrics | sex, ethnicity, age band |
 
@@ -399,6 +399,8 @@ With `evaluation.privacy_attacks.unit: patient` (the default), each patient coun
 2. Metrics are averaged within each source, then across sources, into a utility, a privacy and a fairness score between 0 and 1.
 3. The overall score is the weighted geometric mean of the three, with weights from `evaluation.rank_weights`. A near-zero score on one dimension cannot be made up by the others.
 
+A few reported metrics are left out of the ranking because they cannot tell a copy of the training data from a fresh draw (synthcity's k-anonymization, k-map, distinct l-diversity, delta-presence, alpha-precision coverage, data_leakage linear and mlp, DomiasMIA accuracy, and the augmentation scores) or only qualify another score (the feat_rank_distance p-value). They still appear in `combined_evaluation.csv`; [verification.md](verification.md) says why.
+
 With replicates, each score is the mean over seeds with a 95% confidence interval, and a model is "tied with best" when a one-sided Welch t-test cannot place its overall score below the best model's.
 
 ### Running on large data
@@ -456,7 +458,7 @@ After updating dependencies or the synthcity and SynthEval submodules, run the g
 uv run --with catboost==1.2.10 pytest tests/integration -m regression
 ```
 
-If the change was intended, rewrite the reference with `SYNTHDATA_UPDATE_GOLDEN=1` in front of the same command and commit it with the change. To compare two runs on your own data, put their `combined_evaluation.csv` files side by side.
+Each operating system and device (CPU or CUDA) keeps its own reference, because torch-trained generators and metrics give different numbers on each. The repository keeps two: Linux with an NVIDIA GPU (the canonical one) and Linux CPU. On a machine without a reference the test is skipped, so record one on a known-good commit with `SYNTHDATA_UPDATE_GOLDEN=1` in front of the same command. If a later change is intended, rewrite the reference the same way and commit it with the change. To compare two runs on your own data, put their `combined_evaluation.csv` files side by side.
 
 ## 12. Setting up your own dataset
 

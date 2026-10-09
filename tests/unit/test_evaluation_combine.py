@@ -117,6 +117,25 @@ class TestSynthcityFrames:
             "performance.feat_rank_distance.corr"
         ]
 
+    def test_copy_blind_privacy_proxies_are_not_ranked(self):
+        # KA-07: these score a copy of train as well as a fresh draw.
+        keys = [
+            "stats.prdc.coverage",
+            "privacy.k-map.score",
+            "privacy.delta-presence.score",
+            "attack.data_leakage_mlp.mean",
+        ]
+        result = pd.DataFrame(
+            {
+                "mean": [0.9, 30.0, 1.5, 0.7],
+                "direction": ["maximize", "maximize", "minimize", "minimize"],
+            },
+            index=keys,
+        )
+        raw, oriented = _synthcity_frames({"model_a": result}, model_names=["model_a"])
+        assert raw.columns.get_level_values(2).tolist() == keys
+        assert oriented.columns.get_level_values(2).tolist() == ["stats.prdc.coverage"]
+
 
 class TestSyntheEvalFrames:
     def _benchmark_results(self):

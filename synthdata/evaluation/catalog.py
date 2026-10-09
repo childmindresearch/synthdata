@@ -100,7 +100,37 @@ SYNTHCITY_REDUNDANT_SUBMETRIC_SUFFIXES = ("_naive",)
 #: correlation in ``feat_rank_distance.corr``: it says how sure that score is,
 #: and shares the metric's single "maximize" direction, which would reward
 #: uncertain correlations.
-SYNTHCITY_UNRANKED_SUBMETRICS = frozenset({"performance.feat_rank_distance.pvalue"})
+#:
+#: The others failed the known-answer checks (docs/verification.md, KA-07):
+#: an exact copy of the training rows, or one row repeated, scores as well as
+#: or better than an independent draw from the real distribution.
+#: delta-presence, k-anonymization, k-map and distinct l-diversity are KMeans
+#: cluster-size proxies, not the definitions they are named after, and a
+#: collapsed generator scores best on them. ``delta_coverage_beta_OC`` is about
+#: 0.5 for a perfect generator by construction and reaches 1 only for a copy.
+#: PRDC coverage, Anonymeter and the holdout distance metrics measure the same
+#: properties correctly and stay ranked. data_leakage (linear, mlp) and
+#: DomiasMIA_prior accuracy score a copy like a fresh draw; the augmentation
+#: scores barely move even for a generator collapsed onto one row. Their xgb
+#: and AUC siblings separate a copy and stay ranked.
+SYNTHCITY_UNRANKED_SUBMETRICS = frozenset(
+    {
+        "performance.feat_rank_distance.pvalue",
+        "privacy.delta-presence.score",
+        "privacy.k-anonymization.gt",
+        "privacy.k-anonymization.syn",
+        "privacy.k-map.score",
+        "privacy.distinct l-diversity.gt",
+        "privacy.distinct l-diversity.syn",
+        "stats.alpha_precision.delta_coverage_beta_OC",
+        "attack.data_leakage_linear.mean",
+        "attack.data_leakage_mlp.mean",
+        "privacy.DomiasMIA_prior.accuracy",
+        "performance.linear_model_augmentation.aug_ood",
+        "performance.mlp_augmentation.aug_ood",
+        "performance.xgb_augmentation.aug_ood",
+    }
+)
 
 
 def is_redundant_synthcity_submetric(metric_key: str) -> bool:
@@ -129,7 +159,9 @@ SYNTHEVAL_PRESET = {
     "ks_test": {"sig_lvl": 0.05, "n_perms": 1000},
     "h_dist": {},
     "p_mse": {"k_folds": 5, "max_iter": 100, "solver": "liblinear"},
-    "q_mse": {"num_quants": 10, "cat_mse": False},
+    # cat_mse: compare category shares too. Most clinical columns are
+    # categorical, and the fork skips them otherwise (KA-01).
+    "q_mse": {"num_quants": 10, "cat_mse": True},
     "auroc_diff": {"model": "log_reg", "num_boots": 1},
     "cls_acc": {
         "cls_models": ["rf", "adaboost", "svm", "logreg"],
