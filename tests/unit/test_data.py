@@ -14,7 +14,6 @@ from synthdata.data import (
     decode_label_encoded_columns,
     decode_ordinal_columns,
     encode_ordinal_columns,
-    infer_nominal_columns,
     label_encode_non_numeric_columns,
     load_dataset,
     load_variable_schema,
@@ -27,79 +26,6 @@ from synthdata.data import (
 )
 
 pytestmark = pytest.mark.unit
-
-
-class TestInferNominalColumns:
-    def test_explicit_list_wins_and_is_filtered_to_features(self):
-        df = pd.DataFrame({"a": [1, 2, 3], "b": [1.0, 2.0, 3.0]})
-        result = infer_nominal_columns(
-            df, feature_columns=["a", "b"], explicit=["a", "not_a_feature"]
-        )
-        assert result == ["a"]
-
-    def test_explicit_list_excludes_ordinal_columns(self):
-        df = pd.DataFrame({"a": [1, 2, 3], "b": [1.0, 2.0, 3.0]})
-        result = infer_nominal_columns(
-            df, feature_columns=["a", "b"], explicit=["a", "b"], ordinal_columns=["b"]
-        )
-        assert result == ["a"]
-
-    def test_uci_metadata_used_when_no_explicit_list(self):
-        df = pd.DataFrame({"a": [1, 2, 3], "b": [1.5, 2.5, 3.5]})
-        result = infer_nominal_columns(
-            df,
-            feature_columns=["a", "b"],
-            explicit="auto",
-            uci_variable_types={"a": "Categorical", "b": "Continuous"},
-        )
-        assert result == ["a"]
-
-    def test_falls_back_to_heuristic_when_no_uci_categorical_tags(self):
-        df = pd.DataFrame({"a": np.linspace(0, 100, 20), "b": ["x", "y"] * 10})
-        result = infer_nominal_columns(
-            df,
-            feature_columns=["a", "b"],
-            explicit="auto",
-            uci_variable_types={"a": "Continuous", "b": "Continuous"},
-        )
-        # No UCI column tagged "Categorical" -> heuristic: b is object dtype,
-        # a is high-cardinality numeric (stays continuous).
-        assert result == ["b"]
-
-    def test_heuristic_dtype_and_cardinality(self):
-        df = pd.DataFrame(
-            {
-                "obj_col": ["x", "y", "z"],
-                "bool_col": [True, False, True],
-                "low_card_numeric": [1, 1, 2],
-                "high_card_numeric": np.linspace(0, 1, 3),
-            }
-        )
-        result = infer_nominal_columns(
-            df,
-            feature_columns=list(df.columns),
-            explicit="auto",
-            unique_threshold=2,
-        )
-        assert set(result) == {"obj_col", "bool_col", "low_card_numeric"}
-
-    def test_heuristic_excludes_ordinal_columns(self):
-        df = pd.DataFrame({"obj_col": ["x", "y", "z"], "low_card_numeric": [1, 1, 2]})
-        result = infer_nominal_columns(
-            df,
-            feature_columns=list(df.columns),
-            explicit="auto",
-            ordinal_columns=["low_card_numeric"],
-            unique_threshold=2,
-        )
-        assert result == ["obj_col"]
-
-    def test_no_categorical_columns_inferred(self):
-        df = pd.DataFrame({"x": np.linspace(0, 100, 20)})
-        result = infer_nominal_columns(
-            df, feature_columns=["x"], explicit="auto", unique_threshold=2
-        )
-        assert result == []
 
 
 class TestVariableSchema:

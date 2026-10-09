@@ -486,55 +486,6 @@ def schema_column_roles(schema: dict, target_column: str) -> tuple[list, list, d
     return nominal_columns, ordinal_columns, ordinal_orders
 
 
-def infer_nominal_columns(
-    df: pd.DataFrame,
-    feature_columns: list,
-    explicit: str | list,
-    ordinal_columns: list | None = None,
-    unique_threshold: int = 10,
-    uci_variable_types: dict | None = None,
-) -> list:
-    """Determine which feature columns should be treated as nominal (unordered categorical).
-
-    Resolution order:
-        1. An explicit list of column names in the config always wins.
-        2. If UCI variable metadata is available, use its "Categorical" tag.
-        3. Otherwise fall back to a dtype/cardinality heuristic
-           (object/category/bool dtype, or nunique <= unique_threshold).
-
-    ``ordinal_columns`` (a dataset's separately-configured ordered-categorical
-    columns) are excluded from every resolution path above, regardless of
-    source -- they're a distinct first-class role handled by the caller, never
-    folded back into "nominal" just because they'd otherwise match the heuristic.
-    """
-    ordinal_set = set(ordinal_columns or [])
-
-    if isinstance(explicit, list):
-        return [c for c in explicit if c in feature_columns and c not in ordinal_set]
-
-    if uci_variable_types is not None:
-        cats = [
-            c
-            for c in feature_columns
-            if uci_variable_types.get(c) == "Categorical" and c not in ordinal_set
-        ]
-        if cats:
-            return cats
-
-    cats = []
-    for c in feature_columns:
-        if c in ordinal_set:
-            continue
-        dtype = df[c].dtype
-        if (
-            dtype in (object, bool)
-            or str(dtype) == "category"
-            or df[c].nunique(dropna=True) <= unique_threshold
-        ):
-            cats.append(c)
-    return cats
-
-
 def encode_ordinal_columns(df: pd.DataFrame, ordinal_categories: dict) -> pd.DataFrame:
     """Map declared-ordinal columns to integers in their configured natural order.
 

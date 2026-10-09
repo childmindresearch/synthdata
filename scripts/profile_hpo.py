@@ -260,6 +260,7 @@ def main() -> None:
                     if match_prior
                     else None
                 ),
+                discrete_columns=dataset.all_categorical_columns,
             )
             try:
                 hpo_mod.run_study(

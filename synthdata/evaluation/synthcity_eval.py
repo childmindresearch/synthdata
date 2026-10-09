@@ -67,8 +67,14 @@ def run_synthcity_metrics(
     task_type: str = "classification",
     random_state: int = 42,
     workspace: str | None = None,
+    *,
+    discrete_columns: list,
 ) -> pd.DataFrame:
     """Evaluate a cached synthetic DataFrame with synthcity's Metrics.evaluate.
+
+    ``discrete_columns`` (the schema's categorical columns) decide which
+    columns synthcity's metrics treat as categorical, instead of its guess from
+    the number of distinct values.
 
     Runs ``Metrics.evaluate`` once per real reference (see the module
     docstring) and stacks the results:
@@ -84,6 +90,7 @@ def run_synthcity_metrics(
 
     from synthcity.metrics import Metrics
     from synthcity.plugins.core.dataloader import GenericDataLoader
+    from synthcity.utils.dataframe import declared_discrete_columns
 
     x_syn_raw = _align_dtypes(
         synthetic_df[x_real_train.columns].reset_index(drop=True), x_real_train
@@ -105,22 +112,25 @@ def run_synthcity_metrics(
         "use_cache": False,
     }
     results = []
-    if on_train:
-        results.append(
-            Metrics.evaluate(_loader(x_real_train), _loader(x_syn_raw), metrics=on_train, **common)
-        )
-    if on_held_out:
-        results.append(
-            Metrics.evaluate(
-                _loader(x_real_held_out),
-                _loader(x_syn_raw),
-                _loader(x_real_train),
-                _loader(x_syn_raw),
-                _loader(x_augmented_raw),
-                metrics=on_held_out,
-                **common,
+    with declared_discrete_columns(discrete_columns):
+        if on_train:
+            results.append(
+                Metrics.evaluate(
+                    _loader(x_real_train), _loader(x_syn_raw), metrics=on_train, **common
+                )
             )
-        )
+        if on_held_out:
+            results.append(
+                Metrics.evaluate(
+                    _loader(x_real_held_out),
+                    _loader(x_syn_raw),
+                    _loader(x_real_train),
+                    _loader(x_syn_raw),
+                    _loader(x_augmented_raw),
+                    metrics=on_held_out,
+                    **common,
+                )
+            )
     combined = pd.concat(results)
     missing = [
         f"{category}.{name}"
@@ -169,6 +179,8 @@ def run_synthcity_evaluation(
     selection_cfg,
     seed: int = 42,
     workspace: str | None = None,
+    *,
+    discrete_columns: list,
 ) -> dict[str, pd.DataFrame]:
     """Run synthcity Metrics on every cached synthetic dataset.
 
@@ -194,6 +206,7 @@ def run_synthcity_evaluation(
                 metric_config,
                 random_state=seed,
                 workspace=workspace,
+                discrete_columns=discrete_columns,
             )
         except Exception as exc:  # noqa: BLE001 -- one model's failure must not stop the rest
             logger.warning("[synthcity] evaluation failed for %s: %r", name, exc)

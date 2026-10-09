@@ -287,7 +287,8 @@ def generate_tabpfn_standard(
     synthetic_values = np.asarray(experiment.synthetic_X.detach().cpu().numpy(), dtype=float)
     synthetic_encoded = pd.DataFrame(synthetic_values, columns=attribute_names)
 
-    clf = TabPFNClassifier()
+    # Schema categorical columns, not TabPFN's own guess from cardinality.
+    clf = TabPFNClassifier(categorical_features_indices=categorical_indices)
     clf.fit(x, y)
     proba = clf.predict_proba(synthetic_encoded.to_numpy(dtype=float))
     target_values = sample_labels(proba, clf.classes_, seed)

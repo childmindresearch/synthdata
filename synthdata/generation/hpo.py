@@ -55,8 +55,12 @@ def build_synthetic_eval_fn(
     metric_config: dict,
     seed: int,
     workspace: str | Path | None = None,
+    *,
+    discrete_columns: list,
 ) -> Callable[[pd.DataFrame], float]:
     """Build a ``syn_df -> score`` function via synthcity's Metrics.evaluate.
+
+    ``discrete_columns`` are the columns synthcity's metrics treat as categorical.
 
     Mirrors the notebooks' ``_eval_syn_df`` helper: builds a second independent
     synthetic draw (bootstrap resample) for DomiasMIA's reference set, and an
@@ -64,6 +68,7 @@ def build_synthetic_eval_fn(
     """
     from synthcity.metrics import Metrics
     from synthcity.plugins.core.dataloader import GenericDataLoader
+    from synthcity.utils.dataframe import declared_discrete_columns
 
     workspace_path = Path(workspace) if workspace else Path("workspace")
 
@@ -77,19 +82,20 @@ def build_synthetic_eval_fn(
             drop=True
         )
         x_aug = pd.concat([train_reference_df, syn_df], ignore_index=True)
-        report = Metrics.evaluate(
-            _loader(holdout_df),
-            _loader(syn_df),
-            _loader(train_reference_df),
-            _loader(ref_df),
-            _loader(x_aug),
-            metrics=metric_config,
-            task_type="classification",
-            random_state=seed,
-            workspace=workspace_path,
-            # The cache keys on data and metric name, not code; see synthcity_eval.
-            use_cache=False,
-        )
+        with declared_discrete_columns(discrete_columns):
+            report = Metrics.evaluate(
+                _loader(holdout_df),
+                _loader(syn_df),
+                _loader(train_reference_df),
+                _loader(ref_df),
+                _loader(x_aug),
+                metrics=metric_config,
+                task_type="classification",
+                random_state=seed,
+                workspace=workspace_path,
+                # The cache keys on data and metric name, not code; see synthcity_eval.
+                use_cache=False,
+            )
         return hpo_score(report)
 
     return eval_fn
@@ -284,6 +290,8 @@ def build_hpo_eval_fn(
             hpo_cfg.metric_config,
             seed,
             workspace=workspace,
+            discrete_columns=list(categorical_columns)
+            + ([target_column] if target_is_categorical else []),
         )
     )
 

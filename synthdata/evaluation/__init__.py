@@ -86,6 +86,7 @@ def run_evaluation(
         eval_cfg.synthcity,
         seed=cfg.seed,
         workspace=output_dir / "synthcity_workspace",
+        discrete_columns=dataset.all_categorical_columns,
     )
 
     # Native SynthEval diagnostics can only be created during SynthEval's
