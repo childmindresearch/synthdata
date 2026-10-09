@@ -56,6 +56,11 @@ def main() -> None:
         default=None,
         help="Override data.version and select that version's artifact lineage.",
     )
+    parser.add_argument(
+        "--strict-checks",
+        action="store_true",
+        help="Exit with an error if any output check warns (see checks.csv).",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -124,6 +129,13 @@ def main() -> None:
     )
 
     logger.info("Done. Combined table saved under %s", cfg.evaluation.output_dir)
+
+    checks = extras.get("checks")
+    if args.strict_checks and checks is not None and (checks["status"] == "warn").any():
+        raise SystemExit(
+            f"{int((checks['status'] == 'warn').sum())} output check(s) warned; see "
+            f"{Path(cfg.evaluation.output_dir) / 'checks.csv'}."
+        )
 
 
 if __name__ == "__main__":

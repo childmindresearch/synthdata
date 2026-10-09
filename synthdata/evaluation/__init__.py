@@ -11,6 +11,7 @@ from synthdata.data import Dataset
 from synthdata.evaluation import (
     artifacts,
     baselines,
+    checks,
     combine,
     custom_eval,
     report,
@@ -181,6 +182,13 @@ def run_evaluation(
     ranking_summary = combine.summarize_replicates(combined)
     ranking_summary.to_csv(output_dir / "ranking_summary.csv")
 
+    checks_table = None
+    if eval_cfg.run_checks:
+        checks_table = checks.run_output_checks(
+            dataset, selected_datasets, combined, cfg.generation.match_class_prior
+        )
+        checks_table.to_csv(output_dir / "checks.csv", index=False)
+
     artifact_manifest = artifacts.persist_evaluation_artifacts(
         output_dir,
         combined,
@@ -198,6 +206,7 @@ def run_evaluation(
         "privacy_result": privacy_result,
         "ovr_per_class": ovr_per_class,
         "ranking_summary": ranking_summary,
+        "checks": checks_table,
         "artifact_manifest": str(artifact_manifest),
     }
 
