@@ -284,7 +284,7 @@ def run_generation(
                 name,
                 lambda seed, count, name=name: sc.fit_generate(
                     name,
-                    {},
+                    sc.untuned_params(name, gen_cfg.hpo),
                     train_loader,
                     count,
                     seed,

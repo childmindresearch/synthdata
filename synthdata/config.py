@@ -488,6 +488,8 @@ class HPOConfig:
     #: Training length searched per model as ``[low, high, step]`` (synthcity
     #: ``n_iter`` epochs, TabPFGen SGLD steps). Unlisted models use their
     #: library's own range (``EPOCH_RANGE_DEFAULTS`` where the library has none).
+    #: The top of the range also caps the untuned (default) model's training
+    #: length when the library default is longer.
     epoch_ranges: dict = dataclasses.field(default_factory=dict)
     #: "median": Optuna's MedianPruner stops a trial whose intermediate score
     #: falls below the median of earlier trials at the same step. null = off.

@@ -268,3 +268,34 @@ def test_ddpm_slice_normalizer_keeps_small_slices_finite():
     )
     assert torch.isfinite(out).all()
     assert torch.allclose(out, expected, atol=1e-5)
+
+
+def test_untuned_params_cap_training_length_at_the_searched_top():
+    pytest.importorskip("synthcity.plugins")
+    from synthdata.config import HPOConfig
+    from synthdata.generation.synthcity_backend import untuned_params
+
+    cfg = HPOConfig(epoch_ranges={"ctgan": [25, 150, 25], "ddpm": [100, 1000, 100]})
+    assert untuned_params("ctgan", cfg) == {"n_iter": 150}
+    assert untuned_params("adsgan", cfg) == {"n_iter": 1000}  # EPOCH_RANGE_DEFAULTS
+    assert untuned_params("ddpm", cfg) == {}  # library default is not longer
+    assert untuned_params("arf", cfg) == {}  # no n_iter
+
+
+def test_arf_samples_stay_in_range_on_wide_data():
+    """Edge leaves are bounded by the training range, so strict sampling keeps rows."""
+    pytest.importorskip("arfpy")
+    import numpy as np
+    import pandas as pd
+
+    from synthdata.generation.synthcity_backend import fit_generate, make_loader
+
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame(rng.gamma(2, size=(300, 40)), columns=[f"c{i}" for i in range(40)])
+    df["y"] = rng.integers(0, 2, 300)
+    params = {"num_trees": 10, "verbose": False, "sampling_patience": 3}
+    syn = fit_generate("arf", params, make_loader(df, "y", []), 200, 1, discrete_columns=["y"])
+    assert len(syn) == 200
+    features = df.columns.drop("y")
+    assert (syn[features] >= df[features].min()).all().all()
+    assert (syn[features] <= df[features].max()).all().all()
