@@ -26,13 +26,17 @@ The suite needs six independent pipeline runs (`RUNS` in `conftest.py`). They st
 | `test_pipeline_end_to_end.py` | `integration` | Three-way patient split, both imputers, missing indicators, generated data, HPO (TSTR objective, constraint screens, searched epochs, pruner reports), every metric family in range (SynthCity, SynthEval, class metrics, Anonymeter, DCR/NNDR), ranks, the seven report sections and their links, plots, no stray files |
 | `test_reproducibility_and_leakage.py` | `integration` | A second identical run gives identical data and metrics; generation reuses its cache; held-out rows don't leak into imputation, tuning or generation |
 | `test_metric_known_answers.py` | `integration` | Planted "copy of train" and "column-shuffled" datasets are scored in the right order; SynthEval role metrics are skipped when no sensitive or protected columns are declared |
+| `test_golden_metrics.py` | `integration`, `regression` | Every raw metric of the `baseline` run against `fixtures/golden/baseline_run_<platform>_<device>.csv`, within tolerances (tight for the baselines, loose for trained generators). Torch training differs between CPU and CUDA and between operating systems, so each platform keeps its own reference; without one the test is skipped. Opt-in: run it after a dependency or submodule bump; when a change is intended, rewrite the reference with `SYNTHDATA_UPDATE_GOLDEN=1` and commit it |
 | `test_full_generators.py` | `integration`, `slow` | Every SynthCity model, TabPFN and TabPFGen, with HPO (GPU recommended) |
 
 On a 4-core machine the non-slow suite takes about 6 minutes (16 before the runs went parallel).
 
 ```bash
 # What CI runs (needs catboost for RefiDiff imputation):
-uv run --with catboost==1.2.10 pytest tests/integration -m "integration and not slow"
+uv run --with catboost==1.2.10 pytest tests/integration -m "integration and not slow and not regression"
+
+# Golden run (opt-in): did a dependency bump move any metric?
+uv run --with catboost==1.2.10 pytest tests/integration -m regression
 
 # Full-generator run on a GPU machine (needs the tabpfn extra and a TabPFN token in .env):
 uv sync --extra tabpfn

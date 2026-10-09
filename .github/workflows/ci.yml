@@ -23,6 +23,8 @@ jobs:
       # Lint doesn't need the project installed at all -- just ruff itself.
       - run: uvx ruff check .
       - run: uvx ruff format --check .
+      # Patient data must never reach the repository (see .pre-commit-config.yaml).
+      - run: uvx pre-commit run no-data-files --all-files
 
   test:
     name: Test (pytest)
@@ -74,4 +76,4 @@ jobs:
       # which lives in the `refidiff` extra next to CUDA-only packages, so it
       # is added on its own here.
       - name: Run end-to-end tests on the fixture dataset
-        run: uv run --with catboost==1.2.10 pytest tests/integration -m "integration and not slow and not network" --durations=10
+        run: uv run --with catboost==1.2.10 pytest tests/integration -m "integration and not slow and not network and not regression" --durations=10
