@@ -96,7 +96,7 @@ uv run synthdata-evaluate --config configs/config_hepatitis.yaml --plot
 uv run synthdata-plot     --config configs/config_hepatitis.yaml
 ```
 
-`--plot` draws that stage's figures as it goes; `synthdata-plot` at the end redraws everything and rewrites the report so every figure is in it. When the last command finishes, open:
+`--plot` draws that stage's figures as it goes; `synthdata-plot` at the end redraws everything and rewrites the report so every figure is in it. `uv run synthdata-run --config configs/config_hepatitis.yaml` runs the same four commands in one go and keeps a log; see [Long runs and remote machines](#long-runs-and-remote-machines). When the last command finishes, open:
 
 ```
 output/hepatitis/evaluation/data_v_1.0/exp_v_0.1/report.md
@@ -148,6 +148,28 @@ The three example configs are templates, not defaults for your data:
 - [`config_hepatitis.yaml`](../configs/config_hepatitis.yaml): small, one row per patient, CPU-friendly.
 - [`config_sim.yaml`](../configs/config_sim.yaml): a wide (680-column), multi-visit, three-class dataset with profiled GPU budgets. Start here for real clinical data.
 - [`config_loris.yaml`](../configs/config_loris.yaml): the LORIS dataset, which shows the `binary_target` option for a multi-class target.
+
+### Long runs and remote machines
+
+`synthdata-run` runs the four stages in order, each in its own process, and stops at the first one that fails. Everything the stages print goes to the terminal and to a log file:
+
+```
+<output root>/logs/<UTC time>_run.log      for example output/sim/logs/20261010T080000Z_run.log
+```
+
+`<output root>` is the folder above `generation.output_dir`. Logs sit next to the stage folders, not inside an experiment, so a run that fails before generation still has its log.
+
+On a remote machine, add `--detach`. The run moves to the background in its own session, so closing the terminal or losing the SSH connection does not stop it. The command prints the log path and the process id and returns at once:
+
+```bash
+uv run synthdata-run --config configs/config_sim.yaml --experiment-id sim_full --detach
+# Running in the background (pid 41237).
+#   Log:    output/sim/logs/20261010T080000Z_run.log
+#   Follow: tail -f output/sim/logs/20261010T080000Z_run.log
+#   Stop:   kill -- -41237
+```
+
+`Stop` ends the whole run, including the stage and its worker processes. To resume after a stop, a crash or a reboot, run the same command with the same `--experiment-id`: finished models, HPO trials and evaluation checkpoints are reused. Other options: `--stages generate evaluate plot` runs only those stages, `--no-plot` skips the figures drawn during each stage, and `--tag`, `--dataset-version` and `--strict-checks` are passed to the stages that take them. On Windows, `Follow` and `Stop` print the PowerShell and `taskkill` equivalents.
 
 ### Using the machine's cores
 
@@ -535,6 +557,7 @@ All training runs locally: the pipeline downloads the TabPFN weights and, for `d
 | HPO finishes far below `n_trials` | The timeout was reached first. Raise `timeout_seconds_per_model` or shorten `epoch_ranges`. |
 | Every HPO trial is infeasible | The generator copies rows, drops categories or produces out-of-range values. Look at the trial table in `optuna_studies.db`; a longer training range often helps. |
 | Bayesian network or DDPM is extremely slow | Expected on wide data; remove them from `synthcity.names` for hundreds of columns. |
+| A detached run stopped | The last lines of its log in `<output root>/logs/` say which stage failed and why. Rerun the same `synthdata-run` command with the same `--experiment-id` to resume. |
 | Generation or evaluation is killed, the machine runs out of memory, or the GPU runs out of memory | Lower `compute.workers` (or `max_workers`), or raise `compute.memory_per_worker_gib`. |
 | Warning that singling out stopped short | Anonymeter could not find enough unique predicates within `singling_out_max_attempts`; the risk may be underestimated. Raise the limit if time allows. |
 | Report says a figure is "not rendered yet" | Run `synthdata-plot` with the same config (and `--experiment-id` if needed). |
