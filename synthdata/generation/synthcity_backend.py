@@ -34,7 +34,23 @@ HPO_EXCLUDED_CHOICES: dict[str, dict[str, frozenset]] = {
 #: 0.5 + delta), so every draw above 0 crashes the trial; and the plugin types
 #: it ``int``, so a float range would be truncated to 0 anyway. 0 is the
 #: default of arfpy and of the reference R package (Watson et al. 2023).
-HPO_FIXED_PARAMS: dict[str, dict[str, object]] = {"arf": {"delta": 0}}
+#: ARF also holds ``early_stop`` on, the default of arfpy and of the R
+#: package: with it off every adversarial round refits the forest and
+#: re-samples from it, and one 40-tree, 5-round trial ran over 11 h on the
+#: 682-column sim data. PATE-GAN holds ``generator_n_iter`` (GAN epochs per
+#: teacher round, searched 1-100) at the plugin default of 10: each outer
+#: iteration trains the GAN for that many epochs, so one draw of 91 made a
+#: 10-iteration trial take 7.5 h; ``hpo.epoch_ranges.pategan`` sets the rounds.
+HPO_FIXED_PARAMS: dict[str, dict[str, object]] = {
+    "arf": {"delta": 0, "early_stop": True},
+    "pategan": {"generator_n_iter": 10},
+}
+
+#: Narrowed ``[low, high, step]`` integer ranges. ARF's trees stop at 50 (the
+#: plugin searches 10-100; arfpy's default is 30, the R package's 10).
+HPO_PARAM_RANGES: dict[str, dict[str, tuple[int, int, int]]] = {
+    "arf": {"num_trees": (10, 50, 10)},
+}
 
 #: Searched epochs for plugins that take ``n_iter`` but leave it out of their
 #: own search space: ADS-GAN gets CTGAN's range (the same conditional GAN
@@ -84,7 +100,8 @@ class _SearchSpaceTrial:
     synthcity's ``sample_hyperparameters_optuna`` reads the plugin's own search
     space and calls ``trial.suggest_*`` per parameter. This proxy drops
     excluded categorical choices, returns ``fixed`` values without searching
-    them, replaces the ``n_iter`` range with ``epochs`` when given, and keeps
+    them, replaces integer ranges with ``ranges`` and the ``n_iter`` range with
+    ``epochs`` when given, and keeps
     the rest of the space as synthcity defines it.
     """
 
@@ -94,8 +111,10 @@ class _SearchSpaceTrial:
         excluded: dict[str, frozenset] | None = None,
         epochs: tuple[int, int, int] | None = None,
         fixed: dict[str, object] | None = None,
+        ranges: dict[str, tuple[int, int, int]] | None = None,
     ):
         self._trial = trial
+        self._ranges = ranges or {}
         self._excluded = excluded or {}
         self._epochs = epochs
         self._fixed = fixed or {}
@@ -111,6 +130,8 @@ class _SearchSpaceTrial:
             return self._fixed[name]
         if name == "n_iter" and self._epochs is not None:
             low, high, step = self._epochs
+        elif name in self._ranges:
+            low, high, step = self._ranges[name]
         return self._trial.suggest_int(name, low, high, step=step, log=log)
 
     def __getattr__(self, attr):
@@ -273,7 +294,11 @@ def build_synthcity_objective(
         # Training length is searched, not capped: the plugin's own n_iter
         # range unless hpo.epoch_ranges (or EPOCH_RANGE_DEFAULTS) sets one.
         proxy = _SearchSpaceTrial(
-            trial, HPO_EXCLUDED_CHOICES.get(name), epochs, HPO_FIXED_PARAMS.get(name)
+            trial,
+            HPO_EXCLUDED_CHOICES.get(name),
+            epochs,
+            HPO_FIXED_PARAMS.get(name),
+            HPO_PARAM_RANGES.get(name),
         )
         params = plugin_cls.sample_hyperparameters_optuna(proxy)
         if epochs is not None and "n_iter" not in params:

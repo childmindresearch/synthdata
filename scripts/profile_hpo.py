@@ -40,9 +40,10 @@ from synthdata.utils import ensure_dir, get_logger, resolve_device, set_global_s
 
 logger = get_logger("profile_hpo")
 
-#: Pinned training length per trial; other models that take ``n_iter`` use 50.
+#: Pinned training length per trial (PATE-GAN: iterations of 10 GAN epochs);
+#: other models that take ``n_iter`` use 50.
 #: ARF's tree count stays searched, so its trials span the 10-100 range.
-PROFILE_EPOCHS = {"pategan": 10, "ddpm": 100}
+PROFILE_EPOCHS = {"pategan": 6, "ddpm": 100}
 DEFAULT_EPOCHS = 50
 #: Trial params that measure training length, for the per-unit time.
 LENGTH_PARAMS = ("n_iter", "num_trees", "n_estimators")
