@@ -22,6 +22,7 @@ from synthdata.data import (
     schema_column_roles,
     split_by_patient,
     stratification_key,
+    warn_identifier_like_feature_columns,
     warn_non_numeric_feature_columns,
 )
 
@@ -552,3 +553,26 @@ class TestLoadLocalFile:
         path.write_text("{}")
         with pytest.raises(ValueError, match="Unsupported file extension"):
             _load_local_file(self._cfg(path))
+
+
+class TestWarnIdentifierLikeFeatureColumns:
+    def test_flags_identifier_names_and_near_unique_categoricals(self):
+        n = 60
+        df = pd.DataFrame(
+            {
+                "MRN": np.arange(n),
+                "visit_code": [f"v{i}" for i in range(n)],
+                "zip_code": [10001] * n,
+                "lab": np.linspace(0, 1, n),  # unique but continuous: a measurement
+                "sex": [0, 1] * (n // 2),
+                "VALID": [1] * n,  # "id" inside a word is not an identifier
+            }
+        )
+        flagged = warn_identifier_like_feature_columns(
+            df, list(df.columns), ["visit_code", "sex", "VALID"]
+        )
+        assert flagged == ["MRN", "visit_code", "zip_code"]
+
+    def test_small_tables_are_not_flagged_on_cardinality(self):
+        df = pd.DataFrame({"code": ["a", "b", "c"]})
+        assert warn_identifier_like_feature_columns(df, ["code"], ["code"]) == []

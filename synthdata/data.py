@@ -14,6 +14,7 @@ downstream stage (imputation, generation, evaluation, plotting).
 import dataclasses
 import hashlib
 import json
+import re
 import types
 from datetime import UTC, datetime
 from pathlib import Path
@@ -564,6 +565,49 @@ def decode_ordinal_columns(df: pd.DataFrame, ordinal_categories: dict) -> pd.Dat
     return out
 
 
+_IDENTIFIER_NAME = re.compile(
+    r"(^|_)(id|mrn|ssn|nhs|name|first_?name|last_?name|surname|dob|birth_?date|"
+    r"date_of_birth|email|e_?mail|phone|address|street|zip|zipcode|postcode|postal_?code)($|_)",
+    re.IGNORECASE,
+)
+
+
+def warn_identifier_like_feature_columns(
+    df: pd.DataFrame, feature_columns: list, categorical_columns: list
+) -> list:
+    """Log a loud warning for feature columns that look like direct identifiers.
+
+    Two signals: the name looks like an identifier (``mrn``, ``dob``, ``zip``,
+    ``patient_id``...), or a categorical or text column has a distinct value on
+    almost every row (a generator can only memorise such a column, and copying it
+    into synthetic rows can re-identify a patient). Neither is an error, because
+    a ZIP code can be a deliberate quasi-identifier; drop the column with
+    ``data.drop_columns`` unless it is meant to be modelled.
+
+    Returns the list of flagged column names (empty if none).
+    """
+    flagged = []
+    for column in feature_columns:
+        values = df[column].dropna()
+        if _IDENTIFIER_NAME.search(str(column)) or (
+            (column in categorical_columns or not pd.api.types.is_numeric_dtype(values))
+            and len(values) >= 50
+            and values.nunique() >= 0.9 * len(values)
+        ):
+            flagged.append(column)
+    if flagged:
+        logger.warning(
+            "%d feature column(s) look like direct identifiers (identifier-like name, or a "
+            "categorical/text column that is unique on almost every row): %s. Generators can "
+            "copy such values into synthetic rows. Drop them with data.drop_columns (the "
+            "patient identifier belongs in data.patient_id_column) unless they are meant to be "
+            "modelled.",
+            len(flagged),
+            flagged,
+        )
+    return flagged
+
+
 def warn_non_numeric_feature_columns(
     df: pd.DataFrame, feature_columns: list, categorical_columns: list
 ) -> list:
@@ -1052,6 +1096,7 @@ def load_dataset(cfg: Config) -> Dataset:
         }
     categorical_columns = nominal_columns + ordinal_columns
     warn_non_numeric_feature_columns(df, feature_columns, categorical_columns)
+    warn_identifier_like_feature_columns(df, feature_columns, categorical_columns)
 
     target_is_categorical = (
         variable_schema.get(target_column, {}).get("kind", "categorical") == "categorical"

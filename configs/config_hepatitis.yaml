@@ -17,7 +17,7 @@ data:
   source: uci
   uci_id: 46
   version: "1.0" # Use a new value whenever the source data changes.
-  variable_schema_path: data/hepatitis/hepatitis_variable_schema.csv
+  variable_schema_path: configs/schemas/hepatitis_variable_schema.csv # Public data, so the schema ships with the repo.
   data_dir: data/hepatitis # Cached download, splits and imputed data.
 
   # Modeling columns

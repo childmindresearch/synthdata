@@ -23,6 +23,8 @@ jobs:
       # Lint doesn't need the project installed at all -- just ruff itself.
       - run: uvx ruff check .
       - run: uvx ruff format --check .
+      # Patient data must never reach the repository (see .pre-commit-config.yaml).
+      - run: uvx pre-commit run no-data-files --all-files
 
   test:
     name: Test (pytest)
