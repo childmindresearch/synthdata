@@ -158,13 +158,15 @@ def test_other_backends_are_rejection_sampled_without_repeating_rows(
     _set_schema(dataset, target_kind="categorical")
     target = dataset.target_column
     calls = iter(range(100))
+    counts = []
 
-    def generate(*args, **kwargs):
+    def generate(train_df, categorical_columns, target_column, n_samples, **kwargs):
         # A generator that makes class 1 only 10% of the time.
+        counts.append(n_samples)
         rng = np.random.default_rng(next(calls))
-        frame = pd.DataFrame({c: rng.normal(size=100) for c in dataset.feature_columns}).assign(
-            **{target: (rng.random(100) < 0.1).astype(int)}
-        )
+        frame = pd.DataFrame(
+            {c: rng.normal(size=n_samples) for c in dataset.feature_columns}
+        ).assign(**{target: (rng.random(n_samples) < 0.1).astype(int)})
         return frame, None
 
     mocker.patch("synthdata.generation.pipeline.tpfn.generate_tabpfn_custom", side_effect=generate)
@@ -177,3 +179,5 @@ def test_other_backends_are_rejection_sampled_without_repeating_rows(
     record = pd.read_csv(Path(cfg.generation.output_dir) / "diagnostics" / "class_sampling.csv")
     assert set(record["method"]) == {"rejection"}
     assert record["rounds"].iloc[0] > 1
+    # Each batch is asked for the count sample_to_quota chose.
+    assert counts[0] == 100 and len(counts) == record["rounds"].iloc[0]

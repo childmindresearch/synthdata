@@ -35,6 +35,10 @@ logger = get_logger(__name__)
 MAX_ROUNDS = 10
 #: A later batch asks for at most this many times the total quota.
 MAX_BATCH_FACTOR = 10
+#: A later batch asks for this many times the rows expected to fill the
+#: scarcest short class, so one top-up batch usually suffices. Backends that
+#: refit per batch (TabPFN, TabPFGen) pay mostly per batch, not per row.
+TOP_UP_MARGIN = 1.5
 #: Batch ``r`` is drawn with seed ``seed + ROUND_SEED_STRIDE * r``, far from the
 #: replicate seeds ``seed + replicate``.
 ROUND_SEED_STRIDE = 10_000
@@ -138,9 +142,11 @@ def sample_to_quota(
                 count = n
             else:
                 # Draw enough for the scarcest short class at its observed
-                # rate (one pseudo-row for a class not seen yet), capped.
+                # rate (one pseudo-row for a class not seen yet), with a
+                # margin, capped.
                 rate = (observed[need > 0] + 1) / (total_drawn + 1)
-                count = min(math.ceil((need[need > 0] / rate).max()), MAX_BATCH_FACTOR * n)
+                expected = (need[need > 0] / rate).max()
+                count = min(math.ceil(TOP_UP_MARGIN * expected), MAX_BATCH_FACTOR * n)
             batch = sample_fn(count, round_seed, None)
         rounds += 1
         if target_column not in batch:
