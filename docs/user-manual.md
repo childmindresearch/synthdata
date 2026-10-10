@@ -343,7 +343,18 @@ Synthcity models are chosen with `generation.synthcity.names`. TabPFN runs when 
 
 ### Training models in parallel
 
-The synthcity models are trained side by side, each in its own process that runs the model's whole chain: the untuned fit, its hyperparameter search, the tuned fit and every replicate. The top-level `compute` section sets how many run at once (see [Using the machine's cores](#using-the-machines-cores)). Models with the longest search budget start first, so the stage takes about as long as the slowest model rather than the sum of all of them. With two or more GPUs, models are spread across them; each synthcity model used under 3 GB of GPU memory in profiling, so several share one GPU easily. If one model fails, the others still finish and are cached, and rerunning with the same experiment id redoes only the failed one. Within a model, HPO trials still run one at a time, because running them in parallel would make the search depend on timing. TabPFN and TabPFGen run after the synthcity models, in the main process.
+The synthcity models are trained side by side, each in its own process that runs the model's whole chain: the untuned fit, its hyperparameter search, the tuned fit and every replicate. The top-level `compute` section sets how many run at once (see [Using the machine's cores](#using-the-machines-cores)). Models with the longest search budget start first, so the stage takes about as long as the slowest model rather than the sum of all of them. With two or more GPUs, models are spread across them. GPU memory per model varies widely: on the simulated clinical dataset, six models sharing one 48 GB GPU held between 1 and 21 GB each, so check `nvidia-smi` or the resource log ([Long runs and remote machines](#long-runs-and-remote-machines)) on a smaller GPU. If one model fails, the others still finish and are cached, and rerunning with the same experiment id redoes only the failed one. Within a model, HPO trials still run one at a time, because running them in parallel would make the search depend on timing. TabPFN and TabPFGen run after the synthcity models, in the main process.
+
+While models run side by side, every line a model's process prints starts with its step and name, so the terminal and the log stay readable:
+
+```
+[17:19:02] synthdata.compute INFO: [generation] started tvae (pid 6863; 2 of 7)
+[generation: tvae] [17:19:04] synthdata.generation.hpo INFO: [hpo_tvae] starting hyperparameter optimization: 40 trial(s) remaining
+[generation: ctgan]  50%|█████     | 75/150 [21:07<20:31, 16.42s/it]
+[17:52:40] synthdata.compute INFO: [generation] tvae finished after 33.6 min; 1 of 7 done, running: ctgan, ddpm, rtvae, adsgan, arf, pategan
+```
+
+Evaluation does the same (`[syntheval full: tvae]`, `[synthcity: ddpm]`, ...). In a model's process, each progress bar update is printed as a line of its own, at most once every 30 seconds (set `TQDM_MININTERVAL` to change it), instead of redrawing one line.
 
 ### How the hyperparameter search works
 

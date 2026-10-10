@@ -7,9 +7,13 @@ how the machine's cores and memory are used.
 """
 
 import dataclasses
+import io
+import logging
 import multiprocessing
 import os
 import pickle
+import re
+import sys
 import tempfile
 import time
 import traceback
@@ -138,8 +142,76 @@ THREAD_ENV_VARS = (
 TASK_ENV_VAR = "SYNTHDATA_TASK"
 
 
+class _Prefixed(io.TextIOBase):
+    """A text stream that writes whole lines, each starting with a prefix.
+
+    Several models print to one terminal and one log at once; the prefix says
+    which model each line, log message or progress bar belongs to. Text is
+    held until its line ends and then written in one piece, so lines from
+    different models never run into each other. A progress bar's redraw
+    (``\\r``) ends its line too, so each update is a line of its own.
+    """
+
+    def __init__(self, stream, prefix: str):
+        self._stream = stream
+        self._prefix = prefix
+        self._pending = ""
+
+    def write(self, text: str) -> int:
+        out = []
+        for piece in re.split(r"(\r\n|[\r\n])", text):
+            if piece in ("\n", "\r\n") or (piece == "\r" and self._pending):
+                out.append(f"{self._prefix}{self._pending}\n")
+                self._pending = ""
+            elif piece != "\r":
+                self._pending += piece
+        if out:
+            self._stream.write("".join(out))
+        return len(text)
+
+    def close_line(self) -> None:
+        """Write a last line that never ended (the process is finishing)."""
+        if self._pending:
+            self._stream.write(f"{self._prefix}{self._pending}\n")
+            self._pending = ""
+        self._stream.flush()
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def isatty(self) -> bool:
+        return self._stream.isatty()
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+    @property
+    def encoding(self):
+        return getattr(self._stream, "encoding", "utf-8")
+
+
+def _prefix_output(task: str) -> list[_Prefixed]:
+    """Prefix this process's stdout, stderr and logging handlers with ``[task]``."""
+    prefix = f"[{task}] "
+    swaps = {}
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        if stream is not None:
+            swaps[id(stream)] = _Prefixed(stream, prefix)
+            setattr(sys, name, swaps[id(stream)])
+    # Handlers created on import (before this ran) still hold the raw streams.
+    loggers = [logging.getLogger(), *logging.Logger.manager.loggerDict.values()]
+    for log in loggers:
+        for handler in getattr(log, "handlers", []):
+            stream = getattr(handler, "stream", None)
+            if isinstance(handler, logging.StreamHandler) and id(stream) in swaps:
+                handler.setStream(swaps[id(stream)])
+    return list(swaps.values())
+
+
 def _child(fn, args, result_path: str, cores: int) -> None:
     """Run ``fn(*args)`` in a spawned process and pickle its outcome to ``result_path``."""
+    streams = _prefix_output(task) if (task := os.environ.get(TASK_ENV_VAR)) else []
     try:
         import torch
 
@@ -153,8 +225,19 @@ def _child(fn, args, result_path: str, cores: int) -> None:
             "error": f"{type(exc).__name__}: {exc}",
             "traceback": traceback.format_exc(),
         }
+    for stream in streams:
+        stream.close_line()
     with open(result_path, "wb") as f:
         pickle.dump(outcome, f)
+
+
+def _duration(seconds: float) -> str:
+    """``"42 s"``, ``"12.5 min"`` or ``"3.2 h"``."""
+    if seconds < 60:
+        return f"{seconds:.0f} s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f} min"
+    return f"{seconds / 3600:.1f} h"
 
 
 @dataclasses.dataclass
@@ -217,8 +300,13 @@ def run_per_model(
         from multiprocessing import resource_tracker
 
         resource_tracker.ensure_running()
-    saved_env = {var: os.environ.get(var) for var in (*THREAD_ENV_VARS, TASK_ENV_VAR)}
+    saved_env = {
+        var: os.environ.get(var) for var in (*THREAD_ENV_VARS, TASK_ENV_VAR, "TQDM_MININTERVAL")
+    }
     os.environ.update({var: str(cores) for var in THREAD_ENV_VARS})
+    # Each progress bar update is a line of its own in a worker (see
+    # _Prefixed): one every 30 s keeps the terminal and the log readable.
+    os.environ.setdefault("TQDM_MININTERVAL", "30")
     try:
         with tempfile.TemporaryDirectory(prefix="synthdata-") as scratch:
 
@@ -235,18 +323,25 @@ def run_per_model(
                 # monitor of synthdata-run can attribute its use to the model.
                 os.environ[TASK_ENV_VAR] = f"{label}: {name}"
                 process.start()
-                active[name] = (process, result_path)
-                logger.info("[%s] started %s (pid %s)", label, name, process.pid)
+                active[name] = (process, result_path, time.monotonic())
+                logger.info(
+                    "[%s] started %s (pid %s; %d of %d)",
+                    label,
+                    name,
+                    process.pid,
+                    index + 1,
+                    len(tasks),
+                )
 
             for _ in range(max(n_workers, 1)):
                 start_next()
             while active:
-                done = [name for name, (process, _) in active.items() if not process.is_alive()]
+                done = [name for name, (process, *_) in active.items() if not process.is_alive()]
                 if not done:
                     time.sleep(0.2)
                     continue
                 for name in done:
-                    process, result_path = active.pop(name)
+                    process, result_path, started = active.pop(name)
                     process.join()
                     try:
                         with open(result_path, "rb") as f:
@@ -257,6 +352,16 @@ def run_per_model(
                             "without a result (killed, possibly out of memory)"
                         }
                     start_next()
+                    logger.info(
+                        "[%s] %s %s after %s; %d of %d done%s",
+                        label,
+                        name,
+                        "failed" if "error" in outcomes[name] else "finished",
+                        _duration(time.monotonic() - started),
+                        len(outcomes),
+                        len(tasks),
+                        f", running: {', '.join(active)}" if active else "",
+                    )
     finally:
         for var, value in saved_env.items():
             if value is None:
