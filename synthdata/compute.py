@@ -133,6 +133,10 @@ THREAD_ENV_VARS = (
     "LOKY_MAX_CPU_COUNT",
 )
 
+#: Names the model a worker process runs, e.g. ``"generation: ctgan"``; read
+#: by :mod:`synthdata.resources`.
+TASK_ENV_VAR = "SYNTHDATA_TASK"
+
 
 def _child(fn, args, result_path: str, cores: int) -> None:
     """Run ``fn(*args)`` in a spawned process and pickle its outcome to ``result_path``."""
@@ -207,7 +211,13 @@ def run_per_model(
     outcomes: dict[str, dict] = {}
     # Spawned processes inherit the environment, so thread limits set here
     # take effect before their numeric libraries load.
-    saved_env = {var: os.environ.get(var) for var in THREAD_ENV_VARS}
+    if os.name != "nt":
+        # multiprocessing's helper process starts with the first worker and
+        # would inherit that worker's task name; start it before naming any.
+        from multiprocessing import resource_tracker
+
+        resource_tracker.ensure_running()
+    saved_env = {var: os.environ.get(var) for var in (*THREAD_ENV_VARS, TASK_ENV_VAR)}
     os.environ.update({var: str(cores) for var in THREAD_ENV_VARS})
     try:
         with tempfile.TemporaryDirectory(prefix="synthdata-") as scratch:
@@ -221,6 +231,9 @@ def run_per_model(
                 process = context.Process(
                     target=_child, args=(fn, args, result_path, cores), name=f"{label}-{name}"
                 )
+                # The spawned process inherits this name, so the resource
+                # monitor of synthdata-run can attribute its use to the model.
+                os.environ[TASK_ENV_VAR] = f"{label}: {name}"
                 process.start()
                 active[name] = (process, result_path)
                 logger.info("[%s] started %s (pid %s)", label, name, process.pid)
