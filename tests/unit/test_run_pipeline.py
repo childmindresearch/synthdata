@@ -47,6 +47,7 @@ def test_forwarded_argv_round_trips_without_detach():
         "strict_checks",
         "tag",
         "monitor_interval",
+        "dashboard_interval",
     ):
         assert getattr(again, field) == getattr(args, field), field
 

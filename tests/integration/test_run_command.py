@@ -49,4 +49,10 @@ def test_detached_run_finishes_in_its_own_session_and_logs(tmp_path_factory):
     text = log.read_text()
     assert "all stages finished" in text, text[-3000:]
     assert "=== impute finished" in text
+    # The status page gets its final rewrite as the runner exits.
+    page = log.with_name(log.name.replace("_run.log", "_dashboard.html"))
+    deadline = time.time() + 60
+    while not (page.exists() and "<title>Finished" in page.read_text()) and time.time() < deadline:
+        time.sleep(0.5)
+    assert "<title>Finished" in page.read_text()
     assert run.data_dir.exists()

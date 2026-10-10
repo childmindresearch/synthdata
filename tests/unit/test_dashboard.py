@@ -1,0 +1,319 @@
+"""Unit tests for the run dashboard (synthdata.dashboard, synthdata-dashboard)."""
+
+import csv
+import os
+from datetime import UTC, datetime, timedelta
+
+import optuna
+import pytest
+
+from scripts import run_dashboard
+from synthdata import dashboard
+from synthdata.config import Config
+
+pytestmark = pytest.mark.unit
+
+T0 = datetime(2026, 10, 10, 22, 0, 0, tzinfo=UTC)
+
+
+def _runner(t: datetime, msg: str) -> str:
+    return f"[{t:%Y-%m-%d %H:%M:%S} UTC] {msg}\n"
+
+
+def _logline(t: datetime, logger: str, level: str, msg: str, task: str | None = None) -> str:
+    local = t.astimezone(dashboard._LOCAL_TZ)
+    prefix = f"[{task}] " if task else ""
+    return f"{prefix}[{local:%H:%M:%S}] {logger} {level}: {msg}\n"
+
+
+def _minutes(m: float) -> datetime:
+    return T0 + timedelta(minutes=m)
+
+
+def _write_run(tmp_path, finished: bool = False, host: str | None = None):
+    """A run that imputed, and is generating three models (one failed, one running)."""
+    cfg = Config()
+    cfg.name = "sim"
+    cfg.data.version = "1.2"
+    cfg.generation.output_dir = str(tmp_path / "out" / "synthetic_data")
+    cfg.evaluation.output_dir = str(tmp_path / "out" / "evaluation")
+    logs = tmp_path / "out" / "logs"
+    logs.mkdir(parents=True)
+    log = logs / "20261010T220000Z_run.log"
+    host = host or dashboard.socket.gethostname()
+    lines = [
+        _runner(
+            T0, f"synthdata-run: stages impute generate evaluate, pid {os.getpid()}, host {host}"
+        ),
+        _runner(T0, "=== impute: -m scripts.run_imputation --config c.yaml"),
+        _runner(_minutes(5), "peak use during impute: RAM 2.0 GiB, CPU 4.0 cores"),
+        _runner(_minutes(5), "=== impute finished"),
+        _runner(_minutes(5), "=== generate: -m scripts.run_generation --config c.yaml"),
+        _logline(
+            _minutes(5.1),
+            "synthdata.experiment",
+            "INFO",
+            "Experiment '1.2' (tag=-, dataset=sim@1.2)",
+        ),
+        _logline(
+            _minutes(6),
+            "synthdata.compute",
+            "INFO",
+            "[generation] 4 models, 2 at a time with 4 CPU threads each",
+        ),
+        _logline(
+            _minutes(6), "synthdata.compute", "INFO", "[generation] started ctgan (pid 11; 1 of 4)"
+        ),
+        _logline(
+            _minutes(6), "synthdata.compute", "INFO", "[generation] started tvae (pid 12; 2 of 4)"
+        ),
+        _logline(
+            _minutes(6.5),
+            "synthdata.generation.hpo",
+            "INFO",
+            "[hpo_ctgan] starting hyperparameter optimization: 10 trial(s) remaining "
+            "(0 already finished, target=10, timeout=7200s)",
+            task="generation: ctgan",
+        ),
+        "[generation: ctgan] Epochs:  40%|####      | 40/100 [00:30<00:45, 1.3it/s]\n",
+        _logline(
+            _minutes(7),
+            "py.warnings",
+            "WARNING",
+            "UserWarning: column age has 3 values",
+            task="generation: tvae",
+        ),
+        _logline(
+            _minutes(8),
+            "py.warnings",
+            "WARNING",
+            "UserWarning: column age has 4 values",
+            task="generation: tvae",
+        ),
+        _logline(
+            _minutes(20),
+            "synthdata.compute",
+            "INFO",
+            "[generation] tvae failed after 14 min 00 s; 1 of 4 done, running: ctgan",
+        ),
+        _logline(
+            _minutes(20), "synthdata.compute", "INFO", "[generation] started arf (pid 13; 3 of 4)"
+        ),
+        _logline(
+            _minutes(21),
+            "synthdata.compute",
+            "ERROR",
+            "[generation] tvae failed: RuntimeError: CUDA out of memory",
+        ),
+        "Traceback (most recent call last):\n",
+        '  File "x.py", line 1, in <module>\n',
+        "RuntimeError: CUDA out of memory\n",
+        _logline(
+            _minutes(30),
+            "synthdata.compute",
+            "INFO",
+            "[generation] arf finished after 10 min 00 s; 2 of 4 done, running: ctgan",
+        ),
+    ]
+    if finished:
+        lines += [
+            _runner(_minutes(40), "=== generate finished"),
+            _runner(_minutes(40), "=== evaluate: -m scripts.run_evaluation"),
+            _runner(_minutes(50), "=== evaluate finished"),
+            _runner(_minutes(50), "synthdata-run: all stages finished"),
+        ]
+    log.write_text("".join(lines), encoding="utf-8")
+
+    with open(dashboard.companion_path(log, "resources.csv"), "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "time_utc",
+                "stage",
+                "pipeline_ram_gib",
+                "pipeline_cpu_cores",
+                "system_ram_used_gib",
+                "system_ram_total_gib",
+                "gpu_util_pct",
+                "gpu_mem_used_mib",
+                "pipeline_vram_mib",
+            ]
+        )
+        for i in range(31):
+            stage = "impute" if i < 5 else "generate"
+            writer.writerow(
+                [
+                    f"{_minutes(i):%Y-%m-%dT%H:%M:%SZ}",
+                    stage,
+                    2 + i * 0.1,
+                    4,
+                    10 + i * 0.1,
+                    64,
+                    50,
+                    4000,
+                    3000,
+                ]
+            )
+    with open(dashboard.companion_path(log, "resources_by_task.csv"), "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time_utc", "stage", "task", "ram_gib", "cpu_cores", "vram_mib"])
+        writer.writerow(
+            [f"{_minutes(29):%Y-%m-%dT%H:%M:%SZ}", "generate", "generation: tvae", 9.0, 4, 2000]
+        )
+        writer.writerow(
+            [f"{_minutes(30):%Y-%m-%dT%H:%M:%SZ}", "generate", "generation: ctgan", 3.0, 4, 3000]
+        )
+        writer.writerow([f"{_minutes(30):%Y-%m-%dT%H:%M:%SZ}", "generate", "main", 1.0, 0.1, ""])
+
+    gen_dir, eval_dir = dashboard.experiment_dirs(cfg, "1.2")
+    gen_dir.mkdir(parents=True)
+    storage = f"sqlite:///{(gen_dir / 'optuna_studies.db').as_posix()}"
+    study = optuna.create_study(study_name="hpo_ctgan", direction="maximize", storage=storage)
+    for value in (0.5, 0.7, 0.6):
+        study.add_trial(
+            optuna.trial.create_trial(
+                params={}, distributions={}, value=value, user_attrs={"constraints": [0.0]}
+            )
+        )
+    # Infeasible: a better value that fails a screen must not count as best.
+    study.add_trial(
+        optuna.trial.create_trial(
+            params={}, distributions={}, value=0.9, user_attrs={"constraints": [1.0]}
+        )
+    )
+    study.add_trial(
+        optuna.trial.create_trial(params={}, distributions={}, state=optuna.trial.TrialState.FAIL)
+    )
+    if finished:
+        eval_dir.mkdir(parents=True)
+        (eval_dir / "ranking_summary.csv").write_text(
+            "model,rank,n_replicates,baseline,overall_mean,overall_ci_low,overall_ci_high,eligible,tied_with_best\n"
+            "ctgan,1,3,False,0.81,0.78,0.84,True,True\n"
+            "baseline_train_copy,2,1,True,0.79,,,False,False\n"
+        )
+        (eval_dir / "checks.csv").write_text(
+            "check,model,status,value,limit,detail\nrows,ctgan,pass,1,1,\nclass_share,ctgan,warn,0.4,0.3,off\n"
+        )
+        (eval_dir / "report.md").write_text("# Report\n")
+    return cfg, log
+
+
+def test_collect_reads_stages_models_hpo_resources_and_problems(tmp_path):
+    cfg, log = _write_run(tmp_path)
+    d = dashboard.collect(log, cfg, now=_minutes(31))
+
+    assert d["run"]["state"] == "running"
+    assert d["run"]["elapsed_s"] == 31 * 60
+    assert d["experiment"] == "1.2"
+    assert [(s["name"], s["status"]) for s in d["stages"]] == [
+        ("impute", "done"),
+        ("generate", "running"),
+        ("evaluate", "pending"),
+    ]
+    assert d["stages"][0]["duration_s"] == 300 and "RAM 2.0 GiB" in d["stages"][0]["peak"]
+
+    status = {t["model"]: t["status"] for t in d["tasks"]}
+    assert status == {"ctgan": "running", "tvae": "failed", "arf": "done"}
+    tvae = next(t for t in d["tasks"] if t["model"] == "tvae")
+    assert "CUDA out of memory" in tvae["error"]
+    assert d["steps"] == [
+        {
+            "label": "generation",
+            "total": 4,
+            "workers": 2,
+            "cores": 4,
+            "done": 1,
+            "failed": 1,
+            "running": 1,
+        }
+    ]
+
+    (study,) = d["hpo"]
+    assert (study["model"], study["complete"], study["failed"], study["target"]) == (
+        "ctgan",
+        4,
+        1,
+        10,
+    )
+    assert study["best"] == 0.7  # the 0.9 trial failed a screen
+    assert study["timeout"] == 7200
+
+    series = d["resources"]["series"]
+    assert len(series["t"]) == 31 and series["pipeline_ram_gib"][-1] == 5.0
+    assert d["resources"]["peaks"]["impute"]["pipeline_ram_gib"] == pytest.approx(2.4)
+    active = [t["task"] for t in d["resources"]["tasks"] if t.get("active")]
+    assert active == ["generation: ctgan", "main"]
+
+    # The two warnings differ only in a number: one entry with a count; the
+    # error keeps its traceback.
+    assert d["n_errors"] == 1 and d["n_warnings"] == 2
+    error, warning = d["problems"]
+    assert error["level"] == "error" and "Traceback" in error["context"][0]
+    assert warning["count"] == 2 and warning["source"] == "generation: tvae"
+    assert d["results"] == {}
+    assert "generation: ctgan" in d["tasks_in_tail"]
+
+
+def test_finished_run_shows_results_and_page_renders(tmp_path):
+    cfg, log = _write_run(tmp_path, finished=True)
+    d = dashboard.collect(log, cfg, now=_minutes(60))
+    assert d["run"]["state"] == "finished" and d["run"]["elapsed_s"] == 50 * 60
+    assert [s["status"] for s in d["stages"]] == ["done", "done", "done"]
+    # A worker never reported as finished is not left "running" after the run ended.
+    assert {t["model"]: t["status"] for t in d["tasks"]}["ctgan"] == "stopped"
+    assert d["results"]["ranking"][0]["model"] == "ctgan"
+    assert d["results"]["checks"]["warn"] == 1
+    assert d["results"]["report_rel"] == "../evaluation/data_v_1.2/exp_v_1.2/report.md"
+
+    path = dashboard.write_dashboard(log, cfg)
+    assert path == log.with_name("20261010T220000Z_dashboard.html")
+    page = path.read_text(encoding="utf-8")
+    assert page.startswith("<!doctype html>") and "Finished" in page
+    assert "ctgan" in page and "report.md" in page and "CUDA out of memory" in page
+
+
+def test_runner_gone_without_an_end_is_stopped_and_log_text_is_escaped(tmp_path):
+    cfg, log = _write_run(tmp_path)
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(_logline(_minutes(30), "x", "ERROR", "<script>alert(1)</script>"))
+    # A pid that is not running on this host.
+    text = log.read_text().replace(f"pid {os.getpid()}", "pid 999999999")
+    log.write_text(text)
+    d = dashboard.collect(log, cfg, now=_minutes(31))
+    assert d["run"]["state"] == "stopped"
+    assert all(t["status"] != "running" for t in d["tasks"])
+    page = dashboard.build(log, cfg)
+    assert "<script>alert(1)</script>" not in page.split('<script type="application/json"')[0]
+    assert "<\\/script>" in page  # the JSON copy of the log tail cannot close the script
+
+
+def test_other_host_skips_the_process_check(tmp_path):
+    cfg, log = _write_run(tmp_path, host="some-other-node")
+    text = log.read_text().replace(f"pid {os.getpid()}", "pid 999999999")
+    log.write_text(text)
+    d = dashboard.collect(log, cfg, now=_minutes(31))
+    assert d["run"]["state"] == "running" and d["machine"] == {}
+
+
+def test_missing_files_give_an_empty_but_valid_page(tmp_path):
+    log = tmp_path / "20261010T000000Z_run.log"
+    d = dashboard.collect(log, None)
+    assert d["run"]["state"] == "waiting" and d["hpo"] == [] and d["results"] == {}
+    assert "<!doctype html>" in dashboard.build(log, None)
+
+
+def test_log_lines_without_a_date_roll_over_midnight():
+    clock = dashboard._Clock()
+    late = datetime(2026, 10, 10, 23, 59, 50, tzinfo=dashboard._LOCAL_TZ).astimezone(UTC)
+    clock.runner(late)
+    moment = clock.local("00:00:10")
+    assert moment - late == timedelta(seconds=20)
+    # A worker line a little behind the newest one stays on the same day.
+    assert late - clock.local("23:59:40") == timedelta(seconds=10)
+
+
+def test_cli_writes_the_newest_runs_page(tmp_path, monkeypatch):
+    cfg, log = _write_run(tmp_path, finished=True)
+    monkeypatch.setattr(run_dashboard, "load_config", lambda _: cfg)
+    run_dashboard.main(["--config", "c.yaml"])
+    assert dashboard.dashboard_path(log).exists()

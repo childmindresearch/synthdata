@@ -35,6 +35,8 @@ Or run all four in one go with a log file, in the background on a remote machine
 uv run synthdata-run --config path/to/your-config.yaml --detach
 ```
 
+While it runs, `<output root>/logs/<UTC time>_dashboard.html` is a live status page for the run (stages, models, HPO progress, resources, errors, results); open it in a browser, or serve it with `synthdata-dashboard --serve` (see [The live status page](docs/user-manual.md#the-live-status-page)).
+
 ## Your dataset configuration
 
 One YAML file drives every stage. Its sections (`data`, `imputation`, `generation`, `evaluation`, `compute`, `plots`, `experiment`) follow the pipeline order. The example files list only the options worth reviewing for each run: data source and column roles, the patient-level split, imputation method, generators and their HPO budgets, metric selection and ranking weights. Every option left out takes its default. [`synthdata/config.py`](synthdata/config.py) is the full reference: every option there has its default and an explanation, and an unknown or misspelled key stops the run with the list of valid keys.

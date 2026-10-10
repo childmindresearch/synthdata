@@ -40,6 +40,7 @@ synthdata-generate = "scripts.run_generation:main"
 synthdata-evaluate = "scripts.run_evaluation:main"
 synthdata-plot = "scripts.run_plots:main"
 synthdata-run = "scripts.run_pipeline:main"
+synthdata-dashboard = "scripts.run_dashboard:main"
 
 [project.optional-dependencies]
 presidio = [
