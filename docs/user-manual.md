@@ -437,7 +437,7 @@ With `evaluation.privacy_attacks.unit: patient` (the default), each patient coun
 
 ### Ranking
 
-1. Every metric is oriented so higher is better, then min-max scaled across the models in this run. Scores therefore compare models within the run; they are not absolute quality measures.
+1. Every metric is oriented so higher is better, then min-max scaled across the models in this run. Scores therefore compare models within the run; they are not absolute quality measures. A metric that failed for one model while others have it scores 0, the worst value, for that model, so a failure cannot lift its rank.
 2. Metrics are averaged within each source, then across sources, into a utility, a privacy and a fairness score between 0 and 1.
 3. The overall score is the weighted geometric mean of the three, with weights from `evaluation.rank_weights`. A near-zero score on one dimension cannot be made up by the others.
 
@@ -457,7 +457,7 @@ Evaluation scores several synthetic datasets at once, each in its own process, u
 
 `report.md` sits in the evaluation folder and is the one page to read after a run. Every table and figure it mentions is linked. Its seven sections:
 
-1. **At a glance.** Dataset, experiment, seed, the recommended model and its overall score, how it compares with the two baselines, the [output checks](#output-checks) count, and a "Read with care" list of warnings (for example, a single seed, a failed output check, or an Anonymeter attack whose 95% interval is above 0).
+1. **At a glance.** Dataset, experiment, seed, the recommended model and its overall score, how it compares with the two baselines, the [output checks](#output-checks) count, and a "Read with care" list of warnings (for example, a single seed, a failed output check, a metric that failed for a model and is scored as its worst value, or an Anonymeter attack whose 95% interval is above 0).
 2. **Ranking.** One row per model with overall, utility, privacy and fairness scores (with intervals and "tied with best" when there are replicates), followed by how the scores were built and the trade-off plots.
 3. **Utility.** Real versus synthetic distribution plots per model, and the holdout TSTR table against the real-data ceiling.
 4. **Privacy evidence.** The attack and distance results next to the baselines, with how to read each column.
