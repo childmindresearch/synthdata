@@ -103,6 +103,60 @@ def git_commit() -> str | None:
     return None
 
 
+#: Packages whose versions decide metric values; recorded with every run.
+_PROVENANCE_PACKAGES = (
+    "synthcity",
+    "syntheval",
+    "torch",
+    "xgboost",
+    "scikit-learn",
+    "tabpfn",
+    "anonymeter",
+    "numpy",
+    "pandas",
+)
+
+
+def _git_output(*args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=Path(__file__).resolve().parent,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def provenance() -> dict:
+    """Best-effort record of the code and packages a run used.
+
+    The root commit alone does not pin a run: the submodule checkouts or the
+    working tree can differ from it. Every field is ``None`` when it cannot be
+    read (no git, not a checkout, package missing); this never raises.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    status = _git_output("status", "--porcelain", "--untracked-files=no")
+    submodules = _git_output("submodule", "status")
+    versions = {}
+    for package in _PROVENANCE_PACKAGES:
+        try:
+            versions[package] = version(package)
+        except PackageNotFoundError:
+            versions[package] = None
+    return {
+        "git_dirty": None if status is None else bool(status),
+        # One line per submodule: "<sha> <path> (<describe>)"; a leading "+"
+        # means the checkout differs from the commit the root repo pins.
+        "submodules": None if submodules is None else submodules.splitlines(),
+        "packages": versions,
+    }
+
+
 def cached_csv(
     path: str | Path,
     build_fn: Callable[[], pd.DataFrame],

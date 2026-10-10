@@ -90,7 +90,7 @@ def run_log_disparity_evaluation(
 
 
 def build_log_disparity_summary_table(reports: dict[str, dict]) -> pd.DataFrame:
-    """Models x {log_disparity_mean_abs, log_disparity_median_abs, log_disparity_share_significant}.
+    """Models x {log_disparity_mean_abs, _median_abs, _share_significant, _synthetic_only_row_share}.
 
     Models whose report failed (see ``run_log_disparity_evaluation``'s
     ``{"error": ...}`` entries) get all-NaN rows here rather than being
@@ -103,6 +103,7 @@ def build_log_disparity_summary_table(reports: dict[str, dict]) -> pd.DataFrame:
                 "log_disparity_mean_abs": None,
                 "log_disparity_median_abs": None,
                 "log_disparity_share_significant": None,
+                "log_disparity_synthetic_only_row_share": None,
             }
             continue
         stats = report["summary_stats"]
@@ -110,6 +111,8 @@ def build_log_disparity_summary_table(reports: dict[str, dict]) -> pd.DataFrame:
             "log_disparity_mean_abs": stats.get("mean_abs_log_disparity"),
             "log_disparity_median_abs": stats.get("median_abs_log_disparity"),
             "log_disparity_share_significant": stats.get("share_significant_bh"),
+            # Rows in subgroups the real data does not have; reported, not ranked.
+            "log_disparity_synthetic_only_row_share": stats.get("synthetic_only_row_share"),
         }
     return pd.DataFrame.from_dict(rows, orient="index")
 

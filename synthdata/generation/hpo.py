@@ -91,7 +91,8 @@ def build_synthetic_eval_fn(
                 _loader(ref_df),
                 _loader(x_aug),
                 metrics=metric_config,
-                task_type="classification",
+                # The target is discrete exactly when the schema declares it categorical.
+                task_type="classification" if target_column in discrete_columns else "regression",
                 random_state=seed,
                 workspace=workspace_path,
                 # The cache keys on data and metric name, not code; see synthcity_eval.

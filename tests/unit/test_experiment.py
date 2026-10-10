@@ -114,6 +114,9 @@ class TestRecordAppendOnly:
         assert len(manifest["runs"]) == 1
         assert manifest["runs"][0]["stage"] == "generation"
         assert manifest["runs"][0]["artifacts"] == {"model": "ctgan"}
+        provenance = manifest["runs"][0]["provenance"]
+        assert set(provenance) == {"git_dirty", "submodules", "packages"}
+        assert "synthcity" in provenance["packages"]
 
     def test_second_record_appends_not_replaces(self, make_config):
         cfg = make_config()

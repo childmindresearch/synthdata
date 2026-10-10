@@ -122,6 +122,7 @@ class TestBuildLogDisparitySummaryTable:
                     "mean_abs_log_disparity": 0.5,
                     "median_abs_log_disparity": 0.4,
                     "share_significant_bh": 0.1,
+                    "synthetic_only_row_share": 0.0,
                 }
             },
             "bad": {"error": "boom", "error_type": "ValueError"},

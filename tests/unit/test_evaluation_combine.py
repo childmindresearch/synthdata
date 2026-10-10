@@ -256,6 +256,31 @@ class TestBuildCombinedTable:
         # model_a has the higher raw metric -> higher overall rank -> sorted first.
         assert combined.index[0] == "model_a"
 
+    def test_missing_metric_scores_as_worst_not_skipped(self):
+        # model_b is worse on ks_test and its second metric failed. Skipping
+        # the failed metric would rank it on ks_test alone; scoring it worst
+        # keeps a failure from lifting it.
+        index = ["stats.ks_test", "stats.jensenshannon_dist"]
+        synthcity_results = {
+            "model_a": pd.DataFrame(
+                {"mean": [0.6, 0.2], "direction": ["maximize", "minimize"]}, index=index
+            ),
+            "model_b": pd.DataFrame(
+                {"mean": [0.5], "direction": ["maximize"]}, index=["stats.ks_test"]
+            ),
+            "model_c": pd.DataFrame(
+                {"mean": [0.4, 0.3], "direction": ["maximize", "minimize"]}, index=index
+            ),
+        }
+        combined = build_combined_table(
+            synthcity_results, None, None, {}, model_names=["model_a", "model_b", "model_c"]
+        )
+        rank = combined[("synthcity", "utility", "rank")]
+        assert rank["model_b"] == pytest.approx(0.25)  # (0.5 + 0) / 2
+        assert pd.isna(
+            combined.loc["model_b", ("synthcity", "utility", "stats.jensenshannon_dist")]
+        )
+
     def test_combines_multiple_sources(self):
         synthcity_results = {
             "model_a": pd.DataFrame(

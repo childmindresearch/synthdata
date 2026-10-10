@@ -112,10 +112,15 @@ SYNTHCITY_REDUNDANT_SUBMETRIC_SUFFIXES = ("_naive",)
 #: properties correctly and stay ranked. data_leakage (linear, mlp) and
 #: DomiasMIA_prior accuracy score a copy like a fresh draw; the augmentation
 #: scores barely move even for a generator collapsed onto one row. Their xgb
-#: and AUC siblings separate a copy and stay ranked.
+#: and AUC siblings separate a copy and stay ranked. ``detection_gmm`` is not a
+#: real-vs-synthetic classifier: synthcity fits an unsupervised Gaussian
+#: mixture (the labels are ignored) and reads one mixture component's
+#: probability as "synthetic", so it scores about 0.5 whether the synthetic
+#: data is a fresh draw, shifted or shuffled (re-audit N2).
 SYNTHCITY_UNRANKED_SUBMETRICS = frozenset(
     {
         "performance.feat_rank_distance.pvalue",
+        "detection.detection_gmm.mean",
         "privacy.delta-presence.score",
         "privacy.k-anonymization.gt",
         "privacy.k-anonymization.syn",
