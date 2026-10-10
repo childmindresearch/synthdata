@@ -277,7 +277,9 @@ class TestBuildCombinedTable:
         )
         rank = combined[("synthcity", "utility", "rank")]
         assert rank["model_b"] == pytest.approx(0.25)  # (0.5 + 0) / 2
-        assert pd.isna(combined.loc["model_b", ("synthcity", "stats", "stats.jensenshannon_dist")])
+        assert pd.isna(
+            combined.loc["model_b", ("synthcity", "utility", "stats.jensenshannon_dist")]
+        )
 
     def test_combines_multiple_sources(self):
         synthcity_results = {

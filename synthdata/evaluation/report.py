@@ -292,7 +292,9 @@ def _glance_section(cfg, dataset, combined, extras, model_names, experiment) -> 
     raw = raw.loc[_candidates(raw.index), raw.notna().any()]
     missing = raw.isna().sum(axis=1)
     for model in missing.index[missing > 0]:
-        cautions.append(f"`{model}`: {int(missing[model])} metric(s) missing (failed or skipped), scored as the worst model on each.")
+        cautions.append(
+            f"`{model}`: {int(missing[model])} metric(s) missing (failed or skipped), scored as the worst model on each."
+        )
     cautions += _privacy_flags(extras.get("privacy_attacks"))
     checks = extras.get("checks")
     if checks is not None and not checks.empty:
