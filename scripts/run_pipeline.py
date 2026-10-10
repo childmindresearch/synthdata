@@ -9,7 +9,11 @@ stages print is shown and also written to
     <output root>/logs/<UTC time>_run.log
 
 where ``<output root>`` is the parent of ``generation.output_dir`` (for
-example ``output/sim/logs/``). With ``--detach`` the run moves to the
+example ``output/sim/logs/``). Next to it, ``<UTC time>_resources.csv``
+records the run's RAM, CPU and GPU use once a minute, and
+``<UTC time>_resources_by_task.csv`` splits it by model (see
+``synthdata.resources``); the log gets each stage's peak use and its
+heaviest models. With ``--detach`` the run moves to the
 background in its own session, so closing the terminal or losing an SSH
 connection does not stop it; the command prints the log path and the
 process id and returns at once. Rerunning with the same ``--experiment-id``
@@ -18,6 +22,7 @@ resumes: finished models, HPO trials and evaluation checkpoints are reused.
 Usage:
     synthdata-run --config configs/config_sim.yaml [--detach] [--experiment-id ID]
                   [--stages impute generate evaluate plot] [--no-plot] [--strict-checks]
+                  [--monitor-interval SECONDS]
 """
 
 import argparse
@@ -28,6 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from synthdata.config import load_config
+from synthdata.resources import ResourceMonitor
 
 #: Stage name -> module run with ``python -m``, in pipeline order.
 STAGES = {
@@ -63,9 +69,25 @@ def _stamp() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def resources_path(log_path: Path) -> Path:
+    """``<UTC time>_resources.csv`` next to ``<UTC time>_run.log``."""
+    return log_path.with_name(log_path.name.removesuffix("_run.log") + "_resources.csv")
+
+
 def run_stages(args, log_path: Path, echo: bool = True) -> int:
     """Run the stages in order, copying their output to ``log_path``; 0 on success."""
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    monitor = None
+    if args.monitor_interval > 0:
+        monitor = ResourceMonitor(resources_path(log_path), args.monitor_interval).start()
+    try:
+        return _run_stages(args, log_path, echo, env, monitor)
+    finally:
+        if monitor is not None:
+            monitor.stop()
+
+
+def _run_stages(args, log_path: Path, echo: bool, env: dict, monitor) -> int:
     with open(log_path, "a", encoding="utf-8") as log:
 
         def write(line: str) -> None:
@@ -76,9 +98,13 @@ def run_stages(args, log_path: Path, echo: bool = True) -> int:
                 sys.stdout.flush()
 
         write(f"[{_stamp()}] synthdata-run: stages {' '.join(args.stages)}, pid {os.getpid()}\n")
+        if monitor is not None:
+            write(f"[{_stamp()}] resource use: {monitor.path}\n")
         for stage in args.stages:
             command = stage_command(stage, args)
             write(f"[{_stamp()}] === {stage}: {' '.join(command[1:])}\n")
+            if monitor is not None:
+                monitor.set_stage(stage)
             process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
@@ -92,6 +118,10 @@ def run_stages(args, log_path: Path, echo: bool = True) -> int:
             for line in process.stdout:
                 write(line)
             code = process.wait()
+            if monitor is not None:
+                write(f"[{_stamp()}] {monitor.peak_line(stage)}\n")
+                if heaviest := monitor.heaviest_line(stage):
+                    write(f"[{_stamp()}] {heaviest}\n")
             if code != 0:
                 write(f"[{_stamp()}] === {stage} failed (exit code {code}); stopping\n")
                 return code
@@ -141,6 +171,7 @@ def forwarded_argv(args) -> list[str]:
         argv.append("--no-plot")
     if args.strict_checks:
         argv.append("--strict-checks")
+    argv += ["--monitor-interval", f"{args.monitor_interval:g}"]
     return argv
 
 
@@ -177,6 +208,13 @@ def parse_args(argv: list[str]):
         "--strict-checks",
         action="store_true",
         help="Make the evaluation stage fail when an output check warns.",
+    )
+    parser.add_argument(
+        "--monitor-interval",
+        type=float,
+        default=60.0,
+        metavar="SECONDS",
+        help="Seconds between rows of the resource-use CSV next to the log; 0 turns it off.",
     )
     # Set by --detach for the background process; not meant to be typed.
     parser.add_argument("--log-file", default=None, help=argparse.SUPPRESS)

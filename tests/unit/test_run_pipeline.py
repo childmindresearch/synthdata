@@ -39,7 +39,15 @@ def test_forwarded_argv_round_trips_without_detach():
     args = _args("--detach", "--stages", "impute", "evaluate", "--experiment-id", "e1", "--no-plot")
     again = run_pipeline.parse_args(run_pipeline.forwarded_argv(args))
     assert not again.detach
-    for field in ("config", "stages", "experiment_id", "no_plot", "strict_checks", "tag"):
+    for field in (
+        "config",
+        "stages",
+        "experiment_id",
+        "no_plot",
+        "strict_checks",
+        "tag",
+        "monitor_interval",
+    ):
         assert getattr(again, field) == getattr(args, field), field
 
 
@@ -64,3 +72,40 @@ def test_run_stops_at_the_first_failing_stage_and_logs_everything(tmp_path, monk
     assert code == 3
     assert "imputed" in text and "boom" in text and "generate failed (exit code 3)" in text
     assert "never" not in text
+
+
+def test_run_records_resource_use_per_stage(tmp_path, monkeypatch):
+    resources = tmp_path / "20261010T000000Z_resources.csv"
+    # The stage runs until the monitor has written two impute rows, however slow sampling is.
+    stage = (
+        "import pathlib, time\n"
+        f"path = pathlib.Path({str(resources)!r})\n"
+        "deadline = time.time() + 60\n"
+        "while time.time() < deadline:\n"
+        "    rows = path.read_text().splitlines() if path.exists() else []\n"
+        "    if sum(',impute,' in row for row in rows) >= 2:\n"
+        "        break\n"
+        "    time.sleep(0.1)\n"
+    )
+    monkeypatch.setattr(
+        run_pipeline, "stage_command", lambda stage_name, args: [sys.executable, "-c", stage]
+    )
+    log = tmp_path / "20261010T000000Z_run.log"
+    args = _args("--stages", "impute", "--monitor-interval", "0.3")
+    assert run_pipeline.run_stages(args, log, echo=False) == 0
+    rows = resources.read_text().splitlines()
+    assert rows[0].startswith("time_utc,stage,pipeline_ram_gib")
+    assert sum(",impute," in row for row in rows[1:]) >= 2
+    assert "peak use during impute: RAM" in log.read_text()
+    by_task = tmp_path / "20261010T000000Z_resources_by_task.csv"
+    assert by_task.read_text().startswith("time_utc,stage,task,ram_gib")
+
+
+def test_monitor_interval_zero_writes_no_resource_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        run_pipeline, "stage_command", lambda stage, args: [sys.executable, "-c", "pass"]
+    )
+    log = tmp_path / "x_run.log"
+    run_pipeline.run_stages(_args("--stages", "impute", "--monitor-interval", "0"), log, echo=False)
+    assert not (tmp_path / "x_resources.csv").exists()
+    assert "peak use" not in log.read_text()

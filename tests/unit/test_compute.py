@@ -66,7 +66,7 @@ def _square_or_fail(x):
         raise ValueError("three")
     if x == 4:
         os._exit(9)  # a killed process (out-of-memory killer, segfault)
-    return x * x, os.environ.get("OMP_NUM_THREADS")
+    return x * x, os.environ.get("OMP_NUM_THREADS"), os.environ.get("SYNTHDATA_TASK")
 
 
 @pytest.mark.parametrize("workers", [1, 2])
@@ -80,11 +80,14 @@ def test_run_per_model_collects_results_and_failures(workers):
         label="test",
     )
     assert list(run.results) == ["m1", "m2"]
-    assert [value for value, _ in run.results.values()] == [1, 4]
+    assert [value for value, *_ in run.results.values()] == [1, 4]
     assert run.failures == {"m3": "ValueError: three"}
     if workers > 1:
         # Each process is limited to cores_per_worker threads.
-        assert {threads for _, threads in run.results.values()} == {"1"}
+        assert {threads for _, threads, _ in run.results.values()} == {"1"}
+        # Each process names its model, for synthdata-run's resource monitor.
+        assert [task for *_, task in run.results.values()] == ["test: m1", "test: m2"]
+        assert "SYNTHDATA_TASK" not in os.environ
 
 
 def test_run_per_model_survives_a_killed_process():

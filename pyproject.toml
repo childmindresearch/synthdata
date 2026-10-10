@@ -28,6 +28,7 @@ dependencies = [
     "optuna",
     "anonymeter>=1.1.0",
     "filelock",
+    "psutil",
     "torch>=2.7.1",
     "torchvision>=0.22.1",
 ]

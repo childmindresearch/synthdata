@@ -159,6 +159,21 @@ The three example configs are templates, not defaults for your data:
 
 `<output root>` is the folder above `generation.output_dir`. Logs sit next to the stage folders, not inside an experiment, so a run that fails before generation still has its log.
 
+Next to the log, `<UTC time>_resources.csv` records once a minute how much the run uses, and the log gets one line per stage with that stage's peaks (for example `peak use during generate: RAM 52.3 GiB, CPU 21.4 cores, GPU memory 43.6 GiB (43.5 GiB by this run)`). Use these to size a machine or a cluster job (see [Using the machine's cores](#using-the-machines-cores)). All times are UTC. The columns:
+
+| Column | What it measures |
+| --- | --- |
+| `time_utc`, `stage` | When, and which stage was running |
+| `pipeline_ram_gib` | Memory held by the run and all its worker processes. Memory shared between processes counts once per process, so this is an upper bound |
+| `pipeline_cpu_cores` | CPU cores the run kept busy since the previous row (4.0 = four cores) |
+| `system_ram_used_gib`, `system_ram_total_gib` | The whole machine, including other users |
+| `gpu_util_pct`, `gpu_mem_used_mib` | All GPUs as `nvidia-smi` reports them, including other users; empty without an NVIDIA GPU |
+| `pipeline_vram_mib` | GPU memory held by this run's processes |
+
+A second file, `<UTC time>_resources_by_task.csv`, splits `pipeline_ram_gib`, `pipeline_cpu_cores` and `pipeline_vram_mib` by task, one row per task per sample (columns `time_utc`, `stage`, `task`, `ram_gib`, `cpu_cores`, `vram_mib`). A task is one model in one parallel step, named like `generation: ctgan`, `syntheval full: tvae`, `synthcity: ddpm` or `privacy attacks: arf`, and includes any process the model starts. `main` is the runner and the stage process, which also runs the models itself when `compute.workers` is 1. After each stage, the log names the three heaviest tasks by peak RAM, CPU and GPU memory. Use this to see which model needs the most memory. Individual metrics run one after another inside a model's process, so their use is not split out further.
+
+`--monitor-interval 10` samples every 10 seconds; `--monitor-interval 0` turns both files off.
+
 On a remote machine, add `--detach`. The run moves to the background in its own session, so closing the terminal or losing the SSH connection does not stop it. The command prints the log path and the process id and returns at once:
 
 ```bash
@@ -191,12 +206,12 @@ On a cluster, `auto` counts only what the job was given: the CPUs the job is bou
 ```bash
 #SBATCH --cpus-per-task=26        # workers x cores_per_worker (6 x 4), plus 2 for the main process
 #SBATCH --mem=100G                # memory_reserve_gib + workers x memory_per_worker_gib (16 + 6 x 14)
-#SBATCH --gres=gpu:1              # every synthcity model shares one GPU (under 3 GB each when profiled)
+#SBATCH --gres=gpu:1              # every synthcity model shares one GPU; check the peaks in the resources CSV
 #SBATCH --time=3-00:00:00         # generation takes about as long as the slowest model's HPO timeout
 uv run synthdata-run --config configs/config_sim.yaml --experiment-id sim_full
 ```
 
-Leave out `--detach` inside a batch job: the job is already detached, and its output goes to the SLURM log as well as `<output root>/logs/`.
+The memory and GPU figures above are starting points; after a first run, set `--mem` and the GPU size from the peaks in the log (`peak use during generate: ...`), with some headroom. Leave out `--detach` inside a batch job: the job is already detached, and its output goes to the SLURM log as well as `<output root>/logs/`.
 
 ## 5. Stage 1: load and split the data
 
