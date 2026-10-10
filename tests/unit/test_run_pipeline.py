@@ -75,17 +75,27 @@ def test_run_stops_at_the_first_failing_stage_and_logs_everything(tmp_path, monk
 
 
 def test_run_records_resource_use_per_stage(tmp_path, monkeypatch):
-    scripts = {"impute": "import time; x = bytearray(50 * 2**20); time.sleep(1.5)"}
+    resources = tmp_path / "20261010T000000Z_resources.csv"
+    # The stage runs until the monitor has written two impute rows, however slow sampling is.
+    stage = (
+        "import pathlib, time\n"
+        f"path = pathlib.Path({str(resources)!r})\n"
+        "deadline = time.time() + 60\n"
+        "while time.time() < deadline:\n"
+        "    rows = path.read_text().splitlines() if path.exists() else []\n"
+        "    if sum(',impute,' in row for row in rows) >= 2:\n"
+        "        break\n"
+        "    time.sleep(0.1)\n"
+    )
     monkeypatch.setattr(
-        run_pipeline, "stage_command", lambda stage, args: [sys.executable, "-c", scripts[stage]]
+        run_pipeline, "stage_command", lambda stage_name, args: [sys.executable, "-c", stage]
     )
     log = tmp_path / "20261010T000000Z_run.log"
     args = _args("--stages", "impute", "--monitor-interval", "0.3")
     assert run_pipeline.run_stages(args, log, echo=False) == 0
-    resources = tmp_path / "20261010T000000Z_resources.csv"
     rows = resources.read_text().splitlines()
     assert rows[0].startswith("time_utc,stage,pipeline_ram_gib")
-    assert len(rows) > 3 and any(",impute," in row for row in rows[1:])
+    assert sum(",impute," in row for row in rows[1:]) >= 2
     assert "peak use during impute: RAM" in log.read_text()
 
 
