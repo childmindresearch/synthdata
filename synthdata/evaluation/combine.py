@@ -208,6 +208,20 @@ def _minmax_scale(col: pd.Series) -> pd.Series:
     return (col - lo) / (hi - lo)
 
 
+def _missing_as_worst(col: pd.Series) -> pd.Series:
+    """A scaled metric some rows have and others lack scores 0 (worst) for those.
+
+    A metric is missing for a model when it failed or produced no result on
+    that model's data (e.g. synthcity's data_leakage raising on a category the
+    synthetic data lacks). Averaging over the metrics a model happens to have
+    would let such a failure lift it above models that were fully scored.
+    A metric missing for every model stays NaN and drops out.
+    """
+    if col.notna().any():
+        return col.fillna(0.0)
+    return col
+
+
 #: Types rolled up in the combined table. Order matters for iteration below
 #: but not for correctness (the weighted geometric mean is order-independent).
 _TYPES = ("utility", "privacy", "fairness")
@@ -246,7 +260,8 @@ def build_combined_table(
     syntheval's single-column ``cls_acc``) purely by virtue of column count:
 
       1. Every metric is oriented so "higher = better", then min-max scaled
-         across models (independently per metric).
+         across models (independently per metric). A metric a model lacks
+         (failed or empty) while others have it scores 0, the worst value.
       2. A sub-rank is computed per ``(framework, type)`` group as the MEAN
          of that group's scaled metrics -- column ``(framework, type, "rank")``.
       3. A rolled-up rank per ``type`` (utility/privacy/fairness) is the MEAN
@@ -284,7 +299,7 @@ def build_combined_table(
     raw_df = pd.concat(raw_parts, axis=1)
     oriented_df = pd.concat(oriented_parts, axis=1)
 
-    scaled_df = oriented_df.apply(_minmax_scale, axis=0)
+    scaled_df = oriented_df.apply(_minmax_scale, axis=0).apply(_missing_as_worst, axis=0)
 
     combined = raw_df.copy()
 
