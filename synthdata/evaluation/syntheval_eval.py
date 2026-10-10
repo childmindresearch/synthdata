@@ -230,7 +230,11 @@ def _evaluate_seeded(
             parts.append(part)
     if not parts:
         return None, failed
-    return pd.concat(parts, ignore_index=True), failed
+    # Leave each part's all-NA columns out of the concat (pandas no longer lets
+    # them decide the dtype), then restore every column in its first-seen order.
+    columns = list(dict.fromkeys(c for part in parts for c in part.columns))
+    trimmed = [part.dropna(axis=1, how="all") for part in parts]
+    return pd.concat(trimmed, ignore_index=True).reindex(columns=columns), failed
 
 
 def _model_worker(

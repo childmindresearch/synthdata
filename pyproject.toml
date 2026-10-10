@@ -167,6 +167,18 @@ quote-style = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers --strict-config"
+# Deprecations raised inside third-party libraries (synthcity's pydantic v1
+# and old pandas calls, pgmpy's google.generativeai import, arfpy, SynthEval's
+# n_jobs for sklearn, pandas hashing NaN rows for synthcity's cache keys).
+# They repeat once per call and hide warnings that point to our own code.
+filterwarnings = [
+    "ignore::DeprecationWarning:synthcity.*",
+    "ignore::FutureWarning:synthcity.*",
+    "ignore::FutureWarning:pgmpy.*",
+    "ignore::FutureWarning:arfpy.*",
+    "ignore:'n_jobs' has no effect:FutureWarning",
+    "ignore:invalid value encountered in cast:RuntimeWarning:pandas.core.util.hashing",
+]
 markers = [
     "unit: fast, pure-logic tests with no I/O or external dependencies",
     "cache: tests exercising file/SQLite caching and resumability logic",
