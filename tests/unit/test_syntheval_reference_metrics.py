@@ -169,6 +169,35 @@ class TestNearestNeighbourAdversarialAccuracy:
         assert row["n_err"] == pytest.approx(0.02)
 
 
+class TestCramersV:
+    def test_matches_the_definition_with_the_square_root(self):
+        from scipy.stats import chi2_contingency
+        from syntheval.metrics.utility.metric_mixed_correlation import _cramers_V
+
+        rng = np.random.default_rng(0)
+        a = rng.integers(0, 3, 2000)
+        b = np.where(rng.random(2000) < 0.4, a, rng.integers(0, 3, 2000))
+        table = pd.crosstab(a, b).to_numpy()
+        expected = np.sqrt(chi2_contingency(table)[0] / (table.sum() * (min(table.shape) - 1)))
+
+        assert _cramers_V(a, b) == pytest.approx(expected)
+        assert 0.3 < _cramers_V(a, b) < 0.6  # V, not V^2 (which would be ~0.16)
+
+
+class TestAurocDifference:
+    @pytest.mark.parametrize(("diff", "expected"), [(0.0, 1.0), (0.1, 0.9), (-0.1, 0.9)])
+    def test_normalized_score_rewards_agreement_not_overperformance(self, diff, expected):
+        from syntheval.metrics.utility.metric_auroc_difference import PredictionAUROCDifference
+
+        metric = PredictionAUROCDifference.__new__(PredictionAUROCDifference)
+        metric.results = {"auroc_diff": diff}
+        metric.full_output = False
+
+        (row,) = metric.normalize_output()
+
+        assert row["n_val"] == pytest.approx(expected)
+
+
 class TestAnalysisConfigTargetTypes:
     """Integer and categorical targets must be typed categorical on every platform.
 

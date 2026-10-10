@@ -37,8 +37,9 @@ _RANK_COLUMNS = {"rank", "u_rank", "p_rank", "f_rank"}
 #: bins, eps-identifiability, fairness and NNAA fixes; v5: integer targets
 #: typed categorical on Windows, so classification and fairness metrics run;
 #: v6: q_mse, mi_diff and statistical parity fixes from the known-answer checks;
-#: v7: q_mse preset compares categorical columns too).
-_CHECKPOINT_SCHEMA_VERSION = 7
+#: v7: q_mse preset compares categorical columns too; v8: Cramér's V square
+#: root and auroc scored by agreement, 1 - |diff|).
+_CHECKPOINT_SCHEMA_VERSION = 8
 
 #: SynthEval tags every result row it returns with a ``dim`` of "u", "p" or "f"
 #: (see each metric's ``normalize_output``). That tag, not the preset key the
@@ -1009,9 +1010,9 @@ def average_ovr_results(
 
     ``per_class_results``/``per_class_ranks`` map each class to that pass's
     SynthEval ``(results, ranks)``. A metric's value, error and oriented score
-    are each averaged over the classes it ran for (the oriented scores are
-    linear in the value, so the mean of the oriented scores is the oriented
-    mean). Returns ``(results, ranks, per_class)`` where ``per_class`` is a
+    are each averaged over the classes it ran for. The oriented score is
+    averaged per class, not recomputed from the mean value: for ``auroc``
+    (1 - |diff|) opposite per-class gaps must not cancel. Returns ``(results, ranks, per_class)`` where ``per_class`` is a
     models x (metric, class) table of the raw values, so a failing minority
     class stays visible behind the average.
     """
