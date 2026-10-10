@@ -70,10 +70,21 @@ def gpu_usage(pids: set[int]) -> dict:
         "gpu_mem_used_mib": sum(int(float(g[1])) for g in gpus),
     }
     apps = _nvidia_smi("--query-compute-apps=pid,used_memory") or []
-    usage["pipeline_vram_mib"] = sum(
-        int(float(mem)) for pid, mem in apps if pid.isdigit() and int(pid) in pids
-    )
+    ours = [mem for pid, mem in apps if pid.isdigit() and int(pid) in pids]
+    # Windows (WDDM) reports per-process memory as "[N/A]": leave the column empty
+    # rather than fail the whole row.
+    known = [int(float(mem)) for mem in ours if _is_number(mem)]
+    if known or not ours:
+        usage["pipeline_vram_mib"] = sum(known)
     return usage
+
+
+def _is_number(text: str) -> bool:
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
 
 
 class ResourceMonitor:

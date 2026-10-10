@@ -22,6 +22,16 @@ def test_gpu_usage_sums_memory_and_keeps_only_the_pipelines_processes(monkeypatc
     }
 
 
+def test_gpu_usage_leaves_pipeline_vram_empty_when_per_process_memory_is_na(monkeypatch):
+    # Windows (WDDM) drivers report a process's GPU memory as "[N/A]".
+    replies = {
+        "--query-gpu=utilization.gpu,memory.used": [["40", "3000"]],
+        "--query-compute-apps=pid,used_memory": [["11", "[N/A]"], ["99", "[N/A]"]],
+    }
+    monkeypatch.setattr(resources, "_nvidia_smi", lambda query: replies[query])
+    assert resources.gpu_usage({11}) == {"gpu_util_pct": 40.0, "gpu_mem_used_mib": 3000}
+
+
 def test_gpu_usage_is_empty_without_nvidia_smi(monkeypatch):
     monkeypatch.setattr(resources.subprocess, "run", _raise(FileNotFoundError))
     assert resources.gpu_usage({1}) == {}
