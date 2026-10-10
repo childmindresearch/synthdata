@@ -170,7 +170,9 @@ Next to the log, `<UTC time>_resources.csv` records once a minute how much the r
 | `gpu_util_pct`, `gpu_mem_used_mib` | All GPUs as `nvidia-smi` reports them, including other users; empty without an NVIDIA GPU |
 | `pipeline_vram_mib` | GPU memory held by this run's processes |
 
-`--monitor-interval 10` samples every 10 seconds; `--monitor-interval 0` turns the file off.
+A second file, `<UTC time>_resources_by_task.csv`, splits `pipeline_ram_gib`, `pipeline_cpu_cores` and `pipeline_vram_mib` by task, one row per task per sample (columns `time_utc`, `stage`, `task`, `ram_gib`, `cpu_cores`, `vram_mib`). A task is one model in one parallel step, named like `generation: ctgan`, `syntheval full: tvae`, `synthcity: ddpm` or `privacy attacks: arf`, and includes any process the model starts. `main` is the runner and the stage process, which also runs the models itself when `compute.workers` is 1. After each stage, the log names the three heaviest tasks by peak RAM, CPU and GPU memory. Use this to see which model needs the most memory. Individual metrics run one after another inside a model's process, so their use is not split out further.
+
+`--monitor-interval 10` samples every 10 seconds; `--monitor-interval 0` turns both files off.
 
 On a remote machine, add `--detach`. The run moves to the background in its own session, so closing the terminal or losing the SSH connection does not stop it. The command prints the log path and the process id and returns at once:
 

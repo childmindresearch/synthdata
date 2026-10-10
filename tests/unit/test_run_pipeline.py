@@ -97,6 +97,8 @@ def test_run_records_resource_use_per_stage(tmp_path, monkeypatch):
     assert rows[0].startswith("time_utc,stage,pipeline_ram_gib")
     assert sum(",impute," in row for row in rows[1:]) >= 2
     assert "peak use during impute: RAM" in log.read_text()
+    by_task = tmp_path / "20261010T000000Z_resources_by_task.csv"
+    assert by_task.read_text().startswith("time_utc,stage,task,ram_gib")
 
 
 def test_monitor_interval_zero_writes_no_resource_file(tmp_path, monkeypatch):

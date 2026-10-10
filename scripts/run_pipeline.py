@@ -10,8 +10,10 @@ stages print is shown and also written to
 
 where ``<output root>`` is the parent of ``generation.output_dir`` (for
 example ``output/sim/logs/``). Next to it, ``<UTC time>_resources.csv``
-records the run's RAM, CPU and GPU use once a minute (see
-``synthdata.resources``), and the log gets each stage's peak use. With ``--detach`` the run moves to the
+records the run's RAM, CPU and GPU use once a minute, and
+``<UTC time>_resources_by_task.csv`` splits it by model (see
+``synthdata.resources``); the log gets each stage's peak use and its
+heaviest models. With ``--detach`` the run moves to the
 background in its own session, so closing the terminal or losing an SSH
 connection does not stop it; the command prints the log path and the
 process id and returns at once. Rerunning with the same ``--experiment-id``
@@ -118,6 +120,8 @@ def _run_stages(args, log_path: Path, echo: bool, env: dict, monitor) -> int:
             code = process.wait()
             if monitor is not None:
                 write(f"[{_stamp()}] {monitor.peak_line(stage)}\n")
+                if heaviest := monitor.heaviest_line(stage):
+                    write(f"[{_stamp()}] {heaviest}\n")
             if code != 0:
                 write(f"[{_stamp()}] === {stage} failed (exit code {code}); stopping\n")
                 return code
