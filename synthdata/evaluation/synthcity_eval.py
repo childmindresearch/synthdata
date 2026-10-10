@@ -66,7 +66,7 @@ def run_synthcity_metrics(
     target_column: str,
     sensitive_features: list,
     metrics: dict,
-    task_type: str = "classification",
+    task_type: str | None = None,
     random_state: int = 42,
     workspace: str | None = None,
     *,
@@ -105,6 +105,9 @@ def run_synthcity_metrics(
         )
 
     on_train, on_held_out = _split_by_reference(metrics)
+    if task_type is None:
+        # The target is discrete exactly when the schema declares it categorical.
+        task_type = "classification" if target_column in discrete_columns else "regression"
     common = {
         "task_type": task_type,
         "random_state": random_state,

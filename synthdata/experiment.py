@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from synthdata.config import Config
-from synthdata.utils import ensure_dir, get_logger, git_commit
+from synthdata.utils import ensure_dir, get_logger, git_commit, provenance
 
 logger = get_logger(__name__)
 
@@ -112,6 +112,7 @@ class Experiment:
             "stage": stage,
             "timestamp": datetime.now(UTC).isoformat(),
             "git_commit": git_commit(),
+            "provenance": provenance(),
             "artifacts": artifacts or {},
             **extra,
         }
