@@ -4,14 +4,19 @@ import os
 
 import pytest
 
-from synthdata.compute import resolve_workers, run_per_model
+from synthdata.compute import (
+    _cgroup_memory_headroom_gib,
+    resolve_workers,
+    run_per_model,
+    usable_cpus,
+)
 from synthdata.config import ComputeConfig
 
 pytestmark = pytest.mark.unit
 
 
 def _machine(monkeypatch, cpus, available_gib):
-    monkeypatch.setattr("synthdata.compute.os.cpu_count", lambda: cpus)
+    monkeypatch.setattr("synthdata.compute.usable_cpus", lambda: cpus)
     monkeypatch.setattr("synthdata.compute.available_memory_gib", lambda: available_gib)
 
 
@@ -93,3 +98,58 @@ def test_run_per_model_survives_a_killed_process():
     )
     assert run.results["ok"][0] == 4
     assert "exited with code 9" in run.failures["killed"]
+
+
+def test_usable_cpus_follows_the_slurm_allocation(monkeypatch):
+    monkeypatch.setattr("synthdata.compute.os.sched_getaffinity", lambda _pid: set(range(64)))
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "12")
+    assert usable_cpus() == 12
+    monkeypatch.delenv("SLURM_CPUS_PER_TASK")
+    monkeypatch.setattr("synthdata.compute.os.sched_getaffinity", lambda _pid: set(range(8)))
+    assert usable_cpus() == 8  # bound to 8 CPUs of a larger node
+
+
+def _cgroup(tmp_path, proc_line, files):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    proc = tmp_path / "proc_cgroup"
+    proc.write_text(proc_line + "\n")
+    root = tmp_path / "cgroup"
+    for relative, value in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value)
+    return proc, root
+
+
+def test_cgroup_v2_limit_gives_the_headroom_left_under_it(tmp_path):
+    gib = 1024**3
+    proc, root = _cgroup(
+        tmp_path,
+        "0::/slurm/job_7/step_0",
+        {
+            "slurm/job_7/memory.max": str(64 * gib),  # the job's --mem
+            "slurm/job_7/memory.current": str(10 * gib),
+            "slurm/job_7/step_0/memory.max": "max",
+            "slurm/job_7/step_0/memory.current": str(10 * gib),
+        },
+    )
+    assert _cgroup_memory_headroom_gib(proc, root) == pytest.approx(54.0)
+
+
+def test_cgroup_v1_and_unlimited_cgroups(tmp_path):
+    gib = 1024**3
+    proc, root = _cgroup(
+        tmp_path,
+        "4:memory:/slurm/job_7",
+        {
+            "memory/slurm/job_7/memory.limit_in_bytes": str(32 * gib),
+            "memory/slurm/job_7/memory.usage_in_bytes": str(2 * gib),
+        },
+    )
+    assert _cgroup_memory_headroom_gib(proc, root) == pytest.approx(30.0)
+    proc, root = _cgroup(
+        tmp_path / "unlimited",
+        "0::/user.slice",
+        {"user.slice/memory.max": "max", "user.slice/memory.current": "1"},
+    )
+    assert _cgroup_memory_headroom_gib(proc, root) is None
