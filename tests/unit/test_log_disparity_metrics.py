@@ -103,9 +103,18 @@ class TestComparePopulationProportion:
     def test_background_zero_returns_no_base(self):
         assert compare_population_proportion(0, 100, 10, 100) == SENTINEL_NO_BASE
 
-    def test_small_counts_return_insufficient_sentinel(self):
-        # All counts must be >=5 for the chi-squared path; here they aren't.
+    def test_small_real_counts_return_insufficient_sentinel(self):
+        # The real cells must hold >=5 counts for any test; here they don't.
         assert compare_population_proportion(2, 3, 1, 2) == SENTINEL_INSUFFICIENT
+
+    def test_small_synthetic_count_uses_fisher_exact(self):
+        from scipy.stats import fisher_exact
+
+        # 200 of 1000 real rows vs 1 of 1000 synthetic rows: a clear shortfall
+        # that the chi-squared size rule alone would call "insufficient".
+        p = compare_population_proportion(200, 1000, 1, 1000)
+        assert p == pytest.approx(fisher_exact([[1, 999], [200, 800]])[1])
+        assert p < 1e-10
 
 
 class TestBenjaminiHochbergCorrection:
@@ -272,4 +281,46 @@ class TestSummaryCountsAbsentSubgroups:
 
         # The two male leaves are significantly over-represented (0.5 vs 0.25)
         # and the two female leaves are absent: every leaf is misrepresented.
+        assert summary["share_significant_bh"] == pytest.approx(1.0)
+
+    def test_share_counts_only_subgroups_testable_on_real_data(self):
+        from synthdata.log_disparity.metric_log_disparity import compute_log_disparity_report
+
+        # Real: 100 rows, groups A and B with 2 targets; group C has 3 rows only.
+        real = pd.DataFrame(
+            {
+                "grp": ["A"] * 50 + ["B"] * 47 + ["C"] * 3,
+                "target": ([0, 1] * 25) + ([0, 1] * 23 + [0]) + [0, 1, 0],
+            }
+        )
+        # Synthetic: same A/B mix, group C dropped, plus 10 rows of a group D
+        # the real data never has.
+        synthetic = pd.concat(
+            [real[real["grp"] != "C"], pd.DataFrame({"grp": ["D"] * 10, "target": [0] * 10})],
+            ignore_index=True,
+        )
+        summary = compute_log_disparity_report(
+            real_data=real, synth_data=synthetic, target_col="target", protected_cols=["grp"]
+        )["summary_stats"]
+
+        # Only the four A/B leaves are testable; none is misrepresented. The
+        # tiny C leaves and the invented D leaf stay out of the share.
+        assert summary["n_subgroups_tested"] == 4
+        assert summary["share_significant_bh"] == pytest.approx(0.0)
+        assert summary["n_synthetic_only_subgroups"] == 1
+        assert summary["synthetic_only_row_share"] == pytest.approx(10 / 107)
+
+    def test_one_row_for_a_large_subgroup_is_misrepresented(self):
+        from synthdata.log_disparity.metric_log_disparity import compute_log_disparity_report
+
+        real = pd.DataFrame({"sex": ["M", "F"] * 200, "target": [0, 0, 1, 1] * 100})
+        synthetic = pd.concat(
+            [real[real["sex"] == "M"], real[real["sex"] == "F"].head(1)], ignore_index=True
+        )
+        summary = compute_log_disparity_report(
+            real_data=real, synth_data=synthetic, target_col="target", protected_cols=["sex"]
+        )["summary_stats"]
+
+        # One female row (the target-0 leaf) and none in the target-1 leaf:
+        # both female leaves are misrepresented, not "insufficient".
         assert summary["share_significant_bh"] == pytest.approx(1.0)

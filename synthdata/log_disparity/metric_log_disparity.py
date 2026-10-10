@@ -46,7 +46,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from scipy.stats import chi2_contingency
+from scipy.stats import chi2_contingency, fisher_exact
 
 from synthdata.utils import get_logger
 
@@ -68,6 +68,10 @@ TOLERANCE_2: float = -math.log(0.8)  # ~0.22314 (extreme threshold)
 SENTINEL_NO_INFO: int = -9999999  # Both rates are zero
 SENTINEL_NO_BASE: int = -8888888  # Background rate is zero
 SENTINEL_INSUFFICIENT: int = -7777777  # Insufficient sample size
+
+# Smallest count in each real-data cell (subgroup and rest) for a subgroup to be
+# tested at all; the chi-squared rule of thumb Bhanot et al. (2021) use.
+MIN_CELL_COUNT: int = 5
 
 # Equity classification colors
 EQUITY_COLORS: dict[str, str] = {
@@ -175,6 +179,12 @@ def compare_population_proportion(
     from the proportion in the real data. Uses chi-squared test without continuity
     correction when sample size requirements are met (all counts >= 5).
 
+    Deviation from Bhanot et al. (2021): when the real cells meet the
+    requirement but a synthetic cell does not, Fisher's exact test is used
+    instead of returning the insufficient-data sentinel. Otherwise a generator
+    that emits 1-4 rows for a well-populated real subgroup would never be
+    flagged, while one that emits 0 rows would.
+
     Args:
         background_pos: Number of positive cases in real data.
         background_total: Total number of cases in real data.
@@ -186,7 +196,7 @@ def compare_population_proportion(
             - SENTINEL_NO_INFO if both counts are zero
             - -inf if synthetic count is zero
             - SENTINEL_NO_BASE if real count is zero
-            - SENTINEL_INSUFFICIENT if sample size requirements not met
+            - SENTINEL_INSUFFICIENT if a real-data cell has fewer than 5 counts
 
     Example:
         >>> compare_population_proportion(50, 100, 45, 100)
@@ -203,30 +213,31 @@ def compare_population_proportion(
     observed_neg = observed_total - observed_pos
     background_neg = background_total - background_pos
 
-    # Check sample size requirements for chi-squared test
-    if observed_pos >= 5 and observed_neg >= 5 and background_pos >= 5 and background_neg >= 5:
-        # Construct 2x2 contingency table
-        table = np.array(
-            [[observed_pos, observed_neg], [background_pos, background_neg]],
-            dtype=float,
+    if background_pos < MIN_CELL_COUNT or background_neg < MIN_CELL_COUNT:
+        return float(SENTINEL_INSUFFICIENT)
+
+    table = np.array(
+        [[observed_pos, observed_neg], [background_pos, background_neg]],
+        dtype=float,
+    )
+    if observed_pos < MIN_CELL_COUNT or observed_neg < MIN_CELL_COUNT:
+        _, p_value = fisher_exact(table.astype(int), alternative="two-sided")
+        return float(p_value)
+
+    try:
+        # Perform chi-squared test without continuity correction
+        _, p_value, _, _ = chi2_contingency(table, correction=False)
+        return float(p_value)
+    except ValueError:
+        logger.warning(
+            "chi2_contingency degenerate table observed=(%d,%d) background=(%d,%d); "
+            "returning insufficient-data sentinel",
+            observed_pos,
+            observed_neg,
+            background_pos,
+            background_neg,
         )
-
-        try:
-            # Perform chi-squared test without continuity correction
-            _, p_value, _, _ = chi2_contingency(table, correction=False)
-            return float(p_value)
-        except ValueError:
-            logger.warning(
-                "chi2_contingency degenerate table observed=(%d,%d) background=(%d,%d); "
-                "returning insufficient-data sentinel",
-                observed_pos,
-                observed_neg,
-                background_pos,
-                background_neg,
-            )
-            return float(SENTINEL_INSUFFICIENT)
-
-    return float(SENTINEL_INSUFFICIENT)
+        return float(SENTINEL_INSUFFICIENT)
 
 
 def benjamini_hochberg_correction(p_values: pd.Series) -> pd.Series:
@@ -735,14 +746,25 @@ def compute_log_disparity_report(
         [SENTINEL_NO_INFO, SENTINEL_NO_BASE, SENTINEL_INSUFFICIENT]
     ) & ~np.isinf(leaf["EquityValue"])
     valid_values = leaf.loc[valid_mask, "EquityValue"]
-    # A subgroup the synthetic data leaves out entirely (or fills entirely)
-    # has an infinite disparity and no test p-value. Bhanot et al. (2021)
-    # label it "Absent", the worst outcome, so it counts as misrepresented
-    # here; leaving it out would reward a generator for dropping a minority.
-    misrepresented = leaf["BH_p"].between(0, SIG_THRESHOLD, inclusive="both") | np.isinf(
-        leaf["EquityValue"]
+    # The share is taken over the subgroups that can be tested: at least
+    # MIN_CELL_COUNT real rows in the subgroup and outside it. Subgroups too
+    # small in the real data, and subgroups only the synthetic data has, carry
+    # no test and would otherwise dilute the share (a generator inventing
+    # impossible combinations would lower its own share).
+    testable = (leaf["background_n"] >= MIN_CELL_COUNT) & (
+        leaf["total_background"] - leaf["background_n"] >= MIN_CELL_COUNT
     )
-    sig_share = misrepresented.mean() if len(leaf) else np.nan
+    # A testable subgroup the synthetic data leaves out entirely (or fills
+    # entirely) has an infinite disparity and no test p-value. Bhanot et al.
+    # (2021) label it "Absent", the worst outcome, so it counts as
+    # misrepresented here; leaving it out would reward a generator for
+    # dropping a minority.
+    misrepresented = testable & (
+        leaf["BH_p"].between(0, SIG_THRESHOLD, inclusive="both") | np.isinf(leaf["EquityValue"])
+    )
+    n_testable = int(testable.sum())
+    sig_share = misrepresented.sum() / n_testable if n_testable else np.nan
+    synthetic_only = (leaf["background_n"] == 0) & (leaf["user_n"] > 0)
 
     summary_stats = {
         "model": model_name,
@@ -752,6 +774,11 @@ def compute_log_disparity_report(
         if len(valid_values)
         else np.nan,
         "share_significant_bh": float(sig_share) if pd.notna(sig_share) else np.nan,
+        "n_subgroups_tested": n_testable,
+        "n_synthetic_only_subgroups": int(synthetic_only.sum()),
+        "synthetic_only_row_share": float(leaf.loc[synthetic_only, "user_n"].sum() / total_user)
+        if total_user
+        else np.nan,
     }
 
     label_counts = (
