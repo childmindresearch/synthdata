@@ -101,11 +101,15 @@ def test_run_per_model_survives_a_killed_process():
 
 
 def test_usable_cpus_follows_the_slurm_allocation(monkeypatch):
-    monkeypatch.setattr("synthdata.compute.os.sched_getaffinity", lambda _pid: set(range(64)))
+    monkeypatch.setattr(
+        "synthdata.compute.os.sched_getaffinity", lambda _pid: set(range(64)), raising=False
+    )
     monkeypatch.setenv("SLURM_CPUS_PER_TASK", "12")
     assert usable_cpus() == 12
     monkeypatch.delenv("SLURM_CPUS_PER_TASK")
-    monkeypatch.setattr("synthdata.compute.os.sched_getaffinity", lambda _pid: set(range(8)))
+    monkeypatch.setattr(
+        "synthdata.compute.os.sched_getaffinity", lambda _pid: set(range(8)), raising=False
+    )
     assert usable_cpus() == 8  # bound to 8 CPUs of a larger node
 
 
