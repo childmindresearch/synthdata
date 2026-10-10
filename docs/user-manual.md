@@ -186,6 +186,18 @@ compute:
 
 With `workers: auto`, the count is the CPU cores divided by `cores_per_worker`, then lowered to fit free memory, `max_workers` and the number of models. A 24-core machine with 125 GB runs 6 models at once. Each model sets its own seeds, so the results are the same as running one model at a time with the same `cores_per_worker`; the integration tests check this byte for byte. Changing `cores_per_worker` can change results in the last digits on the CPU, because the order of floating-point sums depends on the thread count, so keep it fixed across runs you compare.
 
+On a cluster, `auto` counts only what the job was given: the CPUs the job is bound to (capped by `SLURM_CPUS_PER_TASK`), and the memory left under the job's limit, not the whole node's. To size a SLURM request, work backwards from the workers you want:
+
+```bash
+#SBATCH --cpus-per-task=26        # workers x cores_per_worker (6 x 4), plus 2 for the main process
+#SBATCH --mem=100G                # memory_reserve_gib + workers x memory_per_worker_gib (16 + 6 x 14)
+#SBATCH --gres=gpu:1              # every synthcity model shares one GPU (under 3 GB each when profiled)
+#SBATCH --time=3-00:00:00         # generation takes about as long as the slowest model's HPO timeout
+uv run synthdata-run --config configs/config_sim.yaml --experiment-id sim_full
+```
+
+Leave out `--detach` inside a batch job: the job is already detached, and its output goes to the SLURM log as well as `<output root>/logs/`.
+
 ## 5. Stage 1: load and split the data
 
 Stage 1 runs inside `synthdata-impute`. It loads the data, cleans it, assigns column roles and splits it.

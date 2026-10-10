@@ -21,26 +21,91 @@ from synthdata.utils import get_logger
 logger = get_logger(__name__)
 
 
-def available_memory_gib() -> float | None:
-    """Return Linux MemAvailable in GiB, or None where it cannot be observed."""
+def usable_cpus() -> int:
+    """CPUs this process may run on: its affinity mask, else the machine's count.
+
+    A SLURM job (or a container) is often bound to fewer CPUs than the node
+    has; ``os.cpu_count()`` would still report the whole node. ``SLURM_CPUS_PER_TASK``
+    caps the count on clusters that allocate CPUs without binding them.
+    """
     try:
-        lines = Path("/proc/meminfo").read_text().splitlines()
+        cpus = len(os.sched_getaffinity(0))
+    except AttributeError:  # not available on Windows or macOS
+        cpus = os.cpu_count() or 1
+    slurm = os.environ.get("SLURM_CPUS_PER_TASK", "")
+    if slurm.isdigit() and int(slurm) > 0:
+        cpus = min(cpus, int(slurm))
+    return max(1, cpus)
+
+
+def _cgroup_memory_headroom_gib(
+    proc_cgroup: Path = Path("/proc/self/cgroup"), root: Path = Path("/sys/fs/cgroup")
+) -> float | None:
+    """Memory left under this process's cgroup limit (cgroup v2 or v1), or None if unlimited.
+
+    SLURM enforces a job's ``--mem`` through its cgroup; the node's
+    MemAvailable knows nothing of that limit.
+    """
+    try:
+        lines = proc_cgroup.read_text().splitlines()
     except OSError:
         return None
     for line in lines:
-        if line.startswith("MemAvailable:"):
-            return int(line.split()[1]) / 1024**2
+        hierarchy, controllers, path = (line.split(":", 2) + ["", ""])[:3]
+        relative = path.lstrip("/")
+        if hierarchy == "0" and controllers == "":  # v2 unified hierarchy
+            limit_file, usage_file = "memory.max", "memory.current"
+            base = root / relative
+        elif "memory" in controllers.split(","):  # v1
+            limit_file, usage_file = "memory.limit_in_bytes", "memory.usage_in_bytes"
+            base = root / "memory" / relative
+        else:
+            continue
+        # The tightest limit on the path from this cgroup up to the root applies.
+        headroom = None
+        for directory in (base, *base.parents):
+            if not str(directory).startswith(str(root)):
+                break
+            try:
+                limit = (directory / limit_file).read_text().strip()
+                usage = int((directory / usage_file).read_text().strip())
+            except (OSError, ValueError):
+                continue
+            # "max" (v2) or a huge number (v1) means no limit at this level.
+            if limit.isdigit() and int(limit) < 2**60:
+                free = max(0, int(limit) - usage) / 1024**3
+                headroom = free if headroom is None else min(headroom, free)
+        if headroom is not None:
+            return headroom
     return None
+
+
+def available_memory_gib() -> float | None:
+    """RAM (GiB) this process can still use: Linux MemAvailable, capped by a cgroup limit.
+
+    None where neither can be observed (not Linux).
+    """
+    available = None
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                available = int(line.split()[1]) / 1024**2
+                break
+    except OSError:
+        pass
+    cgroup = _cgroup_memory_headroom_gib()
+    if cgroup is not None:
+        available = cgroup if available is None else min(available, cgroup)
+    return available
 
 
 def resolve_workers(compute_cfg, *, n_models: int, n_columns: int) -> int:
     """Resolve a memory- and CPU-bounded number of concurrent model processes.
 
-    The Linux ``MemAvailable`` value is already the kernel's estimate of
-    immediately allocatable memory. It is therefore the only host-memory
-    value used for auto-sizing: ``MemTotal`` can describe a smaller container
-    or runner limit than the available-memory probe supplied by callers/tests,
-    making worker selection depend on an unrelated second system read.
+    CPUs are the ones this process may run on (a SLURM job's allocation, not
+    the whole node). Memory is Linux ``MemAvailable``, the kernel's estimate
+    of immediately allocatable memory, capped by the job's cgroup limit; the
+    node's ``MemTotal`` is never used.
     """
     if not n_models:
         return 0
@@ -48,8 +113,7 @@ def resolve_workers(compute_cfg, *, n_models: int, n_columns: int) -> int:
     if requested != "auto":
         return min(requested, compute_cfg.max_workers, n_models)
 
-    cpu_count = os.cpu_count() or 1
-    cpu_bound = max(1, cpu_count // compute_cfg.cores_per_worker)
+    cpu_bound = max(1, usable_cpus() // compute_cfg.cores_per_worker)
     per_model_gib = compute_cfg.memory_per_worker_gib or max(6.0, 0.0135 * n_columns)
     available_gib = available_memory_gib()
     if available_gib is None:
