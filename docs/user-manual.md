@@ -181,10 +181,36 @@ uv run synthdata-run --config configs/config_sim.yaml --experiment-id sim_full -
 # Running in the background (pid 41237).
 #   Log:    output/sim/logs/20261010T080000Z_run.log
 #   Follow: tail -f output/sim/logs/20261010T080000Z_run.log
+#   Status: output/sim/logs/20261010T080000Z_dashboard.html (open in a browser)
 #   Stop:   kill -- -41237
 ```
 
 `Stop` ends the whole run, including the stage and its worker processes. To resume after a stop, a crash or a reboot, run the same command with the same `--experiment-id`: finished models, HPO trials and evaluation checkpoints are reused. Other options: `--stages generate evaluate plot` runs only those stages, `--no-plot` skips the figures drawn during each stage, and `--tag`, `--dataset-version` and `--strict-checks` are passed to the stages that take them. On Windows, `Follow` and `Stop` print the PowerShell and `taskkill` equivalents.
+
+#### The live status page
+
+While it runs, `synthdata-run` rewrites `<UTC time>_dashboard.html` next to the log every 30 seconds. Open it in a browser and it reloads itself; it needs no server or internet connection. One page shows:
+
+- whether the run is running, finished, failed or stopped (the runner process is gone without logging an end), with elapsed time and a note when the log has been quiet for 20 minutes;
+- each stage's status, duration and peak resource use;
+- every model in each parallel step (generation, SynthEval, synthcity, TSTR, privacy attacks) as running, done, failed or queued, on a timeline, with the error of a failed model;
+- each HPO study's trials against its budget, best score so far (trials that fail a sanity screen don't count), a sparkline of the best score by trial, median trial time and an estimate of the time left;
+- RAM, CPU, GPU utilization and GPU memory over time, and use by model;
+- errors and warnings from the log, repeated ones folded together, each with its traceback;
+- once evaluation is done, the top of the ranking, how many output checks passed and a link to `report.md`;
+- the end of the log, filterable by model and by text.
+
+Per-model rows appear only when `compute.workers` is more than 1, because only then does each model run in its own process. `--dashboard-interval 60` rewrites the page every minute, and `--dashboard-interval 0` turns it off.
+
+To watch a run on a remote machine from your own computer, serve the page there and forward the port over SSH:
+
+```bash
+ssh -L 8765:localhost:8765 augur          # on your computer
+uv run synthdata-dashboard --config configs/config_sim.yaml --serve   # on augur
+# then open http://localhost:8765/ on your computer
+```
+
+`--serve` builds the page fresh for each request from the newest run log and serves only that page, on `127.0.0.1` (this machine) unless you pass `--bind`. Don't bind to a public address on a shared machine: the page shows log lines and scores. Without `--serve`, `synthdata-dashboard --config ... [--log <file>_run.log]` writes the page once, for example for a finished run or one started with `--dashboard-interval 0`. On a cluster, the page is a file on the shared disk, so you can open it from a login node or copy it to your computer.
 
 ### Using the machine's cores
 
