@@ -1,9 +1,11 @@
 """Unit tests for the shared worker-count rule."""
 
+import io
 import os
 
 import pytest
 
+from synthdata import compute
 from synthdata.compute import (
     _cgroup_memory_headroom_gib,
     resolve_workers,
@@ -11,6 +13,7 @@ from synthdata.compute import (
     usable_cpus,
 )
 from synthdata.config import ComputeConfig
+from synthdata.utils import get_logger
 
 pytestmark = pytest.mark.unit
 
@@ -160,3 +163,39 @@ def test_cgroup_v1_and_unlimited_cgroups(tmp_path):
         {"user.slice/memory.max": "max", "user.slice/memory.current": "1"},
     )
     assert _cgroup_memory_headroom_gib(proc, root) is None
+
+
+def test_prefixed_stream_writes_whole_prefixed_lines():
+    out = io.StringIO()
+    stream = compute._Prefixed(out, "[gen: ctgan] ")
+    stream.write("first\nsec")
+    stream.write("ond\r\n\r 10%|#")
+    stream.write("\r 20%|##")
+    assert out.getvalue() == "[gen: ctgan] first\n[gen: ctgan] second\n[gen: ctgan]  10%|#\n"
+    stream.close_line()  # the last update, held until its line ends
+    assert out.getvalue().endswith("[gen: ctgan]  10%|#\n[gen: ctgan]  20%|##\n")
+
+
+def _chatty(x):
+    print(f"printed {x}")
+    get_logger("synthdata.test_chatty").info("logged %s", x)
+    return x
+
+
+def test_worker_output_names_its_model(capfd, monkeypatch):
+    messages = []
+    monkeypatch.setattr(compute.logger, "info", lambda msg, *a: messages.append(msg % a))
+    run = run_per_model(
+        _chatty,
+        {"ctgan": (1,), "tvae": (2,)},
+        ComputeConfig(workers=2, cores_per_worker=1),
+        n_columns=1,
+        label="generation",
+    )
+    assert run.results == {"ctgan": 1, "tvae": 2}
+    captured = capfd.readouterr()
+    output = captured.out + captured.err
+    assert "[generation: ctgan] printed 1" in output
+    assert "[generation: tvae] printed 2" in output
+    assert "[generation: ctgan] [" in output and "logged 1" in output
+    assert any("finished after" in m and "2 of 2 done" in m for m in messages)
