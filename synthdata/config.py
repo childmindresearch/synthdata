@@ -485,6 +485,12 @@ class HPOConfig:
     #: Seconds per model study; set from a profiling run as trials x measured
     #: trial time x 1.5, so one slow model can't use up another's budget.
     timeout_seconds_per_model: dict = dataclasses.field(default_factory=dict)
+    #: Wall-clock hours for the whole generation stage, counted from its start
+    #: (None = no limit). Every model's search stops starting trials early
+    #: enough to leave time for its tuned fit and replicates, so the stage
+    #: ends near this limit with every model finished. Meant as a safety net
+    #: just under a cluster job's time limit; per-model timeouts still apply.
+    stage_time_limit_hours: float | None = None
     #: Training length searched per model as ``[low, high, step]`` (synthcity
     #: ``n_iter`` epochs, TabPFGen SGLD steps). Unlisted models use their
     #: library's own range (``EPOCH_RANGE_DEFAULTS`` where the library has none).
@@ -1023,6 +1029,14 @@ def _validate_hpo(hpo: HPOConfig) -> None:
     if hpo.pruner not in HPO_PRUNERS:
         raise ValueError(
             f"generation.hpo.pruner must be one of {list(HPO_PRUNERS)}, got {hpo.pruner!r}"
+        )
+    limit = hpo.stage_time_limit_hours
+    if limit is not None and (
+        isinstance(limit, bool) or not isinstance(limit, int | float) or limit <= 0
+    ):
+        raise ValueError(
+            "generation.hpo.stage_time_limit_hours must be a positive number of hours "
+            f"or null, got {limit!r}"
         )
     for key in ("n_trials_per_model", "timeout_seconds_per_model"):
         for model, value in getattr(hpo, key).items():

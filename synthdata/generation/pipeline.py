@@ -8,7 +8,9 @@ JSON file (see :class:`synthdata.generation.hpo.BestParamsCache`).
 """
 
 import copy
+import time
 from collections.abc import Callable
+from pathlib import Path
 
 import pandas as pd
 from filelock import FileLock
@@ -23,8 +25,10 @@ from synthdata.generation import tabpfn_backend as tpfn
 from synthdata.utils import (
     ensure_dir,
     get_logger,
+    load_json,
     replicate_name,
     resolve_device,
+    save_json,
     set_global_seed,
     split_replicate_name,
 )
@@ -108,6 +112,21 @@ def _run_synthcity_workers(cfg: Config, dataset: Dataset, device: str) -> dict:
     return run.results
 
 
+def _untuned_fit_seconds(output_dir, name: str, measured: float) -> float:
+    """Seconds ``name``'s untuned fits took, remembered across resumed runs.
+
+    A resumed run loads the untuned datasets from cache in no time, so the
+    first measurement is kept in ``untuned_fit_seconds.json``.
+    """
+    path = Path(output_dir) / "untuned_fit_seconds.json"
+    with FileLock(f"{path}.lock"):
+        record = load_json(path, {})
+        if measured >= 60 or name not in record:
+            record[name] = round(measured)
+            save_json(path, record)
+        return float(record[name])
+
+
 def run_generation(
     cfg: Config,
     dataset: Dataset,
@@ -135,6 +154,7 @@ def run_generation(
         )
 
     gen_cfg = cfg.generation
+    hpo_mod.mark_stage_start()
     output_dir = ensure_dir(gen_cfg.output_dir)
     n_samples = gen_cfg.n_samples
     seed = cfg.seed
@@ -358,6 +378,9 @@ def run_generation(
                 for generated_name in generated:
                     _plot(generated_name, datasets[generated_name], None)
                 continue
+            # The untuned fits take about as long as the tuned ones will (same
+            # training-length cap), so their time is what the search leaves for them.
+            untuned_started = time.monotonic()
             _cached_or_build(
                 name,
                 lambda seed, count, name=name: sc.fit_generate(
@@ -374,6 +397,9 @@ def run_generation(
                 ),
             )
 
+            untuned_seconds = _untuned_fit_seconds(
+                output_dir, name, time.monotonic() - untuned_started
+            )
             if gen_cfg.hpo.enabled and hpo_mod.model_budget(gen_cfg.hpo, name)[0] > 0:
                 if not best_params.has("synthcity", name):
                     objective = sc.build_synthcity_objective(
@@ -397,6 +423,7 @@ def run_generation(
                         seed,
                         checkpoint_workspace=output_dir / "synthcity_workspace",
                         checkpoint_plugin=name,
+                        reserve_seconds=untuned_seconds,
                     )
                     best_params.set("synthcity", name, params)
                 params = dict(best_params.get("synthcity", name))

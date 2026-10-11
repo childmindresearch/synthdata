@@ -237,7 +237,21 @@ On a cluster, `auto` counts only what the job was given: the CPUs the job is bou
 uv run synthdata-run --config configs/config_sim.yaml --experiment-id sim_full
 ```
 
-The memory and GPU figures above are starting points; after a first run, set `--mem` and the GPU size from the peaks in the log (`peak use during generate: ...`), with some headroom. Leave out `--detach` inside a batch job: the job is already detached, and its output goes to the SLURM log as well as `<output root>/logs/`.
+The memory and GPU figures above are starting points; after a first run, set `--mem` and the GPU size from the peaks in the log (`peak use during generate: ...`), with some headroom. A batch job is stopped at its `--time` limit, even in the middle of a model's hyperparameter search. To end cleanly instead, set a time limit for the generation stage a little under the job's:
+
+```yaml
+generation:
+  hpo:
+    stage_time_limit_hours: 66   # for --time=3-00:00:00, leaving about 6 h for imputation and evaluation
+```
+
+Every model's search then stops starting new trials early enough to leave time for its tuned fit and replicates. That margin is taken from how long the model's untuned fits took, which uses the same training-length cap. A trial is also not started when the longest trial so far would run past it. The models that run out of time keep the best trial found so far, and the log says so (`stopping the search at the stage time limit`). The limit counts from the start of the generation stage and is off by default (`null`). It only cuts trials and makes nothing faster, so leave it off when there is no hard limit. Each finished trial is logged with its score, its duration, how many trials are done, the best so far and, with a limit set, the time left for the search:
+
+```
+[hpo_ddpm] trial 12 tstr_macro_f1=0.3121 after 24 min (13 of 40 done); best 0.3254 (trial 7); search stops in 5.2 h
+```
+
+Leave out `--detach` inside a batch job: the job is already detached, and its output goes to the SLURM log as well as `<output root>/logs/`.
 
 ## 5. Stage 1: load and split the data
 

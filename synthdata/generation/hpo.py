@@ -18,7 +18,9 @@ Provides:
 """
 
 import dataclasses
+import os
 import re
+import time
 import warnings
 from collections.abc import Callable
 from pathlib import Path
@@ -548,6 +550,92 @@ def create_study(
     )
 
 
+#: Wall-clock start of the generation stage (seconds since the epoch), set
+#: once by the stage and inherited by its worker processes; the stage time
+#: limit counts from it.
+STAGE_START_ENV_VAR = "SYNTHDATA_GENERATION_START"
+
+
+def mark_stage_start() -> None:
+    """Record the generation stage's start, unless a parent process already did."""
+    os.environ.setdefault(STAGE_START_ENV_VAR, f"{time.time():.0f}")
+
+
+def stage_deadline(hpo_cfg: HPOConfig) -> float | None:
+    """When the generation stage must end (seconds since the epoch), or None."""
+    if hpo_cfg.stage_time_limit_hours is None:
+        return None
+    start = float(os.environ.get(STAGE_START_ENV_VAR, time.time()))
+    return start + hpo_cfg.stage_time_limit_hours * 3600
+
+
+def _hours(seconds: float) -> str:
+    return f"{seconds / 60:.0f} min" if seconds < 3600 else f"{seconds / 3600:.1f} h"
+
+
+class _TrialProgress:
+    """Optuna callback: one log line per finished trial; stops at the search deadline.
+
+    A trial is not started when the longest trial so far would not finish
+    before ``search_deadline``.
+    """
+
+    def __init__(self, study_name: str, objective: str, n_target: int, search_deadline):
+        self.study_name = study_name
+        self.objective = objective
+        self.n_target = n_target
+        self.search_deadline = search_deadline
+        self.longest = 0.0
+
+    def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        seconds = trial.duration.total_seconds() if trial.duration else 0.0
+        self.longest = max(self.longest, seconds)
+        finished = (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)
+        n_done = len([t for t in study.trials if t.state in finished])
+        if trial.state == optuna.trial.TrialState.COMPLETE:
+            feasible = all(v <= 0 for v in _trial_constraints(trial))
+            outcome = f"{self.objective}={trial.value:.4f}" + ("" if feasible else " (infeasible)")
+        else:
+            outcome = trial.state.name.lower()
+        best = _best_feasible(study)
+        best_text = (
+            f"best {best.value:.4f} (trial {best.number})" if best is not None else "no best yet"
+        )
+        left = ""
+        if self.search_deadline is not None:
+            left = f"; search stops in {_hours(max(self.search_deadline - time.time(), 0))}"
+        logger.info(
+            "[%s] trial %d %s after %s (%d of %d done); %s%s",
+            self.study_name,
+            trial.number,
+            outcome,
+            _hours(seconds),
+            n_done,
+            self.n_target,
+            best_text,
+            left,
+        )
+        if self.search_deadline is not None and time.time() + self.longest > self.search_deadline:
+            logger.warning(
+                "[%s] stopping the search at the stage time limit: the longest trial "
+                "(%s) would not finish in time; %d of %d trials done",
+                self.study_name,
+                _hours(self.longest),
+                n_done,
+                self.n_target,
+            )
+            study.stop()
+
+
+def _best_feasible(study: optuna.Study):
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    feasible = [t for t in completed if all(v <= 0 for v in _trial_constraints(t))]
+    if not feasible:
+        return None
+    pick = max if study.direction == optuna.study.StudyDirection.MAXIMIZE else min
+    return pick(feasible, key=lambda t: t.value)
+
+
 def run_study(
     study_name: str,
     objective_fn: Callable[[optuna.Trial], float],
@@ -558,6 +646,7 @@ def run_study(
     checkpoint_workspace: str | Path | None = None,
     checkpoint_plugin: str | None = None,
     model: str | None = None,
+    reserve_seconds: float = 0.0,
 ) -> dict:
     """Run (or resume, via SQLite storage) an Optuna study; return best params.
 
@@ -565,6 +654,11 @@ def run_study(
     (default: ``study_name`` without its ``hpo_`` prefix); 0 trials skips the
     search and returns ``{}``. Pruned trials count towards the trial budget.
     ``drop_keys`` are removed from the returned best-params dict.
+
+    With ``hpo.stage_time_limit_hours`` set, the search also stops starting
+    trials ``reserve_seconds`` before the stage deadline (the time the
+    model's final fits need), and a trial is not started when the longest
+    one so far would run past that point.
 
     When both checkpoint arguments are provided, synthcity HPO studies with no
     running trial retain only their best and latest generator caches. Studies
@@ -582,6 +676,22 @@ def run_study(
     finished = (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)
     n_done = len([t for t in study.trials if t.state in finished])
     n_remaining = max(n_trials - n_done, 0)
+    deadline = stage_deadline(hpo_cfg)
+    search_deadline = None if deadline is None else deadline - reserve_seconds
+    if search_deadline is not None and n_remaining > 0:
+        left = search_deadline - time.time()
+        if left <= 0:
+            logger.warning(
+                "[%s] no time left for the search under the stage time limit "
+                "(%.1f h; %s reserved for the final fits); %d trial(s) done",
+                study_name,
+                hpo_cfg.stage_time_limit_hours,
+                _hours(reserve_seconds),
+                n_done,
+            )
+            n_remaining = 0
+        else:
+            timeout = int(left) if timeout is None else min(timeout, int(left))
     if n_remaining > 0:
         logger.info(
             "[%s] starting hyperparameter optimization: %d trial(s) remaining "
@@ -599,6 +709,7 @@ def run_study(
             # A crashed fit or a non-finite score marks the trial failed.
             catch=(ValueError, RuntimeError),
             show_progress_bar=False,
+            callbacks=[_TrialProgress(study_name, hpo_cfg.objective, n_trials, search_deadline)],
         )
 
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
@@ -606,7 +717,8 @@ def run_study(
         logger.warning("[%s] all trials pruned/failed; falling back to defaults", study_name)
         return {}
     feasible = [t for t in completed if all(v <= 0 for v in _trial_constraints(t))]
-    if not feasible:
+    best_trial = _best_feasible(study)
+    if best_trial is None:
         logger.warning(
             "[%s] no trial passed the HPO screens (%d completed); falling back to defaults",
             study_name,
@@ -614,8 +726,6 @@ def run_study(
         )
         return {}
 
-    pick = max if study.direction == optuna.study.StudyDirection.MAXIMIZE else min
-    best_trial = pick(feasible, key=lambda t: t.value)
     best = {k: v for k, v in best_trial.params.items() if k not in drop_keys}
     logger.info(
         "[%s] best %s=%.4f (trial %d; %d feasible of %d completed) params=%s",

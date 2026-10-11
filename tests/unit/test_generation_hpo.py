@@ -313,3 +313,58 @@ def test_best_params_cache_keeps_writes_from_other_instances(tmp_path):
     reread = BestParamsCache(path)
     assert reread.get("synthcity", "ctgan") == {"n_iter": 50}
     assert reread.get("synthcity", "tvae") == {"n_iter": 75}
+
+
+def _timed_study(tmp_path, monkeypatch, *, limit_hours, reserve, started_ago, trial_seconds):
+    """Run a 10-trial study on a fake clock where each trial takes ``trial_seconds``."""
+    from synthdata.generation import hpo
+
+    clock = {"now": 1_000_000.0}
+    monkeypatch.setattr(hpo.time, "time", lambda: clock["now"])
+    monkeypatch.setenv(hpo.STAGE_START_ENV_VAR, str(clock["now"] - started_ago))
+    messages = []
+    monkeypatch.setattr(hpo.logger, "info", lambda msg, *a: messages.append(msg % a))
+    monkeypatch.setattr(hpo.logger, "warning", lambda msg, *a: messages.append(msg % a))
+
+    def objective(trial):
+        clock["now"] += trial_seconds
+        return float(trial.number)
+
+    cfg = HPOConfig(n_trials=10, timeout_seconds=None, stage_time_limit_hours=limit_hours)
+    run_study("hpo_tvae", objective, cfg, tmp_path, seed=0, reserve_seconds=reserve)
+    study = optuna.load_study(study_name="hpo_tvae", storage=default_storage_url(tmp_path))
+    return len(study.trials), messages
+
+
+def test_every_finished_trial_is_logged(tmp_path, monkeypatch):
+    n, messages = _timed_study(
+        tmp_path, monkeypatch, limit_hours=None, reserve=0, started_ago=0, trial_seconds=90
+    )
+    trial_lines = [m for m in messages if "] trial " in m]
+    assert n == 10 and len(trial_lines) == 10
+    # Durations come from Optuna's own clock, so only the shape is checked here.
+    assert trial_lines[2].startswith("[hpo_tvae] trial 2 tstr_macro_f1=2.0000 after ")
+    assert trial_lines[2].endswith(" (3 of 10 done); best 2.0000 (trial 2)")
+
+
+def test_stage_time_limit_leaves_the_reserve_for_the_final_fits(tmp_path, monkeypatch):
+    # 10 h limit, 2 h already used, 3 h reserved: 5 h for 1-hour trials.
+    n, messages = _timed_study(
+        tmp_path,
+        monkeypatch,
+        limit_hours=10,
+        reserve=3 * 3600,
+        started_ago=2 * 3600,
+        trial_seconds=3600,
+    )
+    assert n == 5
+    assert any("search stops in 0 min" in m for m in messages)
+    assert any("stopping the search at the stage time limit" in m for m in messages)
+
+
+def test_stage_time_limit_already_used_up_skips_the_search(tmp_path, monkeypatch):
+    n, messages = _timed_study(
+        tmp_path, monkeypatch, limit_hours=1, reserve=0, started_ago=2 * 3600, trial_seconds=60
+    )
+    assert n == 0
+    assert any("no time left for the search" in m for m in messages)

@@ -609,3 +609,12 @@ class TestLoadConfig:
         yaml_path.write_text("data: [unclosed\n")
         with pytest.raises(yaml.YAMLError):
             load_config(yaml_path)
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, "12"])
+def test_stage_time_limit_must_be_positive_hours(limit):
+    from synthdata.config import HPOConfig, _validate_hpo
+
+    with pytest.raises(ValueError, match="stage_time_limit_hours"):
+        _validate_hpo(HPOConfig(stage_time_limit_hours=limit))
+    _validate_hpo(HPOConfig(stage_time_limit_hours=46.5))
