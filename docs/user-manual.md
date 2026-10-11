@@ -224,7 +224,7 @@ compute:
   cores_per_worker: 4      # CPU threads each model's process may use
   memory_reserve_gib: 16   # RAM kept free for everything else
   memory_per_worker_gib: 14  # RAM one model needs; leave out to estimate from the column count
-  fits_per_gpu: auto       # fits training on one GPU at once (auto = 2); 0 = no limit
+  fits_per_gpu: auto       # each fit on the least busy GPU, no limit; a number caps fits per GPU
 ```
 
 With `workers: auto`, the count is the CPU cores divided by `cores_per_worker`, then lowered to fit free memory, `max_workers` and the number of models. A 24-core machine with 125 GB runs 6 models at once. Each model sets its own seeds, so the results are the same as running one model at a time with the same `cores_per_worker`; the integration tests check this byte for byte. Changing `cores_per_worker` can change results in the last digits on the CPU, because the order of floating-point sums depends on the thread count, so keep it fixed across runs you compare.
@@ -389,26 +389,19 @@ The synthcity models are trained side by side, each in its own process that runs
 
 #### How the GPUs are shared (auto mode)
 
-Training is limited by the GPU, not the CPU: when six models train on one GPU at once, they take turns and each runs about six times slower, so nothing finishes sooner. With `compute.fits_per_gpu: auto` (the default), each GPU takes at most 2 fits at a time, and the models queue for those places ("slots"):
+Every fit (an HPO trial, the untuned fit, the tuned fit or a replicate) runs on whichever GPU is training the fewest fits at that moment. A model uses the GPU only while it trains and samples, and leaves it for its CPU work (scoring a trial, screens, saving). With two GPUs, the work spreads over both as it goes; nothing is assigned in advance, so a model can run its trials on either GPU.
 
-- A model holds a slot only while it trains and samples one generator: an HPO trial, the untuned fit, the tuned fit or a replicate. It gives the slot back for its CPU work (scoring the trial, screens, saving), so another model's fit can use the GPU meanwhile.
-- Each fit takes a slot on whichever GPU is least busy. With two GPUs, the work spreads over both as it goes; nothing is assigned in advance, so a model can run its trials on either GPU.
-- When several models wait, the one with the most estimated work left goes first. That is the model that would otherwise finish last, so giving it the GPU first shortens the whole stage.
+With `compute.fits_per_gpu: auto` (the default), there is no limit on how many fits share a GPU. Measured on the LORIS data with one GPU (`scripts/gpu_concurrency.py`), CTGAN fits got 1.33 times as much done in total at two at once and 1.72 times at six. A DDPM fit shared with five CTGAN fits ran about 9 times slower, but the GPU got as much done in total, and DDPM runs at full speed again once the others finish. Holding fits back would only leave part of the GPU idle. On the larger simulated clinical table, sharing gained nothing (six fits each ran about 6 times slower), but it did not lose anything either.
 
-A model's work left is the training epochs it still has to run (untuned fit, trials, tuned fit, replicates) times its seconds per epoch. Until its first fit finishes, the seconds per epoch come from a rough table measured on the simulated clinical dataset; after that, from its own finished fits. No fit waits for a measurement: every model starts training at once and the estimates only reorder the queue. Slots change when and on which GPU a fit runs, never what it computes, so results are the same as without them.
+Set a number to cap the fits per GPU, for example when the GPU's memory is small: six models on one GPU held 1 to 21 GB each on the simulated data. Fits then wait for a place, and the model with the most estimated work left goes first: its remaining epochs times its seconds per epoch, from a rough table until its first fit finishes and from its own fits after that. `fits_per_gpu: 0` (or `null`) turns this off and keeps each model on one GPU, assigned in turn. To choose for a new dataset or GPU, run the script on an idle GPU:
 
-Every fit is listed in `<generation dir>/gpu_slots/fits.csv` (model, kind, GPU, epochs, when it asked for a slot, seconds it waited and seconds it trained), and a fit that waited more than a minute is logged (`[ddpm] trial got cuda:1 after waiting 12 min`). Set `fits_per_gpu: 0` (or `null`) to turn the slots off and let every model use its GPU whenever it likes, as before; a higher number lets more fits share a GPU, which helps when single fits leave a large GPU mostly idle. Slots are used only while models train in parallel on a GPU; with one model at a time or on the CPU they do nothing.
-
-While models run side by side, every line a model's process prints starts with its step and name, so the terminal and the log stay readable:
-
-```
-[17:19:02] synthdata.compute INFO: [generation] started tvae (pid 6863; 2 of 7)
-[generation: tvae] [17:19:04] synthdata.generation.hpo INFO: [hpo_tvae] starting hyperparameter optimization: 40 trial(s) remaining
-[generation: ctgan]  50%|█████     | 75/150 [21:07<20:31, 16.42s/it]
-[17:52:40] synthdata.compute INFO: [generation] tvae finished after 33.6 min; 1 of 7 done, running: ctgan, ddpm, rtvae, adsgan, arf, pategan
+```bash
+uv run python scripts/gpu_concurrency.py --csv <train_imputed.csv> --model ctgan --epochs 20
+uv run python scripts/gpu_concurrency.py --csv <train_imputed.csv> --model ddpm --epochs 100 \
+    --background ctgan --background-epochs 40
 ```
 
-Evaluation does the same (`[syntheval full: tvae]`, `[synthcity: ddpm]`, ...). In a model's process, each progress bar update is printed as a line of its own, at most once every 30 seconds (set `TQDM_MININTERVAL` to change it), instead of redrawing one line.
+None of this changes what a fit computes (same seeds and settings), only when and on which GPU it runs. Every fit is listed in `<generation dir>/gpu_slots/fits.csv` (model, kind, GPU, epochs, when it started, seconds it waited and seconds it trained), and a fit that waited more than a minute for a place is logged.
 
 ### How the hyperparameter search works
 

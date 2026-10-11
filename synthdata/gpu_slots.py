@@ -1,20 +1,21 @@
 """Share the GPUs between models that train in parallel, longest remaining work first.
 
 When generation trains several synthcity models at once (see
-:mod:`synthdata.compute`), each GPU hands out ``compute.fits_per_gpu`` slots.
-A model's process holds a slot only while it fits a generator and samples
-from it, and gives it back for its CPU work (TSTR scoring, screens, saving),
-so:
+:mod:`synthdata.compute`), every fit (an HPO trial, an untuned or a tuned
+fit) goes to the GPU running the fewest fits at that moment, so with two
+GPUs the work spreads over both as it happens, with nothing decided in
+advance. A model's process holds its place on the GPU only while it fits a
+generator and samples from it, not during its CPU work (TSTR scoring,
+screens, saving).
 
-* no more than ``fits_per_gpu`` fits share a GPU at once. Six fits on one
-  GPU take turns and each runs about six times slower; two keep the GPU busy
-  without that;
-* every fit (an HPO trial, an untuned or a tuned fit) takes a slot on
-  whichever GPU has one free, so with two GPUs the work spreads over both as
-  it happens, with nothing decided in advance;
-* when processes wait for a slot, the model with the most estimated work
-  left goes first, so the model that would finish last (the critical one)
-  is not slowed down by the others.
+With ``compute.fits_per_gpu: auto`` there is no limit on the fits sharing a
+GPU: measured on the LORIS data (scripts/gpu_concurrency.py), CTGAN fits
+sharing one GPU trained 1.33 times faster in total at two at once and 1.72
+times at six, and a mix of DDPM and CTGAN fits got as much done as CTGAN
+alone, so holding fits back only left the GPU part idle. A number caps the
+fits per GPU (for example to fit GPU memory); then waiting fits go by
+estimated work left, most first, so the model that would finish last is
+served first.
 
 A model's remaining work is its fits still to come (untuned and tuned fits,
 HPO trials) times its seconds per training epoch: first a rough prior per
@@ -68,11 +69,15 @@ GPU_MODELS = frozenset(PRIOR_SECONDS_PER_EPOCH)
 POLL_SECONDS = 2.0
 
 
-def resolve_fits_per_gpu(value) -> int:
-    """``compute.fits_per_gpu`` as a number of slots; 0 turns the slots off."""
+#: ``slots`` value of a table without a limit per GPU.
+UNLIMITED = 0
+
+
+def resolve_fits_per_gpu(value) -> int | None:
+    """``compute.fits_per_gpu`` as slots per GPU: None is off, :data:`UNLIMITED` no limit."""
     if value == "auto":
-        return 2
-    return int(value or 0)
+        return UNLIMITED
+    return int(value) if value else None
 
 
 def setup(folder: Path, n_gpus: int, fits_per_gpu: int) -> None:
@@ -144,6 +149,10 @@ def _update(folder: Path, change):
 def _try_take(table: dict, key: str, priority: float) -> str | None:
     """Take a slot on the least busy GPU if one is free and no one ahead is waiting."""
     table["waiting"][key]["priority"] = priority
+    if table["slots"] == UNLIMITED:
+        gpu = min(table["gpus"], key=lambda g: (len(table["gpus"][g]), int(g)))
+        table["gpus"][gpu].append(dict(table["waiting"].pop(key)))
+        return gpu
     free = [gpu for gpu, holders in table["gpus"].items() if len(holders) < table["slots"]]
     if not free:
         return None

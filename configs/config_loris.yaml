@@ -18,7 +18,7 @@ compute:
   cores_per_worker: 4
   memory_reserve_gib: 16
   memory_per_worker_gib: 14
-  fits_per_gpu: auto       # fits sharing one GPU at once (auto = 2), longest remaining work first
+  fits_per_gpu: auto       # each fit on the least busy GPU, no limit; a number caps fits per GPU
 
 experiment:
   tag: loris_v2
