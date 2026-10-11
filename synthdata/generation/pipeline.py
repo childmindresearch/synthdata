@@ -8,11 +8,14 @@ JSON file (see :class:`synthdata.generation.hpo.BestParamsCache`).
 """
 
 import copy
+import time
 from collections.abc import Callable
+from pathlib import Path
 
 import pandas as pd
 from filelock import FileLock
 
+from synthdata import gpu_slots
 from synthdata.compute import resolve_workers, run_per_model
 from synthdata.config import Config
 from synthdata.data import Dataset, remask_synthetic
@@ -23,8 +26,10 @@ from synthdata.generation import tabpfn_backend as tpfn
 from synthdata.utils import (
     ensure_dir,
     get_logger,
+    load_json,
     replicate_name,
     resolve_device,
+    save_json,
     set_global_seed,
     split_replicate_name,
 )
@@ -76,7 +81,9 @@ def _run_synthcity_workers(cfg: Config, dataset: Dataset, device: str) -> dict:
     Each model runs exactly the chain the sequential loop would run (its
     seeds do not depend on the other models), so the outputs match a
     sequential run with the same thread count. Models with the longest HPO
-    timeout start first. With several GPUs, models go round-robin across them.
+    timeout start first. With ``compute.fits_per_gpu`` set, each fit takes a
+    slot on whichever GPU has one free, longest remaining work first
+    (synthdata.gpu_slots); otherwise models go round-robin across the GPUs.
     """
     gen_cfg = cfg.generation
     names = list(gen_cfg.synthcity.names)
@@ -89,16 +96,28 @@ def _run_synthcity_workers(cfg: Config, dataset: Dataset, device: str) -> dict:
         import torch
 
         n_gpus = torch.cuda.device_count()
-    run = run_per_model(
-        _synthcity_worker,
-        {
-            name: (cfg, dataset, name, f"cuda:{i % n_gpus}" if n_gpus > 1 else device)
-            for i, name in enumerate(names)
-        },
-        cfg.compute,
-        n_columns=len(dataset.train_df.columns),
-        label="generation",
-    )
+    fits_per_gpu = gpu_slots.resolve_fits_per_gpu(cfg.compute.fits_per_gpu)
+    if n_gpus and fits_per_gpu:
+        # Each fit takes a slot on whichever GPU has one free (synthdata.gpu_slots).
+        gpu_slots.setup(ensure_dir(gen_cfg.output_dir) / "gpu_slots", n_gpus, fits_per_gpu)
+        logger.info(
+            "[generation] GPU slots: %d GPU(s) x %d fits at a time, longest remaining work first",
+            n_gpus,
+            fits_per_gpu,
+        )
+    try:
+        run = run_per_model(
+            _synthcity_worker,
+            {
+                name: (cfg, dataset, name, f"cuda:{i % n_gpus}" if n_gpus > 1 else device)
+                for i, name in enumerate(names)
+            },
+            cfg.compute,
+            n_columns=len(dataset.train_df.columns),
+            label="generation",
+        )
+    finally:
+        gpu_slots.teardown()
     if run.failures:
         # Finished models are cached, so a rerun only redoes the failed ones.
         raise RuntimeError(
@@ -106,6 +125,36 @@ def _run_synthcity_workers(cfg: Config, dataset: Dataset, device: str) -> dict:
             + "; ".join(f"{n}: {e}" for n, e in run.failures.items())
         )
     return run.results
+
+
+def _plan_work(name: str, gen_cfg) -> None:
+    """Tell the GPU slots (synthdata.gpu_slots) how much training ``name`` has ahead.
+
+    Untuned and tuned fits at the top of the searched epoch range, trials at
+    its middle; the slots turn this into seconds with the model's speed.
+    """
+    bounds = hpo_mod.epoch_range(gen_cfg.hpo, name, sc.EPOCH_RANGE_DEFAULTS.get(name))
+    top = float(bounds[1]) if bounds else 1.0
+    middle = (bounds[0] + bounds[1]) / 2 if bounds else 1.0
+    work = gpu_slots.plan(name)
+    work.add(2 * gen_cfg.n_replicates, top)
+    if gen_cfg.hpo.enabled:
+        work.add(hpo_mod.model_budget(gen_cfg.hpo, name)[0], middle)
+
+
+def _untuned_fit_seconds(output_dir, name: str, measured: float) -> float:
+    """Seconds ``name``'s untuned fits took, remembered across resumed runs.
+
+    A resumed run loads the untuned datasets from cache in no time, so the
+    first measurement is kept in ``untuned_fit_seconds.json``.
+    """
+    path = Path(output_dir) / "untuned_fit_seconds.json"
+    with FileLock(f"{path}.lock"):
+        record = load_json(path, {})
+        if measured >= 60 or name not in record:
+            record[name] = round(measured)
+            save_json(path, record)
+        return float(record[name])
 
 
 def run_generation(
@@ -135,6 +184,7 @@ def run_generation(
         )
 
     gen_cfg = cfg.generation
+    hpo_mod.mark_stage_start()
     output_dir = ensure_dir(gen_cfg.output_dir)
     n_samples = gen_cfg.n_samples
     seed = cfg.seed
@@ -358,6 +408,10 @@ def run_generation(
                 for generated_name in generated:
                     _plot(generated_name, datasets[generated_name], None)
                 continue
+            _plan_work(name, gen_cfg)
+            # The untuned fits take about as long as the tuned ones will (same
+            # training-length cap), so their time is what the search leaves for them.
+            untuned_started = time.monotonic()
             _cached_or_build(
                 name,
                 lambda seed, count, name=name: sc.fit_generate(
@@ -371,9 +425,13 @@ def run_generation(
                     classification=dataset.target_is_categorical,
                     class_prior=class_prior,
                     discrete_columns=dataset.all_categorical_columns,
+                    kind="untuned",
                 ),
             )
 
+            untuned_seconds = _untuned_fit_seconds(
+                output_dir, name, time.monotonic() - untuned_started
+            )
             if gen_cfg.hpo.enabled and hpo_mod.model_budget(gen_cfg.hpo, name)[0] > 0:
                 if not best_params.has("synthcity", name):
                     objective = sc.build_synthcity_objective(
@@ -397,6 +455,7 @@ def run_generation(
                         seed,
                         checkpoint_workspace=output_dir / "synthcity_workspace",
                         checkpoint_plugin=name,
+                        reserve_seconds=untuned_seconds,
                     )
                     best_params.set("synthcity", name, params)
                 params = dict(best_params.get("synthcity", name))
@@ -418,6 +477,7 @@ def run_generation(
                         classification=dataset.target_is_categorical,
                         class_prior=class_prior,
                         discrete_columns=dataset.all_categorical_columns,
+                        kind="tuned",
                     ),
                 )
 

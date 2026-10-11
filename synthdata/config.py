@@ -485,6 +485,12 @@ class HPOConfig:
     #: Seconds per model study; set from a profiling run as trials x measured
     #: trial time x 1.5, so one slow model can't use up another's budget.
     timeout_seconds_per_model: dict = dataclasses.field(default_factory=dict)
+    #: Wall-clock hours for the whole generation stage, counted from its start
+    #: (None = no limit). Every model's search stops starting trials early
+    #: enough to leave time for its tuned fit and replicates, so the stage
+    #: ends near this limit with every model finished. Meant as a safety net
+    #: just under a cluster job's time limit; per-model timeouts still apply.
+    stage_time_limit_hours: float | None = None
     #: Training length searched per model as ``[low, high, step]`` (synthcity
     #: ``n_iter`` epochs, TabPFGen SGLD steps). Unlisted models use their
     #: library's own range (``EPOCH_RANGE_DEFAULTS`` where the library has none).
@@ -699,6 +705,11 @@ class ComputeConfig:
     memory_reserve_gib: float = 16.0
     #: RAM (GiB) one model's process needs; None estimates it from the column count.
     memory_per_worker_gib: float | None = None
+    #: Fits sharing one GPU at a time while models train in parallel
+    #: (synthdata.gpu_slots): "auto" (2), a number, or 0/None to let every
+    #: model's process use its GPU whenever it likes. Fits take a slot on the
+    #: least busy GPU, and the model with the most work left goes first.
+    fits_per_gpu: str | int | None = "auto"
 
 
 #: Values of ``evaluation.class_averaging``.
@@ -1024,6 +1035,14 @@ def _validate_hpo(hpo: HPOConfig) -> None:
         raise ValueError(
             f"generation.hpo.pruner must be one of {list(HPO_PRUNERS)}, got {hpo.pruner!r}"
         )
+    limit = hpo.stage_time_limit_hours
+    if limit is not None and (
+        isinstance(limit, bool) or not isinstance(limit, int | float) or limit <= 0
+    ):
+        raise ValueError(
+            "generation.hpo.stage_time_limit_hours must be a positive number of hours "
+            f"or null, got {limit!r}"
+        )
     for key in ("n_trials_per_model", "timeout_seconds_per_model"):
         for model, value in getattr(hpo, key).items():
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -1206,6 +1225,13 @@ def _validate(cfg: Config) -> None:
         value = getattr(compute, field_name)
         if not isinstance(value, int) or value < 1:
             raise ValueError(f"compute.{field_name} must be a positive integer, got {value!r}")
+    fits = compute.fits_per_gpu
+    if fits not in ("auto", None) and (
+        isinstance(fits, bool) or not isinstance(fits, int) or fits < 0
+    ):
+        raise ValueError(
+            f"compute.fits_per_gpu must be 'auto', a non-negative integer or null, got {fits!r}"
+        )
     for field_name in ("memory_reserve_gib", "memory_per_worker_gib"):
         value = getattr(compute, field_name)
         if value is not None and (not isinstance(value, (int, float)) or value <= 0):

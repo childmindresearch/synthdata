@@ -223,6 +223,7 @@ compute:
   cores_per_worker: 4      # CPU threads each model's process may use
   memory_reserve_gib: 16   # RAM kept free for everything else
   memory_per_worker_gib: 14  # RAM one model needs; leave out to estimate from the column count
+  fits_per_gpu: auto       # fits training on one GPU at once (auto = 2); 0 = no limit
 ```
 
 With `workers: auto`, the count is the CPU cores divided by `cores_per_worker`, then lowered to fit free memory, `max_workers` and the number of models. A 24-core machine with 125 GB runs 6 models at once. Each model sets its own seeds, so the results are the same as running one model at a time with the same `cores_per_worker`; the integration tests check this byte for byte. Changing `cores_per_worker` can change results in the last digits on the CPU, because the order of floating-point sums depends on the thread count, so keep it fixed across runs you compare.
@@ -232,12 +233,26 @@ On a cluster, `auto` counts only what the job was given: the CPUs the job is bou
 ```bash
 #SBATCH --cpus-per-task=26        # workers x cores_per_worker (6 x 4), plus 2 for the main process
 #SBATCH --mem=100G                # memory_reserve_gib + workers x memory_per_worker_gib (16 + 6 x 14)
-#SBATCH --gres=gpu:1              # every synthcity model shares one GPU; check the peaks in the resources CSV
+#SBATCH --gres=gpu:2              # fits spread over every GPU the job gets; one works too, just slower
 #SBATCH --time=3-00:00:00         # generation takes about as long as the slowest model's HPO timeout
 uv run synthdata-run --config configs/config_sim.yaml --experiment-id sim_full
 ```
 
-The memory and GPU figures above are starting points; after a first run, set `--mem` and the GPU size from the peaks in the log (`peak use during generate: ...`), with some headroom. Leave out `--detach` inside a batch job: the job is already detached, and its output goes to the SLURM log as well as `<output root>/logs/`.
+The memory and GPU figures above are starting points; after a first run, set `--mem` and the GPU size from the peaks in the log (`peak use during generate: ...`), with some headroom. A batch job is stopped at its `--time` limit, even in the middle of a model's hyperparameter search. To end cleanly instead, set a time limit for the generation stage a little under the job's:
+
+```yaml
+generation:
+  hpo:
+    stage_time_limit_hours: 66   # for --time=3-00:00:00, leaving about 6 h for imputation and evaluation
+```
+
+Every model's search then stops starting new trials early enough to leave time for its tuned fit and replicates. That margin is taken from how long the model's untuned fits took, which uses the same training-length cap. A trial is also not started when the longest trial so far would run past it. The models that run out of time keep the best trial found so far, and the log says so (`stopping the search at the stage time limit`). The limit counts from the start of the generation stage and is off by default (`null`). It only cuts trials and makes nothing faster, so leave it off when there is no hard limit. Each finished trial is logged with its score, its duration, how many trials are done, the best so far and, with a limit set, the time left for the search:
+
+```
+[hpo_ddpm] trial 12 tstr_macro_f1=0.3121 after 24 min (13 of 40 done); best 0.3254 (trial 7); search stops in 5.2 h
+```
+
+Leave out `--detach` inside a batch job: the job is already detached, and its output goes to the SLURM log as well as `<output root>/logs/`.
 
 ## 5. Stage 1: load and split the data
 
@@ -369,7 +384,19 @@ Synthcity models are chosen with `generation.synthcity.names`. TabPFN runs when 
 
 ### Training models in parallel
 
-The synthcity models are trained side by side, each in its own process that runs the model's whole chain: the untuned fit, its hyperparameter search, the tuned fit and every replicate. The top-level `compute` section sets how many run at once (see [Using the machine's cores](#using-the-machines-cores)). Models with the longest search budget start first, so the stage takes about as long as the slowest model rather than the sum of all of them. With two or more GPUs, models are spread across them. GPU memory per model varies widely: on the simulated clinical dataset, six models sharing one 48 GB GPU held between 1 and 21 GB each, so check `nvidia-smi` or the resource log ([Long runs and remote machines](#long-runs-and-remote-machines)) on a smaller GPU. If one model fails, the others still finish and are cached, and rerunning with the same experiment id redoes only the failed one. Within a model, HPO trials still run one at a time, because running them in parallel would make the search depend on timing. TabPFN and TabPFGen run after the synthcity models, in the main process.
+The synthcity models are trained side by side, each in its own process that runs the model's whole chain: the untuned fit, its hyperparameter search, the tuned fit and every replicate. The top-level `compute` section sets how many run at once (see [Using the machine's cores](#using-the-machines-cores)). Models with the longest search budget start first, so the stage takes about as long as the slowest model rather than the sum of all of them. GPU memory per model varies widely: on the simulated clinical dataset, six models sharing one 48 GB GPU held between 1 and 21 GB each, so check `nvidia-smi` or the resource log ([Long runs and remote machines](#long-runs-and-remote-machines)) on a smaller GPU. If one model fails, the others still finish and are cached, and rerunning with the same experiment id redoes only the failed one. Within a model, HPO trials still run one at a time, because running them in parallel would make the search depend on timing. TabPFN and TabPFGen run after the synthcity models, in the main process.
+
+#### How the GPUs are shared (auto mode)
+
+Training is limited by the GPU, not the CPU: when six models train on one GPU at once, they take turns and each runs about six times slower, so nothing finishes sooner. With `compute.fits_per_gpu: auto` (the default), each GPU takes at most 2 fits at a time, and the models queue for those places ("slots"):
+
+- A model holds a slot only while it trains and samples one generator: an HPO trial, the untuned fit, the tuned fit or a replicate. It gives the slot back for its CPU work (scoring the trial, screens, saving), so another model's fit can use the GPU meanwhile.
+- Each fit takes a slot on whichever GPU is least busy. With two GPUs, the work spreads over both as it goes; nothing is assigned in advance, so a model can run its trials on either GPU.
+- When several models wait, the one with the most estimated work left goes first. That is the model that would otherwise finish last, so giving it the GPU first shortens the whole stage.
+
+A model's work left is the training epochs it still has to run (untuned fit, trials, tuned fit, replicates) times its seconds per epoch. Until its first fit finishes, the seconds per epoch come from a rough table measured on the simulated clinical dataset; after that, from its own finished fits. No fit waits for a measurement: every model starts training at once and the estimates only reorder the queue. Slots change when and on which GPU a fit runs, never what it computes, so results are the same as without them.
+
+Every fit is listed in `<generation dir>/gpu_slots/fits.csv` (model, kind, GPU, epochs, when it asked for a slot, seconds it waited and seconds it trained), and a fit that waited more than a minute is logged (`[ddpm] trial got cuda:1 after waiting 12 min`). Set `fits_per_gpu: 0` (or `null`) to turn the slots off and let every model use its GPU whenever it likes, as before; a higher number lets more fits share a GPU, which helps when single fits leave a large GPU mostly idle. Slots are used only while models train in parallel on a GPU; with one model at a time or on the CPU they do nothing.
 
 While models run side by side, every line a model's process prints starts with its step and name, so the terminal and the log stay readable:
 
