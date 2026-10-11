@@ -59,6 +59,11 @@ PRIOR_SECONDS_PER_EPOCH = {
 }
 _DEFAULT_PRIOR = 15.0
 
+#: Models that train on the GPU and so take a slot. Others (ARF, Bayesian
+#: network, marginals) accept a ``device`` but train on the CPU, so they
+#: never wait for a slot.
+GPU_MODELS = frozenset(PRIOR_SECONDS_PER_EPOCH)
+
 #: Seconds between checks while waiting for a slot.
 POLL_SECONDS = 2.0
 
@@ -161,12 +166,14 @@ def _try_take(table: dict, key: str, priority: float) -> str | None:
 def gpu_slot(model: str, kind: str, epochs: float, device: str | None):
     """Hold a GPU slot around a fit; yields the device to use.
 
-    Without a slot table (one model at a time, or slots off) or on the CPU,
-    yields ``device`` unchanged and only does the bookkeeping.
+    Without a slot table (one model at a time, or slots off), on the CPU or
+    for a model that trains on the CPU (not in :data:`GPU_MODELS`), yields
+    ``device`` unchanged and only does the bookkeeping.
     """
     folder = os.environ.get(SLOTS_ENV_VAR)
     work = plan(model)
-    if not folder or device is None or not str(device).startswith("cuda"):
+    on_gpu = model in GPU_MODELS and device is not None and str(device).startswith("cuda")
+    if not folder or not on_gpu:
         started = time.monotonic()
         yield device
         work.done(epochs, time.monotonic() - started)

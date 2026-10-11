@@ -129,3 +129,14 @@ def test_failed_fit_still_releases_its_slot(slots):
     with pytest.raises(RuntimeError), gpu_slots.gpu_slot("ctgan", "trial", 5, "cuda"):
         raise RuntimeError("boom")
     assert _table(folder)["gpus"]["0"] == []
+
+
+def test_cpu_models_never_wait_for_a_slot(slots):
+    folder = slots(n_gpus=1, fits_per_gpu=1)
+    with (
+        gpu_slots.gpu_slot("ctgan", "trial", 5, "cuda"),
+        gpu_slots.gpu_slot("arf", "untuned", 0, "cuda") as device,
+    ):
+        assert device == "cuda"
+    with open(folder / "fits.csv", newline="") as f:
+        assert [r["model"] for r in csv.DictReader(f)] == ["ctgan"]
