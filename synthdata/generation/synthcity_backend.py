@@ -8,6 +8,7 @@ import optuna
 import pandas as pd
 import torch
 
+from synthdata import gpu_slots
 from synthdata.config import HPOConfig
 from synthdata.generation import class_quota
 from synthdata.generation.hpo import TrialScore, epoch_range, score_candidate
@@ -208,8 +209,13 @@ def fit_generate(
     class_prior: pd.Series | None = None,
     *,
     discrete_columns: list,
+    kind: str = "fit",
 ) -> pd.DataFrame:
     """Fit plugin ``name`` on ``train_loader`` and generate ``n_samples`` rows.
+
+    With models training in parallel, the fit holds a GPU slot (see
+    :mod:`synthdata.gpu_slots`) and runs on the GPU the slot is on; ``kind``
+    ("untuned", "trial", "tuned") only labels it in the slot records.
 
     ``discrete_columns`` (the schema's categorical columns, target included when
     categorical) are the only columns synthcity treats as discrete; without it
@@ -235,18 +241,33 @@ def fit_generate(
     # default random_state (0) whatever seed the run uses.
     if "random_state" not in plugin_kwargs and plugin_accepts(name, "random_state"):
         plugin_kwargs["random_state"] = random_state
-    if device is not None and "device" not in plugin_kwargs and plugin_accepts(name, "device"):
-        plugin_kwargs["device"] = torch.device(device)
+    uses_gpu = device is not None and plugin_accepts(name, "device")
+    if "device" in plugin_kwargs:  # an HPO trial passes its device in params
+        device, uses_gpu = str(plugin_kwargs["device"]), True
+    with gpu_slots.gpu_slot(
+        name, kind, _epochs(name, plugin_kwargs), device if uses_gpu else None
+    ) as slot_device:
+        if uses_gpu and slot_device is not None:
+            plugin_kwargs["device"] = torch.device(slot_device)
+        with declared_discrete_columns(discrete_columns):
+            return _fit_generate(
+                Plugins().get(name, **plugin_kwargs),
+                train_loader,
+                n_samples,
+                random_state,
+                class_prior,
+                conditional=bool(plugin_kwargs.get("is_classification")),
+            )
 
-    with declared_discrete_columns(discrete_columns):
-        return _fit_generate(
-            Plugins().get(name, **plugin_kwargs),
-            train_loader,
-            n_samples,
-            random_state,
-            class_prior,
-            conditional=bool(plugin_kwargs.get("is_classification")),
-        )
+
+def _epochs(name: str, plugin_kwargs: dict) -> float:
+    """Training epochs (iterations) of this fit: its ``n_iter`` or the plugin's default."""
+    if "n_iter" in plugin_kwargs:
+        return float(plugin_kwargs["n_iter"])
+    if not plugin_accepts(name, "n_iter"):
+        return 0.0
+    default = inspect.signature(get_plugin_class(name).__init__).parameters["n_iter"].default
+    return 0.0 if default is inspect.Parameter.empty else float(default)
 
 
 def _fit_generate(model, train_loader, n_samples, random_state, class_prior, conditional):
@@ -341,6 +362,7 @@ def build_synthcity_objective(
             classification=classification,
             class_prior=class_prior,
             discrete_columns=discrete_columns,
+            kind="trial",
         )
         return score_candidate(trial, eval_fn, synthetic)
 

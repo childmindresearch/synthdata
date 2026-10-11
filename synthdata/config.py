@@ -705,6 +705,11 @@ class ComputeConfig:
     memory_reserve_gib: float = 16.0
     #: RAM (GiB) one model's process needs; None estimates it from the column count.
     memory_per_worker_gib: float | None = None
+    #: Fits sharing one GPU at a time while models train in parallel
+    #: (synthdata.gpu_slots): "auto" (2), a number, or 0/None to let every
+    #: model's process use its GPU whenever it likes. Fits take a slot on the
+    #: least busy GPU, and the model with the most work left goes first.
+    fits_per_gpu: str | int | None = "auto"
 
 
 #: Values of ``evaluation.class_averaging``.
@@ -1220,6 +1225,13 @@ def _validate(cfg: Config) -> None:
         value = getattr(compute, field_name)
         if not isinstance(value, int) or value < 1:
             raise ValueError(f"compute.{field_name} must be a positive integer, got {value!r}")
+    fits = compute.fits_per_gpu
+    if fits not in ("auto", None) and (
+        isinstance(fits, bool) or not isinstance(fits, int) or fits < 0
+    ):
+        raise ValueError(
+            f"compute.fits_per_gpu must be 'auto', a non-negative integer or null, got {fits!r}"
+        )
     for field_name in ("memory_reserve_gib", "memory_per_worker_gib"):
         value = getattr(compute, field_name)
         if value is not None and (not isinstance(value, (int, float)) or value <= 0):

@@ -290,6 +290,19 @@ class TestValidate:
         with pytest.raises(ValueError, match="compute.workers"):
             _validate(cfg)
 
+    @pytest.mark.parametrize("fits", [-1, "two", 1.5, True])
+    def test_invalid_fits_per_gpu_raise(self, fits):
+        cfg = self._base_valid()
+        cfg.compute.fits_per_gpu = fits
+        with pytest.raises(ValueError, match="fits_per_gpu"):
+            _validate(cfg)
+
+    @pytest.mark.parametrize("fits", ["auto", None, 0, 3])
+    def test_valid_fits_per_gpu_pass(self, fits):
+        cfg = self._base_valid()
+        cfg.compute.fits_per_gpu = fits
+        _validate(cfg)
+
     def test_valid_explicit_compute_workers_pass(self):
         cfg = self._base_valid()
         cfg.compute.workers = 3
