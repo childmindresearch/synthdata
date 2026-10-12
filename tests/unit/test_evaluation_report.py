@@ -7,7 +7,12 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from synthdata.evaluation.report import build_evaluation_report, save_evaluation_report
+from synthdata.evaluation.report import (
+    MAX_EMBED_HEIGHT_PX,
+    _Links,
+    build_evaluation_report,
+    save_evaluation_report,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -183,6 +188,39 @@ class TestBuildEvaluationReport:
         assert "![utility vs privacy](../plots/evaluation/utility_vs_privacy.png)" in text
         assert "![model a](../plots/generation/model_a.png)" in _section(text, "3. Utility")
         assert "[tstr_holdout.csv](tstr_holdout.csv)" in _section(text, "7. File index")
+
+    def test_wide_data_gets_a_column_summary_and_tall_figures_are_linked(
+        self, make_config, make_dataset
+    ):
+        cfg = make_config()
+        generation = Path(cfg.plots.output_dir) / "generation"
+        generation.mkdir(parents=True)
+        pd.DataFrame(
+            {"model_a": [0.02, 0.4, 0.05], "model_b": [0.01, 0.03, 0.02]},
+            index=pd.Index(["age", "income", "sex"], name="column"),
+        ).to_csv(generation / "column_differences.csv")
+        tall_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8 + (1000).to_bytes(4, "big")
+        tall_png += (MAX_EMBED_HEIGHT_PX + 1).to_bytes(4, "big")
+        for model in ("model_a", "model_b"):
+            (generation / f"{model}.png").write_bytes(tall_png)
+            (generation / f"{model}_top_columns.png").write_bytes(b"png")
+        utility = _section(
+            build_evaluation_report(cfg, make_dataset(), _combined_table(), {}), "3. Utility"
+        )
+        assert "income (0.40)" in utility  # model_a's worst column
+        assert utility.index("**model_b**") < utility.index("**model_a**")  # closest first
+        assert (
+            "![model_a: columns that differ most](../plots/generation/model_a_top_columns.png)"
+            in utility
+        )
+        assert "Every column: [model_a.png](../plots/generation/model_a.png)" in utility
+        assert "![model a](" not in utility
+
+        dataset_plots = Path(cfg.plots.output_dir).parent / "dataset" / "data"
+        links = _Links(Path(cfg.evaluation.output_dir))
+        dataset_plots.mkdir(parents=True)
+        (dataset_plots / "column_distributions.png").write_bytes(tall_png)
+        assert "large figure" in links.plots(dataset_plots)[0]
 
 
 class TestSaveEvaluationReport:

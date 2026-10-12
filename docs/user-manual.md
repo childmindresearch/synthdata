@@ -560,11 +560,11 @@ Evaluation scores several synthetic datasets at once, each in its own process, u
 
 ## 10. Reading report.md
 
-`report.md` sits in the evaluation folder and is the one page to read after a run. Every table and figure it mentions is linked. Its seven sections:
+`report.md` sits in the evaluation folder and is the one page to read after a run. Every table and figure it mentions is linked. A figure taller than 3000 pixels, such as a per-column grid of a wide dataset, is linked instead of shown so the page stays readable. Its seven sections:
 
 1. **At a glance.** Dataset, experiment, seed, the recommended model and its overall score, how it compares with the two baselines, the [output checks](#output-checks) count, and a "Read with care" list of warnings (for example, a single seed, a failed output check, a metric that failed for a model and is scored as its worst value, or an Anonymeter attack whose 95% interval is above 0).
 2. **Ranking.** One row per model with overall, utility, privacy and fairness scores (with intervals and "tied with best" when there are replicates), followed by how the scores were built and the trade-off plots.
-3. **Utility.** Real versus synthetic distribution plots per model, and the holdout TSTR table against the real-data ceiling.
+3. **Utility.** How far each model's columns are from the real ones (a table with each model's median and mean difference and its three worst columns; total variation distance for categorical columns, Kolmogorov-Smirnov statistic for continuous ones), a figure per model of its 12 columns that differ most, a link to its every-column figure and to `column_differences.csv` (every column and model), and the holdout TSTR table against the real-data ceiling.
 4. **Privacy evidence.** The attack and distance results next to the baselines, with how to read each column.
 5. **Fairness.** Subgroup gap metrics and log disparity, with links to sunburst pages that show which subgroups are over- or under-represented.
 6. **Data and preparation.** The split table, missingness, imputation checks and the HPO results.
