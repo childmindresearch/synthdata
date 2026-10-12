@@ -683,12 +683,39 @@ def _small_csv(path: Path, max_rows: int = 30) -> list[str]:
     return [_dataframe_to_markdown(df), ""]
 
 
+def _readiness_lines(path: Path, links: _Links) -> list[str]:
+    """Counts per data-readiness check (synthdata.data_readiness), with example columns."""
+    if not path.exists():
+        return ["_Not run (`data.readiness.enabled` is off, or imputation has not run)._"]
+    findings = pd.read_csv(path)
+    if findings.empty:
+        return [f"No findings. Table: {links.file(path)}"]
+    summary = (
+        findings.groupby(["check", "status"], sort=False)["column"]
+        .agg(
+            columns="nunique",
+            examples=lambda c: ", ".join(list(dict.fromkeys(c.astype(str)))[:5]),
+        )
+        .reset_index()
+    )
+    return [
+        "Columns likely to be hard to model, checked on the train split before any fitting "
+        "(advisory: nothing was changed). If results are weak, start here; each row of "
+        f"{links.file(path)} says what to change.",
+        "",
+        _dataframe_to_markdown(summary),
+        "",
+    ]
+
+
 def _data_section(paths: _Paths, links: _Links) -> str:
     lines = ["## 6. Data and preparation", "", "### Patient-level split", ""]
     if paths.data is not None:
         split = paths.data / "split_report.csv"
         lines += _small_csv(split)
         lines.append(f"Table: {links.maybe(split)}")
+    lines += ["", "### Data readiness", ""]
+    lines += _readiness_lines(paths.imputation / "data_readiness.csv", links)
     lines += ["", "### Columns and missingness", ""]
     plots = links.plots(paths.dataset_plots / "data")
     lines += plots or ["_Not rendered yet: run `synthdata-plot` with the `data` section._"]
@@ -730,6 +757,7 @@ _FILE_DESCRIPTIONS = {
     "split_report.csv": "Rows, patients and class balance of each split.",
     "imputation_drift.csv": "Per-column drift between the HPO-phase and final imputation.",
     "imputation_validation_report.csv": "Per-column check that imputed values are plausible.",
+    "data_readiness.csv": "Columns likely to be hard to model, with a suggested change (advisory).",
     "hpo_best_params.json": "Best hyperparameters found per model.",
     "optuna_studies.db": "Optuna studies (open with optuna-dashboard).",
     "manifest.json": "What each stage of this experiment ran and produced.",
@@ -780,7 +808,7 @@ def _file_index_section(paths: _Paths, links: _Links, report_path: Path) -> str:
     if paths.manifest is not None:
         add(paths.manifest)
         add(paths.manifest.parent / "config_snapshot.json")
-    for name in ("imputation_validation_report.csv", "imputation_drift.csv"):
+    for name in ("data_readiness.csv", "imputation_validation_report.csv", "imputation_drift.csv"):
         add(paths.imputation / name)
     if paths.data is not None:
         for name in ("split_report.csv", "full.csv", "train.csv", "test.csv"):
