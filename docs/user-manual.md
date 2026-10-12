@@ -267,6 +267,10 @@ Stage 1 runs inside `synthdata-impute`. It loads the data, cleans it, assigns co
 - `data.outlier_zscore_threshold` with `data.outlier_columns` turns sentinel codes (such as a lone 999 in a 0 to 30 scale) into missing values. List only columns you know contain such codes.
 - The variable schema (`data.variable_schema_path`) must list every remaining feature and the target exactly once. The run stops if a column is missing, duplicated or no longer in the data.
 
+### Data readiness check
+
+Before imputation, `synthdata-impute` checks the train split for columns that tend to give weak synthetic data, break metrics or leak identity. It writes `data_readiness.csv` to `output/<name>/imputation/data_v_<version>/`, with one row per finding: the check, the column, its value, the threshold, `warn` or `info`, and a suggested change. It also logs one line per check, and report.md section 6 summarizes the findings. Nothing is changed automatically. If a run's results are weak, start here: drop constant, duplicate or identifier-like columns with `data.drop_columns`, merge rare or numerous categories in your data, and expect deep generators to underfit when there are few rows per column. The checks and their thresholds (`data.readiness`; set one to `null` to turn its check off, or `enabled: false` for all) are listed with their sources in [verification.md](verification.md#data-readiness).
+
 ### Column roles
 
 Privacy and fairness metrics need to know what each column means. Three lists in `data` hold this:

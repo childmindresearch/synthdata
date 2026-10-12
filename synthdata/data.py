@@ -597,6 +597,22 @@ _IDENTIFIER_NAME = re.compile(
 )
 
 
+def identifier_like_columns(
+    df: pd.DataFrame, feature_columns: list, categorical_columns: list
+) -> list:
+    """Feature columns that look like direct identifiers (see warn_identifier_like_feature_columns)."""
+    flagged = []
+    for column in feature_columns:
+        values = df[column].dropna()
+        if _IDENTIFIER_NAME.search(str(column)) or (
+            (column in categorical_columns or not pd.api.types.is_numeric_dtype(values))
+            and len(values) >= 50
+            and values.nunique() >= 0.9 * len(values)
+        ):
+            flagged.append(column)
+    return flagged
+
+
 def warn_identifier_like_feature_columns(
     df: pd.DataFrame, feature_columns: list, categorical_columns: list
 ) -> list:
@@ -611,15 +627,7 @@ def warn_identifier_like_feature_columns(
 
     Returns the list of flagged column names (empty if none).
     """
-    flagged = []
-    for column in feature_columns:
-        values = df[column].dropna()
-        if _IDENTIFIER_NAME.search(str(column)) or (
-            (column in categorical_columns or not pd.api.types.is_numeric_dtype(values))
-            and len(values) >= 50
-            and values.nunique() >= 0.9 * len(values)
-        ):
-            flagged.append(column)
+    flagged = identifier_like_columns(df, feature_columns, categorical_columns)
     if flagged:
         logger.warning(
             "%d feature column(s) look like direct identifiers (identifier-like name, or a "

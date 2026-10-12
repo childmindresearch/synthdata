@@ -9,6 +9,7 @@ import argparse
 
 from synthdata.config import load_config
 from synthdata.data import load_dataset
+from synthdata.data_readiness import save_readiness_report
 from synthdata.experiment import dataset_plots_dir
 from synthdata.imputation import run_imputation, save_validation_report
 from synthdata.utils import get_logger, set_global_seed
@@ -37,6 +38,8 @@ def main() -> None:
     set_global_seed(cfg.seed)
 
     dataset = load_dataset(cfg)
+    # Advisory only: columns likely to be hard to model, on the train split.
+    save_readiness_report(cfg, dataset)
     dataset = run_imputation(cfg, dataset)
 
     validation_df = None

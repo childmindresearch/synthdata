@@ -26,6 +26,45 @@ import yaml
 
 
 @dataclasses.dataclass
+class DataReadinessConfig:
+    """Thresholds of the data-readiness check (synthdata.data_readiness).
+
+    The check runs on the train split at the start of ``synthdata-impute`` and
+    only advises: it writes ``data_readiness.csv`` and logs warnings, it never
+    drops or changes a column. Each threshold's source is in
+    docs/verification.md (Data readiness); null turns that check off.
+    """
+
+    #: Run the check.
+    enabled: bool = True
+    #: Near-zero variance (caret ``nearZeroVar``): the most common value is at
+    #: more than this many times as frequent as the second (caret's 95/5)...
+    near_zero_freq_ratio: float | None = 95 / 5
+    #: ...and at most this percent of the values are distinct (caret's 10).
+    near_zero_unique_percent: float = 10.0
+    #: Two continuous columns with abs(Spearman) at or above this are flagged
+    #: as near-duplicates (caret ``findCorrelation`` uses 0.90; stricter here
+    #: so only near-redundant pairs are flagged).
+    max_abs_correlation: float | None = 0.95
+    #: Columns missing in at least this share of the train rows.
+    max_missing_fraction: float | None = 0.5
+    #: Categories with fewer train rows than this (the "5 expected counts"
+    #: rule, also the floor of the HPO coverage screens).
+    min_category_rows: int | None = 5
+    #: Nominal columns with more levels than this.
+    max_levels: int | None = 50
+    #: Continuous columns with abs(skewness) above this (West, Finch & Curran).
+    max_abs_skew: float | None = 2.0
+    #: Continuous columns with at least this share of zeros.
+    max_zero_fraction: float | None = 0.5
+    #: Fewer train rows per modelled column than this.
+    min_rows_per_column: float | None = 10.0
+    #: Target classes and protected groups with fewer rows than this in the
+    #: tuning or test split.
+    min_group_rows: int | None = 5
+
+
+@dataclasses.dataclass
 class DataConfig:
     """Where the raw dataset comes from and how columns should be interpreted."""
 
@@ -125,6 +164,9 @@ class DataConfig:
     #: z-scores >10), so only list columns confirmed to have genuine
     #: sentinel/corrupted values, not just a skewed distribution.
     outlier_columns: list = dataclasses.field(default_factory=list)
+
+    #: Data-readiness check run before imputation (see DataReadinessConfig).
+    readiness: DataReadinessConfig = dataclasses.field(default_factory=DataReadinessConfig)
 
     #: Patient-level three-way split, as approximate shares of rows: whole
     #: patients are assigned while the folds balance encounter counts. ``train`` fits the imputer and the HPO

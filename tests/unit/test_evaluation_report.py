@@ -13,6 +13,7 @@ from synthdata.evaluation.report import (
     build_evaluation_report,
     save_evaluation_report,
 )
+from synthdata.experiment import imputation_output_dir
 
 pytestmark = pytest.mark.unit
 
@@ -251,3 +252,26 @@ def test_privacy_flags_handles_no_and_some_successful_attacks(ci_low):
     flags = _privacy_flags(attacks)
     assert len(flags) == (1 if ci_low > 0 else 0)
     assert all("baseline_train_copy" not in flag for flag in flags)
+
+
+def test_data_section_summarizes_the_readiness_findings(make_config, make_dataset):
+    cfg = make_config()
+    findings = pd.DataFrame(
+        {
+            "check": ["constant", "constant", "skewed"],
+            "column": ["a", "b", "c"],
+            "value": [1, 1, 3.1],
+            "threshold": [1, 1, 2],
+            "status": ["warn", "warn", "info"],
+            "action": ["drop", "drop", "log"],
+        }
+    )
+    text = build_evaluation_report(cfg, make_dataset(), _combined_table(), {})
+    assert "_Not run" in _section(text, "6. Data and preparation")
+    findings.to_csv(imputation_output_dir(cfg) / "data_readiness.csv", index=False)
+    data = _section(
+        build_evaluation_report(cfg, make_dataset(), _combined_table(), {}),
+        "6. Data and preparation",
+    )
+    assert "| constant | warn | 2 | a, b |" in data
+    assert "| skewed | info | 1 | c |" in data
