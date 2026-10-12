@@ -54,7 +54,7 @@ generation:
   # many real train rows too.
   n_samples: null
   # Seed replicates per model; 2+ gives every score a 95% interval.
-  n_replicates: 1
+  n_replicates: 3 # Small data, so intervals are cheap here.
 
   synthcity:
     enabled: true
