@@ -19,8 +19,13 @@ class TestResolveMetricConfig:
         assert result["attack"] == SYNTHCITY_METRIC_CONFIG["attack"]
         assert "attacks" not in result
 
-    def test_final_evaluation_catalog_retains_domias(self):
-        assert "DomiasMIA_prior" in SYNTHCITY_METRIC_CONFIG["privacy"]
+    def test_domias_runs_only_when_named(self):
+        # Fails on wide data (singular KDE covariance); see SYNTHCITY_OPT_IN_METRICS.
+        assert "DomiasMIA_prior" not in resolve_metric_config(FrameworkSelectionConfig())["privacy"]
+        by_category = resolve_metric_config(FrameworkSelectionConfig(categories=["privacy"]))
+        assert "DomiasMIA_prior" not in by_category["privacy"]
+        named = resolve_metric_config(FrameworkSelectionConfig(metrics=["DomiasMIA_prior"]))
+        assert named == {"privacy": ["DomiasMIA_prior"]}
 
     def test_privacy_category_includes_attack_metrics(self):
         result = resolve_metric_config(FrameworkSelectionConfig(categories=["privacy"]))

@@ -24,6 +24,7 @@ from synthdata.config import ComputeConfig
 from synthdata.evaluation.catalog import (
     SYNTHCITY_CATEGORY_TO_TYPE,
     SYNTHCITY_METRIC_CONFIG,
+    SYNTHCITY_OPT_IN_METRICS,
     resolve_selection,
     synthcity_metric_uses_held_out,
 )
@@ -155,7 +156,10 @@ def run_synthcity_metrics(
 
 
 def resolve_metric_config(selection_cfg) -> dict:
-    """Filter SYNTHCITY_METRIC_CONFIG down to the configured selection."""
+    """Filter SYNTHCITY_METRIC_CONFIG down to the configured selection.
+
+    SYNTHCITY_OPT_IN_METRICS run only when listed in ``metrics`` by name.
+    """
     all_names = [n for names in SYNTHCITY_METRIC_CONFIG.values() for n in names]
     name_to_type = {
         n: SYNTHCITY_CATEGORY_TO_TYPE[cat]
@@ -169,6 +173,8 @@ def resolve_metric_config(selection_cfg) -> dict:
         all_names,
         name_to_type,
     )
+    if not selection_cfg.metrics:
+        selected = [n for n in selected if n not in SYNTHCITY_OPT_IN_METRICS]
     metric_config = {
         cat: [n for n in names if n in selected] for cat, names in SYNTHCITY_METRIC_CONFIG.items()
     }

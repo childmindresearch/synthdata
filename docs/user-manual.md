@@ -511,7 +511,7 @@ Metrics come from three sources, each switched on in `evaluation.synthcity`, `ev
 
 | Source | Examples |
 | --- | --- |
-| [synthcity](https://github.com/vanderschaarlab/synthcity) | Distribution distances (Wasserstein, KL, PRDC), detection AUC (can a classifier tell real from synthetic?), identifiability, DOMIAS |
+| [synthcity](https://github.com/vanderschaarlab/synthcity) | Distribution distances (Wasserstein, KL, PRDC), detection AUC (can a classifier tell real from synthetic?), identifiability (DOMIAS only when named in `metrics`; it fails on wide data, see [verification.md](verification.md#synthcity-metrics)) |
 | [SynthEval](https://github.com/schneiderkamplab/syntheval) | Correlation and distribution differences, classifier accuracy and AUROC difference, nearest-neighbour adversarial accuracy, epsilon risk, statistical parity and other subgroup gaps |
 | Custom (this project) | Holdout TSTR, Anonymeter attacks, holdout distance checks, log disparity, equalized odds and equal opportunity |
 

@@ -56,6 +56,17 @@ SYNTHCITY_METRIC_CONFIG = {
     ],
 }
 
+#: Metrics in SYNTHCITY_METRIC_CONFIG that run only when named in the
+#: ``metrics`` list of the selection, never by default or by category.
+#: DomiasMIA_prior fits a Gaussian KDE to the synthetic rows in every column:
+#: on wide data (LORIS, ~1090 columns) one constant or duplicated column makes
+#: the covariance singular and it fails for every model, and even when it runs
+#: Scott's bandwidth factor n^(-1/(d+4)) is ~1, so the "KDE" is close to one
+#: Gaussian over the whole data and cannot see local overfitting. SynthEval's
+#: mia, Anonymeter and the holdout DCR/NNDR cover membership inference
+#: (docs/verification.md).
+SYNTHCITY_OPT_IN_METRICS = frozenset({"DomiasMIA_prior"})
+
 #: synthcity's own "category" (sanity/stats/.../attack) rolled up to utility/privacy.
 #: Detection metrics are the AUC of a classifier telling real rows from
 #: synthetic ones, a fidelity measure: a generator that adds noise to every
