@@ -15,12 +15,20 @@ pytestmark = pytest.mark.unit
 
 def test_gpu_usage_sums_memory_and_keeps_only_the_pipelines_processes(monkeypatch):
     replies = {
-        "--query-gpu=utilization.gpu,memory.used": [["90", "40000"], ["10", "2000"]],
+        "--query-gpu=utilization.gpu,memory.used,memory.total": [
+            ["90", "40000", "49152"],
+            ["10", "2000", "24576"],
+        ],
         "--query-compute-apps=pid,used_memory": [["11", "30000"], ["99", "5000"], ["12", "1000"]],
     }
     monkeypatch.setattr(resources, "_nvidia_smi", lambda query: replies[query])
     assert resources.gpu_usage({11, 12}) == (
-        {"gpu_util_pct": 50.0, "gpu_mem_used_mib": 42000, "pipeline_vram_mib": 31000},
+        {
+            "gpu_util_pct": 50.0,
+            "gpu_mem_used_mib": 42000,
+            "gpu_mem_total_mib": 73728,
+            "pipeline_vram_mib": 31000,
+        },
         {11: 30000, 12: 1000},
     )
 
@@ -28,11 +36,14 @@ def test_gpu_usage_sums_memory_and_keeps_only_the_pipelines_processes(monkeypatc
 def test_gpu_usage_leaves_pipeline_vram_empty_when_per_process_memory_is_na(monkeypatch):
     # Windows (WDDM) drivers report a process's GPU memory as "[N/A]".
     replies = {
-        "--query-gpu=utilization.gpu,memory.used": [["40", "3000"]],
+        "--query-gpu=utilization.gpu,memory.used,memory.total": [["40", "3000", "8192"]],
         "--query-compute-apps=pid,used_memory": [["11", "[N/A]"], ["99", "[N/A]"]],
     }
     monkeypatch.setattr(resources, "_nvidia_smi", lambda query: replies[query])
-    assert resources.gpu_usage({11}) == ({"gpu_util_pct": 40.0, "gpu_mem_used_mib": 3000}, {})
+    assert resources.gpu_usage({11}) == (
+        {"gpu_util_pct": 40.0, "gpu_mem_used_mib": 3000, "gpu_mem_total_mib": 8192},
+        {},
+    )
 
 
 def test_gpu_usage_is_empty_without_nvidia_smi(monkeypatch):

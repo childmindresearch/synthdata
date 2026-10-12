@@ -7,7 +7,14 @@ import pandas as pd
 
 from synthdata.config import Config
 from synthdata.data import Dataset
-from synthdata.plotting import add_histogram_with_kde, ordered_categories, save_matplotlib_figure
+from synthdata.plotting import (
+    add_histogram_with_kde,
+    column_bar_chart,
+    ordered_categories,
+    save_matplotlib_figure,
+    set_category_ticks,
+    wrapped_title,
+)
 
 
 def plot_observed_vs_imputed(
@@ -62,12 +69,11 @@ def plot_observed_vs_imputed(
                 width,
                 label="imputed",
             )
-            ax.set_xticks(positions)
-            ax.set_xticklabels(categories)
+            set_category_ticks(ax, positions, categories)
         else:
             add_histogram_with_kde(ax, observed, bins=15, label="observed", alpha=0.45, color="C0")
             add_histogram_with_kde(ax, imputed, bins=15, label="imputed", alpha=0.45, color="C1")
-        ax.set_title(f"{col} (n_imputed = {n_imputed})", fontsize=9)
+        ax.set_title(wrapped_title(f"{col} (n_imputed = {n_imputed})"), fontsize=9)
         ax.legend(fontsize=7)
 
     for ax in axes_flat[len(columns_with_missing) :]:
@@ -81,16 +87,21 @@ def plot_validation_summary(validation_df: pd.DataFrame):
     """Bar chart of per-column imputation validation pass rates."""
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(max(6, 0.5 * len(validation_df)), 4))
-    if len(validation_df):
-        pass_rate = validation_df["n_valid"] / validation_df["n_imputed"].replace(0, np.nan)
-        colors = ["#2a9d8f" if ok else "#e76f51" for ok in validation_df["all_valid"]]
-        ax.bar(validation_df["column"], pass_rate.fillna(1.0), color=colors, zorder=3)
-        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
-        ax.set_ylim(0, 1.05)
-    ax.set_ylabel("Fraction of imputed values\nwithin plausible range")
-    ax.set_title("Imputation validation summary")
-    ax.grid(True, linestyle="--", alpha=0.4, axis="y", zorder=0)
+    if not len(validation_df):
+        fig, ax = plt.subplots(figsize=(4, 2))
+        ax.text(0.5, 0.5, "No imputed values to validate", ha="center", va="center")
+        ax.axis("off")
+        return fig
+    pass_rate = validation_df["n_valid"] / validation_df["n_imputed"].replace(0, np.nan)
+    colors = ["#2a9d8f" if ok else "#e76f51" for ok in validation_df["all_valid"]]
+    fig, _ = column_bar_chart(
+        validation_df["column"].astype(str),
+        pass_rate.fillna(1.0),
+        xlabel="Fraction of imputed values within plausible range",
+        title="Imputation validation summary",
+        colors=colors,
+        xmax=1.05,
+    )
     return fig
 
 

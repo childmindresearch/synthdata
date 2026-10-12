@@ -16,6 +16,8 @@ from synthdata.plotting import (
     ordered_categories,
     save_matplotlib_figure,
     save_plotly_figure,
+    set_category_ticks,
+    wrapped_title,
 )
 from synthdata.utils import get_logger
 
@@ -81,8 +83,7 @@ def plot_real_vs_synthetic(
                 width,
                 label="synthetic",
             )
-            ax.set_xticks(positions)
-            ax.set_xticklabels(categories)
+            set_category_ticks(ax, positions, categories)
             ax.set_ylabel("frequency")
         else:
             add_histogram_with_kde(ax, real_df[col], bins=20, label="real", alpha=0.4, color="C0")
@@ -90,7 +91,7 @@ def plot_real_vs_synthetic(
                 ax, synth_df[col], bins=20, label="synthetic", alpha=0.4, color="C1"
             )
             ax.set_ylabel("density")
-        ax.set_title(col, fontsize=9)
+        ax.set_title(wrapped_title(col), fontsize=9)
         ax.legend(fontsize=7)
 
     for ax in axes_flat[len(feature_columns) :]:
