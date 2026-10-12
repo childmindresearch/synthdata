@@ -19,12 +19,14 @@ Usage:
 """
 
 import argparse
+import contextlib
 import inspect
 import json
 import os
 import platform
 import shutil
 import subprocess
+import sys
 import time
 from importlib import metadata
 from pathlib import Path
@@ -65,10 +67,10 @@ def system_info(dataset, device: str) -> dict:
         if torch.cuda.is_available()
         else []
     )
-    try:
-        ram_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
-    except (ValueError, OSError, AttributeError):
-        ram_gb = None
+    ram_gb = None
+    if sys.platform != "win32":  # os.sysconf does not exist on Windows
+        with contextlib.suppress(ValueError, OSError):
+            ram_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
     return {
         "platform": platform.platform(),
         "python": platform.python_version(),

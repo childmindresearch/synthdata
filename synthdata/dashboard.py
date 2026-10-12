@@ -697,8 +697,10 @@ def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
     resources = read_resources(log_path)
     machine = {}
     if same_host:
-        with contextlib.suppress(AttributeError, OSError):
-            machine["cpu_cores"] = len(os.sched_getaffinity(0))
+        affinity = getattr(os, "sched_getaffinity", None)  # Linux only
+        if affinity is not None:
+            with contextlib.suppress(OSError):
+                machine["cpu_cores"] = len(affinity(0))
         machine.setdefault("cpu_cores", psutil.cpu_count())
 
     problems = list(parsed["problems"])
