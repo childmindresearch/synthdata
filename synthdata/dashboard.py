@@ -451,7 +451,18 @@ def read_hpo(db_path: Path | None, budgets: dict, now: datetime) -> tuple[list[d
         con.close()
 
     out = []
+    with_trials = {study_id for _, study_id, *_ in trials}
+    by_name = {name: study_id for study_id, name in studies.items()}
     for study_id, name in studies.items():
+        if name.endswith("_probe"):
+            # objective: auto's start-up trials; once copied into the main
+            # study they show there, until then they stand in for it.
+            main = by_name.get(name.removesuffix("_probe"))
+            if main in with_trials:
+                continue
+            name = name.removesuffix("_probe")
+        elif name + "_probe" in by_name and study_id not in with_trials:
+            continue
         maximize = str(directions.get(study_id, "MAXIMIZE")).upper().endswith("MAXIMIZE")
         rows = [t for t in trials if t[1] == study_id]
         counts = {"COMPLETE": 0, "PRUNED": 0, "FAIL": 0, "RUNNING": 0}

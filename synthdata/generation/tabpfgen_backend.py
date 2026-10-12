@@ -14,7 +14,7 @@ from sklearn.neighbors import NearestNeighbors
 from tabpfgen import TabPFGen
 
 from synthdata.data import decode_label_encoded_columns, label_encode_non_numeric_columns
-from synthdata.generation.hpo import TrialScore, score_candidate
+from synthdata.generation.hpo import TrialScore, score_candidate, trial_seed
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -288,11 +288,14 @@ def build_tabpfgen_custom_objective(
                 .values
             )
             parts = []
+            draw_seed = trial_seed(trial, seed)
             for cls, prop in proportions.items():
                 n_need = round(n_samples * prop)
                 rows = all_df[all_df[target_column] == cls]
-                parts.append(rows.sample(n=n_need, replace=len(rows) < n_need, random_state=seed))
-            syn = pd.concat(parts).sample(frac=1, random_state=seed).reset_index(drop=True)
+                parts.append(
+                    rows.sample(n=n_need, replace=len(rows) < n_need, random_state=draw_seed)
+                )
+            syn = pd.concat(parts).sample(frac=1, random_state=draw_seed).reset_index(drop=True)
         except (ValueError, RuntimeError) as exc:
             logger.warning("tabpfgen_custom trial %d failed: %s", trial.number, exc)
             raise

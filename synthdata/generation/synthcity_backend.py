@@ -11,7 +11,7 @@ import torch
 from synthdata import gpu_slots
 from synthdata.config import HPOConfig
 from synthdata.generation import class_quota
-from synthdata.generation.hpo import TrialScore, epoch_range, score_candidate
+from synthdata.generation.hpo import TrialScore, epoch_range, score_candidate, trial_seed
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -81,6 +81,65 @@ def untuned_params(name: str, hpo_cfg) -> dict:
     return {"n_iter": bounds[1]} if bounds[1] < default.default else {}
 
 
+def library_defaults(name: str, hpo_cfg) -> dict:
+    """The plugin's constructor defaults, training length capped as for the untuned model."""
+    params = {
+        key: p.default
+        for key, p in inspect.signature(get_plugin_class(name).__init__).parameters.items()
+        if p.default is not inspect.Parameter.empty
+    }
+    params.update(untuned_params(name, hpo_cfg))
+    return params
+
+
+def default_trial_params(name: str, hpo_cfg) -> dict:
+    """The library defaults that fall inside the searched space, as trial params.
+
+    Enqueued as the first trial (``hpo.enqueue_defaults``), so the search
+    starts from the untuned model; a default outside the space (an excluded
+    choice, a value off the integer grid) is left for the sampler to draw.
+    """
+    defaults = library_defaults(name, hpo_cfg)
+    plugin_cls = get_plugin_class(name)
+    native_iter = any(d.name == "n_iter" for d in plugin_cls.hyperparameter_space())
+    epochs = (
+        epoch_range(hpo_cfg, name, None if native_iter else EPOCH_RANGE_DEFAULTS.get(name))
+        if plugin_accepts(name, "n_iter")
+        else None
+    )
+    fixed = HPO_FIXED_PARAMS.get(name, {})
+    ranges = HPO_PARAM_RANGES.get(name, {})
+    excluded = HPO_EXCLUDED_CHOICES.get(name, {})
+    searched = hpo_cfg.search_params.get(name)
+    trial_params = {}
+    spaces = list(plugin_cls.hyperparameter_space())
+    names = [d.name for d in spaces] + (["n_iter"] if epochs and not native_iter else [])
+    for dist_name in names:
+        if dist_name in fixed or dist_name not in defaults:
+            continue
+        if searched is not None and dist_name not in searched:
+            continue
+        value = defaults[dist_name]
+        dist = next((d for d in spaces if d.name == dist_name), None)
+        if dist_name == "n_iter" and epochs is not None:
+            low, high, step = epochs
+            if isinstance(value, int) and low <= value <= high and (value - low) % step == 0:
+                trial_params[dist_name] = value
+        elif hasattr(dist, "choices"):
+            if value in dist.choices and value not in excluded.get(dist_name, frozenset()):
+                trial_params[dist_name] = value
+        elif dist is not None:
+            low, high = ranges.get(dist_name, (dist.low, dist.high))[:2]
+            step = ranges.get(dist_name, (None, None, getattr(dist, "step", None)))[2]
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                continue
+            if low <= value <= high and (
+                not step or isinstance(value, float) or (value - low) % step == 0
+            ):
+                trial_params[dist_name] = value
+    return trial_params
+
+
 def _pruning_patience_metric_class():
     from synthcity.metrics.weighted_metrics import WeightedMetrics
 
@@ -124,7 +183,9 @@ class _SearchSpaceTrial:
     excluded categorical choices, returns ``fixed`` values without searching
     them, replaces integer ranges with ``ranges`` and the ``n_iter`` range with
     ``epochs`` when given, and keeps
-    the rest of the space as synthcity defines it.
+    the rest of the space as synthcity defines it. With ``searched`` (a set of
+    names), any other parameter takes its ``defaults`` value instead of being
+    searched (``hpo.search_params``).
     """
 
     def __init__(
@@ -134,27 +195,44 @@ class _SearchSpaceTrial:
         epochs: tuple[int, int, int] | None = None,
         fixed: dict[str, object] | None = None,
         ranges: dict[str, tuple[int, int, int]] | None = None,
+        searched: set | None = None,
+        defaults: dict | None = None,
     ):
         self._trial = trial
+        self._searched = searched
+        self._defaults = defaults or {}
         self._ranges = ranges or {}
         self._excluded = excluded or {}
         self._epochs = epochs
         self._fixed = fixed or {}
 
+    def _held(self, name) -> bool:
+        return name in self._fixed or (
+            self._searched is not None and name not in self._searched and name in self._defaults
+        )
+
+    def _held_value(self, name):
+        return self._fixed[name] if name in self._fixed else self._defaults[name]
+
     def suggest_categorical(self, name, choices):
-        if name in self._fixed:
-            return self._fixed[name]
+        if self._held(name):
+            return self._held_value(name)
         drop = self._excluded.get(name, frozenset())
         return self._trial.suggest_categorical(name, [c for c in choices if c not in drop])
 
     def suggest_int(self, name, low, high, step=1, log=False):
-        if name in self._fixed:
-            return self._fixed[name]
+        if self._held(name):
+            return self._held_value(name)
         if name == "n_iter" and self._epochs is not None:
             low, high, step = self._epochs
         elif name in self._ranges:
             low, high, step = self._ranges[name]
         return self._trial.suggest_int(name, low, high, step=step, log=log)
+
+    def suggest_float(self, name, low, high, *, step=None, log=False):
+        if self._held(name):
+            return self._held_value(name)
+        return self._trial.suggest_float(name, low, high, step=step, log=log)
 
     def __getattr__(self, attr):
         return getattr(self._trial, attr)
@@ -331,6 +409,8 @@ def build_synthcity_objective(
     default_range = None if native_iter else EPOCH_RANGE_DEFAULTS.get(name)
     epochs = epoch_range(hpo_cfg, name, default_range) if accepts_iter else None
     trial_device = "cpu" if device == "mps" else device
+    searched = hpo_cfg.search_params.get(name)
+    defaults = library_defaults(name, hpo_cfg) if searched is not None else {}
 
     def objective(trial: optuna.Trial) -> float:
         # Training length is searched, not capped: the plugin's own n_iter
@@ -341,11 +421,14 @@ def build_synthcity_objective(
             epochs,
             HPO_FIXED_PARAMS.get(name),
             HPO_PARAM_RANGES.get(name),
+            searched=set(searched) if searched is not None else None,
+            defaults=defaults,
         )
         params = plugin_cls.sample_hyperparameters_optuna(proxy)
         if epochs is not None and "n_iter" not in params:
             params["n_iter"] = proxy.suggest_int("n_iter", *epochs)
-        params["random_state"] = seed
+        fit_seed = trial_seed(trial, seed)
+        params["random_state"] = fit_seed
         if accepts_device:
             params["device"] = torch.device(trial_device)
         if accepts_patience_metric and hpo_cfg.pruner:
@@ -357,7 +440,7 @@ def build_synthcity_objective(
             params,
             train_loader,
             n_samples,
-            seed,
+            fit_seed,
             workspace=workspace,
             classification=classification,
             class_prior=class_prior,

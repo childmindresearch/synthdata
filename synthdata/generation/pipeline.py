@@ -245,6 +245,7 @@ def run_generation(
             seed,
             match_prior=match_prior,
             workspace=output_dir / "synthcity_workspace",
+            protected_columns=dataset.protected_columns,
         )
 
     def _cached_or_build(name, build_fn):
@@ -456,6 +457,8 @@ def run_generation(
                         checkpoint_workspace=output_dir / "synthcity_workspace",
                         checkpoint_plugin=name,
                         reserve_seconds=untuned_seconds,
+                        default_params=sc.default_trial_params(name, gen_cfg.hpo),
+                        headroom=hpo_eval_fn.headroom,
                     )
                     best_params.set("synthcity", name, params)
                 params = dict(best_params.get("synthcity", name))
@@ -571,6 +574,7 @@ def run_generation(
                         gen_cfg.hpo,
                         output_dir,
                         seed,
+                        headroom=getattr(eval_fn, "headroom", None),
                     )
                     best_params.set("tabpfgen", "tabpfgen_standard", params)
                 params = best_params.get("tabpfgen", "tabpfgen_standard")
@@ -620,6 +624,7 @@ def run_generation(
                         gen_cfg.hpo,
                         output_dir,
                         seed,
+                        headroom=getattr(eval_fn, "headroom", None),
                     )
                     best_params.set("tabpfgen", "tabpfgen_custom", params)
                 params = best_params.get("tabpfgen", "tabpfgen_custom")

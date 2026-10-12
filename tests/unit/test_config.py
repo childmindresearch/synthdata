@@ -61,7 +61,7 @@ class TestFromDict:
         assert cfg.generation.hpo.n_trials == 3
         assert cfg.generation.n_samples == 50
         # HPOConfig's other defaults are preserved.
-        assert cfg.generation.hpo.pruner == "median"
+        assert cfg.generation.hpo.pruner is None
 
     def test_unknown_top_level_key_raises(self):
         with pytest.raises(ValueError, match="Unknown config key"):
@@ -192,7 +192,7 @@ class TestValidate:
 
     def test_hpo_objective_and_screens_are_validated(self):
         cfg = self._base_valid()
-        assert cfg.generation.hpo.objective == "tstr_macro_f1"
+        assert cfg.generation.hpo.objective == "auto"
         cfg.generation.hpo.objective = "accuracy"
         with pytest.raises(ValueError, match="hpo.objective"):
             _validate(cfg)
