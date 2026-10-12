@@ -108,6 +108,14 @@ class TestBuildPreset:
         for name in FAIRNESS_METRICS_WITH_POSITIVE_CLASS:
             assert SYNTHEVAL_PRESET[name]["positive_class"] == 1
 
+    def test_multiclass_target_leaves_out_binary_only_metrics(self):
+        # SynthEval returns nothing for them on a 3+ class target; the
+        # one-vs-rest pass computes them instead.
+        full = build_preset(self._selection())
+        multiclass = build_preset(self._selection(), multiclass_target=True)
+        assert full.keys() >= BINARY_ONLY_METRICS
+        assert multiclass.keys() == full.keys() - BINARY_ONLY_METRICS
+
     def test_disabled_selection_returns_empty(self):
         preset = build_preset(self._selection(enabled=False))
         assert preset == {}

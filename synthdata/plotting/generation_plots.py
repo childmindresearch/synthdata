@@ -101,39 +101,109 @@ def plot_real_vs_synthetic(
     return fig
 
 
+#: Columns in each model's summary figure (the ones that differ most).
+TOP_COLUMNS = 12
+
+
+def column_differences(
+    real_df: pd.DataFrame, synth_df: pd.DataFrame, columns: list, categorical_columns: list
+) -> pd.Series:
+    """How far each column's synthetic distribution is from the real one, in [0, 1].
+
+    Categorical (or text) columns: total variation distance between the
+    category shares.
+    Numeric columns outside ``categorical_columns``: the two-sample Kolmogorov-Smirnov statistic
+    (``scipy.stats.ks_2samp``). 0 is identical, 1 disjoint; a column missing
+    from the synthetic data scores 1.
+    """
+    from scipy.stats import ks_2samp
+
+    out = {}
+    for col in columns:
+        if col not in real_df.columns:
+            continue
+        real, synth = real_df[col].dropna(), synth_df[col].dropna() if col in synth_df else None
+        if synth is None or synth.empty or real.empty:
+            out[col] = 1.0
+        elif col in categorical_columns or not pd.api.types.is_numeric_dtype(real):
+            a, b = _category_value_counts(real), _category_value_counts(synth)
+            keys = a.index.union(b.index)
+            out[col] = float(
+                (a.reindex(keys, fill_value=0) - b.reindex(keys, fill_value=0)).abs().sum() / 2
+            )
+        else:
+            out[col] = float(
+                ks_2samp(
+                    pd.to_numeric(real, errors="coerce").dropna(),
+                    pd.to_numeric(synth, errors="coerce").dropna(),
+                ).statistic
+            )
+    return pd.Series(out, name="difference", dtype=float)
+
+
+def save_model_comparison(
+    cfg: Config, dataset: Dataset, name: str, synth_df: pd.DataFrame, output_dir: str | Path
+) -> None:
+    """One model's real-vs-synthetic figures and its column differences.
+
+    Writes ``<name>.png`` (every column), ``<name>_top_columns.png`` (the
+    TOP_COLUMNS columns that differ most) and the model's column of
+    ``column_differences.csv``, all under ``output_dir/generation``. The real
+    reference is the imputed train split (fully observed, so every column is
+    comparable), falling back to the raw train split.
+    """
+    import matplotlib.pyplot as plt
+
+    output_dir = Path(output_dir) / "generation"
+    real_model_df = (
+        dataset.train_imputed_df if dataset.train_imputed_df is not None else dataset.train_df
+    )
+    real_df = dataset.decode_ordinal_frame(real_model_df)
+    synth_df = dataset.decode_ordinal_frame(synth_df)
+    columns = dataset.feature_columns + [dataset.target_column]
+    categorical = dataset.all_categorical_columns
+    differences = column_differences(real_df, synth_df, columns, categorical)
+    _record_differences(output_dir / "column_differences.csv", name, differences)
+    top = differences.sort_values(ascending=False, kind="stable").index[:TOP_COLUMNS].tolist()
+    for suffix, cols in (("", columns), ("_top_columns", top)):
+        fig = plot_real_vs_synthetic(
+            real_df, synth_df, cols, categorical, category_orders=dataset.ordinal_category_orders
+        )
+        try:
+            save_matplotlib_figure(
+                fig, output_dir / f"{name}{suffix}", cfg.plots.dpi, cfg.plots.formats
+            )
+        finally:
+            plt.close(fig)
+
+
+def _record_differences(path: Path, name: str, differences: pd.Series) -> None:
+    """Put one model's column differences into the columns x models table."""
+    from filelock import FileLock
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(f"{path}.lock"):
+        table = pd.read_csv(path, index_col=0) if path.exists() else pd.DataFrame()
+        table = table.reindex(table.index.union(differences.index, sort=False))
+        table[name] = differences
+        table.index.name = "column"
+        table.to_csv(path)
+
+
 def save_generation_plots(
     cfg: Config,
     dataset: Dataset,
     synthetic_datasets: dict[str, pd.DataFrame],
     output_dir: str | Path,
 ) -> None:
-    """Save one real-vs-synthetic figure per generated model.
-
-    All comparisons use the imputed train split as the "real" reference (even
-    for TabPFN variants fit on the pre-imputation split), since it is fully
-    observed and comparable across every column.
-    """
+    """Save each model's real-vs-synthetic figures (see :func:`save_model_comparison`)."""
     import matplotlib.pyplot as plt
 
-    output_dir = Path(output_dir) / "generation"
-    real_model_df = dataset.train_imputed_df
-    if real_model_df is None:
+    if dataset.train_imputed_df is None:
         raise RuntimeError("save_generation_plots() requires imputed training data")
-    real_df = dataset.decode_ordinal_frame(real_model_df)
-    all_columns = dataset.feature_columns + [dataset.target_column]
-    categorical = dataset.all_categorical_columns
-
     for name, synth_df in synthetic_datasets.items():
         try:
-            decoded_synth_df = dataset.decode_ordinal_frame(synth_df)
-            fig = plot_real_vs_synthetic(
-                real_df,
-                decoded_synth_df,
-                all_columns,
-                categorical,
-                category_orders=dataset.ordinal_category_orders,
-            )
-            save_matplotlib_figure(fig, output_dir / name, cfg.plots.dpi, cfg.plots.formats)
+            save_model_comparison(cfg, dataset, name, synth_df, output_dir)
         except (ValueError, TypeError, OSError, RuntimeError) as exc:
             logger.warning("real-vs-synthetic plot failed for %s: %s", name, exc)
         finally:

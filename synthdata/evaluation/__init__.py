@@ -103,6 +103,8 @@ def run_evaluation(
         if want_syntheval_plots
         else None
     )
+    n_classes = dataset.train_imputed_df[dataset.target_column].nunique()
+    multiclass_target = dataset.target_is_categorical and n_classes > 2
     benchmark_results, benchmark_ranks = syntheval_eval.run_syntheval_evaluation(
         selected_datasets,
         dataset,
@@ -114,11 +116,11 @@ def run_evaluation(
         positive_class=eval_cfg.positive_class,
         execution_cfg=cfg.compute,
         seed=cfg.seed,
+        multiclass_target=multiclass_target,
     )
 
     ovr_per_class = None
-    n_classes = dataset.train_imputed_df[dataset.target_column].nunique()
-    if eval_cfg.class_averaging == "ovr_macro" and dataset.target_is_categorical and n_classes > 2:
+    if eval_cfg.class_averaging == "ovr_macro" and multiclass_target:
         ovr_results, ovr_ranks, ovr_per_class = syntheval_eval.run_ovr_macro_syntheval_evaluation(
             selected_datasets,
             dataset,

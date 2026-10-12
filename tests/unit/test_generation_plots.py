@@ -9,7 +9,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from synthdata.plotting import wrapped_title
-from synthdata.plotting.generation_plots import plot_real_vs_synthetic
+from synthdata.plotting.generation_plots import column_differences, plot_real_vs_synthetic
 
 pytestmark = pytest.mark.unit
 
@@ -74,3 +74,38 @@ def test_column_bar_charts_have_no_empty_band_with_many_columns():
         assert (low, high) == (-0.5, len(names) - 0.5)
         assert ax.get_yticklabels()[0].get_text().startswith("simulated_feature_000")
         plt.close(fig)
+
+
+def test_column_differences_are_zero_for_a_copy_and_one_for_disjoint_data():
+    rng = np.random.default_rng(0)
+    real = pd.DataFrame({"cat": rng.integers(0, 3, 300), "num": rng.normal(size=300)})
+    same = column_differences(real, real, ["cat", "num"], ["cat"])
+    assert same.tolist() == [0.0, 0.0]
+    shifted = pd.DataFrame({"cat": real["cat"] + 10, "num": real["num"] + 100})
+    apart = column_differences(real, shifted, ["cat", "num", "gone"], ["cat"])
+    assert apart.tolist() == [1.0, 1.0]  # "gone" is in neither frame: skipped
+    missing = column_differences(real, real[["num"]], ["cat"], ["cat"])
+    assert missing["cat"] == 1.0
+
+
+def test_model_comparison_writes_both_figures_and_one_table_column_per_model(
+    make_config, make_dataset
+):
+    from pathlib import Path
+
+    from synthdata.plotting.generation_plots import TOP_COLUMNS, save_model_comparison
+
+    cfg = make_config()
+    dataset = make_dataset()
+    real = dataset.train_df
+    for name, df in (("copy", real), ("shuffled", real.sample(frac=1, random_state=0))):
+        save_model_comparison(cfg, dataset, name, df, cfg.plots.output_dir)
+    generation = Path(cfg.plots.output_dir) / "generation"
+    for name in ("copy", "shuffled"):
+        assert (generation / f"{name}.png").exists()
+        assert (generation / f"{name}_top_columns.png").exists()
+    table = pd.read_csv(generation / "column_differences.csv", index_col=0)
+    assert list(table.columns) == ["copy", "shuffled"]
+    assert len(table) == len(dataset.feature_columns) + 1 > 0
+    assert (table["copy"] == 0).all()
+    assert TOP_COLUMNS == 12

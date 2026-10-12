@@ -14,6 +14,7 @@ Requires imputed data (run `synthdata-impute` first).
 """
 
 import argparse
+from pathlib import Path
 
 from synthdata.config import load_config
 from synthdata.data import load_dataset, load_imputed_splits
@@ -73,41 +74,28 @@ def main() -> None:
 
     plot_callback = None
     if args.plot:
-        import matplotlib.pyplot as plt
-
-        from synthdata.plotting import save_matplotlib_figure
-        from synthdata.plotting.generation_plots import plot_real_vs_synthetic
+        from synthdata.plotting.generation_plots import save_model_comparison
 
         def plot_callback(name, df, extra):  # noqa: ARG001 - extra unused, kept for interface symmetry
-            real_df = (
-                dataset.train_imputed_df
-                if dataset.train_imputed_df is not None
-                else dataset.train_df
-            )
-            real_df = dataset.decode_ordinal_frame(real_df)
-            df = dataset.decode_ordinal_frame(df)
-            fig = plot_real_vs_synthetic(
-                real_df,
-                df,
-                dataset.feature_columns + [dataset.target_column],
-                dataset.all_categorical_columns,
-                category_orders=dataset.ordinal_category_orders,
-            )
-            save_matplotlib_figure(
-                fig,
-                f"{cfg.plots.output_dir}/generation/{name}",
-                cfg.plots.dpi,
-                cfg.plots.formats,
-            )
-            plt.close(fig)
+            save_model_comparison(cfg, dataset, name, df, cfg.plots.output_dir)
 
     synthetic_datasets = run_generation(
         cfg, dataset, plot_callback=plot_callback, experiment=experiment
     )
 
     if args.plot:
-        from synthdata.plotting.generation_plots import save_hpo_plots
+        from synthdata.plotting.generation_plots import save_generation_plots, save_hpo_plots
 
+        # Models loaded from a cache (a resumed run) were not plotted above;
+        # draw the ones whose figure is missing.
+        figures = Path(cfg.plots.output_dir) / "generation"
+        unplotted = {
+            name: df
+            for name, df in synthetic_datasets.items()
+            if not (figures / f"{name}.{cfg.plots.formats[0]}").exists()
+        }
+        if unplotted:
+            save_generation_plots(cfg, dataset, unplotted, cfg.plots.output_dir)
         save_hpo_plots(cfg, cfg.plots.output_dir)
 
     experiment.record(

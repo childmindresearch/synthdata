@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 """CLI: run every pipeline stage in order, with a log file, optionally detached.
 
-Runs ``synthdata-impute``, ``synthdata-generate``, ``synthdata-evaluate`` and
-``synthdata-plot`` one after another, each in its own process, and stops at
-the first stage that fails (with that stage's exit code). Everything the
-stages print is shown and also written to
+Runs ``synthdata-impute``, ``synthdata-generate`` and ``synthdata-evaluate``
+one after another, each in its own process, and stops at the first stage
+that fails (with that stage's exit code). Each stage draws its own figures
+as it finishes (``--plot``), so ``synthdata-plot`` only redraws them; add
+``plot`` to ``--stages`` to run it too. Everything the stages print is shown
+and also written to
 
     <output root>/logs/<UTC time>_run.log
 
@@ -21,9 +23,13 @@ connection does not stop it; the command prints the log path and the
 process id and returns at once. Rerunning with the same ``--experiment-id``
 resumes: finished models, HPO trials and evaluation checkpoints are reused.
 
+Only one run at a time may use an output root: a second ``synthdata-run``
+on the same ``<output root>`` stops at once, since both would write the same
+experiment, HPO studies and GPU slot table.
+
 Usage:
     synthdata-run --config configs/config_sim.yaml [--detach] [--experiment-id ID]
-                  [--stages impute generate evaluate plot] [--no-plot] [--strict-checks]
+                  [--stages impute generate evaluate [plot]] [--no-plot] [--strict-checks]
                   [--monitor-interval SECONDS] [--dashboard-interval SECONDS]
 """
 
@@ -36,6 +42,8 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+from filelock import FileLock, Timeout
+
 from synthdata.config import load_config
 from synthdata.dashboard import DashboardWriter, dashboard_path
 from synthdata.resources import ResourceMonitor
@@ -47,6 +55,38 @@ STAGES = {
     "evaluate": "scripts.run_evaluation",
     "plot": "scripts.run_plots",
 }
+
+#: Stages run when ``--stages`` is not given: the others draw their own
+#: figures, so ``plot`` would only redraw them.
+DEFAULT_STAGES = ["impute", "generate", "evaluate"]
+
+
+class RunLocked(RuntimeError):
+    """Another synthdata-run is using the same output root."""
+
+
+def run_lock(logs: Path) -> FileLock:
+    """The lock one run holds on its output root (``<output root>/logs/run.lock``)."""
+    return FileLock(str(logs / "run.lock"))
+
+
+def acquire_run_lock(logs: Path) -> FileLock:
+    """Take the output root's run lock, or raise :class:`RunLocked` naming the holder.
+
+    The operating system frees the lock when the holding process dies, so a
+    crashed or killed run never blocks the next one.
+    """
+    lock = run_lock(logs)
+    try:
+        lock.acquire(timeout=0)
+    except Timeout:
+        holder = logs / "run.owner"
+        owner = holder.read_text(encoding="utf-8").strip() if holder.exists() else "unknown"
+        raise RunLocked(
+            f"another synthdata-run is using {logs.parent} ({owner}). Stop it first, or "
+            "give this run a different output root."
+        ) from None
+    return lock
 
 
 def log_dir(cfg) -> Path:
@@ -81,6 +121,25 @@ def resources_path(log_path: Path) -> Path:
 
 def run_stages(args, log_path: Path, echo: bool = True) -> int:
     """Run the stages in order, copying their output to ``log_path``; 0 on success."""
+    try:
+        lock = acquire_run_lock(log_path.parent)
+    except RunLocked as exc:
+        with open(log_path, "a", encoding="utf-8") as log:
+            log.write(f"[{_stamp()}] synthdata-run: {exc}\n")
+        if echo:
+            print(f"synthdata-run: {exc}", file=sys.stderr)
+        return 1
+    try:
+        (log_path.parent / "run.owner").write_text(
+            f"pid {os.getpid()}, host {socket.gethostname()}, log {log_path.name}",
+            encoding="utf-8",
+        )
+        return _run_with_monitors(args, log_path, echo)
+    finally:
+        lock.release()
+
+
+def _run_with_monitors(args, log_path: Path, echo: bool) -> int:
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     monitor = None
     dashboard = None
@@ -209,8 +268,9 @@ def parse_args(argv: list[str]):
         "--stages",
         nargs="+",
         choices=list(STAGES),
-        default=list(STAGES),
-        help="Stages to run, in pipeline order (default: all four).",
+        default=list(DEFAULT_STAGES),
+        help="Stages to run, in pipeline order (default: impute generate evaluate; add plot "
+        "to redraw every figure at the end).",
     )
     parser.add_argument(
         "--experiment-id",
@@ -261,6 +321,10 @@ def main(argv: list[str] | None = None) -> None:
     cfg = load_config(args.config)  # fail fast on a bad config, before detaching
     logs = log_dir(cfg)
     logs.mkdir(parents=True, exist_ok=True)
+    try:  # fail fast, before detaching, if another run holds this output root
+        acquire_run_lock(logs).release()
+    except RunLocked as exc:
+        sys.exit(f"synthdata-run: {exc}")
     log_path = logs / f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_run.log"
 
     if args.detach:

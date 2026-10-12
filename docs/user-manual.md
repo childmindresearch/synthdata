@@ -96,7 +96,7 @@ uv run synthdata-evaluate --config configs/config_hepatitis.yaml --plot
 uv run synthdata-plot     --config configs/config_hepatitis.yaml
 ```
 
-`--plot` draws that stage's figures as it goes; `synthdata-plot` at the end redraws everything and rewrites the report so every figure is in it. `uv run synthdata-run --config configs/config_hepatitis.yaml` runs the same four commands in one go and keeps a log; see [Long runs and remote machines](#long-runs-and-remote-machines). When the last command finishes, open:
+`--plot` draws that stage's figures as it goes, and the evaluate stage rewrites the report with them, so `synthdata-plot` is only needed to redraw figures later (after changing `plots` settings, or for a stage run without `--plot`). `uv run synthdata-run --config configs/config_hepatitis.yaml` runs the first three commands in one go, with `--plot`, and keeps a log; see [Long runs and remote machines](#long-runs-and-remote-machines). When the last command finishes, open:
 
 ```
 output/hepatitis/evaluation/data_v_1.0/exp_v_0.1/report.md
@@ -151,7 +151,7 @@ The three example configs are templates, not defaults for your data:
 
 ### Long runs and remote machines
 
-`synthdata-run` runs the four stages in order, each in its own process, and stops at the first one that fails. Everything the stages print goes to the terminal and to a log file:
+`synthdata-run` runs impute, generate and evaluate in order, each in its own process and each drawing its own figures, and stops at the first one that fails. Add `plot` to `--stages` to redraw every figure at the end as well. Only one run at a time may use an output root: a second `synthdata-run` on the same one stops at once with the first run's process id and log, since both would write the same experiment, HPO studies and GPU slot table. Everything the stages print goes to the terminal and to a log file:
 
 ```
 <output root>/logs/<UTC time>_run.log      for example output/sim/logs/20261010T080000Z_run.log
@@ -186,7 +186,7 @@ uv run synthdata-run --config configs/config_sim.yaml --experiment-id sim_full -
 #   Stop:   kill -- -41237
 ```
 
-`Stop` ends the whole run, including the stage and its worker processes. To resume after a stop, a crash or a reboot, run the same command with the same `--experiment-id`: finished models, HPO trials and evaluation checkpoints are reused. Other options: `--stages generate evaluate plot` runs only those stages, `--no-plot` skips the figures drawn during each stage, and `--tag`, `--dataset-version` and `--strict-checks` are passed to the stages that take them. On Windows, `Follow` and `Stop` print the PowerShell and `taskkill` equivalents.
+`Stop` ends the whole run, including the stage and its worker processes. To resume after a stop, a crash or a reboot, run the same command with the same `--experiment-id`: finished models, HPO trials and evaluation checkpoints are reused. Other options: `--stages generate evaluate` runs only those stages, `--no-plot` skips the figures drawn during each stage, and `--tag`, `--dataset-version` and `--strict-checks` are passed to the stages that take them. On Windows, `Follow` and `Stop` print the PowerShell and `taskkill` equivalents.
 
 #### The live status page
 
@@ -560,11 +560,11 @@ Evaluation scores several synthetic datasets at once, each in its own process, u
 
 ## 10. Reading report.md
 
-`report.md` sits in the evaluation folder and is the one page to read after a run. Every table and figure it mentions is linked. Its seven sections:
+`report.md` sits in the evaluation folder and is the one page to read after a run. Every table and figure it mentions is linked. A figure taller than 3000 pixels, such as a per-column grid of a wide dataset, is linked instead of shown so the page stays readable. Its seven sections:
 
 1. **At a glance.** Dataset, experiment, seed, the recommended model and its overall score, how it compares with the two baselines, the [output checks](#output-checks) count, and a "Read with care" list of warnings (for example, a single seed, a failed output check, a metric that failed for a model and is scored as its worst value, or an Anonymeter attack whose 95% interval is above 0).
 2. **Ranking.** One row per model with overall, utility, privacy and fairness scores (with intervals and "tied with best" when there are replicates), followed by how the scores were built and the trade-off plots.
-3. **Utility.** Real versus synthetic distribution plots per model, and the holdout TSTR table against the real-data ceiling.
+3. **Utility.** How far each model's columns are from the real ones (a table with each model's median and mean difference and its three worst columns; total variation distance for categorical columns, Kolmogorov-Smirnov statistic for continuous ones), a figure per model of its 12 columns that differ most, a link to its every-column figure and to `column_differences.csv` (every column and model), and the holdout TSTR table against the real-data ceiling.
 4. **Privacy evidence.** The attack and distance results next to the baselines, with how to read each column.
 5. **Fairness.** Subgroup gap metrics and log disparity, with links to sunburst pages that show which subgroups are over- or under-represented.
 6. **Data and preparation.** The split table, missingness, imputation checks and the HPO results.

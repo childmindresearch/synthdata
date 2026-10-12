@@ -517,7 +517,7 @@ BINARY_ONLY_METRICS = frozenset(
 )
 
 
-def build_preset(selection_cfg, positive_class=1) -> dict:
+def build_preset(selection_cfg, positive_class=1, multiclass_target: bool = False) -> dict:
     """Filter the full SynthEval preset down to the configured selection.
 
     ``positive_class`` overrides the "positive_class" preset param (default
@@ -527,6 +527,11 @@ def build_preset(selection_cfg, positive_class=1) -> dict:
     target column is already exactly 2 classes (e.g. hepatitis). It does NOT
     apply to the separate binary_target pass (see build_binary_preset), whose
     collapsed target is always 1=positive/0=negative by construction.
+
+    With ``multiclass_target`` (a categorical target with 3 or more classes)
+    the BINARY_ONLY_METRICS are left out: SynthEval returns no result for
+    them on such a target. The one-vs-rest or binary-target pass computes
+    them instead.
     """
     all_names = list(SYNTHEVAL_PRESET.keys())
     selected = resolve_selection(
@@ -536,7 +541,11 @@ def build_preset(selection_cfg, positive_class=1) -> dict:
         all_names,
         SYNTHEVAL_METRIC_TYPE,
     )
-    preset = {k: v for k, v in SYNTHEVAL_PRESET.items() if k in selected}
+    preset = {
+        k: v
+        for k, v in SYNTHEVAL_PRESET.items()
+        if k in selected and not (multiclass_target and k in BINARY_ONLY_METRICS)
+    }
     for name in FAIRNESS_METRICS_WITH_POSITIVE_CLASS & preset.keys():
         # Shallow-copy before overriding -- SYNTHEVAL_PRESET's nested dicts are
         # shared module-level objects reused on every call; mutating in place
@@ -733,6 +742,7 @@ def run_syntheval_evaluation(
     positive_class=1,
     execution_cfg=None,
     seed: int = 0,
+    multiclass_target: bool = False,
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
     """Run SynthEval's benchmark() across all datasets. Returns (benchmark_results, benchmark_ranks).
 
@@ -744,9 +754,10 @@ def run_syntheval_evaluation(
     benchmark/evaluate pass just to regenerate them.
 
     ``positive_class`` (from ``cfg.evaluation.positive_class``) is forwarded to
-    :func:`build_preset` for the 3 fairness metrics -- see its docstring.
+    :func:`build_preset` for the 3 fairness metrics -- see its docstring, as
+    is ``multiclass_target``.
     """
-    preset = build_preset(selection_cfg, positive_class)
+    preset = build_preset(selection_cfg, positive_class, multiclass_target)
     if not preset:
         logger.info("[syntheval] no metrics selected; skipping")
         return None, None

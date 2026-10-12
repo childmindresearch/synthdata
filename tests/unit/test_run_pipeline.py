@@ -110,3 +110,28 @@ def test_monitor_interval_zero_writes_no_resource_file(tmp_path, monkeypatch):
     run_pipeline.run_stages(_args("--stages", "impute", "--monitor-interval", "0"), log, echo=False)
     assert not (tmp_path / "x_resources.csv").exists()
     assert "peak use" not in log.read_text()
+
+
+def test_plot_stage_is_opt_in_because_each_stage_draws_its_own_figures():
+    assert _args().stages == ["impute", "generate", "evaluate"]
+    assert "--plot" in run_pipeline.stage_command("evaluate", _args())
+    assert _args("--stages", "impute", "generate", "evaluate", "plot").stages[-1] == "plot"
+
+
+def test_a_second_run_on_the_same_output_root_stops_at_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        run_pipeline, "stage_command", lambda stage, args: [sys.executable, "-c", "print('ran')"]
+    )
+    held = run_pipeline.acquire_run_lock(tmp_path)  # a run already in progress
+    (tmp_path / "run.owner").write_text("pid 1, host augur, log first_run.log")
+    try:
+        log = tmp_path / "second_run.log"
+        code = run_pipeline.run_stages(_args("--stages", "impute"), log, echo=False)
+        text = log.read_text()
+        assert code == 1
+        assert "another synthdata-run" in text and "first_run.log" in text
+        assert "ran" not in text
+    finally:
+        held.release()
+    # Once the first run ends, the lock is free again.
+    assert run_pipeline.run_stages(_args("--stages", "impute"), log, echo=False) == 0

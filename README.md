@@ -29,7 +29,7 @@ uv run synthdata-evaluate --config path/to/your-config.yaml --plot
 uv run synthdata-plot     --config path/to/your-config.yaml
 ```
 
-Or run all four in one go with a log file, in the background on a remote machine (see [Long runs and remote machines](docs/user-manual.md#long-runs-and-remote-machines)):
+Or run impute, generate and evaluate in one go (each drawing its figures) with a log file, in the background on a remote machine (see [Long runs and remote machines](docs/user-manual.md#long-runs-and-remote-machines)):
 
 ```bash
 uv run synthdata-run --config path/to/your-config.yaml --detach

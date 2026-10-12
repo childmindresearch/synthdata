@@ -25,6 +25,23 @@ from synthdata.utils import get_logger
 logger = get_logger(__name__)
 
 _IMAGE_SUFFIXES = (".png", ".svg", ".jpg", ".jpeg")
+#: Images taller than this (pixels) are linked, not embedded: a per-column
+#: grid of a wide dataset is thousands of panels tall and buries the report.
+MAX_EMBED_HEIGHT_PX = 3000
+
+
+def _png_height(path: Path) -> int | None:
+    """Pixel height from a PNG header, or None when ``path`` is not a PNG."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(24)
+    except OSError:
+        return None
+    if header[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    return int.from_bytes(header[20:24], "big")
+
+
 _DIMS = ("overall", "utility", "privacy", "fairness")
 
 
@@ -83,14 +100,21 @@ class _Links:
         return f"`{label or path.name}` (not produced this run)"
 
     def plots(self, directory: Path, pattern: str = "*") -> list[str]:
-        """Images in ``directory`` embedded inline, interactive HTML pages linked."""
+        """Images in ``directory`` embedded inline, interactive HTML pages linked.
+
+        A PNG taller than MAX_EMBED_HEIGHT_PX is linked instead of embedded.
+        """
         if not directory.is_dir():
             return []
         lines = []
         for path in sorted(directory.glob(pattern)):
             title = path.stem.replace("_", " ")
             if path.suffix.lower() in _IMAGE_SUFFIXES:
-                lines += [f"**{title}**", "", f"![{title}]({self.rel(path)})", ""]
+                height = _png_height(path)
+                if height is not None and height > MAX_EMBED_HEIGHT_PX:
+                    lines += [f"- {self.file(path, title)} (large figure, open it on its own)", ""]
+                else:
+                    lines += [f"**{title}**", "", f"![{title}]({self.rel(path)})", ""]
             elif path.suffix.lower() == ".html":
                 lines += [f"- {self.file(path, title + ' (interactive)')}", ""]
         return lines
@@ -392,10 +416,55 @@ def _ranking_section(cfg, combined, extras, paths: _Paths, links: _Links) -> str
 # ---------------------------------------------------------------------------
 
 
+def _distribution_summary(directory: Path, links: _Links) -> list[str]:
+    """Per model: how far its columns are from the real ones, its worst columns, links.
+
+    Reads ``column_differences.csv`` (columns x models, written with the
+    figures; see synthdata.plotting.generation_plots.column_differences) and
+    embeds each model's ``<model>_top_columns`` figure; the every-column
+    figure is linked. Falls back to listing the figures for older runs.
+    """
+    table_path = directory / "column_differences.csv"
+    if not table_path.exists():
+        return links.plots(directory)
+    table = pd.read_csv(table_path, index_col=0)
+    lines = [
+        "How far each column's synthetic distribution is from the real train split: total "
+        "variation distance for categorical columns, Kolmogorov-Smirnov statistic for "
+        "continuous ones (0 identical, 1 disjoint). Each model's figure shows its "
+        "columns that differ most; the full figure has every column. Every column and "
+        f"model: {links.file(table_path)}.",
+        "",
+    ]
+    summary = pd.DataFrame(
+        {
+            "model": table.columns,
+            "median": table.median().values,
+            "mean": table.mean().values,
+            "columns above 0.1": (table > 0.1).sum().values,
+            "worst columns": [
+                ", ".join(f"{c} ({v:.2f})" for c, v in table[m].nlargest(3).items())
+                for m in table.columns
+            ],
+        }
+    ).sort_values("mean", kind="stable")
+    lines += [_dataframe_to_markdown(summary), ""]
+    for model in summary["model"]:
+        top = next(iter(sorted(directory.glob(f"{model}_top_columns.*"))), None)
+        full = next(iter(sorted(directory.glob(f"{model}.*"))), None)
+        lines += [f"**{model}**", ""]
+        if top is not None:
+            lines += [f"![{model}: columns that differ most]({links.rel(top)})", ""]
+        if full is not None:
+            lines += [f"Every column: {links.file(full)}", ""]
+    return lines
+
+
 def _utility_section(cfg, extras, paths: _Paths, links: _Links) -> str:
     lines = ["## 3. Utility", "", "### Real vs synthetic distributions", ""]
-    plots = links.plots(paths.plots / "generation")
-    lines += plots or ["_Not rendered yet: run `synthdata-plot` with the `generation` section._"]
+    lines += _distribution_summary(paths.plots / "generation", links) or [
+        "_Not rendered yet: run `synthdata-plot` with the `generation` section._"
+    ]
     lines += ["", "### Train on synthetic, test on real (holdout, imbalance-aware)", ""]
     tstr_table = extras.get("tstr_table")
     if tstr_table is not None and not tstr_table.empty:
