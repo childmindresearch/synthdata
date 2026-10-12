@@ -34,7 +34,9 @@ def _waiter(pid, priority, since):
     return {"pid": pid, "model": "m", "kind": "trial", "priority": priority, "since": since}
 
 
-@pytest.mark.parametrize("value, expected", [("auto", 2), (3, 3), (0, 0), (None, 0)])
+@pytest.mark.parametrize(
+    "value, expected", [("auto", gpu_slots.UNLIMITED), (3, 3), (0, None), (None, None)]
+)
 def test_resolve_fits_per_gpu(value, expected):
     assert gpu_slots.resolve_fits_per_gpu(value) == expected
 
@@ -129,3 +131,25 @@ def test_failed_fit_still_releases_its_slot(slots):
     with pytest.raises(RuntimeError), gpu_slots.gpu_slot("ctgan", "trial", 5, "cuda"):
         raise RuntimeError("boom")
     assert _table(folder)["gpus"]["0"] == []
+
+
+def test_cpu_models_never_wait_for_a_slot(slots):
+    folder = slots(n_gpus=1, fits_per_gpu=1)
+    with (
+        gpu_slots.gpu_slot("ctgan", "trial", 5, "cuda"),
+        gpu_slots.gpu_slot("arf", "untuned", 0, "cuda") as device,
+    ):
+        assert device == "cuda"
+    with open(folder / "fits.csv", newline="") as f:
+        assert [r["model"] for r in csv.DictReader(f)] == ["ctgan"]
+
+
+def test_without_a_limit_fits_never_wait_and_spread_over_gpus(slots):
+    folder = slots(n_gpus=2, fits_per_gpu=gpu_slots.UNLIMITED)
+    with (
+        gpu_slots.gpu_slot("ctgan", "trial", 5, "cuda") as a,
+        gpu_slots.gpu_slot("tvae", "trial", 5, "cuda") as b,
+        gpu_slots.gpu_slot("ddpm", "trial", 5, "cuda") as c,
+    ):
+        assert [a, b, c] == ["cuda:0", "cuda:1", "cuda:0"]
+        assert [len(h) for h in _table(folder)["gpus"].values()] == [2, 1]

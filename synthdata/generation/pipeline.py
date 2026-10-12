@@ -81,8 +81,8 @@ def _run_synthcity_workers(cfg: Config, dataset: Dataset, device: str) -> dict:
     Each model runs exactly the chain the sequential loop would run (its
     seeds do not depend on the other models), so the outputs match a
     sequential run with the same thread count. Models with the longest HPO
-    timeout start first. With ``compute.fits_per_gpu`` set, each fit takes a
-    slot on whichever GPU has one free, longest remaining work first
+    timeout start first. Unless ``compute.fits_per_gpu`` is off, each fit runs
+    on the least busy GPU, within the limit per GPU if one is set
     (synthdata.gpu_slots); otherwise models go round-robin across the GPUs.
     """
     gen_cfg = cfg.generation
@@ -97,13 +97,15 @@ def _run_synthcity_workers(cfg: Config, dataset: Dataset, device: str) -> dict:
 
         n_gpus = torch.cuda.device_count()
     fits_per_gpu = gpu_slots.resolve_fits_per_gpu(cfg.compute.fits_per_gpu)
-    if n_gpus and fits_per_gpu:
-        # Each fit takes a slot on whichever GPU has one free (synthdata.gpu_slots).
+    if n_gpus and fits_per_gpu is not None:
+        # Each fit goes to the least busy GPU (synthdata.gpu_slots).
         gpu_slots.setup(ensure_dir(gen_cfg.output_dir) / "gpu_slots", n_gpus, fits_per_gpu)
         logger.info(
-            "[generation] GPU slots: %d GPU(s) x %d fits at a time, longest remaining work first",
+            "[generation] GPU fits: %d GPU(s), each fit on the least busy one; %s",
             n_gpus,
-            fits_per_gpu,
+            "no limit per GPU"
+            if fits_per_gpu == gpu_slots.UNLIMITED
+            else f"at most {fits_per_gpu} per GPU, longest remaining work first",
         )
     try:
         run = run_per_model(

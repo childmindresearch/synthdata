@@ -792,10 +792,11 @@ class ComputeConfig:
     memory_reserve_gib: float = 16.0
     #: RAM (GiB) one model's process needs; None estimates it from the column count.
     memory_per_worker_gib: float | None = None
-    #: Fits sharing one GPU at a time while models train in parallel
-    #: (synthdata.gpu_slots): "auto" (2), a number, or 0/None to let every
-    #: model's process use its GPU whenever it likes. Fits take a slot on the
-    #: least busy GPU, and the model with the most work left goes first.
+    #: GPU sharing while models train in parallel (synthdata.gpu_slots): each
+    #: fit runs on the least busy GPU. "auto" sets no limit per GPU (sharing
+    #: raised total speed in measurements); a number caps the fits per GPU,
+    #: most remaining work first (e.g. to fit GPU memory); 0/None keeps each
+    #: model on one GPU, assigned round-robin.
     fits_per_gpu: str | int | None = "auto"
 
 
