@@ -14,6 +14,7 @@ Requires imputed data (run `synthdata-impute` first).
 """
 
 import argparse
+from pathlib import Path
 
 from synthdata.config import load_config
 from synthdata.data import load_dataset, load_imputed_splits
@@ -106,8 +107,18 @@ def main() -> None:
     )
 
     if args.plot:
-        from synthdata.plotting.generation_plots import save_hpo_plots
+        from synthdata.plotting.generation_plots import save_generation_plots, save_hpo_plots
 
+        # Models loaded from a cache (a resumed run) were not plotted above;
+        # draw the ones whose figure is missing.
+        figures = Path(cfg.plots.output_dir) / "generation"
+        unplotted = {
+            name: df
+            for name, df in synthetic_datasets.items()
+            if not (figures / f"{name}.{cfg.plots.formats[0]}").exists()
+        }
+        if unplotted:
+            save_generation_plots(cfg, dataset, unplotted, cfg.plots.output_dir)
         save_hpo_plots(cfg, cfg.plots.output_dir)
 
     experiment.record(
