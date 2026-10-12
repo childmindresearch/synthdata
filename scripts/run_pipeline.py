@@ -41,8 +41,9 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-from filelock import FileLock, Timeout
+from filelock import BaseFileLock, FileLock, Timeout
 
 from synthdata.config import load_config
 from synthdata.dashboard import DashboardWriter, dashboard_path
@@ -65,12 +66,12 @@ class RunLocked(RuntimeError):
     """Another synthdata-run is using the same output root."""
 
 
-def run_lock(logs: Path) -> FileLock:
+def run_lock(logs: Path) -> BaseFileLock:
     """The lock one run holds on its output root (``<output root>/logs/run.lock``)."""
     return FileLock(str(logs / "run.lock"))
 
 
-def acquire_run_lock(logs: Path) -> FileLock:
+def acquire_run_lock(logs: Path) -> BaseFileLock:
     """Take the output root's run lock, or raise :class:`RunLocked` naming the holder.
 
     The operating system frees the lock when the holding process dies, so a
@@ -193,6 +194,7 @@ def _run_stages(args, log_path: Path, echo: bool, env: dict, monitor, dashboard=
                 encoding="utf-8",
                 errors="replace",
             )
+            assert process.stdout is not None  # stdout=PIPE above
             for line in process.stdout:
                 write(line)
             code = process.wait()
@@ -211,7 +213,7 @@ def _run_stages(args, log_path: Path, echo: bool, env: dict, monitor, dashboard=
 def detach(argv: list[str], log_path: Path) -> int:
     """Start this command again in the background, in its own session; return its pid."""
     command = [sys.executable, "-m", "scripts.run_pipeline", *argv, "--log-file", str(log_path)]
-    kwargs = {}
+    kwargs: dict[str, Any] = {}
     if os.name == "nt":
         kwargs["creationflags"] = (
             subprocess.DETACHED_PROCESS

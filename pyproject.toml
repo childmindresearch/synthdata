@@ -92,6 +92,8 @@ dev = [
     "pytest-mock",
     "ruff",
     "pre-commit",
+    # Type checker and language server (beta, so pinned: new releases add rules).
+    "ty==0.0.86",
 ]
 
 [tool.uv]
@@ -165,6 +167,52 @@ ignore = [
 
 [tool.ruff.format]
 quote-style = "double"
+
+[tool.ty.src]
+# Same scope as ruff: the pipeline, its CLI entry points and its tests.
+include = ["synthdata", "scripts", "tests"]
+exclude = ["scripts/document_pipeline"]
+
+[tool.ty.terminal]
+# Show warnings, but let only errors fail `ty check` (see the rules below).
+error-on-warning = false
+
+[tool.ty.analysis]
+# Optional extras (tabpfn, refidiff) and catboost (added only for the
+# integration tests) are imported lazily and are not installed by `uv sync`.
+allowed-unresolved-imports = [
+    "catboost",
+    "mamba_ssm",
+    "mamba_ssm.**",
+    "tabimpute.**",
+    "tabpfgen",
+    "tabpfn",
+    "tabpfn.**",
+    "tabpfn_extensions",
+    "tabpfn_extensions.**",
+]
+
+[tool.ty.rules]
+# ty (beta) does not yet match a list against pandas' `SequenceNotStr`
+# protocol, so `pd.DataFrame(rows, columns=[...])` and similar calls are
+# reported as wrong argument types. Keep these visible as warnings rather
+# than CI errors until that is fixed upstream.
+invalid-argument-type = "warn"
+
+[[tool.ty.overrides]]
+# Tests read values they just asserted exist, patch modules and configs with
+# deliberately wrong values, and call pytest helpers ty does not model
+# (pytest.skip/fail); report these as warnings so CI fails only on the
+# pipeline code.
+include = ["tests/**"]
+
+[tool.ty.overrides.rules]
+invalid-assignment = "warn"
+not-subscriptable = "warn"
+parameter-already-assigned = "warn"
+too-many-positional-arguments = "warn"
+unresolved-attribute = "warn"
+unsupported-operator = "warn"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

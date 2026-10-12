@@ -52,6 +52,10 @@ jobs:
       # synthdata/generation/pipeline.py's lazy tabpfgen_backend import, which
       # is what makes this possible.
       - run: uv sync
+      # Type check with the project's dependencies installed (ty is in the dev
+      # group). Only errors fail the job; see [tool.ty] in pyproject.toml.
+      - name: Type check (ty)
+        run: uv run ty check
       - name: Run unit tests (excluding integration/slow/network-marked tests)
         run: uv run pytest -m "not integration and not slow and not network" --cov=synthdata --cov-report=term-missing
 

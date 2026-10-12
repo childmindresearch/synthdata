@@ -17,6 +17,8 @@ performance and DomiasMIA (which contrasts members with non-members) need rows
 the generator never saw and use the held-out test split.
 """
 
+from pathlib import Path
+
 import pandas as pd
 
 from synthdata.compute import run_per_model
@@ -69,7 +71,7 @@ def run_synthcity_metrics(
     metrics: dict,
     task_type: str | None = None,
     random_state: int = 42,
-    workspace: str | None = None,
+    workspace: str | Path | None = None,
     *,
     discrete_columns: list,
 ) -> pd.DataFrame:
@@ -189,7 +191,7 @@ def run_synthcity_evaluation(
     sensitive_features: list,
     selection_cfg,
     seed: int = 42,
-    workspace: str | None = None,
+    workspace: str | Path | None = None,
     *,
     discrete_columns: list,
     compute_cfg=None,

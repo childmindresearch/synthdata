@@ -86,7 +86,11 @@ def summary(url: str) -> pd.DataFrame:
                 "feasible": len(feasible),
                 "best_trial": best.number if best else None,
                 "best_value": best.value if best else None,
-                "ties_at_best": sum(np.isclose(t.value, best.value) for t in feasible)
+                "ties_at_best": sum(
+                    # Feasible trials are complete, so their value is never None.
+                    np.isclose(t.value, best.value)  # ty: ignore[no-matching-overload]
+                    for t in feasible
+                )
                 if best
                 else 0,
                 "trials_after_best": len(after),

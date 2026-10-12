@@ -22,8 +22,9 @@ import os
 import re
 import time
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any, Protocol, cast
 
 import numpy as np
 import optuna
@@ -136,6 +137,18 @@ class TrialScore:
     value: float
     constraints: list = dataclasses.field(default_factory=lambda: [0.0] * len(SCREENS))
     attrs: dict = dataclasses.field(default_factory=dict)
+
+
+class HPOEvalFn(Protocol):
+    """Scores one synthetic dataset on the tuning split (see :func:`build_hpo_eval_fn`).
+
+    ``headroom`` holds, per TSTR objective, the real-data ceiling, the chance
+    level and their distance in bootstrap SEs; empty for a regression target.
+    """
+
+    headroom: dict
+
+    def __call__(self, synthetic_df: pd.DataFrame, /) -> TrialScore: ...
 
 
 def objective_direction(objective: str) -> str:
@@ -438,8 +451,8 @@ def build_hpo_eval_fn(
     seed: int,
     match_prior: bool = True,
     workspace: str | Path | None = None,
-    protected_columns: list = (),
-) -> Callable[[pd.DataFrame], TrialScore]:
+    protected_columns: Sequence[str] = (),
+) -> HPOEvalFn:
     """Build a ``synthetic_df -> TrialScore`` function scored on the tuning split.
 
     Candidates are fitted on ``search_train_df`` and never see the tuning or
@@ -554,6 +567,7 @@ def build_hpo_eval_fn(
         dcr_reference = (columns, encode, encode(sample), encode(tuning_df[columns]), _nearest)
 
     def _dcr_closer_to_train(synthetic_df):
+        assert dcr_reference is not None
         columns, encode, x_ref, x_hold, nearest = dcr_reference
         x_syn = encode(synthetic_df.reindex(columns=columns))
         d_ref = nearest(x_ref, x_syn, 1)[:, 0]
@@ -618,6 +632,7 @@ def build_hpo_eval_fn(
                 synthetic_df, tuning_df, categorical_columns, nominal_columns, seed
             )
         if target_is_categorical:
+            assert trtr is not None  # fitted above for a categorical target
             scores = _tstr(synthetic_df)
             attrs |= {
                 "tstr_macro_f1": scores.macro_f1,
@@ -639,13 +654,19 @@ def build_hpo_eval_fn(
                 "trtr_weighted_balanced_accuracy": trtr.weighted_balanced_accuracy,
                 "trtr_worst_group_auprc": _worst_group(trtr),
             }
-        value = attrs[objective_name] if tstr else composite_fn(synthetic_df)
+        if tstr:
+            value = float(attrs[objective_name])
+        else:
+            assert composite_fn is not None  # built above when the objective is not TSTR
+            value = composite_fn(synthetic_df)
         if not np.isfinite(value):
             raise ValueError(f"HPO objective {objective_name} is not finite: {value}")
         return TrialScore(value, [violations[name] for name in SCREENS], attrs)
 
-    eval_fn.headroom = headroom
-    return eval_fn
+    # The real-data ceiling and chance level per objective, read by the
+    # generation stage for its log (see HPOEvalFn).
+    eval_fn.headroom = headroom  # ty: ignore[unresolved-attribute]
+    return cast(HPOEvalFn, eval_fn)
 
 
 def score_candidate(
@@ -947,6 +968,13 @@ class _TrialProgress:
             study.stop()
 
 
+def _value(trial: optuna.trial.FrozenTrial) -> float:
+    """Objective value of a complete trial (Optuna types it ``float | None``)."""
+    if trial.value is None:
+        raise ValueError(f"trial {trial.number} has no objective value")
+    return trial.value
+
+
 def _feasible(trial: optuna.trial.FrozenTrial) -> bool:
     return trial.state == optuna.trial.TrialState.COMPLETE and all(
         v <= 0 for v in _trial_constraints(trial)
@@ -988,8 +1016,8 @@ class _Patience:
         sign = 1.0 if study.direction == optuna.study.StudyDirection.MAXIMIZE else -1.0
         best, since = None, 0
         for t in sorted(done, key=lambda t: t.number):
-            if _feasible(t) and (best is None or sign * (t.value - best) > delta):
-                best, since = t.value, 0
+            if _feasible(t) and (best is None or sign * (_value(t) - best) > delta):
+                best, since = _value(t), 0
             else:
                 since += 1
         # Without a feasible trial yet, keep searching for one.
@@ -1028,7 +1056,7 @@ def choose_objective(
     after them), so they do not depend on the objective. Returns the choice and
     the table behind it.
     """
-    table = {}
+    table: dict[str, dict[str, Any]] = {}
     for name in candidates:
         h = headroom.get(name, {})
         z = h.get("z", float("nan"))
@@ -1125,13 +1153,13 @@ def _refit_top_k(
     if hpo_cfg.refit_seeds == 0 or hpo_cfg.refit_top_k <= 1:
         return _best_feasible(study)
     sign = 1.0 if study.direction == optuna.study.StudyDirection.MAXIMIZE else -1.0
-    top = sorted(feasible, key=lambda t: sign * t.value, reverse=True)[: hpo_cfg.refit_top_k]
+    top = sorted(feasible, key=lambda t: sign * _value(t), reverse=True)[: hpo_cfg.refit_top_k]
     done = dict(study.user_attrs.get("refit", {}))
     for t in top:
         key = str(t.number)
         if key in done:
             continue
-        values = [t.value]
+        values = [_value(t)]
         for j in range(hpo_cfg.refit_seeds):
             fixed = optuna.trial.FixedTrial(dict(t.params), number=t.number)
             fixed.set_user_attr(REFIT_SEED_ATTR, seed + 1000 * (j + 1))

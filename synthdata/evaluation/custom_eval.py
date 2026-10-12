@@ -152,7 +152,7 @@ def run_tstr_evaluation(
         return {}
 
     target = dataset.target_column
-    train_df = dataset.train_imputed_df
+    train_df = dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df")
     test_df = dataset.test_imputed_df
     classes = sorted(train_df[target].dropna().unique().tolist(), key=str)
     seeds = [seed + i for i in range(n_seeds)]

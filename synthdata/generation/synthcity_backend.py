@@ -159,7 +159,7 @@ def _pruning_patience_metric_class():
             super().__init__(
                 metrics=[("detection", "detection_mlp")],
                 weights=[1],
-                **({"workspace": Path(workspace)} if workspace is not None else {}),
+                workspace=Path(workspace) if workspace is not None else Path("workspace"),
             )
             self._trial = trial
             self._step = 0
@@ -281,7 +281,7 @@ def fit_generate(
     train_loader,
     n_samples: int,
     random_state: int = 42,
-    workspace: str | None = None,
+    workspace: str | Path | None = None,
     device: str | None = None,
     classification: bool = False,
     class_prior: pd.Series | None = None,
@@ -383,7 +383,7 @@ def build_synthcity_objective(
     seed: int,
     eval_fn: Callable[[pd.DataFrame], TrialScore],
     n_samples: int,
-    workspace: str | None = None,
+    workspace: str | Path | None = None,
     device: str = "cpu",
     classification: bool = False,
     class_prior: pd.Series | None = None,
