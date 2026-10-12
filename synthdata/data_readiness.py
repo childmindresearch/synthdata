@@ -322,7 +322,7 @@ def assess(dataset: Dataset, cfg: DataReadinessConfig) -> pd.DataFrame:
                             int(small.min()),
                             cfg.min_group_rows,
                             detail=f"in {name}: "
-                            + ", ".join(f"{k} ({v})" for k, v in small.items()),
+                            + "; ".join(f"{c} = {k} has {v} row(s)" for k, v in small.items()),
                         )
                     )
 
