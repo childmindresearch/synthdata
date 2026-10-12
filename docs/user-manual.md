@@ -169,6 +169,7 @@ Next to the log, `<UTC time>_resources.csv` records once a minute how much the r
 | `system_ram_used_gib`, `system_ram_total_gib` | The whole machine, including other users |
 | `gpu_util_pct`, `gpu_mem_used_mib` | All GPUs as `nvidia-smi` reports them, including other users; empty without an NVIDIA GPU |
 | `pipeline_vram_mib` | GPU memory held by this run's processes |
+| `gpu_mem_total_mib` | Combined memory of all GPUs (the limit line on the dashboard's GPU memory chart) |
 
 A second file, `<UTC time>_resources_by_task.csv`, splits `pipeline_ram_gib`, `pipeline_cpu_cores` and `pipeline_vram_mib` by task, one row per task per sample (columns `time_utc`, `stage`, `task`, `ram_gib`, `cpu_cores`, `vram_mib`). A task is one model in one parallel step, named like `generation: ctgan`, `syntheval full: tvae`, `synthcity: ddpm` or `privacy attacks: arf`, and includes any process the model starts. `main` is the runner and the stage process, which also runs the models itself when `compute.workers` is 1. After each stage, the log names the three heaviest tasks by peak RAM, CPU and GPU memory. Use this to see which model needs the most memory. Individual metrics run one after another inside a model's process, so their use is not split out further.
 

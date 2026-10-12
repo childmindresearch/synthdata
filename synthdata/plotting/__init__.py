@@ -1,5 +1,6 @@
 """Shared plotting helpers: figure saving for both matplotlib and Plotly figures."""
 
+import textwrap
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,34 @@ def ordered_categories(values: set, configured_order: list | None = None) -> lis
         return ordered + sorted(extras)
     except TypeError:
         return ordered + sorted(extras, key=str)
+
+
+def wrapped_title(text: str, width: int = 32, max_lines: int = 3) -> str:
+    """Wrap a long column name so it fits over one subplot.
+
+    ``tight_layout`` keeps every title inside its grid cell, so a single-line
+    title wider than the axes squeezes the axes to a sliver. Wrapping (and
+    shortening past ``max_lines``) keeps the plot area at full width.
+    """
+    return "\n".join(textwrap.wrap(str(text), width, max_lines=max_lines, placeholder="..."))
+
+
+def set_category_ticks(ax, positions, categories, max_labels: int = 20) -> None:
+    """Label categorical bars so the labels stay inside the subplot.
+
+    Long or many labels are shortened and rotated, and past ``max_labels`` only
+    every k-th bar is labelled. Unrotated labels wider than the axes would make
+    ``tight_layout`` shrink every plot in that grid column.
+    """
+    labels = [str(c) for c in categories]
+    step = -(-len(labels) // max_labels) if labels else 1
+    ax.set_xticks(list(positions)[::step])
+    shown = labels[::step]
+    if len(shown) > 6 or sum(len(label) for label in shown) > 24:
+        shown = [textwrap.shorten(label, 18, placeholder="...") for label in shown]
+        ax.set_xticklabels(shown, rotation=45, ha="right", fontsize=7)
+    else:
+        ax.set_xticklabels(shown)
 
 
 def add_histogram_with_kde(

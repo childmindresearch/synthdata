@@ -7,7 +7,13 @@ import pandas as pd
 
 from synthdata.config import Config
 from synthdata.data import Dataset
-from synthdata.plotting import add_histogram_with_kde, ordered_categories, save_matplotlib_figure
+from synthdata.plotting import (
+    add_histogram_with_kde,
+    ordered_categories,
+    save_matplotlib_figure,
+    set_category_ticks,
+    wrapped_title,
+)
 
 
 def plot_observed_vs_imputed(
@@ -62,12 +68,11 @@ def plot_observed_vs_imputed(
                 width,
                 label="imputed",
             )
-            ax.set_xticks(positions)
-            ax.set_xticklabels(categories)
+            set_category_ticks(ax, positions, categories)
         else:
             add_histogram_with_kde(ax, observed, bins=15, label="observed", alpha=0.45, color="C0")
             add_histogram_with_kde(ax, imputed, bins=15, label="imputed", alpha=0.45, color="C1")
-        ax.set_title(f"{col} (n_imputed = {n_imputed})", fontsize=9)
+        ax.set_title(wrapped_title(f"{col} (n_imputed = {n_imputed})"), fontsize=9)
         ax.legend(fontsize=7)
 
     for ax in axes_flat[len(columns_with_missing) :]:

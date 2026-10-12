@@ -592,7 +592,7 @@ function draw(){
 chart('c-ram','Memory','GiB',[{name:'This run',values:R.pipeline_ram_gib,color:s1},{name:'Whole machine',values:R.system_ram_used_gib,color:s2},{name:'Machine total',values:R.system_ram_total_gib,color:mu,dash:true}]);
 chart('c-cpu','CPU','cores',[{name:'This run',values:R.pipeline_cpu_cores,color:s1},{name:'Cores available',values:konst(D.machine.cpu_cores),color:mu,dash:true}]);
 chart('c-gpu','GPU utilization','%',[{name:'All GPUs',values:R.gpu_util_pct,color:s1}],{max:100});
-chart('c-vram','GPU memory','GiB',[{name:'This run',values:gib(R.pipeline_vram_mib),color:s1},{name:'All processes',values:gib(R.gpu_mem_used_mib),color:s2}]);}
+chart('c-vram','GPU memory','GiB',[{name:'This run',values:gib(R.pipeline_vram_mib),color:s1},{name:'All processes',values:gib(R.gpu_mem_used_mib),color:s2},{name:'GPU limit',values:gib(R.gpu_mem_total_mib||[]),color:mu,dash:true}]);}
 draw();let rt;window.addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(draw,150);});
 })();
 """

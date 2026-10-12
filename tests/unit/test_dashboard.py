@@ -137,6 +137,7 @@ def _write_run(tmp_path, finished: bool = False, host: str | None = None):
                 "gpu_util_pct",
                 "gpu_mem_used_mib",
                 "pipeline_vram_mib",
+                "gpu_mem_total_mib",
             ]
         )
         for i in range(31):
@@ -152,6 +153,7 @@ def _write_run(tmp_path, finished: bool = False, host: str | None = None):
                     50,
                     4000,
                     3000,
+                    24576,
                 ]
             )
     with open(dashboard.companion_path(log, "resources_by_task.csv"), "w", newline="") as f:
@@ -240,6 +242,7 @@ def test_collect_reads_stages_models_hpo_resources_and_problems(tmp_path):
 
     series = d["resources"]["series"]
     assert len(series["t"]) == 31 and series["pipeline_ram_gib"][-1] == 5.0
+    assert series["gpu_mem_total_mib"][-1] == 24576
     assert d["resources"]["peaks"]["impute"]["pipeline_ram_gib"] == pytest.approx(2.4)
     active = [t["task"] for t in d["resources"]["tasks"] if t.get("active")]
     assert active == ["generation: ctgan", "main"]
