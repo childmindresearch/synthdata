@@ -225,8 +225,15 @@ def test_hpo_studies_ran_and_recorded_best_params(pipeline_run):
         complete = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
         assert len(complete) == pipeline_run.cfg.generation.hpo.n_trials, model
         assert all(math.isfinite(t.value) for t in complete), model
-        # Training length is searched like any other hyperparameter and kept.
-        assert study.best_params == best["synthcity"][model], model
+        # The winner is the best mean over the refitted top trials, and its
+        # training length is kept like any other hyperparameter.
+        feasible = [t for t in complete if all(v <= 0 for v in t.user_attrs["constraints"])]
+        assert feasible, model
+        refit = study.user_attrs["refit"]
+        assert len(refit) == min(2, len(feasible)), model
+        assert all(len(values) == 2 for values in refit.values()), model
+        chosen = max(refit, key=lambda number: sum(refit[number]))
+        assert study.trials[int(chosen)].params == best["synthcity"][model], model
 
 
 def _hpo_studies(run, models=HPO_MODELS):
@@ -244,10 +251,21 @@ def test_hpo_trials_score_tstr_on_tuning_rows_and_record_screens(pipeline_run):
             if trial.state != optuna.trial.TrialState.COMPLETE:
                 continue
             attrs = trial.user_attrs
-            # The objective is TSTR macro-F1; the other scores are logged next to it.
-            assert trial.value == pytest.approx(attrs["tstr_macro_f1"]), model
-            for key in ("tstr_macro_auprc", "tstr_balanced_accuracy", "trtr_macro_f1"):
+            # objective: auto stores its choice; the value is that TSTR score,
+            # and the other scores are logged next to it.
+            objective = study.user_attrs["objective"]
+            assert objective in study.user_attrs["objective_selection"], model
+            assert trial.value == pytest.approx(attrs[objective]), model
+            for key in (
+                "tstr_macro_auprc",
+                "tstr_macro_auroc",
+                "tstr_balanced_accuracy",
+                "trtr_macro_f1",
+                "dcr_closer_to_train",
+            ):
                 assert 0 <= attrs[key] <= 1, (model, key)
+            assert set(attrs["tstr_boot_se"]) >= {"macro_auprc", "macro_f1"}, model
+            assert 0 <= attrs["fid_detection_auc"] <= 1, model
             assert sorted(attrs["tstr_per_class_f1"]) == ["0", "1"], model
             # Every sanity screen is passed to Optuna as a constraint.
             assert len(attrs["constraints"]) == len(SCREENS), model

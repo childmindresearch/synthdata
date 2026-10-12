@@ -96,11 +96,38 @@ generation:
 
   hpo:
     enabled: true
-    # Objective scored on the tuning split: tstr_macro_f1 (fixed XGBoost
-    # trained on synthetic, tested on real) or tstr_macro_auprc.
-    objective: tstr_macro_f1
-    # Lenient sanity screens; a trial that fails one can't be chosen as best.
-    constraints: { copy_margin: 0.02, min_category_coverage: 0.9, max_out_of_range: 0.01, max_class_share_gap: 0.02 }
+    # Objective scored on the tuning split by a fixed XGBoost trained on the
+    # synthetic rows (train on synthetic, test on real). auto picks one of
+    # objective_candidates per model by a fixed rule: candidates whose
+    # real-data headroom over chance is under 2 bootstrap SEs are dropped,
+    # then the one that varies most beyond its noise across the random
+    # start-up trials wins. On the sim run macro-F1 had no headroom (real
+    # 0.305 vs always-majority 0.303), see docs/verification.md.
+    objective: auto
+    objective_candidates: [tstr_macro_auprc, tstr_macro_auroc, tstr_weighted_macro_f1, tstr_macro_f1]
+    # Screens a trial must pass to be chosen as best. Category coverage is the
+    # minimum over all categorical columns; the protected columns are held to
+    # full coverage and their group shares to within 0.05 of the real ones.
+    # dcr: share of synthetic rows nearer to a train row than a tuning row
+    # (0.5 = no memorization).
+    constraints:
+      { copy_margin: 0.02, min_category_coverage: 0.8, max_out_of_range: 0.01,
+        max_class_share_gap: 0.02, min_protected_coverage: 1.0,
+        max_protected_share_gap: 0.05, max_dcr_closer_to_train: 0.6 }
+    # Stop a study after 10 trials in a row without a gain above the
+    # objective's bootstrap SE (min_delta null); timeouts stay as caps.
+    patience: 10
+    min_delta: null
+    # Library defaults first, then multivariate TPE after 10 random trials;
+    # the best 3 feasible trials are refitted with 2 new seeds and the best
+    # mean wins. warm_start: an earlier run's optuna_studies.db (e.g. the sim
+    # run) whose top configs are tried first; search_params narrows a model's
+    # space (scripts/hpo_analysis.py importance shows what matters).
+    enqueue_defaults: true
+    warm_start: { storage: null, top_k: 3, metric: tstr_macro_auprc }
+    search_params: {}
+    refit_top_k: 3
+    refit_seeds: 2
     # Budget for models not listed per model below.
     n_trials: 50
     timeout_seconds: 14400
@@ -130,8 +157,9 @@ generation:
     epoch_ranges:
       { ctgan: [25, 150, 25], tvae: [25, 150, 25], adsgan: [25, 150, 25],
         rtvae: [25, 150, 25], pategan: [2, 10, 2], ddpm: [100, 1000, 100] }
-    # Median pruning on synthcity's early-stopping metric (CTGAN, ADS-GAN).
-    pruner: median
+    # Median pruning on synthcity's GAN detection metric: off, it sat at 1.000
+    # for every GAN trial on the sim run and never checked the shortest ones.
+    pruner: null
 
 evaluation:
   output_dir: output/sim/evaluation

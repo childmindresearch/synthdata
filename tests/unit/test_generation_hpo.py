@@ -246,6 +246,8 @@ def test_per_model_budget_and_zero_trials_skip(tmp_path):
         timeout_seconds=100,
         n_trials_per_model={"ctgan": 2, "tvae": 0},
         timeout_seconds_per_model={"ctgan": 7},
+        objective="synthcity_composite",
+        refit_seeds=0,
     )
     assert model_budget(cfg, "ctgan") == (2, 7)
     assert model_budget(cfg, "rtvae") == (5, 100)
@@ -264,7 +266,14 @@ def test_per_model_budget_and_zero_trials_skip(tmp_path):
 
 def test_median_pruner_stops_weak_trials_and_they_count_towards_the_budget(tmp_path):
     cfg = HPOConfig(
-        n_trials=8, timeout_seconds=None, pruner_startup_trials=2, pruner_warmup_steps=0
+        n_trials=8,
+        timeout_seconds=None,
+        pruner="median",
+        pruner_startup_trials=2,
+        pruner_warmup_steps=0,
+        objective="tstr_macro_f1",
+        refit_seeds=0,
+        patience=None,
     )
 
     def objective(trial):
@@ -330,7 +339,14 @@ def _timed_study(tmp_path, monkeypatch, *, limit_hours, reserve, started_ago, tr
         clock["now"] += trial_seconds
         return float(trial.number)
 
-    cfg = HPOConfig(n_trials=10, timeout_seconds=None, stage_time_limit_hours=limit_hours)
+    cfg = HPOConfig(
+        n_trials=10,
+        timeout_seconds=None,
+        stage_time_limit_hours=limit_hours,
+        objective="tstr_macro_f1",
+        refit_seeds=0,
+        patience=None,
+    )
     run_study("hpo_tvae", objective, cfg, tmp_path, seed=0, reserve_seconds=reserve)
     study = optuna.load_study(study_name="hpo_tvae", storage=default_storage_url(tmp_path))
     return len(study.trials), messages

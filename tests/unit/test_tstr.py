@@ -76,6 +76,7 @@ def test_weighted_fit_predicts_the_minority_class():
     assert set(scores.seed_sd) == {
         "macro_f1",
         "macro_auprc",
+        "macro_auroc",
         "balanced_accuracy",
         "weighted_macro_f1",
         "weighted_balanced_accuracy",

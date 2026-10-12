@@ -415,10 +415,29 @@ For each model, [Optuna](https://optuna.org/) tries a number of settings ("trial
 
 1. Fit the model on search-train with the trial's settings.
 2. Generate synthetic rows, class by class, to the search-train class shares (as described above).
-3. Train a fixed XGBoost classifier on the synthetic rows and test it on the real tuning rows (**TSTR**, train on synthetic, test on real). The score is macro-F1, averaged over `tstr_seeds` (3) seeds. Macro-F1 weighs every class equally, so a rare class counts as much as a common one. Set `objective: tstr_macro_auprc` for a threshold-free alternative.
-4. Check four lenient screens in `hpo.constraints`. A trial that copies training rows (`copy_margin`), drops categories or classes (`min_category_coverage`), produces out-of-range values (`max_out_of_range`), or leaves a class short of its rows (`max_class_share_gap`, the largest allowed total variation distance from the class shares) is marked infeasible and cannot be chosen as best.
+3. Train a fixed XGBoost classifier on the synthetic rows and test it on the real tuning rows (**TSTR**, train on synthetic, test on real). Every trial logs macro AUPRC, macro AUROC, macro-F1 and macro-F1 of a class-weighted fit, each with a bootstrap standard error (how much the score would move with a different sample of tuning rows), plus the same scores for the classifier trained on real rows (**TRTR**, the ceiling). It also logs the worst protected group's AUPRC and three fidelity scores (`fid_marginal`, `fid_association`, `fid_detection_auc`; lower is closer to the real data), which are never optimized.
+4. Check the screens in `hpo.constraints`. A trial that copies training rows (`copy_margin`), drops categories (`min_category_coverage`, the worst categorical column) or classes, produces out-of-range values (`max_out_of_range`), leaves a class short (`max_class_share_gap`), drops a protected group (`min_protected_coverage`, 1.0 = every gender, age-quartile and ethnicity group with at least 1% of the rows), shifts the protected group shares by more than the same number of real rows would (`max_protected_share_gap`), or sits closer to the training rows than to unseen rows (`max_dcr_closer_to_train`; 0.5 means no memorization) is marked infeasible and cannot be chosen as best.
 
-The trial with the best feasible score wins. The final model is refitted with those settings on all of train. The best settings are saved in `hpo_best_params.json`, and every trial is stored in `optuna_studies.db`, so an interrupted search resumes where it stopped when you rerun with the same experiment id.
+**Which score is optimized** (`hpo.objective`). The default, `auto`, decides per model with a rule fixed in advance, so the choice can't be tuned to the results:
+
+1. Before any trial, it compares each candidate's real-data ceiling with chance. A candidate whose ceiling is less than `min_headroom_z` (2) bootstrap standard errors above chance is dropped: if even real data can't beat chance on that score, no synthetic data can be ranked by it. On the simulated data, macro-F1 failed this test (ceiling 0.305, always predicting the majority class 0.303).
+2. The first `n_startup_trials` (10) trials are random settings. Among the remaining candidates, it picks the score whose spread across those trials is largest compared to its noise (its reliability). Ties go to the first in `objective_candidates`.
+
+The choice and the table behind it are logged and stored in the study. Set `objective` to one score, such as `tstr_macro_auprc`, to fix it instead. You then get a warning if that score has no headroom.
+
+**How the search proceeds.** The first trial is the library's default settings (`enqueue_defaults`), followed by the best settings from an earlier run on similar data if you point `warm_start.storage` at its `optuna_studies.db`. After the start-up trials, Optuna's multivariate TPE sampler picks settings likely to score better. A study stops early when `patience` (10) trials in a row bring no gain larger than the score's bootstrap standard error (`min_delta: null`). The trial and time budgets stay as upper limits.
+
+**Choosing the winner.** The best of many noisy trials looks better than it is. So the `refit_top_k` (3) best feasible trials are refitted with `refit_seeds` (2) new seeds, and the one with the best mean wins. The final model is refitted with those settings on all of train. The best settings are saved in `hpo_best_params.json`, and every trial is stored in `optuna_studies.db`, so an interrupted search resumes where it stopped when you rerun with the same experiment id.
+
+**Looking at a finished search.** `scripts/hpo_analysis.py` reads `optuna_studies.db`:
+
+```bash
+uv run python scripts/hpo_analysis.py summary    <path>/optuna_studies.db  # best trial, trials after it, ties
+uv run python scripts/hpo_analysis.py compare    <path>/optuna_studies.db --composite tstr_macro_auprc=1,fid_marginal=0.5
+uv run python scripts/hpo_analysis.py importance <path>/optuna_studies.db --metric tstr_macro_auprc
+```
+
+`compare` shows which trial each logged score, or a weighted mix of them, would have picked, so you can judge a different or composite objective without a new run. `importance` ranks how much each hyperparameter moved the score. Only narrow a model's search (`hpo.search_params: {tvae: [encoder_n_units_hidden, n_iter]}`; the rest stay at library defaults) when a parameter's importance is stable across the bootstrap resamples and the score's spread across trials is clearly larger than its bootstrap standard error.
 
 ### Setting HPO budgets
 
@@ -430,7 +449,8 @@ Each model's search stops at its trial count or its time limit, whichever comes 
 | `hpo.n_trials_per_model` | Trials per model, e.g. `{ctgan: 40, arf: 25}`; `0` skips the search for that model |
 | `hpo.timeout_seconds_per_model` | Seconds per model |
 | `hpo.epoch_ranges` | Training length searched, as `[low, high, step]`, e.g. `{ctgan: [25, 150, 25]}`. The top also caps the untuned default model when the library default is longer |
-| `hpo.pruner: median` | Stops a CTGAN or ADS-GAN trial early when its intermediate score is below the median of earlier trials |
+| `hpo.patience`, `hpo.min_delta` | Stops a study after `patience` trials without a gain above `min_delta` (null: the score's bootstrap standard error) |
+| `hpo.pruner: median` | Off by default. Stops a CTGAN or ADS-GAN trial early when its GAN detection score is below the median of earlier trials; on the simulated data that score was 1.000 for every trial, so it pruned on noise |
 
 A good way to set budgets for a new dataset:
 

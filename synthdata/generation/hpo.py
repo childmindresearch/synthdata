@@ -31,7 +31,7 @@ import pandas as pd
 from filelock import FileLock
 
 from synthdata.config import HPOConfig, HPOConstraintsConfig
-from synthdata.evaluation.tstr import tstr_scores
+from synthdata.evaluation.tstr import XGB_PARAMS, _encode, chance_scores, tstr_scores
 from synthdata.utils import ensure_dir, get_logger, load_json, save_json
 
 logger = get_logger(__name__)
@@ -106,7 +106,24 @@ def build_synthetic_eval_fn(
 
 
 #: Constraint order stored on every trial; a value above 0 marks it infeasible.
-SCREENS = ("copies", "missing_classes", "category_coverage", "out_of_range", "class_share_gap")
+SCREENS = (
+    "copies",
+    "missing_classes",
+    "category_coverage",
+    "out_of_range",
+    "class_share_gap",
+    "protected_coverage",
+    "protected_share_gap",
+    "dcr_closer_to_train",
+)
+
+#: Trial user attribute of a TSTR objective: ``tstr_macro_auprc`` -> its value.
+#: Study user attribute holding the objective a study optimizes (the choice of
+#: ``objective: auto``); trials take their value from that logged score.
+STUDY_OBJECTIVE_ATTR = "objective"
+#: User attribute that makes an objective function fit with another seed
+#: (the top-k refit; see :func:`trial_seed`).
+REFIT_SEED_ATTR = "refit_seed"
 
 #: Categories rarer than this in train are not required in the synthetic data.
 MIN_CATEGORY_FREQUENCY = 0.01
@@ -123,6 +140,177 @@ class TrialScore:
 
 def objective_direction(objective: str) -> str:
     return "minimize" if objective == "synthcity_composite" else "maximize"
+
+
+def trial_seed(trial, seed: int) -> int:
+    """The seed an objective fits with: ``seed``, or the top-k refit's seed."""
+    return int(trial.user_attrs.get(REFIT_SEED_ATTR, seed))
+
+
+def protected_groups(
+    reference: pd.DataFrame, protected_columns: list, n_bins: int = 4
+) -> dict[str, Callable[[pd.DataFrame], pd.Series]]:
+    """Per protected column, a function mapping rows to group labels.
+
+    Categorical columns (or numeric ones with at most 10 values in
+    ``reference``) group by value; other numeric columns by the reference
+    quartiles (``n_bins`` quantile bins), so age-like columns form groups.
+    """
+    groupers = {}
+    for column in protected_columns:
+        if column not in reference:
+            continue
+        values = reference[column]
+        numeric = pd.api.types.is_numeric_dtype(values) and values.nunique() > 10
+        if numeric:
+            edges = np.unique(np.nanquantile(values.astype(float), np.linspace(0, 1, n_bins + 1)))
+            inner = edges[1:-1]
+
+            def grouper(df, column=column, inner=inner):
+                codes = np.digitize(pd.to_numeric(df[column], errors="coerce"), inner)
+                return pd.Series(
+                    np.where(df[column].isna(), "nan", codes.astype(str)), index=df.index
+                )
+        else:
+
+            def grouper(df, column=column):
+                return _comparable(df[column]).astype(str)
+
+        groupers[column] = grouper
+    return groupers
+
+
+def _shares(labels: pd.Series) -> pd.Series:
+    return labels.value_counts(normalize=True)
+
+
+def _tvd(a: pd.Series, b: pd.Series) -> float:
+    keys = a.index.union(b.index)
+    return float((a.reindex(keys, fill_value=0) - b.reindex(keys, fill_value=0)).abs().sum() / 2)
+
+
+def protected_scores(
+    synthetic_df: pd.DataFrame,
+    search_train_df: pd.DataFrame,
+    target_column: str,
+    groupers: dict,
+) -> dict:
+    """Protected-group representation of a candidate against search-train.
+
+    ``protected_coverage``: lowest share, over the protected columns, of the
+    groups with at least 1% frequency (and at least 5 expected rows) that the
+    candidate contains.
+    ``protected_share_gap``: largest total variation distance between the
+    candidate's and search-train's group shares. ``protected_target_gap``:
+    largest total variation distance between the target class shares within
+    one group (groups with at least 1% frequency), i.e. whether each group's
+    relation to the target survives. Columns missing from the candidate
+    count as fully missing.
+    """
+    coverage, share_gap, target_gap = [], [], []
+    for column, grouper in groupers.items():
+        real = grouper(search_train_df)
+        real_shares = _shares(real)
+        # A group expected fewer than 5 times in this many rows may be absent
+        # by chance alone.
+        floor = max(MIN_CATEGORY_FREQUENCY, 5 / max(len(synthetic_df), 1))
+        required = set(real_shares[real_shares >= floor].index)
+        if column not in synthetic_df:
+            coverage.append(0.0)
+            share_gap.append(1.0)
+            continue
+        syn = grouper(synthetic_df)
+        coverage.append(len(required & set(syn)) / len(required) if required else 1.0)
+        share_gap.append(_tvd(_shares(syn), real_shares))
+        if target_column in synthetic_df:
+            for group in required:
+                syn_rows = synthetic_df[target_column][syn == group]
+                if syn_rows.empty:
+                    continue
+                target_gap.append(
+                    _tvd(
+                        _shares(_comparable(syn_rows)),
+                        _shares(_comparable(search_train_df[target_column][real == group])),
+                    )
+                )
+    return {
+        "protected_coverage": min(coverage) if coverage else 1.0,
+        "protected_share_gap": max(share_gap) if share_gap else 0.0,
+        "protected_target_gap": max(target_gap) if target_gap else 0.0,
+    }
+
+
+def fidelity_scores(
+    synthetic_df: pd.DataFrame,
+    real_df: pd.DataFrame,
+    categorical_columns: list,
+    nominal_columns: list,
+    seed: int,
+) -> dict:
+    """Cheap fidelity of ``synthetic_df`` to held-out real rows; lower is closer.
+
+    ``fid_marginal``: mean over columns of the total variation distance of
+    category shares (categorical columns) or the Kolmogorov-Smirnov statistic
+    (numeric ones). ``fid_association``: mean absolute difference between the
+    two Pearson correlation matrices of the columns as numbers (categories as
+    integer codes), a fast proxy for pairwise structure. ``fid_detection_auc``:
+    3-fold cross-validated AUC of the fixed XGBoost telling real from
+    synthetic rows on equal-size samples (0.5 = indistinguishable).
+    Logged for comparison only, never optimized.
+    """
+    from scipy.stats import ks_2samp
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import StratifiedKFold
+    from xgboost import XGBClassifier
+
+    columns = [c for c in real_df.columns if c in synthetic_df.columns]
+    marginal = []
+    codes_real, codes_syn = {}, {}
+    for column in columns:
+        real, syn = real_df[column], synthetic_df[column]
+        if column in categorical_columns or not pd.api.types.is_numeric_dtype(real):
+            real, syn = _comparable(real).astype(str), _comparable(syn).astype(str)
+            marginal.append(_tvd(_shares(syn), _shares(real)))
+            levels = pd.Index(sorted(set(real) | set(syn)))
+            codes_real[column] = levels.get_indexer(real).astype(float)
+            codes_syn[column] = levels.get_indexer(syn).astype(float)
+        else:
+            real_values = pd.to_numeric(real, errors="coerce").dropna()
+            syn_values = pd.to_numeric(syn, errors="coerce").dropna()
+            if len(real_values) and len(syn_values):
+                marginal.append(float(ks_2samp(real_values, syn_values).statistic))
+            codes_real[column] = pd.to_numeric(real, errors="coerce").to_numpy(float)
+            codes_syn[column] = pd.to_numeric(syn, errors="coerce").to_numpy(float)
+
+    def _corr(codes):
+        frame = pd.DataFrame(codes)
+        return frame.fillna(frame.mean()).corr().to_numpy()
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        diff = np.abs(_corr(codes_real) - _corr(codes_syn))
+    upper = diff[np.triu_indices_from(diff, k=1)]
+    association = float(np.nanmean(upper)) if np.isfinite(upper).any() else float("nan")
+
+    n = min(len(real_df), len(synthetic_df))
+    rows = pd.concat(
+        [
+            real_df[columns].sample(n=n, random_state=seed),
+            synthetic_df[columns].sample(n=n, random_state=seed),
+        ],
+        ignore_index=True,
+    )
+    labels = np.r_[np.zeros(n), np.ones(n)]
+    x, _ = _encode(rows, rows.iloc[:1], [c for c in nominal_columns if c in columns])
+    scores = np.zeros(len(labels))
+    for fit_idx, score_idx in StratifiedKFold(3, shuffle=True, random_state=seed).split(x, labels):
+        model = XGBClassifier(**XGB_PARAMS, random_state=seed)
+        model.fit(x.iloc[fit_idx], labels[fit_idx])
+        scores[score_idx] = model.predict_proba(x.iloc[score_idx])[:, 1]
+    return {
+        "fid_marginal": float(np.mean(marginal)) if marginal else float("nan"),
+        "fid_association": association,
+        "fid_detection_auc": float(roc_auc_score(labels, scores)),
+    }
 
 
 def _comparable(series: pd.Series) -> pd.Series:
@@ -250,6 +438,7 @@ def build_hpo_eval_fn(
     seed: int,
     match_prior: bool = True,
     workspace: str | Path | None = None,
+    protected_columns: list = (),
 ) -> Callable[[pd.DataFrame], TrialScore]:
     """Build a ``synthetic_df -> TrialScore`` function scored on the tuning split.
 
@@ -259,9 +448,12 @@ def build_hpo_eval_fn(
     ``class_share_gap`` screen fails one whose shares still miss them by more
     than ``max_class_share_gap`` because a class fell short. The TSTR scores of the
     same classifier trained on the real search-train rows (TRTR) are the
-    ceiling, logged on every trial.
+    ceiling, logged on every trial; with :func:`chance_scores` they give each
+    candidate objective's headroom, attached as ``eval_fn.headroom``
+    (``{objective: {"trtr", "chance", "se", "z"}}``) for ``objective: auto``.
+    ``protected_columns`` get the protected-group screens and per-group TSTR.
     """
-    tstr = hpo_cfg.objective.startswith("tstr_")
+    tstr = hpo_cfg.objective.startswith("tstr_") or hpo_cfg.objective == "auto"
     if tstr and not target_is_categorical:
         raise ValueError(
             f"hpo.objective {hpo_cfg.objective!r} needs a categorical target; use "
@@ -270,25 +462,63 @@ def build_hpo_eval_fn(
     prior = search_train_df[target_column].value_counts(normalize=True)
     classes = sorted(prior.index, key=str)
     seeds = [seed + i for i in range(hpo_cfg.tstr_seeds)]
+    groupers = protected_groups(search_train_df, list(protected_columns))
+    tuning_groups = {column: grouper(tuning_df) for column, grouper in groupers.items()}
 
     def _tstr(fit_df):
         return tstr_scores(
-            fit_df, tuning_df, target_column, nominal_columns, classes, seeds, weighted=True
+            fit_df,
+            tuning_df,
+            target_column,
+            nominal_columns,
+            classes,
+            seeds,
+            weighted=True,
+            n_bootstrap=hpo_cfg.n_bootstrap,
+            groups=tuning_groups,
         )
 
+    def _worst_group(scores):
+        values = [v for groups in scores.group_auprc.values() for v in groups.values()]
+        return float(min(values)) if values else None
+
     trtr = None
+    headroom = {}
     if target_is_categorical:
         trtr = _tstr(search_train_df)
+        chance = chance_scores(tuning_df, target_column, classes)
+        for objective in (
+            "tstr_macro_auprc",
+            "tstr_macro_auroc",
+            "tstr_weighted_macro_f1",
+            "tstr_macro_f1",
+        ):
+            metric = objective.removeprefix("tstr_")
+            value = getattr(trtr, metric)
+            se = trtr.boot_se.get(metric)
+            z = (value - chance[metric]) / se if se else float("nan")
+            headroom[objective] = {"trtr": value, "chance": chance[metric], "se": se, "z": z}
         logger.info(
-            "HPO ceiling (fixed XGBoost trained on real search-train rows, scored on tuning): "
-            "macro-F1=%.4f macro-AUPRC=%.4f balanced-accuracy=%.4f; class-weighted fit: "
-            "macro-F1=%.4f balanced-accuracy=%.4f",
-            trtr.macro_f1,
-            trtr.macro_auprc,
-            trtr.balanced_accuracy,
-            trtr.weighted_macro_f1,
-            trtr.weighted_balanced_accuracy,
+            "HPO ceiling (fixed XGBoost trained on real search-train rows, scored on tuning) "
+            "vs chance, with headroom in bootstrap SEs: %s",
+            "; ".join(
+                f"{name.removeprefix('tstr_')}={h['trtr']:.4f} (chance {h['chance']:.4f}, "
+                f"z={h['z']:.1f})"
+                for name, h in headroom.items()
+            ),
         )
+        fixed = headroom.get(hpo_cfg.objective)
+        if fixed is not None and not fixed["z"] >= hpo_cfg.min_headroom_z:
+            logger.warning(
+                "hpo.objective %s has little headroom on this data: real-data ceiling %.4f vs "
+                "chance %.4f is %.1f bootstrap SEs (< %.1f); the search may only be fitting "
+                "noise. Consider objective: auto.",
+                hpo_cfg.objective,
+                fixed["trtr"],
+                fixed["chance"],
+                fixed["z"],
+                hpo_cfg.min_headroom_z,
+            )
     composite_fn = (
         None
         if tstr
@@ -305,6 +535,47 @@ def build_hpo_eval_fn(
         )
     )
 
+    dcr_reference = None
+    if hpo_cfg.constraints.max_dcr_closer_to_train is not None:
+        from synthdata.evaluation.privacy_attacks import _encoder, _nearest
+
+        columns = list(search_train_df.columns)
+        nominal = [
+            c
+            for c in columns
+            if c in categorical_columns
+            or (c == target_column and target_is_categorical)
+            or not pd.api.types.is_numeric_dtype(search_train_df[c])
+        ]
+        encode = _encoder(search_train_df, nominal)
+        sample = search_train_df.sample(
+            n=min(len(tuning_df), len(search_train_df)), random_state=seed
+        )
+        dcr_reference = (columns, encode, encode(sample), encode(tuning_df[columns]), _nearest)
+
+    def _dcr_closer_to_train(synthetic_df):
+        columns, encode, x_ref, x_hold, nearest = dcr_reference
+        x_syn = encode(synthetic_df.reindex(columns=columns))
+        d_ref = nearest(x_ref, x_syn, 1)[:, 0]
+        d_hold = nearest(x_hold, x_syn, 1)[:, 0]
+        return float(np.mean(d_ref < d_hold) + 0.5 * np.mean(d_ref == d_hold))
+
+    real_gaps = {}
+
+    def _real_share_gap(n_rows: int) -> float:
+        """Protected share gap of ``n_rows`` real tuning rows (resampled if needed)."""
+        if n_rows not in real_gaps:
+            sample = tuning_df.sample(n=n_rows, replace=n_rows > len(tuning_df), random_state=seed)
+            real_gaps[n_rows] = protected_scores(sample, search_train_df, target_column, groupers)[
+                "protected_share_gap"
+            ]
+        return real_gaps[n_rows]
+
+    constraints = hpo_cfg.constraints
+    objective_name = (
+        hpo_cfg.objective_candidates[0] if hpo_cfg.objective == "auto" else hpo_cfg.objective
+    )
+
     def eval_fn(synthetic_df: pd.DataFrame) -> TrialScore:
         violations = screen_violations(
             synthetic_df,
@@ -312,37 +583,68 @@ def build_hpo_eval_fn(
             tuning_df,
             target_column,
             categorical_columns,
-            hpo_cfg.constraints,
+            constraints,
         )
         if not target_is_categorical:
             violations["missing_classes"] = -1.0
-        elif match_prior and hpo_cfg.constraints.max_class_share_gap is not None:
+        elif match_prior and constraints.max_class_share_gap is not None:
             violations["class_share_gap"] = (
                 class_share_gap(synthetic_df[target_column], prior)
-                - hpo_cfg.constraints.max_class_share_gap
+                - constraints.max_class_share_gap
             )
         attrs = {"screens": violations}
+        if groupers:
+            protected = protected_scores(synthetic_df, search_train_df, target_column, groupers)
+            attrs["protected_target_gap"] = protected["protected_target_gap"]
+            attrs["protected_share_gap"] = protected["protected_share_gap"]
+            if constraints.min_protected_coverage is not None:
+                violations["protected_coverage"] = (
+                    constraints.min_protected_coverage - protected["protected_coverage"]
+                )
+            if constraints.max_protected_share_gap is not None:
+                # Calibrated like the copy screen: fresh real rows of the same
+                # size also miss the train shares by sampling noise.
+                violations["protected_share_gap"] = (
+                    protected["protected_share_gap"]
+                    - _real_share_gap(len(synthetic_df))
+                    - constraints.max_protected_share_gap
+                )
+        if dcr_reference is not None:
+            closer = _dcr_closer_to_train(synthetic_df)
+            attrs["dcr_closer_to_train"] = closer
+            violations["dcr_closer_to_train"] = closer - constraints.max_dcr_closer_to_train
+        if hpo_cfg.log_fidelity:
+            attrs |= fidelity_scores(
+                synthetic_df, tuning_df, categorical_columns, nominal_columns, seed
+            )
         if target_is_categorical:
             scores = _tstr(synthetic_df)
             attrs |= {
                 "tstr_macro_f1": scores.macro_f1,
                 "tstr_macro_auprc": scores.macro_auprc,
+                "tstr_macro_auroc": scores.macro_auroc,
                 "tstr_balanced_accuracy": scores.balanced_accuracy,
                 "tstr_weighted_macro_f1": scores.weighted_macro_f1,
                 "tstr_weighted_balanced_accuracy": scores.weighted_balanced_accuracy,
                 "tstr_per_class_f1": scores.per_class_f1,
                 "tstr_seed_sd": scores.seed_sd,
+                "tstr_boot_se": scores.boot_se,
+                "tstr_group_auprc": scores.group_auprc,
+                "tstr_worst_group_auprc": _worst_group(scores),
                 "trtr_macro_f1": trtr.macro_f1,
                 "trtr_macro_auprc": trtr.macro_auprc,
+                "trtr_macro_auroc": trtr.macro_auroc,
                 "trtr_balanced_accuracy": trtr.balanced_accuracy,
                 "trtr_weighted_macro_f1": trtr.weighted_macro_f1,
                 "trtr_weighted_balanced_accuracy": trtr.weighted_balanced_accuracy,
+                "trtr_worst_group_auprc": _worst_group(trtr),
             }
-        value = attrs[hpo_cfg.objective] if tstr else composite_fn(synthetic_df)
+        value = attrs[objective_name] if tstr else composite_fn(synthetic_df)
         if not np.isfinite(value):
-            raise ValueError(f"HPO objective {hpo_cfg.objective} is not finite: {value}")
+            raise ValueError(f"HPO objective {objective_name} is not finite: {value}")
         return TrialScore(value, [violations[name] for name in SCREENS], attrs)
 
+    eval_fn.headroom = headroom
     return eval_fn
 
 
@@ -357,7 +659,13 @@ def score_candidate(
     failed = [name for name, v in zip(SCREENS, score.constraints, strict=True) if v > 0]
     if failed:
         logger.info("trial %d is infeasible: failed screens %s", trial.number, failed)
-    return score.value
+    objective = trial.user_attrs.get(STUDY_OBJECTIVE_ATTR)
+    if objective is None and hasattr(trial, "study"):
+        objective = trial.study.user_attrs.get(STUDY_OBJECTIVE_ATTR)
+    value = score.attrs.get(objective, score.value) if objective else score.value
+    if not np.isfinite(value):
+        raise ValueError(f"HPO objective {objective} is not finite: {value}")
+    return value
 
 
 def _trial_constraints(trial: optuna.trial.FrozenTrial) -> list:
@@ -529,13 +837,25 @@ def create_storage(hpo_cfg: HPOConfig, output_dir: str | Path) -> optuna.storage
 
 
 def create_study(
-    study_name: str, hpo_cfg: HPOConfig, output_dir: str | Path, seed: int
+    study_name: str,
+    hpo_cfg: HPOConfig,
+    output_dir: str | Path,
+    seed: int,
+    sampler: optuna.samplers.BaseSampler | None = None,
 ) -> optuna.Study:
     storage = create_storage(hpo_cfg, output_dir)
-    with warnings.catch_warnings():
-        # constraints_func is marked experimental but stable since Optuna 3.0.
-        warnings.simplefilter("ignore", optuna.exceptions.ExperimentalWarning)
-        sampler = optuna.samplers.TPESampler(seed=seed, constraints_func=_trial_constraints)
+    if sampler is None:
+        with warnings.catch_warnings():
+            # constraints_func, multivariate and group are marked experimental
+            # but stable since Optuna 3.0.
+            warnings.simplefilter("ignore", optuna.exceptions.ExperimentalWarning)
+            sampler = optuna.samplers.TPESampler(
+                seed=seed,
+                constraints_func=_trial_constraints,
+                n_startup_trials=hpo_cfg.n_startup_trials,
+                multivariate=hpo_cfg.multivariate,
+                group=hpo_cfg.multivariate,
+            )
     return optuna.create_study(
         study_name=study_name,
         direction=objective_direction(hpo_cfg.objective),
@@ -627,6 +947,234 @@ class _TrialProgress:
             study.stop()
 
 
+def _feasible(trial: optuna.trial.FrozenTrial) -> bool:
+    return trial.state == optuna.trial.TrialState.COMPLETE and all(
+        v <= 0 for v in _trial_constraints(trial)
+    )
+
+
+def _objective_se(trial: optuna.trial.FrozenTrial, objective: str) -> float | None:
+    se = trial.user_attrs.get("tstr_boot_se", {}).get(objective.removeprefix("tstr_"))
+    return float(se) if se is not None and np.isfinite(se) else None
+
+
+class _Patience:
+    """Optuna callback: stop once ``patience`` finished trials in a row failed
+    to improve the best feasible value by more than ``min_delta``.
+
+    Pruned and failed trials count towards the run. Never stops before
+    ``min_trials`` trials. ``min_delta`` None: the median bootstrap standard
+    error of the objective over the feasible trials so far (0 without one).
+    """
+
+    def __init__(self, study_name: str, patience: int, min_delta: float | None, min_trials: int):
+        self.study_name = study_name
+        self.patience = patience
+        self.min_delta = min_delta
+        self.min_trials = min_trials
+
+    def threshold(self, trials: list, objective: str) -> float:
+        if self.min_delta is not None:
+            return self.min_delta
+        ses = [se for t in trials if _feasible(t) and (se := _objective_se(t, objective))]
+        return float(np.median(ses)) if ses else 0.0
+
+    def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        done = [t for t in study.trials if t.state.is_finished()]
+        if len(done) < max(self.min_trials, self.patience):
+            return
+        objective = study.user_attrs.get(STUDY_OBJECTIVE_ATTR, "")
+        delta = self.threshold(done, objective)
+        sign = 1.0 if study.direction == optuna.study.StudyDirection.MAXIMIZE else -1.0
+        best, since = None, 0
+        for t in sorted(done, key=lambda t: t.number):
+            if _feasible(t) and (best is None or sign * (t.value - best) > delta):
+                best, since = t.value, 0
+            else:
+                since += 1
+        # Without a feasible trial yet, keep searching for one.
+        if best is not None and since >= self.patience:
+            logger.info(
+                "[%s] stopping early: %d trials in a row without a gain above %.4f "
+                "(best %s; patience %d)",
+                self.study_name,
+                since,
+                delta,
+                "none feasible" if best is None else f"{best:.4f}",
+                self.patience,
+            )
+            study.stop()
+
+
+def choose_objective(
+    candidates: list, headroom: dict, trials: list, min_z: float
+) -> tuple[str, dict]:
+    """``objective: auto``: pick the objective from the random start-up trials.
+
+    The rule is fixed before any score is seen, and uses tuning-split scores
+    only:
+
+    1. Drop candidates whose real-data headroom ``(TRTR - chance) / SE`` is
+       under ``min_z``: the real data can't beat chance by more than the noise,
+       so no synthetic data can be told apart on that score. (If none is left,
+       keep the one with the largest headroom.)
+    2. Of the rest, take the most reliable: ``1 - noise variance / observed
+       variance`` across the feasible start-up trials, where the noise variance
+       is the mean squared bootstrap SE. It is the share of the trials' spread
+       that is not evaluation noise (an intraclass correlation). Ties, such as
+       all zero, go to the first candidate.
+
+    The start-up trials are random draws (Optuna's TPE only models results
+    after them), so they do not depend on the objective. Returns the choice and
+    the table behind it.
+    """
+    table = {}
+    for name in candidates:
+        h = headroom.get(name, {})
+        z = h.get("z", float("nan"))
+        values = [t.user_attrs[name] for t in trials if _feasible(t) and name in t.user_attrs]
+        ses = [se for t in trials if _feasible(t) and (se := _objective_se(t, name)) is not None]
+        observed = float(np.var(values, ddof=1)) if len(values) >= 3 else float("nan")
+        noise = float(np.mean(np.square(ses))) if ses else float("nan")
+        reliability = (
+            max(0.0, 1.0 - noise / observed)
+            if np.isfinite(observed) and observed > 0 and np.isfinite(noise)
+            else 0.0
+        )
+        table[name] = {
+            "headroom_z": z,
+            "passes_headroom": bool(z >= min_z),
+            "n_trials": len(values),
+            "trial_sd": float(np.sqrt(observed)) if np.isfinite(observed) else None,
+            "noise_se": float(np.sqrt(noise)) if np.isfinite(noise) else None,
+            "reliability": reliability,
+        }
+    eligible = [n for n in candidates if table[n]["passes_headroom"]]
+    if not eligible:
+        best_z = max(candidates, key=lambda n: np.nan_to_num(table[n]["headroom_z"], nan=-np.inf))
+        logger.warning(
+            "no HPO objective candidate has headroom of %.1f bootstrap SEs on this data; "
+            "using %s, the one with the most",
+            min_z,
+            best_z,
+        )
+        return best_z, table
+    top = max(table[n]["reliability"] for n in eligible)
+    return next(n for n in eligible if table[n]["reliability"] == top), table
+
+
+def _copy_trials(source: optuna.Study, target: optuna.Study, objective: str) -> None:
+    """Add ``source``'s finished trials to ``target`` valued by ``objective``."""
+    for t in source.trials:
+        if not t.state.is_finished():
+            continue
+        value = None
+        if t.state == optuna.trial.TrialState.COMPLETE:
+            value = t.user_attrs.get(objective, t.value)
+        target.add_trial(
+            optuna.trial.create_trial(
+                state=t.state,
+                value=value,
+                params=t.params,
+                distributions=t.distributions,
+                user_attrs=t.user_attrs,
+                intermediate_values=t.intermediate_values,
+            )
+        )
+
+
+def warm_start_params(hpo_cfg: HPOConfig, study_name: str) -> list[dict]:
+    """Params of the top feasible trials of ``study_name`` in ``hpo.warm_start.storage``."""
+    cfg = hpo_cfg.warm_start or {}
+    storage = cfg.get("storage")
+    if not storage:
+        return []
+    url = storage if "://" in str(storage) else f"sqlite:///{Path(storage).resolve()}"
+    try:
+        source = optuna.load_study(study_name=study_name, storage=url)
+    except KeyError:
+        logger.warning("[%s] warm start: no study of that name in %s", study_name, storage)
+        return []
+    metric = cfg.get("metric", "tstr_macro_auprc")
+    ranked = sorted(
+        (t for t in source.trials if _feasible(t) and metric in t.user_attrs),
+        key=lambda t: t.user_attrs[metric],
+        reverse=True,
+    )
+    return [dict(t.params) for t in ranked[: int(cfg.get("top_k", 3))]]
+
+
+def _refit_top_k(
+    study: optuna.Study,
+    objective_fn: Callable,
+    hpo_cfg: HPOConfig,
+    seed: int,
+    objective: str,
+) -> optuna.trial.FrozenTrial | None:
+    """Refit the best feasible trials with new seeds; return the best by mean.
+
+    Each of the ``refit_top_k`` best feasible trials is fitted again with
+    ``refit_seeds`` new seeds (through a ``FixedTrial`` of its params) and
+    scored the same way. Results are kept in the study's ``refit`` user
+    attribute, so a resumed run reuses them. A refit that fails counts as a
+    failed candidate.
+    """
+    feasible = [t for t in study.trials if _feasible(t)]
+    if not feasible:
+        return None
+    if hpo_cfg.refit_seeds == 0 or hpo_cfg.refit_top_k <= 1:
+        return _best_feasible(study)
+    sign = 1.0 if study.direction == optuna.study.StudyDirection.MAXIMIZE else -1.0
+    top = sorted(feasible, key=lambda t: sign * t.value, reverse=True)[: hpo_cfg.refit_top_k]
+    done = dict(study.user_attrs.get("refit", {}))
+    for t in top:
+        key = str(t.number)
+        if key in done:
+            continue
+        values = [t.value]
+        for j in range(hpo_cfg.refit_seeds):
+            fixed = optuna.trial.FixedTrial(dict(t.params), number=t.number)
+            fixed.set_user_attr(REFIT_SEED_ATTR, seed + 1000 * (j + 1))
+            fixed.set_user_attr(STUDY_OBJECTIVE_ATTR, objective)
+            try:
+                values.append(float(objective_fn(fixed)))
+            except (ValueError, RuntimeError) as error:
+                logger.warning(
+                    "[%s] refit of trial %d failed: %s", study.study_name, t.number, error
+                )
+                values.append(float("nan"))
+        done[key] = values
+        study.set_user_attr("refit", done)
+        logger.info(
+            "[%s] refit trial %d with %d new seed(s): %s (mean %.4f)",
+            study.study_name,
+            t.number,
+            hpo_cfg.refit_seeds,
+            ", ".join(f"{v:.4f}" for v in values),
+            float(np.mean(values)),
+        )
+    scored = [(t, float(np.mean(done[str(t.number)]))) for t in top if str(t.number) in done]
+    scored = [(t, m) for t, m in scored if np.isfinite(m)]
+    if not scored:
+        return _best_feasible(study)
+    return max(scored, key=lambda pair: sign * pair[1])[0]
+
+
+def _with_fail_reason(objective_fn: Callable) -> Callable:
+    """Store why a trial failed as its ``fail_reason`` user attribute."""
+
+    def wrapped(trial):
+        try:
+            return objective_fn(trial)
+        except optuna.TrialPruned:
+            raise
+        except Exception as error:
+            trial.set_user_attr("fail_reason", f"{type(error).__name__}: {error}"[:1000])
+            raise
+
+    return wrapped
+
+
 def _best_feasible(study: optuna.Study):
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     feasible = [t for t in completed if all(v <= 0 for v in _trial_constraints(t))]
@@ -647,13 +1195,24 @@ def run_study(
     checkpoint_plugin: str | None = None,
     model: str | None = None,
     reserve_seconds: float = 0.0,
+    default_params: dict | None = None,
+    headroom: dict | None = None,
 ) -> dict:
     """Run (or resume, via SQLite storage) an Optuna study; return best params.
 
     The trial count and timeout come from ``model_budget`` for ``model``
     (default: ``study_name`` without its ``hpo_`` prefix); 0 trials skips the
-    search and returns ``{}``. Pruned trials count towards the trial budget.
-    ``drop_keys`` are removed from the returned best-params dict.
+    search and returns ``{}``. Pruned and failed trials count towards the
+    trial budget. ``drop_keys`` are removed from the returned best-params dict.
+
+    The first trials are ``default_params`` (with ``hpo.enqueue_defaults``)
+    and the ``hpo.warm_start`` configs. With ``objective: auto``, the
+    ``n_startup_trials`` random start-up trials run in a ``<study>_probe``
+    study, :func:`choose_objective` picks the objective from them and
+    ``headroom`` (the eval function's ``headroom``), and they are copied into
+    the main study valued by that objective. The search stops early after
+    ``hpo.patience`` trials without a gain, and the best trial is chosen
+    after refitting the top ``refit_top_k`` with new seeds.
 
     With ``hpo.stage_time_limit_hours`` set, the search also stops starting
     trials ``reserve_seconds`` before the stage deadline (the time the
@@ -672,10 +1231,14 @@ def run_study(
     if n_trials == 0:
         logger.info("[%s] hyperparameter search skipped (0 trials); using defaults", study_name)
         return {}
+    objective_fn = _with_fail_reason(objective_fn)
     study = create_study(study_name, hpo_cfg, output_dir, seed)
-    finished = (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)
-    n_done = len([t for t in study.trials if t.state in finished])
-    n_remaining = max(n_trials - n_done, 0)
+    started = time.monotonic()
+
+    def n_finished(s: optuna.Study) -> int:
+        return len([t for t in s.trials if t.state.is_finished()])
+
+    n_remaining = max(n_trials - n_finished(study), 0)
     deadline = stage_deadline(hpo_cfg)
     search_deadline = None if deadline is None else deadline - reserve_seconds
     if search_deadline is not None and n_remaining > 0:
@@ -687,37 +1250,130 @@ def run_study(
                 study_name,
                 hpo_cfg.stage_time_limit_hours,
                 _hours(reserve_seconds),
-                n_done,
+                n_finished(study),
             )
             n_remaining = 0
         else:
             timeout = int(left) if timeout is None else min(timeout, int(left))
+
+    def time_left():
+        return None if timeout is None else max(int(timeout - (time.monotonic() - started)), 0)
+
+    initial = []
+    if hpo_cfg.enqueue_defaults and default_params:
+        initial.append(dict(default_params))
+    initial += warm_start_params(hpo_cfg, study_name)
+
+    def enqueue(s: optuna.Study) -> None:
+        for params in initial:
+            s.enqueue_trial(params, skip_if_exists=True)
+        if initial:
+            logger.info(
+                "[%s] first trials: %d enqueued config(s) (library defaults: %s; warm start: %d)",
+                s.study_name,
+                len(initial),
+                "yes" if hpo_cfg.enqueue_defaults and default_params else "no",
+                len(initial) - bool(hpo_cfg.enqueue_defaults and default_params),
+            )
+
+    objective = study.user_attrs.get(STUDY_OBJECTIVE_ATTR)
+    if objective is None and study.trials:
+        # A study from before the objective was stored optimized macro-F1.
+        objective = hpo_cfg.objective if hpo_cfg.objective != "auto" else "tstr_macro_f1"
+        logger.warning(
+            "[%s] resuming a study that predates objective selection; it keeps %s",
+            study_name,
+            objective,
+        )
+    elif objective is None and hpo_cfg.objective == "auto":
+        probe = create_study(
+            f"{study_name}_probe",
+            hpo_cfg,
+            output_dir,
+            seed,
+            sampler=optuna.samplers.RandomSampler(seed=seed),
+        )
+        if not probe.trials:
+            enqueue(probe)
+        n_probe = min(hpo_cfg.n_startup_trials, n_trials)
+        if n_remaining > 0 and n_finished(probe) < n_probe and time_left() != 0:
+            logger.info(
+                "[%s] objective: auto; %d random start-up trial(s) first",
+                study_name,
+                n_probe - n_finished(probe),
+            )
+            probe.optimize(
+                objective_fn,
+                n_trials=n_probe - n_finished(probe),
+                timeout=time_left(),
+                catch=(ValueError, RuntimeError),
+                show_progress_bar=False,
+                callbacks=[
+                    _TrialProgress(
+                        probe.study_name, hpo_cfg.objective_candidates[0], n_probe, search_deadline
+                    )
+                ],
+            )
+        objective, table = choose_objective(
+            hpo_cfg.objective_candidates, headroom or {}, probe.trials, hpo_cfg.min_headroom_z
+        )
+        logger.info(
+            "[%s] objective: auto chose %s; %s",
+            study_name,
+            objective,
+            "; ".join(
+                f"{name.removeprefix('tstr_')}: headroom z={row['headroom_z']:.1f}, "
+                f"reliability={row['reliability']:.2f}"
+                for name, row in table.items()
+            ),
+        )
+        study.set_user_attr("objective_selection", table)
+        _copy_trials(probe, study, objective)
+    elif objective is None:
+        objective = hpo_cfg.objective
+        enqueue(study)
+    study.set_user_attr(STUDY_OBJECTIVE_ATTR, objective)
+
+    n_remaining = 0 if n_remaining == 0 else max(n_trials - n_finished(study), 0)
+    if n_remaining > 0 and time_left() == 0:
+        logger.info("[%s] the start-up trials used the study's time budget", study_name)
+        n_remaining = 0
     if n_remaining > 0:
         logger.info(
-            "[%s] starting hyperparameter optimization: %d trial(s) remaining "
+            "[%s] starting hyperparameter optimization of %s: %d trial(s) remaining "
             "(%d already finished, target=%d, timeout=%ss)",
             study_name,
+            objective,
             n_remaining,
-            n_done,
+            n_finished(study),
             n_trials,
-            timeout,
+            time_left(),
         )
+        callbacks = [_TrialProgress(study_name, objective, n_trials, search_deadline)]
+        if hpo_cfg.patience is not None:
+            callbacks.append(
+                _Patience(study_name, hpo_cfg.patience, hpo_cfg.min_delta, hpo_cfg.n_startup_trials)
+            )
         study.optimize(
             objective_fn,
             n_trials=n_remaining,
-            timeout=timeout,
+            timeout=time_left(),
             # A crashed fit or a non-finite score marks the trial failed.
             catch=(ValueError, RuntimeError),
             show_progress_bar=False,
-            callbacks=[_TrialProgress(study_name, hpo_cfg.objective, n_trials, search_deadline)],
+            callbacks=callbacks,
         )
 
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     if not completed:
         logger.warning("[%s] all trials pruned/failed; falling back to defaults", study_name)
         return {}
-    feasible = [t for t in completed if all(v <= 0 for v in _trial_constraints(t))]
-    best_trial = _best_feasible(study)
+    feasible = [t for t in completed if _feasible(t)]
+    if search_deadline is not None and time.time() >= search_deadline:
+        logger.warning("[%s] no time left to refit the top trials; taking the best", study_name)
+        best_trial = _best_feasible(study)
+    else:
+        best_trial = _refit_top_k(study, objective_fn, hpo_cfg, seed, objective)
     if best_trial is None:
         logger.warning(
             "[%s] no trial passed the HPO screens (%d completed); falling back to defaults",
@@ -730,7 +1386,7 @@ def run_study(
     logger.info(
         "[%s] best %s=%.4f (trial %d; %d feasible of %d completed) params=%s",
         study_name,
-        hpo_cfg.objective,
+        objective,
         best_trial.value,
         best_trial.number,
         len(feasible),

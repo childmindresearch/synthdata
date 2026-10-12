@@ -440,7 +440,10 @@ class HPOConstraintsConfig:
     #: Mode collapse: for every categorical column, the share of its train
     #: categories with at least 1% frequency that the synthetic data contains.
     #: Every target class must also be present.
-    min_category_coverage: float | None = 0.9
+    #: The minimum over all categorical columns, so one rare level anywhere
+    #: fails the trial; the protected screens below hold the fairness-relevant
+    #: columns to a stricter standard.
+    min_category_coverage: float | None = 0.8
     #: Implausible values: the share of numeric values outside the train
     #: [min, max] range may exceed the same share for the real tuning rows by
     #: at most this.
@@ -450,6 +453,18 @@ class HPOConstraintsConfig:
     #: search-train shares may be at most this. Candidates are drawn to those
     #: shares, so a gap means a class fell short of its quota.
     max_class_share_gap: float | None = 0.02
+    #: Protected groups present: for every ``data.protected_columns`` column,
+    #: the share of its groups (at least 1% frequency in train; numeric
+    #: columns in train quartiles) the synthetic data contains.
+    min_protected_coverage: float | None = 1.0
+    #: Protected groups in proportion: the largest total variation distance,
+    #: over the protected columns, between the synthetic and search-train
+    #: group shares may exceed that of as many real tuning rows by at most this.
+    max_protected_share_gap: float | None = 0.05
+    #: Memorization: the share of synthetic rows nearer to a search-train row
+    #: than to any tuning row, against a search-train sample as large as the
+    #: tuning split (0.5 = no memorization; Platzer & Reutterer, 2021).
+    max_dcr_closer_to_train: float | None = 0.6
 
 
 @dataclasses.dataclass
@@ -463,15 +478,42 @@ class HPOConfig:
 
     #: Run the search. When False, models train with their library defaults.
     enabled: bool = True
-    #: What a trial optimizes, scored on the tuning split. "tstr_macro_f1"
-    #: (default): macro-F1 of a fixed XGBoost trained on the synthetic rows
-    #: (train on synthetic, test on real), averaged over ``tstr_seeds`` seeds.
-    #: "tstr_macro_auprc": the same classifier's macro AUPRC (threshold-free).
-    #: Both are logged on every trial either way. "synthcity_composite": the
-    #: older average of ``metric_config``, which puts privacy in the objective.
-    objective: str = "tstr_macro_f1"
-    #: XGBoost seeds averaged per TSTR score.
-    tstr_seeds: int = 3
+    #: What a trial optimizes, scored on the tuning split by a fixed XGBoost
+    #: trained on the synthetic rows (train on synthetic, test on real):
+    #: "tstr_macro_auprc", "tstr_macro_auroc", "tstr_weighted_macro_f1"
+    #: (class-weighted fit), "tstr_macro_f1"; all are logged on every trial.
+    #: "auto" (default) picks one of ``objective_candidates`` per model by a
+    #: fixed rule (see ``synthdata.generation.hpo.choose_objective``): drop
+    #: candidates whose real-data headroom over chance is under
+    #: ``min_headroom_z`` bootstrap standard errors, then take the one whose
+    #: scores across the random start-up trials vary most beyond their noise.
+    #: "synthcity_composite": the older average of ``metric_config``.
+    objective: str = "auto"
+    #: Candidates of ``objective: auto``, in order of preference (ties go to
+    #: the first).
+    objective_candidates: list = dataclasses.field(
+        default_factory=lambda: [
+            "tstr_macro_auprc",
+            "tstr_macro_auroc",
+            "tstr_weighted_macro_f1",
+            "tstr_macro_f1",
+        ]
+    )
+    #: Headroom a candidate needs: (TRTR - chance) / bootstrap SE of TRTR.
+    #: A fixed objective under it only gets a warning.
+    min_headroom_z: float = 2.0
+    #: XGBoost seeds averaged per TSTR score. The classifier is deterministic
+    #: (no row or column subsampling), so more seeds only repeat the fit.
+    tstr_seeds: int = 1
+    #: Bootstrap resamples of the tuning rows behind each score's standard
+    #: error (logged as ``tstr_boot_se``; used by ``objective: auto`` and
+    #: ``min_delta``). 0 = off.
+    n_bootstrap: int = 200
+    #: Log cheap fidelity scores on every trial (marginal distance, pairwise
+    #: association difference, detection AUC against the tuning rows), so a
+    #: composite objective can be compared afterwards without a new run
+    #: (``scripts/hpo_analysis.py compare``). Never part of the objective.
+    log_fidelity: bool = True
     #: Sanity screens a trial must pass to be chosen (see HPOConstraintsConfig).
     constraints: HPOConstraintsConfig = dataclasses.field(default_factory=HPOConstraintsConfig)
     #: Trials and wall-clock seconds per study, for models not listed in the
@@ -498,13 +540,49 @@ class HPOConfig:
     #: length when the library default is longer.
     epoch_ranges: dict = dataclasses.field(default_factory=dict)
     #: "median": Optuna's MedianPruner stops a trial whose intermediate score
-    #: falls below the median of earlier trials at the same step. null = off.
-    pruner: str | None = "median"
+    #: (synthcity's GAN detection metric) falls below the median of earlier
+    #: trials at the same step. null (default) = off: on the sim run that
+    #: score sat at 1.000 for every GAN trial, did not predict the objective,
+    #: and never checked the shortest trials, which biased the search to them.
+    pruner: str | None = None
     #: Trials that finish before pruning starts, and intermediate scores a
     #: trial reports before it can be pruned (1: from its first check on).
     pruner_startup_trials: int = 5
     #: See above.
     pruner_warmup_steps: int = 1
+    #: Random start-up trials before TPE models the results (Optuna's default).
+    n_startup_trials: int = 10
+    #: Multivariate TPE (with ``group``): models interactions between
+    #: hyperparameters, such as learning rate and batch size.
+    multivariate: bool = True
+    #: Stop a study once this many finished trials in a row failed to improve
+    #: the best feasible value by more than ``min_delta`` (never before
+    #: ``n_startup_trials`` trials). null = off; timeouts stay as caps.
+    patience: int | None = 10
+    #: Improvement that resets ``patience``. null = the median bootstrap
+    #: standard error of the objective over the trials so far.
+    min_delta: float | None = None
+    #: Enqueue the library's default hyperparameters as the first trial (the
+    #: values inside the searched space), so the search starts from them.
+    enqueue_defaults: bool = True
+    #: Warm start from an earlier run's studies on similar data: the top
+    #: ``top_k`` feasible trials of the study with the same name in the Optuna
+    #: storage ``storage`` (a path or URL), ranked by the logged ``metric``,
+    #: are enqueued first. null storage = off.
+    warm_start: dict = dataclasses.field(
+        default_factory=lambda: {"storage": None, "top_k": 3, "metric": "tstr_macro_auprc"}
+    )
+    #: Per model (synthcity plugin names), the hyperparameters to search;
+    #: the rest stay at the library default. Unlisted models search their whole
+    #: space. ``scripts/hpo_analysis.py importance`` shows which matter.
+    search_params: dict = dataclasses.field(default_factory=dict)
+    #: Before taking the best trial, refit the ``refit_top_k`` best feasible
+    #: trials with ``refit_seeds`` new seeds each and pick the best mean: the
+    #: best of many noisy trials is biased upward (the winner's curse).
+    #: 0 seeds = off.
+    refit_top_k: int = 3
+    #: See above.
+    refit_seeds: int = 2
     #: Metrics of the "synthcity_composite" objective, oriented to "higher is
     #: better" and averaged. Unused by the TSTR objectives.
     metric_config: dict = dataclasses.field(
@@ -1014,7 +1092,13 @@ def _validate_split(cfg: Config) -> None:
                 )
 
 
-HPO_OBJECTIVES = ("tstr_macro_f1", "tstr_macro_auprc", "synthcity_composite")
+TSTR_OBJECTIVES = (
+    "tstr_macro_auprc",
+    "tstr_macro_auroc",
+    "tstr_weighted_macro_f1",
+    "tstr_macro_f1",
+)
+HPO_OBJECTIVES = (*TSTR_OBJECTIVES, "auto", "synthcity_composite")
 HPO_PRUNERS = ("median", None)
 
 
@@ -1031,6 +1115,41 @@ def _validate_hpo(hpo: HPOConfig) -> None:
         raise ValueError(
             f"generation.hpo.tstr_seeds must be a positive integer, got {hpo.tstr_seeds!r}"
         )
+    bad = [c for c in hpo.objective_candidates if c not in TSTR_OBJECTIVES]
+    if not hpo.objective_candidates or bad:
+        raise ValueError(
+            f"generation.hpo.objective_candidates must be a non-empty list of "
+            f"{list(TSTR_OBJECTIVES)}, got {hpo.objective_candidates!r}"
+        )
+    for key in ("n_bootstrap", "n_startup_trials", "refit_top_k", "refit_seeds"):
+        value = getattr(hpo, key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"generation.hpo.{key} must be a non-negative integer, got {value!r}")
+    if hpo.objective == "auto" and hpo.n_bootstrap == 0:
+        raise ValueError("generation.hpo.objective: auto needs generation.hpo.n_bootstrap > 0")
+    if hpo.patience is not None and (
+        isinstance(hpo.patience, bool) or not isinstance(hpo.patience, int) or hpo.patience < 1
+    ):
+        raise ValueError(
+            f"generation.hpo.patience must be a positive integer or null, got {hpo.patience!r}"
+        )
+    if hpo.min_delta is not None and (
+        isinstance(hpo.min_delta, bool)
+        or not isinstance(hpo.min_delta, int | float)
+        or hpo.min_delta < 0
+    ):
+        raise ValueError(
+            f"generation.hpo.min_delta must be a non-negative number or null, got {hpo.min_delta!r}"
+        )
+    unknown = set(hpo.warm_start) - {"storage", "top_k", "metric"}
+    if unknown:
+        raise ValueError(f"generation.hpo.warm_start has unknown keys {sorted(unknown)}")
+    for model, names in hpo.search_params.items():
+        if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+            raise ValueError(
+                f"generation.hpo.search_params.{model} must be a list of parameter names, "
+                f"got {names!r}"
+            )
     if hpo.pruner not in HPO_PRUNERS:
         raise ValueError(
             f"generation.hpo.pruner must be one of {list(HPO_PRUNERS)}, got {hpo.pruner!r}"

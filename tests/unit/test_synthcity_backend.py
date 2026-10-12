@@ -154,7 +154,9 @@ def test_config_epoch_range_and_pruning_metric():
     pytest.importorskip("synthcity.plugins")
     from synthdata.config import HPOConfig
 
-    params = _objective_params("ctgan", HPOConfig(epoch_ranges={"ctgan": [2, 4, 1]}))
+    params = _objective_params(
+        "ctgan", HPOConfig(epoch_ranges={"ctgan": [2, 4, 1]}, pruner="median")
+    )
     assert 2 <= params["n_iter"] <= 4
     assert type(params["patience_metric"]).__name__ == "PruningPatienceMetric"
 

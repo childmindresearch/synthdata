@@ -90,13 +90,18 @@ generation:
     # epochs), but long enough for CTGAN to report its early-stopping metric
     # (every 50 epochs) to the median pruner.
     epoch_ranges: { ctgan: [50, 100, 50] }
-    # Objective scored on the tuning split: tstr_macro_f1 (fixed XGBoost
-    # trained on synthetic, tested on real), tstr_macro_auprc, or the older
-    # synthcity_composite (uses metric_config below, privacy included).
-    objective: tstr_macro_f1
-    tstr_seeds: 3
-    # Lenient sanity screens; a trial that fails one can't be chosen as best.
-    constraints: { copy_margin: 0.02, min_category_coverage: 0.9, max_out_of_range: 0.01 }
+    # objective: auto picks a TSTR score per model from the random start-up
+    # trials (both trials here); the two best are refitted with one new seed.
+    objective: auto
+    n_startup_trials: 2
+    refit_top_k: 2
+    refit_seeds: 1
+    n_bootstrap: 50
+    # The median pruner is off by default; the fixture keeps it on so its
+    # path stays tested.
+    pruner: median
+    # Sanity screens; a trial that fails one can't be chosen as best.
+    constraints: { copy_margin: 0.02, min_category_coverage: 0.8, max_out_of_range: 0.01 }
     metric_config:
       stats: [wasserstein_dist]
       performance: [xgb]
