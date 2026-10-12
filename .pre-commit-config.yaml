@@ -23,6 +23,17 @@ repos:
       - id: check-added-large-files
         args: [--maxkb=1024]
 
+  # Type check in the project environment (ty is in the dev group); only
+  # errors block a commit, see [tool.ty] in pyproject.toml.
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty type check
+        entry: uv run ty check
+        language: system
+        types: [python]
+        pass_filenames: false
+
   # The pipeline runs on sensitive clinical data: refuse to commit any data
   # file except the synthetic test fixture and public-data schemas.
   - repo: local

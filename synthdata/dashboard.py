@@ -523,7 +523,7 @@ def read_hpo(db_path: Path | None, budgets: dict, now: datetime) -> tuple[list[d
                 "last_error": last_error,
             }
         )
-    out.sort(key=lambda s: (-s["running"], s["model"]))
+    out.sort(key=lambda s: (-int(s["running"]), s["model"]))
     return out, None
 
 

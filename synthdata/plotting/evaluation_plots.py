@@ -40,7 +40,7 @@ def plot_rank_tradeoff(
     models = list(combined.index)
     base_models = sorted({_base_model(model) for model in models})
     # tab20 has 20 colors; reuse them rather than fail when a run has more generators.
-    colors = plt.cm.tab20.colors
+    colors = plt.get_cmap("tab20").colors  # ty: ignore[unresolved-attribute]
     palette = {base: colors[i % len(colors)] for i, base in enumerate(base_models)}
 
     fig, ax = plt.subplots(figsize=(11, 7))

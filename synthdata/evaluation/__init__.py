@@ -61,14 +61,16 @@ def run_evaluation(
     eval_cfg = cfg.evaluation
     output_dir = ensure_dir(eval_cfg.output_dir)
 
+    train_df = dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df")
+    test_df = dataset.require_imputed(dataset.test_imputed_df, "test_imputed_df")
     selected_datasets = select_models(cfg, synthetic_datasets)
-    n_samples = cfg.generation.rows_for(len(dataset.train_imputed_df))
+    n_samples = cfg.generation.rows_for(len(train_df))
     # Baselines are replicated like the generators so their scores carry the
     # same seed-to-seed spread.
     for replicate in range(cfg.generation.n_replicates):
         rows = baselines.build_baselines(
             eval_cfg.baselines,
-            dataset.train_imputed_df,
+            train_df,
             n_samples,
             cfg.seed + replicate,
         )
@@ -81,8 +83,8 @@ def run_evaluation(
 
     synthcity_results = synthcity_eval.run_synthcity_evaluation(
         selected_datasets,
-        dataset.train_imputed_df,
-        dataset.test_imputed_df,
+        train_df,
+        test_df,
         dataset.target_column,
         dataset.sensitive_columns,
         eval_cfg.synthcity,
@@ -103,7 +105,7 @@ def run_evaluation(
         if want_syntheval_plots
         else None
     )
-    n_classes = dataset.train_imputed_df[dataset.target_column].nunique()
+    n_classes = train_df[dataset.target_column].nunique()
     multiclass_target = dataset.target_is_categorical and n_classes > 2
     benchmark_results, benchmark_ranks = syntheval_eval.run_syntheval_evaluation(
         selected_datasets,

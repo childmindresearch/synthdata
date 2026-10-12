@@ -87,7 +87,10 @@ uv run pytest -m "not integration"
 uv run --with catboost==1.2.10 pytest tests/integration -m "integration and not slow and not regression"
 uv run ruff check .
 uv run ruff format --check .
+uv run ty check             # type check; only errors fail, see [tool.ty] in pyproject.toml
 ```
+
+[ty](https://docs.astral.sh/ty/) is also a language server: install its editor extension (VS Code: "ty" by Astral) to see type errors as you type.
 
 After a dependency or submodule bump, run the golden test (`pytest tests/integration -m regression`), which flags any metric that moved; see the [integration test guide](tests/integration/README.md).
 

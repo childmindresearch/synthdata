@@ -187,6 +187,8 @@ class TestBinLabelHelpers:
         assert _max_decimal_places([0, 0.5, 1.0]) == 1
         assert _max_decimal_places([0.001, 0.002]) == 3
         assert _max_decimal_places([1, 2, 3]) == 0
+        # An open-ended bin edge has no decimal places (used to raise TypeError).
+        assert _max_decimal_places([0, 2.5, float("inf")]) == 1
 
     def test_generate_bin_labels_integer(self):
         labels = generate_bin_labels([18, 30, 45, 60])

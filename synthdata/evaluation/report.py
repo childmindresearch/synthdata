@@ -159,7 +159,7 @@ def _load_extras(evaluation_dir: Path, combined: pd.DataFrame, extras: dict) -> 
         path = evaluation_dir / name
         if extras.get(key) is None and path.exists():
             try:
-                extras[key] = pd.read_csv(path, **kwargs)
+                extras[key] = pd.read_csv(path, **kwargs)  # ty: ignore[no-matching-overload]
             except (ValueError, pd.errors.ParserError) as exc:
                 logger.warning("[report] could not read %s: %s", path, exc)
     if extras.get("privacy_attacks") is None:

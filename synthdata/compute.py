@@ -185,8 +185,9 @@ class _Prefixed(io.TextIOBase):
     def fileno(self) -> int:
         return self._stream.fileno()
 
+    # typeshed declares TextIOBase.encoding writable; at runtime it is read-only.
     @property
-    def encoding(self):
+    def encoding(self):  # ty: ignore[invalid-property-type-override]
         return getattr(self._stream, "encoding", "utf-8")
 
 

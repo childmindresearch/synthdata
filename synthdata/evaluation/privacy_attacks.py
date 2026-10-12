@@ -369,7 +369,7 @@ def run_privacy_attack_evaluation(
         logger.warning("[custom] privacy attacks need a test split as the control set; skipping")
         return {}
 
-    train = dataset.train_imputed_df
+    train = dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df")
     holdout = dataset.test_imputed_df[train.columns]
     unit = attacks_cfg.unit
     train_patients = _patient_ids(dataset, unit, train.index)

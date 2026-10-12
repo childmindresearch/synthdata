@@ -113,6 +113,8 @@ def _syntheval_frames(
         empty = pd.DataFrame(index=model_names)
         return empty, empty
 
+    # Results and ranks come in pairs: both None or both set.
+    assert benchmark_ranks is not None
     raw = extract_raw_values(benchmark_results).reindex(model_names)
     types = extract_metric_types(benchmark_results)
     oriented = extract_oriented_values(benchmark_ranks).reindex(model_names)
@@ -430,7 +432,7 @@ def summarize_replicates(combined: pd.DataFrame, confidence: float = CONFIDENCE)
     rows = {}
     overall_by_model = {}
     for model, names in models.groupby(models, sort=False).groups.items():
-        row: dict = {"n_replicates": len(names), "baseline": is_baseline(model)}
+        row: dict = {"n_replicates": len(names), "baseline": is_baseline(str(model))}
         for dim in dims:
             mean, low, high = _mean_and_interval(scores[dim][names], confidence)
             row[f"{dim}_mean"] = mean
