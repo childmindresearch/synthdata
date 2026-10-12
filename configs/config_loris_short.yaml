@@ -1,0 +1,208 @@
+# LORIS short run: a quick end-to-end check of every stage on the full LORIS
+# width (about 1-2 hours on one GPU). Differences from config_loris.yaml:
+# experiment id, simple imputation, n_replicates 1, TabPFN off, 3 trials per
+# model, very short training, stage_time_limit_hours 0.75. Scores mean nothing;
+# it checks that the run completes and shows how long evaluation takes.
+#
+# This file lists the options worth reviewing for every run. Anything left out
+# uses its default; synthdata/config.py documents every option and default.
+
+name: loris
+seed: 42 # Split, imputation, generators and metrics all derive from this.
+device: auto # auto | cpu | cuda | mps
+
+# Models processed at once, in generation (one process per synthcity model:
+# its search, final fit and replicates) and in evaluation (one process per
+# synthetic dataset). auto = CPU cores // cores_per_worker, capped by free
+# memory and max_workers: 6 on a 24-core, 125 GB machine.
+compute:
+  workers: auto
+  max_workers: 8
+  cores_per_worker: 4
+  memory_reserve_gib: 16
+  memory_per_worker_gib: 14
+  fits_per_gpu: auto       # fits sharing one GPU at once (auto = 2), longest remaining work first
+
+experiment:
+  tag: loris_v2
+  id: "2.11-short" # Reusing an id resumes that experiment.
+
+data:
+  # Source and schema (LORIS data 2.11, transformed to match the simulated data's schema)
+  source: csv
+  path: data/loris/loris_v2_664_features_us_id.csv
+  version: "2.11" # Use a new value whenever the source data changes.
+  variable_schema_path: data/loris/loris_v2_variable_schema_us.csv
+  data_dir: data/loris # Cached splits and imputed data.
+
+  # Modeling columns
+  target_column: CGAS_class # 0 severe, 1 moderate, 2 typical
+  patient_id_column: patient_id # Split by patient, then dropped before modeling.
+  drop_columns: []
+  drop_rows_missing_target: true
+  # Column roles. Quasi-identifiers are public, linkable attributes an
+  # attacker may know; sensitive columns are the secrets privacy metrics try
+  # to infer; protected columns are the fairness groups. QIs and sensitive
+  # columns must not overlap; neither may hold the target or patient ID.
+  quasi_identifier_columns: [Age, Sex, region, PreInt_Demos_Fam__Child_Ethnicity]
+  sensitive_columns: [Income, PreInt_TxHx__suicide, Diagnosis_Cat__Anxiety_Disorders]
+  protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Ethnicity]
+
+  # Patient-level 60/20/20 split: train fits the imputer and HPO candidates,
+  # tuning scores them, holdout is touched only by evaluation. Stratified
+  # jointly by target, sex and age (<30, 30-60, >=60); strata too small to
+  # spread over the folds fall back to the target alone.
+  train_fraction: 0.6
+  tuning_fraction: 0.2
+  holdout_fraction: 0.2
+  stratify_columns: [CGAS_class, Sex, Age]
+  stratify_bins: [null, null, [30, 60]]
+
+imputation:
+  # Fitted on train minus tuning for HPO, then refitted on all of train.
+  method: simple # missforest | simple (median/mode) | tabimpute | refidiff; MissForest takes ~50 min here
+  round_to_int_default: false # Keep continuous features continuous.
+  missing_indicators:
+    enabled: true
+    min_missing_fraction: 0.05 # Columns missing this often get a <column>__missing feature.
+    # 80%+ missing: generate only the indicator, fill 'recorded' rows by CART on release.
+    # null = impute and generate every column as usual.
+    indicator_only_fraction: 0.8
+
+generation:
+  output_dir: output/loris/synthetic_data
+  n_samples: 2500
+  # Seed replicates per model; 2+ gives every score a 95% interval.
+  n_replicates: 1 # One fit per model to fit the night; the reported run uses 3.
+
+  synthcity:
+    enabled: true
+    # Bayesian network does not scale reliably to this dataset width.
+    names: [ctgan, tvae, adsgan, pategan, rtvae, ddpm, arf]
+
+  # Off: TabPFN's unsupervised sampler refits TabPFN for every earlier column of
+  # every column (3 orderings), so its time grows with the square of the column
+  # count: about 10 h per fit on the 681-column sim data, more here.
+  tabpfn:
+    enabled: false
+    variants: [standard, custom]
+    data_variants: [raw, imputed]
+    model_version: v3.5 # TabPFN weights; each version needs its license accepted (user manual).
+
+  # Off: TabPFGen outputs near-copies of training rows (docs/verification.md).
+  tabpfgen:
+    enabled: false
+
+  # Resample synthetic data to the real train class shares.
+  match_class_prior: true
+
+  hpo:
+    enabled: true
+    # Objective scored on the tuning split by a fixed XGBoost trained on the
+    # synthetic rows (train on synthetic, test on real). auto picks one of
+    # objective_candidates per model by a fixed rule: candidates whose
+    # real-data headroom over chance is under 2 bootstrap SEs are dropped,
+    # then the one that varies most beyond its noise across the random
+    # start-up trials wins. On the sim run macro-F1 had no headroom (real
+    # 0.305 vs always-majority 0.303), see docs/verification.md.
+    objective: auto
+    objective_candidates: [tstr_macro_auprc, tstr_macro_auroc, tstr_weighted_macro_f1, tstr_macro_f1]
+    # Screens a trial must pass to be chosen as best. Category coverage is the
+    # minimum over all categorical columns; the protected columns are held to
+    # full coverage and their group shares to within 0.05 of the real ones.
+    # dcr: share of synthetic rows nearer to a train row than a tuning row
+    # (0.5 = no memorization).
+    constraints:
+      { copy_margin: 0.02, min_category_coverage: 0.8, max_out_of_range: 0.01,
+        max_class_share_gap: 0.02, min_protected_coverage: 1.0,
+        max_protected_share_gap: 0.05, max_dcr_closer_to_train: 0.6 }
+    # Stop a study after 10 trials in a row without a gain above the
+    # objective's bootstrap SE (min_delta null); timeouts stay as caps.
+    patience: 10
+    min_delta: null
+    # Library defaults first, then multivariate TPE after 10 random trials;
+    # the best 3 feasible trials are refitted with 2 new seeds and the best
+    # mean wins. warm_start: an earlier run's optuna_studies.db (e.g. the sim
+    # run) whose top configs are tried first; search_params narrows a model's
+    # space (scripts/hpo_analysis.py importance shows what matters).
+    enqueue_defaults: true
+    warm_start: { storage: null, top_k: 3, metric: tstr_macro_auprc }
+    search_params: {}
+    refit_top_k: 3
+    refit_seeds: 2
+    # Budget for models not listed per model below.
+    n_trials: 50
+    timeout_seconds: 14400
+    # Per-model budgets from scripts/profile_hpo.py on LORIS 2.11
+    # (search-train 2125 rows x 1090 columns), Linux box with an RTX PRO 5000
+    # and 24 CPUs, four model groups running at once, 2026-10-09. MissForest
+    # imputation took 48 min. Seconds per epoch: CTGAN 13.7, TVAE 10.5,
+    # ADS-GAN 9.2, RTVAE 11.6, DDPM 6.1 (2.7-9.4 by batch size); PATE-GAN
+    # 105 per iteration (10 GAN epochs); ARF 45 per tree (CPU, single core).
+    # Trials: about 10 random start-up trials plus 10 per tuned dimension,
+    # capped for run time.
+    # Timeout = trials x (seconds per epoch x middle of the epoch range) x 1.5.
+    # PATE-GAN: each iteration trains the GAN for 10 epochs (generator_n_iter
+    # is held there, see HPO_FIXED_PARAMS); it searches 2-10 iterations.
+    # ARF: early stopping held on, 10-50 trees.
+    n_trials_per_model:
+      { ctgan: 3, tvae: 3, adsgan: 3, rtvae: 3, pategan: 3, ddpm: 3, arf: 3 }
+    stage_time_limit_hours: 0.75
+    timeout_seconds_per_model:
+      { ctgan: 72000, tvae: 55500, adsgan: 48500, rtvae: 61000, pategan: 38000,
+        ddpm: 200500, arf: 50000 }
+    # Training length is searched, [low, high, step]. The libraries' ranges
+    # (100-1000 epochs; PATE-GAN 1-500) would take 3+ hours per trial here.
+    # The top also caps the untuned default model, which would otherwise
+    # train for the library default (CTGAN 2000, ADS-GAN 10000 epochs).
+    epoch_ranges:
+      { ctgan: [5, 10, 5], tvae: [5, 10, 5], adsgan: [5, 10, 5],
+        rtvae: [5, 10, 5], pategan: [1, 2, 1], ddpm: [10, 20, 10] }
+    # Median pruning on synthcity's GAN detection metric: off, it sat at 1.000
+    # for every GAN trial on the sim run and never checked the shortest ones.
+    pruner: null
+
+evaluation:
+  output_dir: output/loris/evaluation
+  positive_class: 0 # Used only if the target is naturally binary.
+  # Fixed reference rows scored next to the generators: real train rows
+  # (utility ceiling, privacy floor) and independent column marginals.
+  baselines: [train_copy, marginals]
+
+  # Metric selection per framework: categories (utility/privacy/fairness) or
+  # exact metric names; null runs everything.
+  synthcity: { enabled: true, categories: null, metrics: null }
+  syntheval: { enabled: true, categories: null, metrics: null }
+  custom: { enabled: true, categories: null, metrics: null }
+
+  log_disparity:
+    protected_columns: [Sex, Age, PreInt_Demos_Fam__Child_Ethnicity]
+    target_map: { 0: severe, 1: moderate, 2: typical }
+    protected_bins: [null, [0, 18, 30, 45, 60, 200], null]
+
+  # Metrics that need two target classes (AUROC difference, subgroup gaps) on a
+  # 3+ class target: ovr_macro = once per class vs the rest, averaged with equal
+  # weight (per-class values in ovr_per_class.csv); binary = once on the
+  # binary_target collapse below, which must then be enabled.
+  class_averaging: ovr_macro
+  # Binary collapse for class_averaging: binary: severe/moderate versus typical.
+  binary_target:
+    enabled: false # true together with class_averaging: binary
+    positive_classes: [0, 1]
+    negative_classes: [2]
+  # Custom privacy metrics (Anonymeter, holdout-referenced DCR/NNDR).
+  # unit: patient = attacks target one encounter per patient and the distance
+  # membership check scores each patient by their closest encounter; row = every
+  # row is an individual. Anonymeter uses the QIs as attacker knowledge and the
+  # sensitive columns as secrets, with the test split as its control set.
+  privacy_attacks:
+    unit: patient
+    anonymeter: { n_attacks: 500 }
+
+
+  # Overall rank = weighted geometric mean of the utility, privacy and
+  # fairness ranks.
+  rank_weights: { utility: 1.0, privacy: 1.0, fairness: 1.0 }
+
+plots:
+  output_dir: output/loris/plots
