@@ -6,7 +6,14 @@ import numpy as np
 import pandas as pd
 
 from synthdata.data import Dataset
-from synthdata.plotting import add_histogram_with_kde, ordered_categories, save_matplotlib_figure
+from synthdata.plotting import (
+    add_histogram_with_kde,
+    column_bar_chart,
+    ordered_categories,
+    save_matplotlib_figure,
+    set_category_ticks,
+    wrapped_title,
+)
 
 
 def plot_column_distributions(
@@ -33,11 +40,13 @@ def plot_column_distributions(
                 set(counts.index), category_orders.get(col) if category_orders else None
             )
             counts = counts.reindex(categories, fill_value=0)
-            ax.bar([str(category) for category in categories], counts.values, zorder=3)
+            positions = np.arange(len(categories))
+            ax.bar(positions, counts.values, zorder=3)
+            set_category_ticks(ax, positions, categories)
         else:
             add_histogram_with_kde(ax, series, bins=20, label="data")
             ax.set_ylabel("density")
-        ax.set_title(col, fontsize=9)
+        ax.set_title(wrapped_title(col), fontsize=9)
         ax.grid(True, linestyle="--", alpha=0.4, zorder=0)
 
     for ax in axes_flat[len(columns) :]:
@@ -52,17 +61,19 @@ def plot_missingness(df: pd.DataFrame, feature_columns: list):
     import matplotlib.pyplot as plt
 
     missing = df[feature_columns].isna().mean()
-    missing = missing[missing > 0].sort_values(ascending=False)
+    missing = missing[missing > 0].sort_values(ascending=False, kind="stable")
 
-    fig, ax = plt.subplots(figsize=(max(6, 0.4 * len(missing)), 4))
-    if len(missing):
-        ax.bar(missing.index.astype(str), missing.values, zorder=3)
-        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
-    else:
+    if not len(missing):
+        fig, ax = plt.subplots(figsize=(4, 2))
         ax.text(0.5, 0.5, "No missing values", ha="center", va="center", transform=ax.transAxes)
-    ax.set_ylabel("Fraction missing")
-    ax.set_title("Missing values per column")
-    ax.grid(True, linestyle="--", alpha=0.4, axis="y", zorder=0)
+        ax.axis("off")
+        return fig
+    fig, _ = column_bar_chart(
+        missing.index.astype(str),
+        missing.values,
+        xlabel="Fraction missing",
+        title="Missing values per column",
+    )
     return fig
 
 

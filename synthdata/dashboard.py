@@ -371,6 +371,7 @@ def read_resources(log_path: Path) -> dict:
         "gpu_util_pct",
         "gpu_mem_used_mib",
         "pipeline_vram_mib",
+        "gpu_mem_total_mib",
     ]
     rows = [row for row in rows if _parse_utc(row.get("time_utc") or "")]
     series: dict[str, list] = {"t": [], "stage": [], **{c: [] for c in columns}}

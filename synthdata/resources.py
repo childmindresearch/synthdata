@@ -12,6 +12,8 @@
 * ``gpu_util_pct`` / ``gpu_mem_used_mib``: all GPUs, as ``nvidia-smi``
   reports them (mean utilization, summed memory, including other users).
 * ``pipeline_vram_mib``: GPU memory held by the pipeline's own processes.
+* ``gpu_mem_total_mib``: the GPUs' combined memory, the limit the two memory
+  columns above can reach.
 
 A second file, ``<UTC time>_resources_by_task.csv``, splits the run's RAM,
 CPU and GPU memory by task: each model's worker process (and anything it
@@ -47,6 +49,7 @@ COLUMNS = [
     "gpu_util_pct",
     "gpu_mem_used_mib",
     "pipeline_vram_mib",
+    "gpu_mem_total_mib",
 ]
 
 TASK_COLUMNS = ["time_utc", "stage", "task", "ram_gib", "cpu_cores", "vram_mib"]
@@ -77,12 +80,13 @@ def gpu_usage(pids: set[int]) -> tuple[dict, dict[int, int]]:
 
     Both are empty without a GPU.
     """
-    gpus = _nvidia_smi("--query-gpu=utilization.gpu,memory.used")
+    gpus = _nvidia_smi("--query-gpu=utilization.gpu,memory.used,memory.total")
     if not gpus:
         return {}, {}
     usage = {
         "gpu_util_pct": round(sum(float(g[0]) for g in gpus) / len(gpus), 1),
         "gpu_mem_used_mib": sum(int(float(g[1])) for g in gpus),
+        "gpu_mem_total_mib": sum(int(float(g[2])) for g in gpus),
     }
     apps = _nvidia_smi("--query-compute-apps=pid,used_memory") or []
     ours = [(int(pid), mem) for pid, mem in apps if pid.isdigit() and int(pid) in pids]

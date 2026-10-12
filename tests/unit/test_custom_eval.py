@@ -159,6 +159,18 @@ class TestRunTstrEvaluation:
         assert {"tstr_macro_f1", "tstr_balanced_accuracy", "tstr_macro_auprc"} <= set(table.columns)
         assert {"f1_0", "f1_1", "f1_2"} <= set(table.columns)
 
+    def test_trtr_ceiling_uses_as_many_real_rows_as_n_samples(self, tstr_dataset):
+        real = tstr_dataset.train_imputed_df
+        full = run_tstr_evaluation({}, tstr_dataset, FrameworkSelectionConfig(), 1, 0)
+        same = run_tstr_evaluation(
+            {}, tstr_dataset, FrameworkSelectionConfig(), 1, 0, n_samples=len(real)
+        )
+        fewer = run_tstr_evaluation(
+            {}, tstr_dataset, FrameworkSelectionConfig(), 1, 0, n_samples=30
+        )
+        assert same["trtr"] == full["trtr"]
+        assert fewer["trtr"] != full["trtr"]
+
     def test_deselected_returns_empty(self, tstr_dataset):
         selection = FrameworkSelectionConfig(categories=["fairness"])
         assert run_tstr_evaluation({}, tstr_dataset, selection, 1, 0) == {}

@@ -614,9 +614,14 @@ class GenerationConfig:
     """Which generators run, how many rows they produce, and their HPO."""
 
     #: Synthetic rows produced per model (fewer if ``match_class_prior`` leaves
-    #: a class short). Matching the real train size makes utility and privacy
-    #: scores easier to compare with the real data.
-    n_samples: int = 200
+    #: a class short). None (the default) matches the real rows the model is
+    #: fitted on: the train split for the final models, search-train for HPO
+    #: candidates. Same-size synthetic data is the usual convention (synthpop),
+    #: keeps TSTR comparable with the real-data ceiling, and adds no rows that
+    #: carry no new signal but more chances to leak a memorized record. An
+    #: integer fixes the count instead (e.g. to cap a slow generator); the
+    #: holdout TRTR ceiling is then fitted on that many real train rows.
+    n_samples: int | None = None
     #: Times each model is fitted and sampled, with seeds seed, seed+1, ...
     #: Replicate r > 0 is saved as "<model>__rep<r>". With 2 or more, the
     #: evaluation reports each score as a mean with a 95% confidence interval
@@ -645,6 +650,10 @@ class GenerationConfig:
     #: Without it, a generator that over-produces minority classes raises
     #: macro-F1 without being more faithful.
     match_class_prior: bool = True
+
+    def rows_for(self, n_real_rows: int) -> int:
+        """Synthetic rows to draw for a model fitted on ``n_real_rows`` real rows."""
+        return n_real_rows if self.n_samples is None else self.n_samples
 
 
 # ---------------------------------------------------------------------------
@@ -1326,6 +1335,13 @@ def _validate(cfg: Config) -> None:
             raise ValueError(
                 f"imputation.benchmark.hpo.{field_name} must be a non-empty list, got {values!r}"
             )
+    n_samples = cfg.generation.n_samples
+    if n_samples is not None and (
+        isinstance(n_samples, bool) or not isinstance(n_samples, int) or n_samples < 1
+    ):
+        raise ValueError(
+            f"generation.n_samples must be null or a positive integer, got {n_samples!r}"
+        )
     if not isinstance(cfg.generation.n_replicates, int) or cfg.generation.n_replicates < 1:
         raise ValueError(
             f"generation.n_replicates must be a positive integer, got {cfg.generation.n_replicates!r}"

@@ -64,7 +64,7 @@ def test_tabpfn_generation_forwards_schema_derived_feature_roles(make_config, ma
     assert arguments[1] == ["smoker"]
     assert "group" not in arguments[1]
     assert arguments[2] == "target"
-    assert arguments[3] == cfg.generation.n_samples
+    assert arguments[3] == len(dataset.train_df)  # n_samples: null matches train
     assert keyword_arguments["target_is_categorical"] is True
     assert keyword_arguments["variable_schema_fingerprint"] is None
     assert result["tabpfn_custom"].equals(generated)
