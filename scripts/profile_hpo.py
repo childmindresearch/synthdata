@@ -256,7 +256,7 @@ def main() -> None:
                 hpo_cfg,
                 cfg.seed,
                 eval_fn,
-                cfg.generation.n_samples,
+                cfg.generation.rows_for(len(dataset.search_train_imputed_df)),
                 workspace=workspace,
                 device=device,
                 classification=classification,

@@ -62,13 +62,14 @@ def run_evaluation(
     output_dir = ensure_dir(eval_cfg.output_dir)
 
     selected_datasets = select_models(cfg, synthetic_datasets)
+    n_samples = cfg.generation.rows_for(len(dataset.train_imputed_df))
     # Baselines are replicated like the generators so their scores carry the
     # same seed-to-seed spread.
     for replicate in range(cfg.generation.n_replicates):
         rows = baselines.build_baselines(
             eval_cfg.baselines,
             dataset.train_imputed_df,
-            cfg.generation.n_samples,
+            n_samples,
             cfg.seed + replicate,
         )
         selected_datasets = {
@@ -161,6 +162,7 @@ def run_evaluation(
         eval_cfg.tstr_seeds,
         cfg.seed,
         compute_cfg=cfg.compute,
+        n_samples=n_samples,
     )
     tstr_table = custom_eval.build_tstr_table(tstr_result)
     if not tstr_table.empty:

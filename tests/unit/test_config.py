@@ -548,6 +548,17 @@ class TestValidate:
         with pytest.raises(ValueError, match="n_replicates"):
             _validate(cfg)
 
+    @pytest.mark.parametrize("value", [0, -5, 2.5, True])
+    def test_bad_n_samples_raise(self, value):
+        cfg = self._base_valid()
+        cfg.generation.n_samples = value
+        with pytest.raises(ValueError, match="n_samples"):
+            _validate(cfg)
+
+    def test_null_n_samples_matches_the_real_rows(self):
+        assert GenerationConfig().rows_for(1234) == 1234
+        assert GenerationConfig(n_samples=50).rows_for(1234) == 50
+
     def test_unknown_baseline_raises(self):
         cfg = self._base_valid()
         cfg.evaluation.baselines = ["train_copy", "holdout"]
