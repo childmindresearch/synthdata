@@ -470,7 +470,12 @@ def run_generation(
                         headroom=hpo_eval_fn.headroom,
                     )
                     best_params.set("synthcity", name, params)
-                params = dict(best_params.get("synthcity", name))
+                # No feasible trial ({}): fit the untuned model's params, so the
+                # fallback keeps the capped training length instead of the
+                # library default (RTVAE diverged at 1000 epochs on LORIS).
+                params = dict(best_params.get("synthcity", name)) or sc.untuned_params(
+                    name, gen_cfg.hpo
+                )
 
                 override = gen_cfg.hpo.final_n_iter_override
                 if override and sc.plugin_accepts(name, "n_iter"):
