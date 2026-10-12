@@ -30,6 +30,7 @@ uv sync --group dev --extra tabpfn        # plain `uv sync --group dev` removes 
 uv run pre-commit install
 
 uv run ruff check . && uv run ruff format --check .
+uv run ty check                                                           # type check; CI fails on errors only
 uv run pytest -m "not integration and not slow and not network"           # unit, as CI
 uv run --with catboost==1.2.10 pytest tests/integration \
   -m "integration and not slow and not network and not regression"        # integration, as CI (needs catboost)
@@ -42,6 +43,7 @@ uv run synthdata-run --config configs/config_sim.yaml --detach            # long
 
 - Golden references live in `tests/integration/fixtures/golden/baseline_run_<os>_<device>.csv`. Linux CUDA is canonical, Linux CPU secondary; other platforms skip. When a PR changes a metric or generator on purpose, re-record on the Linux GPU machine and commit the CSV with the change (or say in the PR that it needs re-recording).
 - Run the golden check after any dependency or submodule bump.
+- ty is beta and pinned in the dev group. Its warnings include a known false positive on pandas (a list passed as `columns=`); fix new errors rather than adding `# ty: ignore`, and when an ignore is unavoidable give the reason on the same line.
 - If a container cannot reach download.pytorch.org, `uv sync` fails on the CUDA torch index; export requirements without `+cu128`/`nvidia-*` and `uv pip install --no-sources` instead.
 
 ## Config
