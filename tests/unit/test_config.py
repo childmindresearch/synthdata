@@ -84,13 +84,7 @@ class TestFromDict:
         assert cfg.imputation.refidiff.denoiser == "auto"
 
     @pytest.mark.parametrize(
-        "config_name",
-        [
-            "config_hepatitis.yaml",
-            "config_loris.yaml",
-            "config_loris_overnight.yaml",
-            "config_sim.yaml",
-        ],
+        "config_name", ["config_hepatitis.yaml", "config_loris.yaml", "config_sim.yaml"]
     )
     def test_shipped_hpo_profiles_exclude_domias(self, config_name):
         root = Path(__file__).parents[2]

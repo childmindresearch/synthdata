@@ -143,12 +143,11 @@ The settings you will most often change, by section:
 | `evaluation.baselines` | Reference rows scored next to the models | `[train_copy, marginals]` |
 | `evaluation.rank_weights` | How much utility, privacy and fairness count in the overall rank | `{utility: 1, privacy: 2, fairness: 1}` |
 
-The example configs are templates, not defaults for your data:
+The three example configs are templates, not defaults for your data:
 
 - [`config_hepatitis.yaml`](../configs/config_hepatitis.yaml): small, one row per patient, CPU-friendly.
 - [`config_sim.yaml`](../configs/config_sim.yaml): a wide (680-column), multi-visit, three-class dataset with profiled GPU budgets. Start here for real clinical data.
 - [`config_loris.yaml`](../configs/config_loris.yaml): the LORIS dataset, which shows the `binary_target` option for a multi-class target.
-- [`config_loris_overnight.yaml`](../configs/config_loris_overnight.yaml): LORIS with HPO and training cut to finish overnight (about 8-9 hours on one GPU); the header lists every difference.
 
 ### Long runs and remote machines
 
