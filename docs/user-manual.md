@@ -135,7 +135,7 @@ The settings you will most often change, by section:
 | `data.quasi_identifier_columns`, `sensitive_columns`, `protected_columns` | Column roles for privacy and fairness | see [section 5](#5-stage-1-load-and-split-the-data) |
 | `data.stratify_columns`, `stratify_bins` | What the split keeps balanced | `[target, gender, age]` |
 | `imputation.method` | How missing values are filled | `missforest`, `simple` |
-| `generation.n_samples` | Synthetic rows per model | about the real train size |
+| `generation.n_samples` | Synthetic rows per model | `null` (the real train size) |
 | `generation.n_replicates` | Times each model is retrained with a new seed | `1`, or `3` for confidence intervals |
 | `generation.synthcity.names` | Which synthcity generators run | `[ctgan, tvae, arf]` |
 | `generation.hpo.*` | Hyperparameter search budgets | see [section 7](#7-stage-3-generation-and-hyperparameter-search) |
@@ -378,7 +378,7 @@ Synthcity models are chosen with `generation.synthcity.names`. TabPFN runs when 
 
 ### Rows, class balance and replicates
 
-- `generation.n_samples` is the number of synthetic rows per model. Setting it close to the real train size makes utility and privacy scores easier to compare with the real data.
+- `generation.n_samples` is the number of synthetic rows per model. `null` (the default) draws as many rows as the model was fitted on: the train rows for the final models, the search-train rows for HPO candidates. This is the usual convention (synthpop does the same): it keeps TSTR comparable with the TRTR ceiling, and rows beyond the real count carry no new signal from the real data but give a model that memorized records more chances to emit them. An integer fixes the count instead, for example to cap a slow generator such as TabPFN on a large dataset; the holdout TRTR ceiling is then fitted on that many random train rows, so the gap between a model and the ceiling is not a sample-size effect.
 - `generation.match_class_prior: true` gives every synthetic dataset the class shares of the real train data. Each class gets its share of `n_samples` rows (with 2500 rows and shares 70/20/10%, that is 1750/500/250). DDPM is given those labels and generates them directly. Every other model is sampled again until each class has its rows, at most 10 batches in all. Each later batch asks for about 1.5 times the rows the shortest class is expected to need, not a full `n_samples`; TabPFN and TabPFGen refit for every batch, so one extra batch costs them a full run. Rows are never repeated to fill a class. A class still short after the last batch stays short, so the dataset can have fewer than `n_samples` rows. `diagnostics/class_sampling.csv` in the generation folder lists, per model and class, the rows wanted (`quota`), the rows kept (`filled`), the class share of the model's first batch (`raw_share`) and the batches drawn. A `raw_share` far from the train share means the model gets the class balance wrong on its own. Without this setting, a generator that produces too many minority-class rows can look better on macro-F1 without being more faithful.
 - `generation.n_replicates` retrains every model that many times with seeds `seed`, `seed+1`, and so on. Replicate r > 0 is saved as `<model>__rep<r>`. With 2 or more, the report gives every score a 95% confidence interval and says which models cannot be told apart from the best. HPO runs only once per model.
 

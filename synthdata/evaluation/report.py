@@ -234,7 +234,8 @@ def _glance_section(cfg, dataset, combined, extras, model_names, experiment) -> 
     replicates = int(summary["n_replicates"].max()) if "n_replicates" in summary else 1
     meta += [
         f"- **Seed**: `{cfg.seed}`; **seed replicates per model**: {replicates}; "
-        f"**synthetic rows per model**: {cfg.generation.n_samples}",
+        f"**synthetic rows per model**: {cfg.generation.rows_for(len(dataset.train_df))}"
+        + (" (train size)" if cfg.generation.n_samples is None else ""),
         f"- **Models evaluated ({len(model_names)})**: " + ", ".join(f"`{m}`" for m in model_names),
     ]
     lines += meta + [""]
@@ -405,7 +406,8 @@ def _utility_section(cfg, extras, paths: _Paths, links: _Links) -> str:
             "test split. Macro-F1 and balanced accuracy weigh every class equally, so a minority "
             "class the synthetic data gets wrong pulls them down; `f1_<class>` shows which "
             "class. The `trtr (real train)` row is the same classifier fitted on the real "
-            "training rows: the ceiling.",
+            "training rows (as many as each synthetic dataset when `n_samples` is below "
+            "the train size): the ceiling.",
             "",
             _dataframe_to_markdown(table),
             "",

@@ -186,7 +186,11 @@ def run_generation(
     gen_cfg = cfg.generation
     hpo_mod.mark_stage_start()
     output_dir = ensure_dir(gen_cfg.output_dir)
-    n_samples = gen_cfg.n_samples
+    # Final models draw as many rows as train has, HPO candidates as many as
+    # search-train has (unless generation.n_samples fixes the count).
+    n_samples = gen_cfg.rows_for(len(dataset.train_df))
+    search_train = dataset.search_train_imputed_df
+    hpo_n_samples = gen_cfg.rows_for(len(search_train)) if search_train is not None else n_samples
     seed = cfg.seed
     device = resolve_device(cfg.device)
 
@@ -441,7 +445,7 @@ def run_generation(
                         gen_cfg.hpo,
                         seed,
                         hpo_eval_fn,
-                        n_samples,
+                        hpo_n_samples,
                         workspace=output_dir / "synthcity_workspace",
                         device=device,
                         classification=dataset.target_is_categorical,
@@ -562,7 +566,7 @@ def run_generation(
                         dataset.feature_columns,
                         dataset.categorical_columns,
                         dataset.target_column,
-                        n_samples,
+                        hpo_n_samples,
                         hpo_mod.epoch_range(
                             gen_cfg.hpo, "tabpfgen_standard", tpfgen.SGLD_STEP_RANGE
                         ),
@@ -613,7 +617,7 @@ def run_generation(
                         dataset.feature_columns,
                         dataset.categorical_columns,
                         dataset.target_column,
-                        n_samples,
+                        hpo_n_samples,
                         hpo_mod.epoch_range(gen_cfg.hpo, "tabpfgen_custom", tpfgen.SGLD_STEP_RANGE),
                         eval_fn,
                         seed=seed,

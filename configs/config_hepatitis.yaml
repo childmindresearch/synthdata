@@ -47,7 +47,12 @@ imputation:
 
 generation:
   output_dir: output/hepatitis/synthetic_data
-  n_samples: 200
+  # Synthetic rows per model. null = as many as the real rows the model is
+  # fitted on (train for final models, search-train for HPO candidates), the
+  # usual convention: more rows add no real signal but more chances to leak.
+  # An integer caps it (e.g. for slow TabPFN); the TRTR ceiling then uses that
+  # many real train rows too.
+  n_samples: null
   # Seed replicates per model; 2+ gives every score a 95% interval.
   n_replicates: 1
 

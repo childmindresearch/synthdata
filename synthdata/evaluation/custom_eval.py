@@ -128,13 +128,16 @@ def run_tstr_evaluation(
     n_seeds: int,
     seed: int,
     compute_cfg=None,
+    n_samples: int | None = None,
 ) -> dict:
     """Holdout TSTR: fit the fixed XGBoost on each dataset, score on the test split.
 
     The classifier is the one HPO tunes against (synthdata.evaluation.tstr),
     but scored here on the test rows, which no generator or search ever saw.
     The same classifier fitted on the real training rows (TRTR) is the
-    ceiling. Returns ``{"scores": {model: TSTRScores}, "trtr": TSTRScores,
+    ceiling; with ``n_samples`` below the train size it is fitted on a random
+    ``n_samples`` of them, so the ceiling has as many rows as each synthetic
+    dataset and the gap is not a sample-size effect. Returns ``{"scores": {model: TSTRScores}, "trtr": TSTRScores,
     "classes": [...]}``, or ``{}`` when TSTR is not selected, the target is
     not categorical, or there is no test split. A model whose fit fails is
     logged and left out (its row is NaN in the combined table).
@@ -154,7 +157,11 @@ def run_tstr_evaluation(
     classes = sorted(train_df[target].dropna().unique().tolist(), key=str)
     seeds = [seed + i for i in range(n_seeds)]
 
-    trtr = tstr_scores(train_df, test_df, target, dataset.nominal_columns, classes, seeds)
+    trtr_df = train_df
+    if n_samples is not None and n_samples < len(train_df):
+        trtr_df = train_df.sample(n=n_samples, random_state=seed)
+        logger.info("[custom] holdout TRTR fitted on %d of %d train rows", n_samples, len(train_df))
+    trtr = tstr_scores(trtr_df, test_df, target, dataset.nominal_columns, classes, seeds)
     logger.info(
         "[custom] holdout TRTR ceiling: macro-F1=%.4f balanced-accuracy=%.4f macro-AUPRC=%.4f",
         trtr.macro_f1,
