@@ -14,10 +14,7 @@ from synthdata.plotting.generation_plots import plot_real_vs_synthetic
 pytestmark = pytest.mark.unit
 
 LONG_NAMES = [
-    "Life Events and History - Serious accident or physical impairment",
-    "Life Events and History - Death of a close family member or friend",
-    "Life Events and History - Conflict-laden or severed relationship",
-    "Life Events and History - Immigration, including refugee status",
+    f"Questionnaire section {i} - an item described by a long sentence of text" for i in range(4)
 ]
 
 
@@ -61,3 +58,18 @@ def test_long_category_labels_are_rotated_and_many_are_thinned():
     assert all(label.get_rotation() == 45 for label in answer_ax.get_xticklabels())
     assert len(site_ax.get_xticks()) <= 20
     plt.close(fig)
+
+
+def test_column_bar_charts_have_no_empty_band_with_many_columns():
+    from synthdata.plotting.data_plots import plot_missingness
+    from synthdata.plotting.imputation_plots import plot_validation_summary
+
+    names = [f"simulated_feature_{i:03d}_with_a_long_descriptive_name" for i in range(120)]
+    df = pd.DataFrame({name: [1.0, None, 2.0] for name in names})
+    validation = pd.DataFrame({"column": names, "n_imputed": 3, "n_valid": 3, "all_valid": True})
+    for fig in (plot_missingness(df, names), plot_validation_summary(validation)):
+        ax = fig.axes[0]
+        low, high = sorted(ax.get_ylim())
+        assert (low, high) == (-0.5, len(names) - 0.5)
+        assert ax.get_yticklabels()[0].get_text().startswith("simulated_feature_000")
+        plt.close(fig)

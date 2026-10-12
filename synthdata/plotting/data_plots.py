@@ -8,6 +8,7 @@ import pandas as pd
 from synthdata.data import Dataset
 from synthdata.plotting import (
     add_histogram_with_kde,
+    column_bar_chart,
     ordered_categories,
     save_matplotlib_figure,
     set_category_ticks,
@@ -62,15 +63,17 @@ def plot_missingness(df: pd.DataFrame, feature_columns: list):
     missing = df[feature_columns].isna().mean()
     missing = missing[missing > 0].sort_values(ascending=False)
 
-    fig, ax = plt.subplots(figsize=(max(6, 0.4 * len(missing)), 4))
-    if len(missing):
-        ax.bar(missing.index.astype(str), missing.values, zorder=3)
-        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
-    else:
+    if not len(missing):
+        fig, ax = plt.subplots(figsize=(4, 2))
         ax.text(0.5, 0.5, "No missing values", ha="center", va="center", transform=ax.transAxes)
-    ax.set_ylabel("Fraction missing")
-    ax.set_title("Missing values per column")
-    ax.grid(True, linestyle="--", alpha=0.4, axis="y", zorder=0)
+        ax.axis("off")
+        return fig
+    fig, _ = column_bar_chart(
+        missing.index.astype(str),
+        missing.values,
+        xlabel="Fraction missing",
+        title="Missing values per column",
+    )
     return fig
 
 
