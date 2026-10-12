@@ -234,6 +234,8 @@ def tstr_scores(
             weighted_balanced.append(balanced_accuracy_score(y_true, w_pred))
         if first_proba is None:
             first_proba, first_weighted = proba, w_pred
+    if first_proba is None:
+        raise ValueError("TSTR needs at least one seed")
 
     boot_se = (
         _bootstrap_se(y_true, first_proba, first_weighted, len(classes), n_bootstrap, seeds[0])

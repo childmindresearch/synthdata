@@ -240,8 +240,8 @@ def run_generation(
     hpo_eval_fn = None
     if gen_cfg.hpo.enabled and needs_imputed_data(gen_cfg):
         hpo_eval_fn = hpo_mod.build_hpo_eval_fn(
-            dataset.search_train_imputed_df,
-            dataset.tuning_imputed_df,
+            dataset.require_imputed(dataset.search_train_imputed_df, "search_train_imputed_df"),
+            dataset.require_imputed(dataset.tuning_imputed_df, "tuning_imputed_df"),
             dataset.target_column,
             dataset.nominal_columns,
             dataset.categorical_columns,
@@ -275,7 +275,9 @@ def run_generation(
         """Values for indicator-only columns in "recorded" synthetic rows (CART leaf sampling)."""
         values = dataset.indicator_only_values
         if not cart:
-            real = dataset.train_imputed_df.set_axis(dataset.train_df.index)
+            real = dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df").set_axis(
+                dataset.train_df.index
+            )
             cart["reference"] = real
             categorical = set(dataset.variable_schema) - {
                 c for c, e in dataset.variable_schema.items() if e.get("kind") == "continuous"
@@ -390,7 +392,7 @@ def run_generation(
         # and l-diversity metrics target; the fairness column is a protected group.
         fairness_column = dataset.protected_columns[0] if dataset.protected_columns else None
         train_loader = sc.make_loader(
-            dataset.train_imputed_df,
+            dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df"),
             dataset.target_column,
             dataset.sensitive_columns,
             random_state=seed,
@@ -398,7 +400,7 @@ def run_generation(
         )
         search_loader = (
             sc.make_loader(
-                dataset.search_train_imputed_df,
+                dataset.require_imputed(dataset.search_train_imputed_df, "search_train_imputed_df"),
                 dataset.target_column,
                 dataset.sensitive_columns,
                 random_state=seed,
@@ -441,6 +443,7 @@ def run_generation(
             )
             if gen_cfg.hpo.enabled and hpo_mod.model_budget(gen_cfg.hpo, name)[0] > 0:
                 if not best_params.has("synthcity", name):
+                    assert hpo_eval_fn is not None  # synthcity models read imputed data
                     objective = sc.build_synthcity_objective(
                         name,
                         search_loader,
@@ -505,7 +508,9 @@ def run_generation(
         tpfn.validate_tabpfn_target(dataset.target_column, dataset.target_is_categorical)
         for data_variant in gen_cfg.tabpfn.data_variants:
             if data_variant == "imputed":
-                train_df_variant = dataset.train_imputed_df
+                train_df_variant = dataset.require_imputed(
+                    dataset.train_imputed_df, "train_imputed_df"
+                )
                 suffix = "_imputed"
             else:
                 train_df_variant = dataset.train_df
@@ -554,7 +559,7 @@ def run_generation(
             _cached_or_build(
                 "tabpfgen_standard",
                 lambda seed, count: tpfgen.generate_tabpfgen_standard(
-                    dataset.train_imputed_df,
+                    dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df"),
                     dataset.feature_columns,
                     dataset.categorical_columns,
                     dataset.target_column,
@@ -569,7 +574,9 @@ def run_generation(
             ):
                 if not best_params.has("tabpfgen", "tabpfgen_standard"):
                     objective = tpfgen.build_tabpfgen_standard_objective(
-                        dataset.search_train_imputed_df,
+                        dataset.require_imputed(
+                            dataset.search_train_imputed_df, "search_train_imputed_df"
+                        ),
                         dataset.feature_columns,
                         dataset.categorical_columns,
                         dataset.target_column,
@@ -593,7 +600,7 @@ def run_generation(
                 _cached_or_build(
                     "tabpfgen_standard_hpo",
                     lambda seed, count, params=params: tpfgen.generate_tabpfgen_standard(
-                        dataset.train_imputed_df,
+                        dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df"),
                         dataset.feature_columns,
                         dataset.categorical_columns,
                         dataset.target_column,
@@ -607,7 +614,7 @@ def run_generation(
             _cached_or_build(
                 "tabpfgen_custom",
                 lambda seed, count: tpfgen.generate_tabpfgen_custom(
-                    dataset.train_imputed_df,
+                    dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df"),
                     dataset.feature_columns,
                     dataset.categorical_columns,
                     dataset.target_column,
@@ -620,7 +627,9 @@ def run_generation(
             if gen_cfg.hpo.enabled and hpo_mod.model_budget(gen_cfg.hpo, "tabpfgen_custom")[0] > 0:
                 if not best_params.has("tabpfgen", "tabpfgen_custom"):
                     objective = tpfgen.build_tabpfgen_custom_objective(
-                        dataset.search_train_imputed_df,
+                        dataset.require_imputed(
+                            dataset.search_train_imputed_df, "search_train_imputed_df"
+                        ),
                         dataset.feature_columns,
                         dataset.categorical_columns,
                         dataset.target_column,
@@ -643,7 +652,7 @@ def run_generation(
                 _cached_or_build(
                     "tabpfgen_custom_hpo",
                     lambda seed, count, params=params: tpfgen.generate_tabpfgen_custom(
-                        dataset.train_imputed_df,
+                        dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df"),
                         dataset.feature_columns,
                         dataset.categorical_columns,
                         dataset.target_column,

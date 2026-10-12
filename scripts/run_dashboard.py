@@ -87,7 +87,7 @@ def main(argv: list[str] | None = None) -> None:
             self.end_headers()
             self.wfile.write(page)
 
-        def log_message(self, *_):  # keep the terminal quiet
+        def log_message(self, format, *args):  # keep the terminal quiet
             pass
 
     server = ThreadingHTTPServer((args.bind, args.port), Handler)

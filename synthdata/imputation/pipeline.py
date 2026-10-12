@@ -48,6 +48,7 @@ def _persist_decoded_imputed_splits(dataset: Dataset) -> None:
         )
     paths = dataset.paths()
     for name, frame in decoded_frames.items():
+        assert frame is not None  # checked above
         frame.to_csv(paths[name], index=False)
     logger.info(
         "Wrote ordinal-decoded imputed splits under %s (model-space caches remain in "
@@ -438,17 +439,18 @@ def run_imputation(cfg: Config, dataset: Dataset) -> Dataset:
             "yes" if runs_search_phase(cfg, dataset) else "skipped, HPO is off",
             len(dataset.train_df),
         )
-        train_imputed, test_imputed, search_imputed = (
-            None
-            if frame is None
-            else apply_rounding(
+
+        def _round(frame: pd.DataFrame) -> pd.DataFrame:
+            return apply_rounding(
                 frame,
                 dataset.feature_columns,
                 cfg.imputation.round_rules,
                 cfg.imputation.round_to_int_default,
             )
-            for frame in _impute_splits(cfg, dataset, device)
-        )
+
+        train_raw, test_raw, search_raw = _impute_splits(cfg, dataset, device)
+        train_imputed, test_imputed = _round(train_raw), _round(test_raw)
+        search_imputed = None if search_raw is None else _round(search_raw)
         full_imputed = pd.concat([train_imputed, test_imputed]).loc[dataset.full_df.index]
         if search_imputed is not None:
             _report_drift(cfg, dataset, search_imputed, train_imputed)

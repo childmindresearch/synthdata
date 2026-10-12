@@ -32,10 +32,9 @@ def usable_cpus() -> int:
     has; ``os.cpu_count()`` would still report the whole node. ``SLURM_CPUS_PER_TASK``
     caps the count on clusters that allocate CPUs without binding them.
     """
-    try:
-        cpus = len(os.sched_getaffinity(0))
-    except AttributeError:  # not available on Windows or macOS
-        cpus = os.cpu_count() or 1
+    # sched_getaffinity exists only on Linux (looked up at call time so tests can patch it).
+    affinity = getattr(os, "sched_getaffinity", None)
+    cpus = len(affinity(0)) if affinity is not None else (os.cpu_count() or 1)
     slurm = os.environ.get("SLURM_CPUS_PER_TASK", "")
     if slurm.isdigit() and int(slurm) > 0:
         cpus = min(cpus, int(slurm))
@@ -185,8 +184,9 @@ class _Prefixed(io.TextIOBase):
     def fileno(self) -> int:
         return self._stream.fileno()
 
+    # typeshed declares TextIOBase.encoding writable; at runtime it is read-only.
     @property
-    def encoding(self):
+    def encoding(self):  # ty: ignore[invalid-property-type-override]
         return getattr(self._stream, "encoding", "utf-8")
 
 

@@ -163,7 +163,19 @@ class Dataset:
     @property
     def search_train_df(self) -> pd.DataFrame:
         """Train rows that HPO candidates and the imputer are fitted on (train minus tuning)."""
-        return self.train_df.drop(index=self.tuning_index)
+        return self.train_df.drop(index=self.tuning_index)  # ty: ignore[no-matching-overload]
+
+    def require_imputed(self, frame: pd.DataFrame | None, name: str) -> pd.DataFrame:
+        """Return an imputed frame of this dataset, or fail with a clear message.
+
+        The ``*_imputed_df`` frames stay ``None`` until imputation has run; later
+        stages call this instead of failing on ``None`` deep inside a metric.
+        """
+        if frame is None:
+            raise RuntimeError(
+                f"{name} is not available: run imputation (synthdata-impute) before this stage"
+            )
+        return frame
 
     def _imputed_rows(self, rows: pd.DataFrame) -> pd.DataFrame | None:
         if self.full_imputed_df is None:
@@ -1206,11 +1218,12 @@ def load_dataset(cfg: Config) -> Dataset:
         fractions_missing = (
             df.loc[train_only, list(missing_indicator_columns.values())].isna().mean()
         )
+        threshold = indicator_cfg.indicator_only_fraction
         indicator_only = [
             column
             for column in missing_indicator_columns.values()
-            if indicator_cfg.indicator_only_fraction is not None
-            and fractions_missing[column] >= indicator_cfg.indicator_only_fraction
+            if threshold is not None
+            and fractions_missing[column] >= threshold
             and column not in protected_from_dropping
         ]
         if indicator_only:
@@ -1226,7 +1239,7 @@ def load_dataset(cfg: Config) -> Dataset:
                 "%d column(s) missing in at least %.0f%% of train rows keep only their "
                 "indicator during imputation and generation: %s",
                 len(indicator_only),
-                100 * indicator_cfg.indicator_only_fraction,
+                100 * (threshold or 0),
                 indicator_only,
             )
     # train_df keeps the tuning rows: HPO searches on train_df minus tuning,

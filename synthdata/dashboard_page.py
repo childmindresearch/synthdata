@@ -188,7 +188,7 @@ def _timeline(d: dict) -> str:
             "Each model's start and finish appear here when <code>compute.workers</code> is more than 1."
             "</p></section>"
         )
-    t1 = _ts(d["run"]["ended"]) or _ts(d["generated"])
+    t1 = _ts(d["run"]["ended"]) or _ts(d["generated"]) or datetime.now(UTC).timestamp()
     t0 = _ts(d["run"]["started"]) or min((_ts(t["start"]) for t in tasks if t["start"]), default=t1)
     span = max(t1 - t0, 1)
     hpo = {s["model"]: s for s in d["hpo"]}

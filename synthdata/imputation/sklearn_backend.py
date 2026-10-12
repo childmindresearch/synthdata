@@ -18,6 +18,7 @@ neither an input nor an output.
 """
 
 import dataclasses
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -38,7 +39,8 @@ class FittedImputer:
     categories: dict
     #: Nominal columns encoded as one indicator per category (missforest only).
     one_hot: list
-    model: object
+    #: The fitted estimator, or ``{strategy: SimpleImputer}`` for method "simple".
+    model: Any
 
 
 def _encode(frame: pd.DataFrame, state: FittedImputer) -> pd.DataFrame:

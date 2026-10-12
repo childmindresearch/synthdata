@@ -63,8 +63,10 @@ def _atomic_parquet(path: Path, frame: pd.DataFrame) -> None:
     os.replace(temporary, path)
 
 
-def _frame_fingerprint(frame: pd.DataFrame) -> str:
+def _frame_fingerprint(frame: pd.DataFrame | None) -> str:
     """Content hash including column order and dtypes for cache validity."""
+    if frame is None:
+        return "none"
     digest = hashlib.sha256()
     digest.update(
         repr([(str(column), str(dtype)) for column, dtype in frame.dtypes.items()]).encode()
@@ -292,7 +294,6 @@ def _model_worker(
             role: AnalysisConfig(
                 dataset=real_frame,
                 target_vars=target_column,
-                confounder_vars=None,
                 sensitive_vars=columns,
             )
             for role, columns in (
@@ -309,7 +310,8 @@ def _model_worker(
             os.chdir(plot_dir)
         se = SynthEval(
             real_frame,
-            holdout_dataframe=holdout_frame,
+            # SynthEval annotates this DataFrame but defaults it to None.
+            holdout_dataframe=holdout_frame,  # ty: ignore[invalid-argument-type]
             cat_cols=cat_cols,
             verbose=False,
             enable_plots=plot_dir is not None,
@@ -599,6 +601,7 @@ def _run_resumable_syntheval(
     """
     from syntheval.syntheval import aggregate_benchmark_results
 
+    train_df = dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df")
     checkpoint_root = ensure_dir(output_folder).resolve()
     plots_enabled = plots_output_dir is not None
     context_fingerprint = _evaluation_context_fingerprint(
@@ -628,9 +631,9 @@ def _run_resumable_syntheval(
             "(train=%s, holdout=%s, features=%d, plots=%s)",
             pass_name,
             len(pending),
-            dataset.train_imputed_df.shape,
+            train_df.shape,
             dataset.test_imputed_df.shape if dataset.test_imputed_df is not None else None,
-            dataset.train_imputed_df.shape[1],
+            train_df.shape[1],
             plots_enabled,
         )
         run_per_model(
@@ -657,7 +660,7 @@ def _run_resumable_syntheval(
                 for model_name, frame, model_fingerprint in pending
             },
             execution_cfg,
-            n_columns=dataset.train_imputed_df.shape[1],
+            n_columns=train_df.shape[1],
             label=f"syntheval {pass_name}",
             # Even one at a time, each model gets its own process: its exit
             # releases native and allocator high-water memory.
@@ -905,7 +908,7 @@ def _run_collapsed_target_pass(
         out[column] = build_binary_target_series(out[column], positive_classes, negative_classes)
         return out
 
-    train_df = _binarize(dataset.train_imputed_df)
+    train_df = _binarize(dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df"))
     hout_df = _binarize(dataset.test_imputed_df) if dataset.test_imputed_df is not None else None
     binary_synthetic_datasets = {name: _binarize(df) for name, df in synthetic_datasets.items()}
 
@@ -1087,7 +1090,8 @@ def run_ovr_macro_syntheval_evaluation(
         return None, None, None
 
     column = dataset.target_column
-    classes = sorted(dataset.train_imputed_df[column].dropna().unique().tolist(), key=str)
+    train_df = dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df")
+    classes = sorted(train_df[column].dropna().unique().tolist(), key=str)
     per_class_results, per_class_ranks = {}, {}
     for cls in classes:
         rest = [c for c in classes if c != cls]
@@ -1130,6 +1134,8 @@ def merge_binary_target_results(
     if benchmark_results is None:
         return binary_results, binary_ranks
 
+    # Results and ranks come in pairs: both None or both set.
+    assert benchmark_ranks is not None and binary_ranks is not None
     new_metrics = [
         m for m in binary_results.columns.get_level_values(0).unique() if m not in _RANK_COLUMNS
     ]
