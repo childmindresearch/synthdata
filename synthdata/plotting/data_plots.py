@@ -61,7 +61,7 @@ def plot_missingness(df: pd.DataFrame, feature_columns: list):
     import matplotlib.pyplot as plt
 
     missing = df[feature_columns].isna().mean()
-    missing = missing[missing > 0].sort_values(ascending=False)
+    missing = missing[missing > 0].sort_values(ascending=False, kind="stable")
 
     if not len(missing):
         fig, ax = plt.subplots(figsize=(4, 2))

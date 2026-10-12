@@ -67,6 +67,7 @@ def test_column_bar_charts_have_no_empty_band_with_many_columns():
     names = [f"simulated_feature_{i:03d}_with_a_long_descriptive_name" for i in range(120)]
     df = pd.DataFrame({name: [1.0, None, 2.0] for name in names})
     validation = pd.DataFrame({"column": names, "n_imputed": 3, "n_valid": 3, "all_valid": True})
+    # Every column is equally missing: ties keep the schema order.
     for fig in (plot_missingness(df, names), plot_validation_summary(validation)):
         ax = fig.axes[0]
         low, high = sorted(ax.get_ylim())
