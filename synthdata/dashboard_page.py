@@ -10,7 +10,7 @@ import html
 import json
 from datetime import UTC, datetime
 
-from synthdata.dashboard import _duration
+from synthdata.dashboard import _duration, base_model
 
 STATE_LABEL = {
     "running": ("Running", "run"),
@@ -28,7 +28,8 @@ STATUS_LABEL = {
     "queued": ("queued", "muted"),
     "paused": ("paused", "warn"),
 }
-BASELINE_TAG = ' <span class="muted small">baseline</span>'
+#: Categorical colors for the steps on the model timeline (--k1 ...).
+STEP_COLORS = 7
 ICON = {"run": "▶", "good": "✓", "bad": "✕", "warn": "!", "muted": "•"}
 
 
@@ -180,6 +181,44 @@ def _stage_strip(d: dict) -> str:
     )
 
 
+def _at(iso: str | None, fallback: float) -> float:
+    """Epoch seconds of ``iso``, or ``fallback`` (e.g. now, for a task still running)."""
+    moment = _ts(iso)
+    return fallback if moment is None else moment
+
+
+def _ticks(t0: float, t1: float, max_ticks: int = 8) -> list[float]:
+    """Round clock times between ``t0`` and ``t1`` (epoch seconds) for axis ticks."""
+    span = max(t1 - t0, 1)
+    steps = [60 * m for m in (1, 2, 5, 10, 15, 30, 60, 120, 180, 360, 720, 1440)]
+    step = next((s for s in steps if span / s <= max_ticks), steps[-1])
+    first = (int(t0) // step + 1) * step
+    return [t for t in range(first, int(t1), step) if 0.05 < (t - t0) / span < 0.93]
+
+
+def _segments(tasks: list[dict], t1: float) -> list[dict]:
+    """One segment per step for a model: its replicates' intervals merged where they overlap."""
+    out = []
+    for step in dict.fromkeys(t["step"] for t in tasks):
+        mine = sorted(
+            (t for t in tasks if t["step"] == step and t["start"]),
+            key=lambda t: t["start"],
+        )
+        spans: list[list] = []
+        for t in mine:
+            start, end = _at(t["start"], t1), _at(t["end"], t1)
+            if spans and start <= spans[-1][1]:
+                spans[-1][1] = max(spans[-1][1], end)
+                spans[-1][2].append(t)
+            else:
+                spans.append([start, end, [t]])
+        for start, end, group in spans:
+            statuses = {t["status"] for t in group}
+            status = next((s for s in ("failed", "stopped", "running") if s in statuses), "done")
+            out.append({"step": step, "start": start, "end": end, "tasks": group, "status": status})
+    return out
+
+
 def _timeline(d: dict) -> str:
     tasks = d["tasks"]
     if not d["steps"] and not tasks:
@@ -189,59 +228,101 @@ def _timeline(d: dict) -> str:
             "</p></section>"
         )
     t1 = _ts(d["run"]["ended"]) or _ts(d["generated"]) or datetime.now(UTC).timestamp()
-    t0 = _ts(d["run"]["started"]) or min((_ts(t["start"]) for t in tasks if t["start"]), default=t1)
+    t0 = _ts(d["run"]["started"]) or min(
+        (_at(t["start"], t1) for t in tasks if t["start"]), default=t1
+    )
     span = max(t1 - t0, 1)
+
+    def pct(t: float) -> float:
+        return (t - t0) / span * 100
+
+    steps = list(dict.fromkeys([s["label"] for s in d["steps"]] + [t["step"] for t in tasks]))
+    color = {step: f"var(--k{i % STEP_COLORS + 1})" for i, step in enumerate(steps)}
+    ticks = _ticks(t0, t1)
+    grid = "".join(f'<i class="tick" style="left:{pct(t):.2f}%"></i>' for t in ticks)
     hpo = {s["model"]: s for s in d["hpo"]}
-    blocks = []
-    for step in d["steps"] or [{"label": t["step"]} for t in tasks][:1]:
-        label = step["label"]
-        mine = sorted((t for t in tasks if t["step"] == label), key=lambda t: t["order"])
-        rows = []
-        for t in mine:
-            start = _ts(t["start"])
-            end = _ts(t["end"]) or t1
-            if start is None:
-                bar = ""
-            else:
-                left = (start - t0) / span * 100
-                width = max((end - start) / span * 100, 0.4)
-                tip = f"{t['model']} · {t['status']} · {_duration(t['duration_s'])}"
-                bar = (
-                    f'<div class="bar {t["status"]}" style="left:{left:.2f}%;width:{width:.2f}%" '
-                    f'title="{_e(tip)}"></div>'
-                )
-            extra = ""
-            study = hpo.get(t["model"]) if label == "generation" else None
-            if study and study["target"]:
-                n = study["complete"] + study["pruned"]
-                extra = f'<span class="muted small">HPO {n}/{study["target"]}</span>'
-            err = f'<div class="row-error">{_e(t["error"])}</div>' if t.get("error") else ""
-            rows.append(
-                f'<div class="g-row"><div class="g-name"><span class="model">{_e(t["model"])}</span>'
-                f'{_badge(t["status"])}<span class="g-dur">{_e(_duration(t["duration_s"]))}</span>{extra}{err}</div>'
-                f'<div class="g-track">{bar}</div></div>'
+
+    by_model: dict[str, list] = {}
+    for t in sorted(tasks, key=lambda t: (t["start"] or "~", t["order"])):
+        by_model.setdefault(base_model(t["model"]), []).append(t)
+    rows = []
+    for model, mine in by_model.items():
+        segs = []
+        for s in _segments(mine, t1):
+            n = len(s["tasks"])
+            what = f"{n} replicates" if n > 1 else s["tasks"][0]["model"]
+            tip = f"{model} · {s['step']} · {what} · {s['status']} · {_duration(s['end'] - s['start'])}"
+            segs.append(
+                f'<div class="seg {s["status"]}" style="left:{pct(s["start"]):.2f}%;'
+                f'width:{max(pct(s["end"]) - pct(s["start"]), 0.4):.2f}%;background:{color[s["step"]]}" '
+                f'title="{_e(tip)}"></div>'
             )
-        queued = step.get("total", len(mine)) - len(mine)
-        if queued > 0:
-            rows.append(
-                f'<div class="g-row"><div class="g-name">{_badge("queued")}'
-                f'<span class="muted small">{queued} more model{"s" * (queued != 1)} waiting for a worker</span>'
-                f'</div><div class="g-track"></div></div>'
-            )
-        pool = ""
-        if step.get("workers"):
-            pool = f" · {step['workers']} at a time, {step['cores']} CPU threads each"
-        summary = f"{step.get('done', 0)} of {step.get('total', len(mine))} done{pool}"
-        blocks.append(
-            f'<div class="g-step"><h3>{_e(label)} <span class="muted small">{_e(summary)}</span></h3>'
-            f"{''.join(rows)}</div>"
+        statuses = {t["status"] for t in mine}
+        status = next((s for s in ("failed", "running", "stopped") if s in statuses), "done")
+        starts = [_at(t["start"], t1) for t in mine if t["start"]]
+        ends = [_at(t["end"], t1) for t in mine if t["start"]]
+        busy = sum(t["duration_s"] or 0 for t in mine)
+        wall = _duration(max(ends) - min(starts)) if starts else "-"
+        dur = f'<span class="g-dur" title="first start to last finish; {_e(_duration(busy))} of worker time">{_e(wall)}</span>'
+        study = hpo.get(model)
+        extra = ""
+        if study and study["target"]:
+            extra = f'<span class="muted small">HPO {study["complete"] + study["pruned"]}/{study["target"]}</span>'
+        errors = [f"{t['step']}: {t['error']}" for t in mine if t.get("error")]
+        err = f'<div class="row-error">{_e(errors[-1])}</div>' if errors else ""
+        rows.append(
+            f'<div class="g-row"><div class="g-name"><span class="model">{_e(model)}</span>'
+            f"{_badge(status)}{dur}{extra}{err}</div>"
+            f'<div class="g-track">{grid}{"".join(segs)}</div></div>'
         )
+
+    stage_bands = "".join(
+        f'<div class="band" style="left:{pct(_at(s["start"], t1)):.2f}%;'
+        f'width:{max(pct(_at(s["end"], t1)) - pct(_at(s["start"], t1)), 0.4):.2f}%" '
+        f'title="{_e(s["name"])} · {_e(_duration(s["duration_s"]))}"><span>{_e(s["name"])}</span></div>'
+        for s in d["stages"]
+        if s["start"]
+    )
+    stage_row = (
+        f'<div class="g-row g-stages"><div class="g-name muted small">pipeline stage</div>'
+        f'<div class="g-track">{grid}{stage_bands}</div></div>'
+    )
+    tick_labels = "".join(
+        f'<span style="left:{pct(t):.2f}%">{_time(datetime.fromtimestamp(t, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), "time")}</span>'
+        for t in ticks
+    )
     axis = (
         f'<div class="g-row g-axis"><div class="g-name"></div><div class="g-track">'
-        f'<span style="left:0">{_time(d["run"]["started"], "time")}</span>'
+        f'<span style="left:0">{_time(d["run"]["started"], "time")}</span>{tick_labels}'
         f'<span style="right:0">{_time(d["run"]["ended"] or d["generated"], "time")}</span></div></div>'
     )
-    return f'<section class="card"><h2>Models</h2>{"".join(blocks)}{axis}</section>'
+
+    summary = []
+    for step in d["steps"]:
+        queued = step["total"] - sum(t["step"] == step["label"] for t in tasks)
+        text = f"{step['done']} of {step['total']} done"
+        if step["failed"]:
+            text += f", {step['failed']} failed"
+        if step["running"]:
+            text += f", {step['running']} running"
+        if queued > 0:
+            text += f", {queued} waiting"
+        if step.get("workers"):
+            text += f" · {step['workers']} at a time, {step['cores']} CPU threads each"
+        summary.append(
+            f'<li><i class="sw" style="background:{color[step["label"]]}"></i>'
+            f'<b>{_e(step["label"])}</b> <span class="muted">{_e(text)}</span></li>'
+        )
+    legend = (
+        f'<ul class="steps-legend">{"".join(summary)}</ul>'
+        '<p class="muted small">One bar per model; each colored segment is one step, from its '
+        "first replicate's start to its last one's finish. Hover a segment for details. "
+        "Striped: running; red outline: failed.</p>"
+    )
+    return (
+        f'<section class="card"><h2>Models</h2>{legend}'
+        f'<div class="gantt">{stage_row}{"".join(rows)}{axis}</div></section>'
+    )
 
 
 def _sparkline(curve: list, maximize: bool) -> str:
@@ -311,7 +392,7 @@ def _hpo(d: dict) -> str:
             eta = _duration(s["eta_s"]) if s["eta_s"] is not None and status == "running" else "-"
             rows.append(
                 f'<tr><td class="model">{_e(s["model"])}</td><td>{_badge(status)}</td>'
-                f'<td><div class="num">{counts}</div>{prog}<div class="muted small">{detail}</div></td>'
+                f'<td><div class="tnum">{counts}</div>{prog}<div class="muted small">{detail}</div></td>'
                 f'<td class="num">{_num(s["best"])}</td><td>{_sparkline(s["curve"], s["maximize"])}</td>'
                 f'<td class="num">{_e(_duration(s["median_trial_s"]))}</td><td class="num">{_e(eta)}</td>'
                 f"<td>{err}</td></tr>"
@@ -322,10 +403,83 @@ def _hpo(d: dict) -> str:
             '<th class="num">Time left</th><th></th></tr></thead><tbody>'
             + "".join(rows)
             + "</tbody></table></div>"
+            '<p class="legend-row small">'
+            '<span class="legend"><svg class="spark" width="10" height="10"><circle cx="5" cy="5" r="2.6" class="dot"/></svg>'
+            "trial score</span>"
+            '<span class="legend"><svg class="spark" width="10" height="10"><circle cx="5" cy="5" r="2.6" class="dot off"/></svg>'
+            "trial that failed a sanity screen (never chosen)</span>"
+            '<span class="legend"><i style="border-color:var(--s1)"></i>best passing score so far</span>'
+            '<span class="muted">x: trial number, y: the HPO objective</span></p>'
             '<p class="muted small">Best counts only trials that pass the sanity screens. '
             "Time left is remaining trials times the median of the last ten, capped by the study's timeout.</p>"
         )
     return f'<section class="card"><h2>Hyperparameter search</h2>{body}</section>'
+
+
+def _resource_rows(tasks: list[dict], by: str) -> str:
+    """``tbody`` rows of use by task, under a header row per step (``by="step"``) or model."""
+
+    def split(task: str) -> tuple[str, str]:
+        step, _, model = task.partition(": ")
+        return (step, model) if model else ("pipeline", task)
+
+    # Replicates of a model in a step fold into one row: peaks are the
+    # largest, "now" values the sum over those running.
+    merged: dict[tuple[str, str], dict] = {}
+    for t in tasks:
+        step, model = split(t["task"])
+        m = merged.setdefault(
+            (step, base_model(model)),
+            {"n": 0, "ram_peak": 0.0, "cpu_peak": 0.0, "vram_peak": 0.0, "active": False},
+        )
+        m["n"] += 1
+        for k in ("ram_peak", "cpu_peak", "vram_peak"):
+            m[k] = max(m[k], t[k] or 0)
+        if t.get("active"):
+            m["active"] = True
+            for k in ("ram_now", "cpu_now"):
+                m[k] = (m.get(k) or 0) + (t.get(k) or 0)
+    groups: dict[str, list] = {}
+    for (step, model), t in merged.items():
+        key, label = (step, model) if by == "step" else (model, step)
+        if t["n"] > 1:
+            label += f" ×{t['n']}"
+        groups.setdefault(key, []).append((label, t))
+    order = sorted(groups, key=lambda k: (k in ("pipeline", "main"), k))
+    out = []
+    for key in order:
+        members = sorted(groups[key], key=lambda m: m[0])
+        active = sum(bool(t.get("active")) for _, t in members)
+        peak = max(t["ram_peak"] for _, t in members)
+        note = f"{len(members)} row{'s' * (len(members) != 1)}" + (
+            f", {active} running" if active else ""
+        )
+        out.append(
+            f'<tr class="group"><th colspan="7">{_e(key)} <span class="muted small">{note}, '
+            f"RAM peak {peak:.1f} GiB</span></th></tr>"
+        )
+        out += [
+            f'<tr><td class="indent">{_e(label)}</td><td>{_badge("running") if t.get("active") else ""}</td>'
+            f'<td class="num">{_num(t.get("ram_now"), 1)}</td><td class="num">{_num(t["ram_peak"], 1)}</td>'
+            f'<td class="num">{_num(t.get("cpu_now"), 1)}</td><td class="num">{_num(t["cpu_peak"], 1)}</td>'
+            f'<td class="num">{_num((t["vram_peak"] or 0) / 1024, 1)}</td></tr>'
+            for label, t in members
+        ]
+    return "".join(out)
+
+
+def _resource_table(tasks: list[dict]) -> str:
+    head = (
+        '<thead><tr><th>Task</th><th></th><th class="num">RAM now (GiB)</th><th class="num">RAM peak</th>'
+        '<th class="num">CPU now (cores)</th><th class="num">CPU peak</th>'
+        '<th class="num">GPU memory peak (GiB)</th></tr></thead>'
+    )
+    return (
+        '<h3>By task <span class="filters inline"><label><input type="radio" name="res-by" value="step" checked> '
+        'group by step</label><label><input type="radio" name="res-by" value="model"> group by model</label></span></h3>'
+        f'<div class="scroll"><table class="res" data-by="step">{head}<tbody>{_resource_rows(tasks, "step")}</tbody></table>'
+        f'<table class="res" data-by="model" hidden>{head}<tbody>{_resource_rows(tasks, "model")}</tbody></table></div>'
+    )
 
 
 def _resources(d: dict) -> str:
@@ -335,22 +489,7 @@ def _resources(d: dict) -> str:
             '<section class="card"><h2>Resources</h2><p class="empty">No resource samples yet '
             "(the first row lands one monitor interval after the start).</p></section>"
         )
-    tasks = res["tasks"]
-    rows = "".join(
-        f"<tr><td>{_e(t['task'])}</td><td>{_badge('running') if t.get('active') else ''}</td>"
-        f'<td class="num">{_num(t.get("ram_now"), 1)}</td><td class="num">{_num(t["ram_peak"], 1)}</td>'
-        f'<td class="num">{_num(t.get("cpu_now"), 1)}</td><td class="num">{_num(t["cpu_peak"], 1)}</td>'
-        f'<td class="num">{_num((t["vram_peak"] or 0) / 1024, 1)}</td></tr>'
-        for t in tasks[:30]
-    )
-    table = (
-        '<h3>By model</h3><div class="scroll"><table><thead><tr><th>Task</th><th></th>'
-        '<th class="num">RAM now (GiB)</th><th class="num">RAM peak</th><th class="num">CPU now (cores)</th>'
-        '<th class="num">CPU peak</th><th class="num">GPU memory peak (GiB)</th></tr></thead>'
-        f"<tbody>{rows}</tbody></table></div>"
-        if tasks
-        else ""
-    )
+    table = _resource_table(res["tasks"]) if res["tasks"] else ""
     return (
         '<section class="card"><h2>Resources</h2><div class="charts">'
         '<figure id="c-ram"></figure><figure id="c-cpu"></figure>'
@@ -382,6 +521,77 @@ def _problems(d: dict) -> str:
     return f'<section class="card" id="problems"><h2>Problems</h2>{body}</section>'
 
 
+def _ci_bar(x: dict, lo: float, hi: float, best: float | None) -> str:
+    """The overall score and its 95% interval on a shared scale, as a small SVG."""
+    w, h, pad = 220, 18, 4
+
+    def px(v: float) -> float:
+        return pad + (v - lo) / (hi - lo) * (w - 2 * pad)
+
+    marks = ""
+    if best is not None:
+        marks += f'<line x1="{px(best):.1f}" x2="{px(best):.1f}" y1="0" y2="{h}" class="ref"/>'
+    if x["low"] is not None and x["high"] is not None:
+        marks += (
+            f'<line x1="{px(x["low"]):.1f}" x2="{px(x["high"]):.1f}" y1="9" y2="9" class="ci"/>'
+            f'<line x1="{px(x["low"]):.1f}" x2="{px(x["low"]):.1f}" y1="5" y2="13" class="ci"/>'
+            f'<line x1="{px(x["high"]):.1f}" x2="{px(x["high"]):.1f}" y1="5" y2="13" class="ci"/>'
+        )
+    if x["overall"] is not None:
+        kind = "base" if x["baseline"] else "mean"
+        marks += f'<circle cx="{px(x["overall"]):.1f}" cy="9" r="3.5" class="{kind}"/>'
+    label = f"overall {_num(x['overall'])}, 95% CI {_num(x['low'])} to {_num(x['high'])}"
+    return (
+        f'<svg class="cibar" width="{w}" height="{h}" viewBox="0 0 {w} {h}" role="img" '
+        f'aria-label="{label}"><title>{label}</title>{marks}</svg>'
+    )
+
+
+def _ranking(ranking: list[dict]) -> str:
+    values = [v for x in ranking for v in (x["overall"], x["low"], x["high"]) if v is not None]
+    lo, hi = (min(values), max(values)) if values else (0.0, 1.0)
+    margin = max((hi - lo) * 0.05, 1e-6)
+    lo, hi = lo - margin, hi + margin
+    best_row = next((x for x in ranking if not x["baseline"]), None)
+    best = best_row["overall"] if best_row else None
+    dims = [
+        d for d in ("utility", "privacy", "fairness") if any(x.get(d) is not None for x in ranking)
+    ]
+    rows = []
+    for x in ranking:
+        if x["baseline"]:
+            vs = '<span class="muted small">baseline</span>'
+        elif x is best_row:
+            vs = '<span class="pill good">best</span>'
+        elif x["tied"] is None:
+            vs = '<span class="muted small" title="needs 2+ replicates on both sides">n/a</span>'
+        else:
+            vs = (
+                '<span class="pill good">tied</span>'
+                if x["tied"]
+                else '<span class="muted">below</span>'
+            )
+        rows.append(
+            f'<tr class="{"baseline" if x["baseline"] else ""}"><td class="num">{_e(x["rank"])}</td>'
+            f'<td class="model">{_e(x["model"])}</td>'
+            f'<td class="num">{_num(x["overall"])}</td><td>{_ci_bar(x, lo, hi, best)}</td>'
+            f'<td class="num muted small">{_num(x["low"])} to {_num(x["high"])}</td><td>{vs}</td>'
+            + "".join(f'<td class="num">{_num(x.get(dim))}</td>' for dim in dims)
+            + f'<td class="num">{_e(x["n"])}</td></tr>'
+        )
+    head = "".join(f'<th class="num">{dim.title()}</th>' for dim in dims)
+    return (
+        '<h3>Ranking</h3><div class="scroll"><table><thead><tr><th class="num">Rank</th><th>Model</th>'
+        f'<th class="num">Overall</th><th>95% CI <span class="muted small">{_num(lo, 2)} to {_num(hi, 2)}</span></th>'
+        f'<th></th><th>vs best</th>{head}<th class="num">Replicates</th></tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+        '<p class="muted small">Scores are rank scores, higher is better; each is the mean over seed '
+        "replicates. The bar is the 95% interval of the overall score and the dashed line the best model's "
+        "mean. <b>tied</b>: a one-sided Welch t-test at the 5% level cannot place the model below the best "
+        "one; <b>below</b>: it can; <b>n/a</b>: one side has a single replicate. Baselines are reference rows, "
+        "never ranked against the models.</p>"
+    )
+
+
 def _results(d: dict) -> str:
     r = d["results"]
     if not r:
@@ -391,19 +601,7 @@ def _results(d: dict) -> str:
         )
     parts = []
     if "ranking" in r:
-        rows = "".join(
-            f'<tr class="{"baseline" if x["baseline"] else ""}"><td class="num">{_e(x["rank"])}</td>'
-            f'<td class="model">{_e(x["model"])}{BASELINE_TAG if x["baseline"] else ""}</td>'
-            f'<td class="num">{_num(x["overall"])}</td>'
-            f'<td class="num muted">{_num(x["low"])} to {_num(x["high"])}</td>'
-            f'<td>{_badge("done") if x["tied"] else ""}</td><td class="num">{_e(x["n"])}</td></tr>'
-            for x in r["ranking"][:12]
-        )
-        parts.append(
-            '<h3>Ranking</h3><div class="scroll"><table><thead><tr><th class="num">Rank</th><th>Model</th>'
-            '<th class="num">Overall</th><th class="num">95% CI</th><th>Tied with best</th>'
-            f'<th class="num">Replicates</th></tr></thead><tbody>{rows}</tbody></table></div>'
-        )
+        parts.append(_ranking(r["ranking"]))
     if "checks" in r:
         c = r["checks"]
         kind = "warn" if c["warn"] else "good"
@@ -421,16 +619,19 @@ def _results(d: dict) -> str:
     return f'<section class="card"><h2>Results</h2>{"".join(parts)}</section>'
 
 
-def _tail(d: dict) -> str:
-    options = "".join(f'<option value="{_e(t)}">{_e(t)}</option>' for t in d["tasks_in_tail"])
+def _log(d: dict) -> str:
+    options = "".join(f'<option value="{_e(t)}">{_e(t)}</option>' for t in d["log_tasks"])
+    dropped = d["log_progress_dropped"]
+    note = f", {dropped} progress-bar lines hidden" if dropped else ""
     return f"""
 <section class="card"><h2>Log <span class="muted small">{_e(d["log"])}</span></h2>
   <div class="filters">
-    <label>Model <select id="tail-task"><option value="">all</option>{options}</select></label>
-    <label>Contains <input id="tail-text" type="search" placeholder="text"></label>
-    <label><input id="tail-problems" type="checkbox"> errors and warnings only</label>
+    <label>Model <select id="log-task"><option value="">all</option>{options}</select></label>
+    <label>Contains <input id="log-text" type="search" placeholder="text"></label>
+    <label><input id="log-problems" type="checkbox"> errors and warnings only</label>
+    <span class="muted small" id="log-count">{len(d["log_lines"])} lines{_e(note)}</span>
   </div>
-  <pre id="tail" class="tail"></pre>
+  <pre id="log" class="tail"></pre>
 </section>"""
 
 
@@ -439,7 +640,8 @@ def _tail(d: dict) -> str:
 CSS = """
 :root{color-scheme:light;--page:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--muted:#898781;
 --grid:#e1e0d9;--axis:#c3c2b7;--s1:#2a78d6;--s2:#eb6834;--good:#0ca30c;--good-ink:#006300;--warn:#fab219;
---warn-ink:#8a5a00;--bad:#d03b3b;--run:#2a78d6;--track:#f0efec;--shadow:0 1px 2px rgba(0,0,0,.06)}
+--warn-ink:#8a5a00;--bad:#d03b3b;--run:#2a78d6;--track:#f0efec;--shadow:0 1px 2px rgba(0,0,0,.06);
+--k1:#2a78d6;--k2:#eb6834;--k3:#1a9e8f;--k4:#8a5cd1;--k5:#c4458f;--k6:#8f9a1b;--k7:#a0703c}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;
 --ink:#f0efec;--ink2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--axis:#383835;--s1:#3987e5;--s2:#d95926;--good-ink:#0ca30c;
 --warn-ink:#fab219;--run:#3987e5;--track:#262624;--shadow:none}}
@@ -452,7 +654,7 @@ h1{font-size:20px;margin:0;font-weight:650}h2{font-size:15px;margin:0 0 12px;fon
 h3{font-size:13px;margin:16px 0 8px;font-weight:600;color:var(--ink2)}
 a{color:var(--s1)}code{font-size:12px}
 .muted{color:var(--muted)}.small{font-size:12px;font-weight:400}.spacer{flex:1}
-.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.tnum{font-variant-numeric:tabular-nums;font-weight:600}.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .top{margin-bottom:16px}.title-row{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px}
 .controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 button{font:inherit;font-size:12px;padding:4px 10px;border-radius:6px;border:1px solid var(--axis);background:var(--surface);color:var(--ink);cursor:pointer}
@@ -478,15 +680,29 @@ button{font:inherit;font-size:12px;padding:4px 10px;border-radius:6px;border:1px
 .stage.running{border-top-color:var(--run)}.stage.done{border-top-color:var(--good)}.stage.failed,.stage.stopped{border-top-color:var(--bad)}
 .stage-name{font-weight:600;margin-bottom:4px}.stage-time{font-variant-numeric:tabular-nums;margin-top:4px}
 .stage-peak{font-size:11px;color:var(--muted);margin-top:2px}
-.g-step h3{margin-top:4px}.g-row{display:grid;grid-template-columns:minmax(220px,34%) 1fr;gap:12px;align-items:center;padding:3px 0;border-bottom:1px solid var(--grid)}
+.g-row{display:grid;grid-template-columns:minmax(220px,30%) 1fr;gap:12px;align-items:center;padding:3px 0;border-bottom:1px solid var(--grid)}
 .g-name{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;min-width:0}.model{font-weight:600;overflow-wrap:anywhere}
 .g-dur{font-variant-numeric:tabular-nums;color:var(--ink2);font-size:12px}
-.g-track{position:relative;height:14px;background:var(--track);border-radius:4px}
-.bar{position:absolute;top:2px;bottom:2px;border-radius:4px;background:var(--axis)}
-.bar.running{background:var(--run)}.bar.done{background:var(--good)}.bar.failed,.bar.stopped{background:var(--bad)}
-.bar.running{background-image:linear-gradient(90deg,transparent 60%,rgba(255,255,255,.35));background-size:40px 100%;animation:slide 1.2s linear infinite}
-@keyframes slide{to{background-position:40px 0}}
+.g-track{position:relative;height:18px;background:var(--track);border-radius:4px}
+.g-track .tick{position:absolute;top:0;bottom:0;border-left:1px dashed var(--axis);opacity:.7}
+.seg{position:absolute;top:3px;bottom:3px;border-radius:3px;min-width:2px}
+.seg.running{background-image:repeating-linear-gradient(-45deg,transparent 0 5px,rgba(255,255,255,.4) 5px 10px)!important;background-size:28px 100%;animation:slide 1.2s linear infinite}
+.seg.failed,.seg.stopped{outline:2px solid var(--bad);outline-offset:1px}
+.seg.stopped{opacity:.55}
+@keyframes slide{to{background-position:28px 0}}
+.g-stages .g-track{background:none}
+.band{position:absolute;top:1px;bottom:1px;border:1px solid var(--axis);border-radius:3px;background:var(--page);font-size:11px;color:var(--ink2);overflow:hidden;white-space:nowrap}
+.band span{padding:0 4px;line-height:14px}
 .g-axis{border:0}.g-axis .g-track{background:none;height:16px;font-size:11px;color:var(--muted)}.g-axis span{position:absolute}
+.g-axis span[style^="left:"]:not([style="left:0"]){transform:translateX(-50%)}
+.steps-legend{list-style:none;margin:0 0 6px;padding:0;display:flex;flex-wrap:wrap;gap:4px 18px;font-size:13px}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+.legend-row{display:flex;flex-wrap:wrap;gap:4px 18px;align-items:center;margin:8px 0 2px}
+.cibar .ci{stroke:var(--ink2);stroke-width:1.5}.cibar .mean{fill:var(--s1)}.cibar .base{fill:none;stroke:var(--muted);stroke-width:1.5}
+.cibar .ref{stroke:var(--s1);stroke-dasharray:3 3;opacity:.6}
+.pill{display:inline-block;font-size:11px;font-weight:600;padding:0 7px;border-radius:999px;border:1px solid}.pill.good{color:var(--good-ink)}
+tr.group th{background:var(--track);color:var(--ink);font-size:13px}td.indent{padding-left:20px}
+.filters.inline{display:inline-flex;margin:0 0 0 12px;font-weight:400;color:var(--ink2)}
 .row-error{flex-basis:100%;font-size:12px;color:var(--bad);overflow-wrap:anywhere}
 .scroll{overflow-x:auto}table{border-collapse:collapse;width:100%}
 th,td{padding:6px 8px;border-bottom:1px solid var(--grid);text-align:left;vertical-align:middle}
@@ -523,7 +739,7 @@ const D=JSON.parse(document.getElementById('data').textContent);
 const store={get(k){try{return sessionStorage.getItem(k)}catch(e){return null}},set(k,v){try{sessionStorage.setItem(k,v)}catch(e){}}};
 const pad=n=>String(n).padStart(2,'0');
 function fmt(d,f){const t=pad(d.getHours())+':'+pad(d.getMinutes());
-  if(f==='time')return t;if(f==='hm')return t;
+  if(f==='time')return t;if(f==='hm')return t;if(f==='hms')return t+':'+pad(d.getSeconds());
   return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+t;}
 function ago(d){const s=Math.max(0,(Date.now()-d)/1000);if(s<90)return Math.round(s)+' s ago';if(s<5400)return Math.round(s/60)+' min ago';return Math.round(s/3600)+' h ago';}
 document.querySelectorAll('time[datetime]').forEach(el=>{const d=new Date(el.getAttribute('datetime'));if(isNaN(d))return;
@@ -541,16 +757,22 @@ const sy=store.get('dash-scroll');if(sy)window.scrollTo(0,+sy);
 window.addEventListener('scroll',()=>store.set('dash-scroll',String(window.scrollY)),{passive:true});
 if(live&&D.refresh>0)setInterval(()=>{if(!paused)location.reload();},D.refresh*1000);
 
-// ---- log tail
-const tail=document.getElementById('tail'),selTask=document.getElementById('tail-task'),txt=document.getElementById('tail-text'),onlyP=document.getElementById('tail-problems');
+// ---- resource table grouping
+const resBy=document.querySelectorAll('input[name=res-by]');
+function showRes(by){document.querySelectorAll('table.res').forEach(t=>t.hidden=t.dataset.by!==by);store.set('dash-res-by',by);}
+resBy.forEach(r=>{r.addEventListener('change',()=>showRes(r.value));if(r.value===store.get('dash-res-by')){r.checked=true;showRes(r.value);}});
+
+// ---- log
+const tail=document.getElementById('log'),selTask=document.getElementById('log-task'),txt=document.getElementById('log-text'),onlyP=document.getElementById('log-problems'),cnt=document.getElementById('log-count'),cnt0=cnt.textContent;
 const isErr=l=>/ (ERROR|CRITICAL): |Traceback|failed/.test(l),isWarn=l=>/ WARNING: |Warning: /.test(l);
 function esc(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 function renderTail(){const task=selTask.value,q=txt.value.toLowerCase(),p=onlyP.checked;
-  store.set('dash-tail',JSON.stringify([task,txt.value,p]));
-  const lines=D.tail.filter(l=>(!task||l.startsWith('['+task+']'))&&(!q||l.toLowerCase().includes(q))&&(!p||isErr(l)||isWarn(l)));
+  store.set('dash-log',JSON.stringify([task,txt.value,p]));
+  const lines=D.log.filter(l=>(!task||l.startsWith('['+task+']'))&&(!q||l.toLowerCase().includes(q))&&(!p||isErr(l)||isWarn(l)));
   tail.innerHTML=lines.map(l=>isErr(l)?'<span class="e">'+esc(l)+'</span>':isWarn(l)?'<span class="w">'+esc(l)+'</span>':esc(l)).join('\n')||'<span class="muted">no matching lines</span>';
+  cnt.textContent=(task||q||p)?lines.length+' of '+cnt0:cnt0;
   tail.scrollTop=tail.scrollHeight;}
-try{const s=JSON.parse(store.get('dash-tail')||'null');if(s){selTask.value=s[0];txt.value=s[1];onlyP.checked=s[2];}}catch(e){}
+try{const s=JSON.parse(store.get('dash-log')||'null');if(s){selTask.value=s[0];txt.value=s[1];onlyP.checked=s[2];}}catch(e){}
 [selTask,txt,onlyP].forEach(el=>el.addEventListener('input',renderTail));renderTail();
 
 // ---- resource charts
@@ -570,7 +792,7 @@ function chart(id,title,unit,series,opt){const fig=document.getElementById(id);i
   const x=t=>L+(t-t0)/(t1-t0)*(W-L-Rr),y=v=>T+(1-v/max)*(H-T-B);
   let g='';for(let i=0;i<=4;i++){const v=max*i/4,yy=y(v);g+='<line class="gridline" x1="'+L+'" x2="'+(W-Rr)+'" y1="'+yy+'" y2="'+yy+'"/><text class="tick" x="'+(L-6)+'" y="'+(yy+4)+'" text-anchor="end">'+(+v.toFixed(v<10?1:0))+'</text>';}
   const nt=Math.max(2,Math.min(6,Math.floor((W-L)/110)));
-  for(let i=0;i<=nt;i++){const t=t0+(t1-t0)*i/nt;g+='<text class="tick" x="'+x(t)+'" y="'+(H-6)+'" text-anchor="'+(i===0?'start':i===nt?'end':'middle')+'">'+fmt(new Date(t),'hm')+'</text>';}
+  for(let i=0;i<=nt;i++){const t=t0+(t1-t0)*i/nt;g+='<text class="tick" x="'+x(t)+'" y="'+(H-6)+'" text-anchor="'+(i===0?'start':i===nt?'end':'middle')+'">'+fmt(new Date(t),t1-t0<1200000?'hms':'hm')+'</text>';}
   const labels=[];if(R.stage[0])labels.push([L,R.stage[0]]);
   for(let i=1;i<R.stage.length;i++)if(R.stage[i]!==R.stage[i-1]&&R.stage[i]){const xx=x(times[i]);labels.push([xx,R.stage[i]]);g+='<line class="stageline" x1="'+xx+'" x2="'+xx+'" y1="'+T+'" y2="'+(H-B)+'"/>';}
   let next=1e9;for(let i=labels.length-1;i>=0;i--){const [xx,n]=labels[i];if(next-xx>60){g+='<text class="stagelabel" x="'+(xx+3)+'" y="'+(T+8)+'">'+n+'</text>';next=xx;}}
@@ -603,7 +825,7 @@ def render(d: dict, refresh_seconds: int = 30) -> str:
     payload = {
         "run": d["run"],
         "refresh": refresh_seconds,
-        "tail": d["tail"],
+        "log": d["log_lines"],
         "resources": {"series": d["resources"]["series"]},
         "machine": d["machine"],
     }
@@ -624,7 +846,7 @@ def render(d: dict, refresh_seconds: int = 30) -> str:
 {_resources(d)}
 {_problems(d)}
 {_results(d)}
-{_tail(d)}
+{_log(d)}
 <p class="muted small">Built from {_e(d["log_name"])} and the files next to it by synthdata-dashboard. Times are shown in your local time zone; hover a time for UTC.</p>
 </main>
 <script type="application/json" id="data">{data}</script>

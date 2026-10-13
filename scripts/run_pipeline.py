@@ -142,6 +142,10 @@ def run_stages(args, log_path: Path, echo: bool = True) -> int:
 
 def _run_with_monitors(args, log_path: Path, echo: bool) -> int:
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    if not (echo and sys.stdout.isatty()):
+        # Nobody watches the bars redraw: in the log each update is a line of
+        # its own. An explicit TQDM_DISABLE=0 keeps them.
+        env.setdefault("TQDM_DISABLE", "1")
     monitor = None
     dashboard = None
     if args.monitor_interval > 0:

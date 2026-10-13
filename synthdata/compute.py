@@ -362,6 +362,17 @@ def run_per_model(
                         len(tasks),
                         f", running: {', '.join(active)}" if active else "",
                     )
+                    if "error" in outcomes[name]:
+                        # Now, not once the whole pool is done: a long run
+                        # shows why a model failed while the others go on.
+                        outcome = outcomes[name]
+                        logger.error(
+                            "[%s] %s failed: %s\n%s",
+                            label,
+                            name,
+                            outcome["error"],
+                            outcome.get("traceback", ""),
+                        )
     finally:
         for var, value in saved_env.items():
             if value is None:
@@ -372,13 +383,6 @@ def run_per_model(
     for name in tasks:
         outcome = outcomes[name]
         if "error" in outcome:
-            logger.error(
-                "[%s] %s failed: %s\n%s",
-                label,
-                name,
-                outcome["error"],
-                outcome.get("traceback", ""),
-            )
             failures[name] = outcome["error"]
         else:
             results[name] = outcome["result"]
