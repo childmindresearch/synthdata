@@ -194,12 +194,14 @@ While it runs, `synthdata-run` rewrites `<UTC time>_dashboard.html` next to the 
 
 - whether the run is running, finished, failed or stopped (the runner process is gone without logging an end), with elapsed time and a note when the log has been quiet for 20 minutes;
 - each stage's status, duration and peak resource use;
-- every model in each parallel step (generation, SynthEval, synthcity, TSTR, privacy attacks) as running, done, failed or queued, on a timeline, with the error of a failed model;
-- each HPO study's trials against its budget, best score so far (trials that fail a sanity screen don't count), a sparkline of the best score by trial, median trial time and an estimate of the time left;
-- RAM, CPU, GPU utilization and GPU memory over time, and use by model;
+- a timeline with one bar per model: each parallel step (generation, SynthEval, synthcity, TSTR, privacy attacks) is a colored segment on it, replicates folded together, with clock-time ticks, the pipeline stages above and the error of a failed model;
+- each HPO study's trials against its budget, best score so far (trials that fail a sanity screen don't count), a plot of every trial's score and the best so far, median trial time and an estimate of the time left;
+- RAM, CPU, GPU utilization and GPU memory over time, and use by model, grouped by step or by model;
 - errors and warnings from the log, repeated ones folded together, each with its traceback;
-- once evaluation is done, the top of the ranking, how many output checks passed and a link to `report.md`;
-- the end of the log, filterable by model and by text.
+- once evaluation is done, the ranking with each model's 95% interval drawn as a bar, whether it is statistically tied with the best, how many output checks passed and a link to `report.md`;
+- the whole log (up to 20,000 lines), filterable by model and by text.
+
+When its output goes to a file rather than a terminal (always with `--detach`), `synthdata-run` turns off progress bars (`TQDM_DISABLE=1`), since each redraw would be a line of its own in the log. Set `TQDM_DISABLE=0` to keep them.
 
 Per-model rows appear only when `compute.workers` is more than 1, because only then does each model run in its own process. `--dashboard-interval 60` rewrites the page every minute, and `--dashboard-interval 0` turns it off.
 

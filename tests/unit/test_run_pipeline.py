@@ -75,6 +75,20 @@ def test_run_stops_at_the_first_failing_stage_and_logs_everything(tmp_path, monk
     assert "never" not in text
 
 
+def test_progress_bars_are_off_when_nobody_watches(tmp_path, monkeypatch):
+    stage = "import os; print('bars', os.environ.get('TQDM_DISABLE'))"
+    monkeypatch.setattr(run_pipeline, "stage_command", lambda s, a: [sys.executable, "-c", stage])
+    monkeypatch.delenv("TQDM_DISABLE", raising=False)
+    log = tmp_path / "run.log"
+    args = _args("--stages", "impute", "--monitor-interval", "0", "--dashboard-interval", "0")
+    assert run_pipeline.run_stages(args, log, echo=False) == 0
+    assert "bars 1" in log.read_text()
+    # An explicit setting wins.
+    monkeypatch.setenv("TQDM_DISABLE", "0")
+    assert run_pipeline.run_stages(args, log, echo=False) == 0
+    assert "bars 0" in log.read_text()
+
+
 def test_run_records_resource_use_per_stage(tmp_path, monkeypatch):
     resources = tmp_path / "20261010T000000Z_resources.csv"
     # The stage runs until the monitor has written two impute rows, however slow sampling is.

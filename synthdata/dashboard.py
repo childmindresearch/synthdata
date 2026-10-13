@@ -11,7 +11,8 @@ here talks to the running processes:
 
 * ``<UTC time>_run.log``: stages, per-model workers (``[step] started`` /
   ``finished`` lines from :mod:`synthdata.compute`), HPO budgets, the
-  experiment id, errors and warnings, and the log tail.
+  experiment id, errors and warnings, and the log itself (progress-bar
+  lines dropped).
 * ``<UTC time>_resources.csv`` and ``_resources_by_task.csv``
   (:mod:`synthdata.resources`): RAM, CPU and GPU use over time and by model.
 * ``optuna_studies.db`` in the experiment's generation folder: HPO trials,
@@ -39,8 +40,10 @@ import psutil
 
 #: Seconds of silence in the log after which a running run is flagged as quiet.
 QUIET_AFTER_SECONDS = 20 * 60
-#: Lines of the log kept for the log-tail panel.
-TAIL_LINES = 400
+#: Most log lines embedded in the page: the first ``LOG_HEAD_LINES`` and the
+#: rest from the end, so a very long run keeps the page loadable.
+MAX_LOG_LINES = 20000
+LOG_HEAD_LINES = 2000
 #: Points per resource chart (rows are bucketed, keeping each bucket's maximum).
 MAX_POINTS = 600
 
@@ -54,6 +57,7 @@ _LOGLINE = re.compile(
 )
 _PY_WARNING = re.compile(r"\b\w*Warning: ")
 _TQDM = re.compile(r"\d+%\||it/s\]|s/it\]")
+_REPLICATE = re.compile(r"__rep\d+$")
 
 _RUN_START = re.compile(
     r"^synthdata-run: stages (?P<stages>.+?), pid (?P<pid>\d+)(?:, host (?P<host>\S+))?$"
@@ -543,9 +547,16 @@ def read_results(eval_dir: Path | None, logs_dir: Path) -> dict:
                 "overall": _float(row.get("overall_mean")),
                 "low": _float(row.get("overall_ci_low")),
                 "high": _float(row.get("overall_ci_high")),
-                "tied": str(row.get("tied_with_best", "")).lower() == "true",
+                # True, False, or None when one side has a single replicate.
+                "tied": {"true": True, "false": False}.get(
+                    str(row.get("tied_with_best", "")).lower()
+                ),
                 "baseline": str(row.get("baseline", "")).lower() == "true",
                 "n": row.get("n_replicates", ""),
+                **{
+                    dim: _float(row.get(f"{dim}_mean"))
+                    for dim in ("utility", "privacy", "fairness")
+                },
             }
             for row in ranking
         ]
@@ -719,7 +730,7 @@ def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
                 }
             )
 
-    tail = [line.rstrip("\n") for line in lines[-TAIL_LINES:]]
+    log_lines, n_progress = log_excerpt(lines)
     return {
         "generated": _iso(now),
         "log": str(log_path.resolve()),
@@ -747,9 +758,35 @@ def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
         "n_errors": sum(p["level"] == "error" for p in problems),
         "n_warnings": sum(p["level"] == "warning" for p in problems),
         "results": read_results(evaluation_dir, log_path.parent),
-        "tail": tail,
-        "tasks_in_tail": sorted({m["task"] for line in tail if (m := _TASK_PREFIX.match(line))}),
+        "log_lines": log_lines,
+        "log_progress_dropped": n_progress,
+        "log_tasks": sorted({m["task"] for line in log_lines if (m := _TASK_PREFIX.match(line))}),
     }
+
+
+def log_excerpt(lines: list[str]) -> tuple[list[str], int]:
+    """The log without progress-bar lines, capped at ``MAX_LOG_LINES``; and how many bars were dropped.
+
+    A progress bar written to a file is a line per update, which buries the
+    messages around it; ``synthdata-run`` turns bars off when nobody watches
+    its output, so this mostly matters for runs started in a terminal.
+    """
+    kept = [line.rstrip("\n") for line in lines if not _TQDM.search(line)]
+    dropped = len(lines) - len(kept)
+    if len(kept) > MAX_LOG_LINES:
+        tail = MAX_LOG_LINES - LOG_HEAD_LINES
+        skipped = len(kept) - MAX_LOG_LINES
+        kept = [
+            *kept[:LOG_HEAD_LINES],
+            f"... {skipped} lines left out here; the full log is the file named above ...",
+            *kept[-tail:],
+        ]
+    return kept, dropped
+
+
+def base_model(name: str) -> str:
+    """``ctgan`` for a replicate's task name such as ``ctgan__rep2``."""
+    return _REPLICATE.sub("", name)
 
 
 def _duration(seconds: float | None) -> str:

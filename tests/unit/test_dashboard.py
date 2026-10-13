@@ -254,7 +254,11 @@ def test_collect_reads_stages_models_hpo_resources_and_problems(tmp_path):
     assert error["level"] == "error" and "Traceback" in error["context"][0]
     assert warning["count"] == 2 and warning["source"] == "generation: tvae"
     assert d["results"] == {}
-    assert "generation: ctgan" in d["tasks_in_tail"]
+    assert "generation: ctgan" in d["log_tasks"]
+    # The whole log is kept, without the progress bar.
+    assert d["log_progress_dropped"] == 1
+    assert d["log_lines"][0].startswith("[2026-10-10 22:00:00 UTC] synthdata-run")
+    assert not any("40%|" in line for line in d["log_lines"])
 
 
 def test_finished_run_shows_results_and_page_renders(tmp_path):
@@ -273,6 +277,61 @@ def test_finished_run_shows_results_and_page_renders(tmp_path):
     page = path.read_text(encoding="utf-8")
     assert page.startswith("<!doctype html>") and "Finished" in page
     assert "ctgan" in page and "report.md" in page and "CUDA out of memory" in page
+    # The ranking draws the interval and says tied in words, not with a status badge.
+    assert 'class="cibar"' in page and '<span class="pill good">best</span>' in page
+    # One timeline row per model, a segment per step, ticks and the stage bands.
+    assert page.count('class="seg ') == 3 and 'class="band"' in page and 'class="tick"' in page
+
+
+def test_replicates_fold_into_one_timeline_row_and_one_resource_row(tmp_path):
+    cfg, log = _write_run(tmp_path, finished=True)
+    with open(log, "a", encoding="utf-8") as f:
+        for i, (start, end) in enumerate([(41, 44), (41, 45), (46, 48)]):
+            f.write(
+                _logline(
+                    _minutes(start),
+                    "synthdata.compute",
+                    "INFO",
+                    f"[syntheval utility] started arf__rep{i} (pid 2{i}; {i + 1} of 3)",
+                )
+            )
+            f.write(
+                _logline(
+                    _minutes(end),
+                    "synthdata.compute",
+                    "INFO",
+                    f"[syntheval utility] arf__rep{i} finished after 1 min; {i + 1} of 3 done",
+                )
+            )
+    with open(dashboard.companion_path(log, "resources_by_task.csv"), "a", newline="") as f:
+        writer = csv.writer(f)
+        for i in range(3):
+            writer.writerow(
+                [
+                    f"{_minutes(30):%Y-%m-%dT%H:%M:%SZ}",
+                    "evaluate",
+                    f"syntheval utility: arf__rep{i}",
+                    1.0 + i,
+                    1,
+                    0,
+                ]
+            )
+    page = dashboard.build(log, cfg)
+    arf_row = page.split('<span class="model">arf</span>')[1].split('class="g-row')[0]
+    # generation, then the two overlapping replicates merged, then the third.
+    assert arf_row.count('class="seg ') == 3
+    assert "2 replicates" in arf_row
+    assert page.count('<span class="model">arf__rep') == 0
+    assert "arf ×3" in page and "syntheval utility ×3" in page
+
+
+def test_long_logs_keep_their_start_and_end():
+    lines = [f"line {i}\n" for i in range(dashboard.MAX_LOG_LINES + 500)]
+    bar = "Epochs:  10%|#   | 1/10 [00:01<00:09, 1.0it/s]\n"
+    kept, dropped = dashboard.log_excerpt([*lines, bar])
+    assert dropped == 1 and len(kept) == dashboard.MAX_LOG_LINES + 1
+    assert kept[0] == "line 0" and kept[-1] == f"line {dashboard.MAX_LOG_LINES + 499}"
+    assert "500 lines left out" in kept[dashboard.LOG_HEAD_LINES]
 
 
 def test_runner_gone_without_an_end_is_stopped_and_log_text_is_escaped(tmp_path):
