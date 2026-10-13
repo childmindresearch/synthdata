@@ -245,6 +245,12 @@ def _timeline(d: dict) -> str:
     by_model: dict[str, list] = {}
     for t in sorted(tasks, key=lambda t: (t["start"] or "~", t["order"])):
         by_model.setdefault(base_model(t["model"]), []).append(t)
+    # A tuned model (ctgan_hpo) sits under its untuned one, whose generation
+    # worker also trained it; families keep the order they started in.
+    family = {m: i for i, m in enumerate(dict.fromkeys(m.removesuffix("_hpo") for m in by_model))}
+    by_model = dict(
+        sorted(by_model.items(), key=lambda kv: (family[kv[0].removesuffix("_hpo")], kv[0]))
+    )
     rows = []
     for model, mine in by_model.items():
         segs = []
@@ -523,10 +529,10 @@ def _problems(d: dict) -> str:
 
 def _ci_bar(x: dict, lo: float, hi: float, best: float | None) -> str:
     """The overall score and its 95% interval on a shared scale, as a small SVG."""
-    w, h, pad = 220, 18, 4
+    w, h, pad = 260, 18, 4
 
     def px(v: float) -> float:
-        return pad + (v - lo) / (hi - lo) * (w - 2 * pad)
+        return pad + (min(max(v, lo), hi) - lo) / (hi - lo) * (w - 2 * pad)
 
     marks = ""
     if best is not None:
@@ -550,6 +556,9 @@ def _ci_bar(x: dict, lo: float, hi: float, best: float | None) -> str:
 def _ranking(ranking: list[dict]) -> str:
     values = [v for x in ranking for v in (x["overall"], x["low"], x["high"]) if v is not None]
     lo, hi = (min(values), max(values)) if values else (0.0, 1.0)
+    # Rank scores live in [0, 1]; a t-interval from three replicates can
+    # reach past that, and stretching the axis for it squeezes every bar.
+    lo, hi = max(lo, 0.0), min(hi, 1.0)
     margin = max((hi - lo) * 0.05, 1e-6)
     lo, hi = lo - margin, hi + margin
     best_row = next((x for x in ranking if not x["baseline"]), None)
@@ -680,11 +689,11 @@ button{font:inherit;font-size:12px;padding:4px 10px;border-radius:6px;border:1px
 .stage.running{border-top-color:var(--run)}.stage.done{border-top-color:var(--good)}.stage.failed,.stage.stopped{border-top-color:var(--bad)}
 .stage-name{font-weight:600;margin-bottom:4px}.stage-time{font-variant-numeric:tabular-nums;margin-top:4px}
 .stage-peak{font-size:11px;color:var(--muted);margin-top:2px}
-.g-row{display:grid;grid-template-columns:minmax(220px,30%) 1fr;gap:12px;align-items:center;padding:3px 0;border-bottom:1px solid var(--grid)}
+.g-row{display:grid;grid-template-columns:minmax(280px,30%) 1fr;gap:12px;align-items:center;padding:3px 0;border-bottom:1px solid var(--grid)}
 .g-name{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;min-width:0}.model{font-weight:600;overflow-wrap:anywhere}
 .g-dur{font-variant-numeric:tabular-nums;color:var(--ink2);font-size:12px}
 .g-track{position:relative;height:18px;background:var(--track);border-radius:4px}
-.g-track .tick{position:absolute;top:0;bottom:0;border-left:1px dashed var(--axis);opacity:.7}
+.g-track .tick{position:absolute;top:0;bottom:0;border-left:1px solid var(--axis)}
 .seg{position:absolute;top:3px;bottom:3px;border-radius:3px;min-width:2px}
 .seg.running{background-image:repeating-linear-gradient(-45deg,transparent 0 5px,rgba(255,255,255,.4) 5px 10px)!important;background-size:28px 100%;animation:slide 1.2s linear infinite}
 .seg.failed,.seg.stopped{outline:2px solid var(--bad);outline-offset:1px}

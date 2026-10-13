@@ -379,3 +379,19 @@ def test_cli_writes_the_newest_runs_page(tmp_path, monkeypatch):
     monkeypatch.setattr(run_dashboard, "load_config", lambda _: cfg)
     run_dashboard.main(["--config", "c.yaml"])
     assert dashboard.dashboard_path(log).exists()
+
+
+def test_tuned_model_row_sits_under_its_untuned_one(tmp_path):
+    cfg, log = _write_run(tmp_path, finished=True)
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(
+            _logline(
+                _minutes(41),
+                "synthdata.compute",
+                "INFO",
+                "[synthcity] started ctgan_hpo (pid 31; 1 of 1)",
+            )
+        )
+    page = dashboard.build(log, cfg)
+    order = [m.split("</span>")[0] for m in page.split('<span class="model">')[1:]]
+    assert order.index("ctgan_hpo") == order.index("ctgan") + 1

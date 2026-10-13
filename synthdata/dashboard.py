@@ -483,8 +483,11 @@ def read_hpo(db_path: Path | None, budgets: dict, now: datetime) -> tuple[list[d
             if started and (first_start is None or started < first_start):
                 first_start = started
             finished = _local_naive_to_utc(end)
-            if started and finished and state in ("COMPLETE", "PRUNED"):
-                durations.append((finished - started).total_seconds())
+            seconds = (finished - started).total_seconds() if started and finished else 0
+            # Trials copied from the objective probe (objective: auto) are
+            # stamped at copy time: zero length, so they say nothing of speed.
+            if seconds > 0.5 and state in ("COMPLETE", "PRUNED"):
+                durations.append(seconds)
             if state == "FAIL" and trial_id in fail_reasons:
                 with contextlib.suppress(ValueError, TypeError):
                     last_error = json.loads(fail_reasons[trial_id])
