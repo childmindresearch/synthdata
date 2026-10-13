@@ -191,12 +191,14 @@ def _write_run(tmp_path, finished: bool = False, host: str | None = None):
         (eval_dir / "ranking_summary.csv").write_text(
             "model,rank,n_replicates,baseline,overall_mean,overall_ci_low,overall_ci_high,eligible,tied_with_best\n"
             "ctgan,1,3,False,0.81,0.78,0.84,True,True\n"
+            "ctgan_hpo,3,3,False,0.81,0.78,0.84,True,True\n"
             "baseline_train_copy,2,1,True,0.79,,,False,False\n"
         )
         (eval_dir / "checks.csv").write_text(
             "check,model,status,value,limit,detail\nrows,ctgan,pass,1,1,\nclass_share,ctgan,warn,0.4,0.3,off\n"
         )
         (eval_dir / "report.md").write_text("# Report\n")
+        (gen_dir / "hpo_best_params.json").write_text('{"synthcity": {"ctgan": {}}}')
     return cfg, log
 
 
@@ -269,6 +271,8 @@ def test_finished_run_shows_results_and_page_renders(tmp_path):
     # A worker never reported as finished is not left "running" after the run ended.
     assert {t["model"]: t["status"] for t in d["tasks"]}["ctgan"] == "stopped"
     assert d["results"]["ranking"][0]["model"] == "ctgan"
+    # Its search found no passing trial: the tuned row repeats the untuned model.
+    assert [x["untuned"] for x in d["results"]["ranking"]] == [False, True, False]
     assert d["results"]["checks"]["warn"] == 1
     assert d["results"]["report_rel"] == "../evaluation/data_v_1.2/exp_v_1.2/report.md"
 

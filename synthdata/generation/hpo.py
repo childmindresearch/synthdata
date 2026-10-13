@@ -706,6 +706,17 @@ def default_best_params_path(output_dir: str | Path) -> Path:
     return Path(output_dir) / "hpo_best_params.json"
 
 
+def untuned_fallbacks(best_params_path: str | Path) -> dict[str, str]:
+    """``{"<model>_hpo": "<model>"}`` for searches where no trial passed the screens.
+
+    Those tuned models were fitted with the untuned settings (an empty entry
+    in the best-params cache), so with the same seeds they repeat the
+    untuned model and should be read as such, not as a tuning result.
+    """
+    data = load_json(Path(best_params_path), default={})
+    return {f"{name}_hpo": name for name, params in data.get("synthcity", {}).items() if not params}
+
+
 def cleanup_hpo_generator_checkpoints(
     workspace: str | Path,
     study: optuna.Study,

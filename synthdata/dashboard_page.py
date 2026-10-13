@@ -580,9 +580,15 @@ def _ranking(ranking: list[dict]) -> str:
                 if x["tied"]
                 else '<span class="muted">below</span>'
             )
+        untuned = (
+            ' <span class="pill warn" title="No HPO trial passed the screens: fitted with the '
+            'untuned settings, so it repeats the untuned model.">untuned</span>'
+            if x.get("untuned")
+            else ""
+        )
         rows.append(
             f'<tr class="{"baseline" if x["baseline"] else ""}"><td class="num">{_e(x["rank"])}</td>'
-            f'<td class="model">{_e(x["model"])}</td>'
+            f'<td class="model">{_e(x["model"])}{untuned}</td>'
             f'<td class="num">{_num(x["overall"])}</td><td>{_ci_bar(x, lo, hi, best)}</td>'
             f'<td class="num muted small">{_num(x["low"])} to {_num(x["high"])}</td><td>{vs}</td>'
             + "".join(f'<td class="num">{_num(x.get(dim))}</td>' for dim in dims)
@@ -597,7 +603,8 @@ def _ranking(ranking: list[dict]) -> str:
         "replicates. The bar is the 95% interval of the overall score and the dashed line the best model's "
         "mean. <b>tied</b>: a one-sided Welch t-test at the 5% level cannot place the model below the best "
         "one; <b>below</b>: it can; <b>n/a</b>: one side has a single replicate. Baselines are reference rows, "
-        "never ranked against the models.</p>"
+        "never ranked against the models. <b>untuned</b>: no HPO trial passed the screens, so the "
+        "tuned model was fitted with the untuned settings and repeats the untuned one.</p>"
     )
 
 
@@ -709,7 +716,7 @@ button{font:inherit;font-size:12px;padding:4px 10px;border-radius:6px;border:1px
 .legend-row{display:flex;flex-wrap:wrap;gap:4px 18px;align-items:center;margin:8px 0 2px}
 .cibar .ci{stroke:var(--ink2);stroke-width:1.5}.cibar .mean{fill:var(--s1)}.cibar .base{fill:none;stroke:var(--muted);stroke-width:1.5}
 .cibar .ref{stroke:var(--s1);stroke-dasharray:3 3;opacity:.6}
-.pill{display:inline-block;font-size:11px;font-weight:600;padding:0 7px;border-radius:999px;border:1px solid}.pill.good{color:var(--good-ink)}
+.pill{display:inline-block;font-size:11px;font-weight:600;padding:0 7px;border-radius:999px;border:1px solid}.pill.good{color:var(--good-ink)}.pill.warn{color:var(--warn-ink);font-weight:500;margin-left:6px}
 tr.group th{background:var(--track);color:var(--ink);font-size:13px}td.indent{padding-left:20px}
 .filters.inline{display:inline-flex;margin:0 0 0 12px;font-weight:400;color:var(--ink2)}
 .row-error{flex-basis:100%;font-size:12px;color:var(--bad);overflow-wrap:anywhere}
