@@ -90,6 +90,21 @@ class TestBuildEvaluationReport:
         assert "`c`" not in glance.split("Tied with it")[1]
         assert "Single seed" not in glance
 
+    def test_hpo_that_fell_back_to_untuned_settings_is_marked(
+        self, make_config, make_dataset, tmp_path
+    ):
+        import json
+
+        cfg = make_config()
+        cfg.generation.output_dir = str(tmp_path)
+        (tmp_path / "hpo_best_params.json").write_text(
+            json.dumps({"synthcity": {"model": {}, "other": {"n_iter": 5}}})
+        )
+        combined = _combined_table().rename(index={"model_a": "model_hpo"})
+        text = build_evaluation_report(cfg, make_dataset(), combined, {"selected_datasets": {}})
+        ranked = _section(text, "2. Ranking")
+        assert "`model_hpo` = `model`" in ranked and "other_hpo" not in ranked
+
     def test_single_seed_report_says_there_is_no_uncertainty(self, make_config, make_dataset):
         text = build_evaluation_report(
             make_config(), make_dataset(), _combined_table(), {"selected_datasets": {}}

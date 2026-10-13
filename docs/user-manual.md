@@ -554,7 +554,7 @@ With `evaluation.privacy_attacks.unit: patient` (the default), each patient coun
 
 A few reported metrics are left out of the ranking because they cannot tell a copy of the training data from a fresh draw (synthcity's k-anonymization, k-map, distinct l-diversity, delta-presence, alpha-precision coverage, data_leakage linear and mlp, DomiasMIA accuracy, and the augmentation scores) or only qualify another score (the feat_rank_distance p-value). They still appear in `combined_evaluation.csv`; [verification.md](verification.md) says why.
 
-With replicates, each score is the mean over seeds with a 95% confidence interval, and a model is "tied with best" when a one-sided Welch t-test cannot place its overall score below the best model's.
+With replicates, each score is the mean over seeds with a 95% confidence interval, and a model is "tied with best" when a one-sided Welch t-test cannot place its overall score below the best model's. A tuned model marked **(untuned)** (dashboard: *untuned*) had no HPO trial pass the screens, so it was fitted with the untuned settings and repeats its untuned model: read the two rows as one model, and check the `hpo` log lines for why every trial failed.
 
 ### Running on large data
 

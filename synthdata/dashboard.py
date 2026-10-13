@@ -483,8 +483,11 @@ def read_hpo(db_path: Path | None, budgets: dict, now: datetime) -> tuple[list[d
             if started and (first_start is None or started < first_start):
                 first_start = started
             finished = _local_naive_to_utc(end)
-            if started and finished and state in ("COMPLETE", "PRUNED"):
-                durations.append((finished - started).total_seconds())
+            seconds = (finished - started).total_seconds() if started and finished else 0
+            # Trials copied from the objective probe (objective: auto) are
+            # stamped at copy time: zero length, so they say nothing of speed.
+            if seconds > 0.5 and state in ("COMPLETE", "PRUNED"):
+                durations.append(seconds)
             if state == "FAIL" and trial_id in fail_reasons:
                 with contextlib.suppress(ValueError, TypeError):
                     last_error = json.loads(fail_reasons[trial_id])
@@ -534,10 +537,17 @@ def read_hpo(db_path: Path | None, budgets: dict, now: datetime) -> tuple[list[d
 # ---------------------------------------------------------------- results
 
 
-def read_results(eval_dir: Path | None, logs_dir: Path) -> dict:
+def read_results(eval_dir: Path | None, logs_dir: Path, best_params: Path | None = None) -> dict:
     if eval_dir is None or not eval_dir.is_dir():
         return {}
     out: dict = {}
+    # Searches with no trial passing the screens store {} (see
+    # synthdata.generation.hpo.untuned_fallbacks): "<model>_hpo" then repeats "<model>".
+    untuned: set[str] = set()
+    if best_params is not None:
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            cache = json.loads(best_params.read_text(encoding="utf-8"))
+            untuned = {f"{m}_hpo" for m, p in cache.get("synthcity", {}).items() if not p}
     ranking = _read_csv(eval_dir / "ranking_summary.csv")
     if ranking:
         out["ranking"] = [
@@ -552,6 +562,7 @@ def read_results(eval_dir: Path | None, logs_dir: Path) -> dict:
                     str(row.get("tied_with_best", "")).lower()
                 ),
                 "baseline": str(row.get("baseline", "")).lower() == "true",
+                "untuned": row.get("model", "") in untuned,
                 "n": row.get("n_replicates", ""),
                 **{
                     dim: _float(row.get(f"{dim}_mean"))
@@ -612,6 +623,13 @@ def _hpo_db(cfg, generation_dir: Path | None) -> Path | None:
             Path(storage.removeprefix("sqlite:///")) if storage.startswith("sqlite:///") else None
         )
     return generation_dir / "optuna_studies.db" if generation_dir else None
+
+
+def _best_params(cfg, generation_dir: Path | None) -> Path | None:
+    path = getattr(getattr(getattr(cfg, "generation", None), "hpo", None), "best_params_path", None)
+    if path:
+        return Path(path)
+    return generation_dir / "hpo_best_params.json" if generation_dir else None
 
 
 def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
@@ -757,7 +775,7 @@ def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
         "problems": _group_problems(problems),
         "n_errors": sum(p["level"] == "error" for p in problems),
         "n_warnings": sum(p["level"] == "warning" for p in problems),
-        "results": read_results(evaluation_dir, log_path.parent),
+        "results": read_results(evaluation_dir, log_path.parent, _best_params(cfg, generation_dir)),
         "log_lines": log_lines,
         "log_progress_dropped": n_progress,
         "log_tasks": sorted({m["task"] for line in log_lines if (m := _TASK_PREFIX.match(line))}),

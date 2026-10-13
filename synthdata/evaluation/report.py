@@ -344,9 +344,19 @@ def _glance_section(cfg, dataset, combined, extras, model_names, experiment) -> 
 # ---------------------------------------------------------------------------
 
 
+def _untuned_fallbacks(cfg) -> dict[str, str]:
+    from synthdata.generation.hpo import default_best_params_path, untuned_fallbacks
+
+    path = cfg.generation.hpo.best_params_path or default_best_params_path(
+        cfg.generation.output_dir
+    )
+    return untuned_fallbacks(path)
+
+
 def _ranking_section(cfg, combined, extras, paths: _Paths, links: _Links) -> str:
     ranking_summary = extras.get("ranking_summary")
     lines = ["## 2. Ranking", ""]
+    fallbacks = _untuned_fallbacks(cfg)
     if _has_replicates(ranking_summary):
         dims = [d for d in _DIMS if f"{d}_mean" in ranking_summary]
         rows = []
@@ -355,7 +365,7 @@ def _ranking_section(cfg, combined, extras, paths: _Paths, links: _Links) -> str
             rows.append(
                 {
                     "rank": row["rank"],
-                    "model": model,
+                    "model": f"{model} (untuned)" if model in fallbacks else model,
                     "seeds": row["n_replicates"],
                     **{dim: _score_with_interval(row, dim) for dim in dims},
                     "tied with best": "" if pd.isna(tied) else ("yes" if tied else "no"),
@@ -380,6 +390,16 @@ def _ranking_section(cfg, combined, extras, paths: _Paths, links: _Links) -> str
                 _dataframe_to_markdown(summary.reset_index()),
             ]
         index = summary.index
+    shown = [m for m in index if m in fallbacks]
+    if shown:
+        pairs = ", ".join(f"`{m}` = `{fallbacks[m]}`" for m in shown)
+        lines += [
+            "",
+            f"**(untuned)**: no HPO trial passed the screens, so these were fitted with the "
+            f"untuned settings and repeat the untuned model ({pairs}). Read them as one model "
+            "listed twice, not as a tuning result; check the `hpo` log lines for why every "
+            "trial failed.",
+        ]
     if any(is_baseline(m) for m in index):
         lines += [
             "",
