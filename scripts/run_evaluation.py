@@ -15,10 +15,8 @@ Requires generated synthetic data (run `synthdata-generate` first).
 import argparse
 from pathlib import Path
 
-import pandas as pd
-
 from synthdata.config import load_config
-from synthdata.data import load_dataset, load_imputed_splits
+from synthdata.data import load_dataset, load_imputed_splits, read_like
 from synthdata.evaluation import run_evaluation
 from synthdata.evaluation.combine import simple_rank_summary
 from synthdata.experiment import load_experiment
@@ -27,11 +25,11 @@ from synthdata.utils import get_logger, set_global_seed
 logger = get_logger("run_evaluation")
 
 
-def _load_synthetic_datasets(cfg) -> dict:
+def _load_synthetic_datasets(cfg, reference) -> dict:
     output_dir = Path(cfg.generation.output_dir)
     datasets = {}
     for path in sorted(output_dir.glob("*.csv")):
-        datasets[path.stem] = pd.read_csv(path, low_memory=False)
+        datasets[path.stem] = read_like(path, reference)
     return datasets
 
 
@@ -80,7 +78,7 @@ def main() -> None:
     cfg.evaluation.output_dir = str(experiment.evaluation_dir)
     cfg.plots.output_dir = str(experiment.plots_dir)
 
-    synthetic_datasets = _load_synthetic_datasets(cfg)
+    synthetic_datasets = _load_synthetic_datasets(cfg, dataset.full_df)
     if not synthetic_datasets:
         raise SystemExit(
             f"No synthetic datasets found in {cfg.generation.output_dir}. "
