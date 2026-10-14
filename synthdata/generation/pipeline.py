@@ -18,7 +18,7 @@ from filelock import FileLock
 from synthdata import gpu_slots
 from synthdata.compute import resolve_workers, run_per_model
 from synthdata.config import Config
-from synthdata.data import Dataset, remask_synthetic
+from synthdata.data import Dataset, read_like, remask_synthetic
 from synthdata.generation import cart_fill, class_quota
 from synthdata.generation import hpo as hpo_mod
 from synthdata.generation import synthcity_backend as sc
@@ -317,7 +317,7 @@ def run_generation(
         path = output_dir / f"{name}.csv"
         if path.exists() and not gen_cfg.force_retrain:
             logger.info("[%s] using cached synthetic data at %s", name, path)
-            df = pd.read_csv(path, low_memory=False)
+            df = read_like(path, dataset.full_df)
             synthetic_datasets[name] = df
             _write_released(name, df, overwrite=False, replicate_seed=replicate_seed)
             return df

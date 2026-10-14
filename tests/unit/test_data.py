@@ -580,11 +580,28 @@ class TestWarnIdentifierLikeFeatureColumns:
 
 def test_imputed_csv_read_keeps_one_type_per_column(tmp_path):
     """A code/label column must not come back as ints in one chunk and strings in another."""
-    from synthdata.data import _read_table
+    from synthdata.data import read_like
 
     n = 600_000  # past pandas' chunk size for a narrow table
     path = tmp_path / "train_imputed.csv"
-    pd.DataFrame({"c": ["1"] * n + ["Unknown"] * 10}).to_csv(path, index=False)
-    column = _read_table(path)["c"]
+    real = pd.DataFrame({"c": ["1"] * n + ["Unknown"] * 10})
+    real.to_csv(path, index=False)
+    column = read_like(path, real)["c"]
     assert column.map(type).nunique() == 1
     np.unique(column.to_numpy())  # what synthcity's encoders do; raised TypeError before
+
+
+def test_numeric_looking_text_stays_text(tmp_path):
+    """A text target of "0"/"1"/"2" comes back as the same strings, not ints.
+
+    ddpm looks up its training labels with np.searchsorted; labels taken from
+    the real data (strings) against reloaded ints raised the int/str TypeError.
+    """
+    from synthdata.data import read_like
+
+    real = pd.DataFrame({"y": ["0", "1", "2"], "x": [1.5, 2.0, 3.0], "k": [1, 2, 3]})
+    path = tmp_path / "train_imputed.csv"
+    real.to_csv(path, index=False)
+    back = read_like(path, real)
+    pd.testing.assert_frame_equal(back, real)
+    np.searchsorted(np.sort(back["y"].unique()), real["y"].to_numpy())

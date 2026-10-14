@@ -1343,16 +1343,27 @@ def migrate_legacy_imputation_layout(dataset: Dataset) -> None:
         )
 
 
-def _read_table(path: Path) -> pd.DataFrame:
-    """Read a data CSV in one pass, as :func:`load_dataframe` does.
+def read_like(path: Path, reference: pd.DataFrame) -> pd.DataFrame:
+    """Read a data CSV the pipeline wrote, with ``reference``'s text columns kept as text.
 
-    pandas' default chunked read infers each chunk's dtype on its own, so a
-    categorical column of codes and labels ("1", "2", "Unknown") can come back
-    as Python ints in one chunk and strings in another; sorting such a column
-    (synthcity's encoders do) then raises ``'<' not supported between 'int'
-    and 'str'``.
+    Two things go wrong when such a CSV is read back with pandas' defaults.
+    The chunked read infers each chunk's dtype on its own, so a column of codes
+    and labels ("1", "2", "Unknown") can come back as ints in one chunk and
+    strings in another. And a text column whose values all look like numbers
+    ("0", "1", "2", e.g. from a Parquet source or a split that lacks the one
+    label) comes back as ints while the real data holds strings. Either way
+    synthcity then compares ints with strings (sorting categories, or ddpm
+    looking up its class labels) and raises ``'<' not supported between
+    'int' and 'str'``. Reading in one pass with the reference's non-numeric
+    columns as ``str`` gives back exactly the values that were written.
     """
-    return pd.read_csv(path, low_memory=False)
+    text = {
+        column: str
+        for column in reference.columns
+        if not pd.api.types.is_numeric_dtype(reference[column])
+        and not pd.api.types.is_bool_dtype(reference[column])
+    }
+    return pd.read_csv(path, low_memory=False, dtype=text)
 
 
 def load_imputed_splits(dataset: Dataset) -> Dataset:
@@ -1409,7 +1420,7 @@ def load_imputed_splits(dataset: Dataset) -> Dataset:
         )
         return dataset
 
-    frames = {name: _read_table(path) for name, path in imputed_paths.items()}
+    frames = {name: read_like(path, dataset.full_df) for name, path in imputed_paths.items()}
     expected_columns = dataset.full_df.columns.tolist()
     recorded_row_counts = provenance.get("imputed_row_counts")
     if isinstance(recorded_row_counts, dict) and all(
@@ -1448,7 +1459,7 @@ def load_imputed_splits(dataset: Dataset) -> Dataset:
                 paths["search_imputed"].name,
             )
             return dataset
-        search_imputed = _read_table(paths["search_imputed"])
+        search_imputed = read_like(paths["search_imputed"], dataset.full_df)
         if len(search_imputed) != len(dataset.train_df) or (
             search_imputed.columns.tolist() != expected_columns
         ):
