@@ -31,7 +31,7 @@ def _load_synthetic_datasets(cfg) -> dict:
     output_dir = Path(cfg.generation.output_dir)
     datasets = {}
     for path in sorted(output_dir.glob("*.csv")):
-        datasets[path.stem] = pd.read_csv(path)
+        datasets[path.stem] = pd.read_csv(path, low_memory=False)
     return datasets
 
 

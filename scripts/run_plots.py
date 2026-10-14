@@ -40,7 +40,9 @@ def _load_synthetic_datasets(cfg) -> dict:
     output_dir = Path(cfg.generation.output_dir)
     if not output_dir.exists():
         return {}
-    return {path.stem: pd.read_csv(path) for path in sorted(output_dir.glob("*.csv"))}
+    return {
+        path.stem: pd.read_csv(path, low_memory=False) for path in sorted(output_dir.glob("*.csv"))
+    }
 
 
 def main() -> None:

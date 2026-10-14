@@ -576,3 +576,15 @@ class TestWarnIdentifierLikeFeatureColumns:
     def test_small_tables_are_not_flagged_on_cardinality(self):
         df = pd.DataFrame({"code": ["a", "b", "c"]})
         assert warn_identifier_like_feature_columns(df, ["code"], ["code"]) == []
+
+
+def test_imputed_csv_read_keeps_one_type_per_column(tmp_path):
+    """A code/label column must not come back as ints in one chunk and strings in another."""
+    from synthdata.data import _read_table
+
+    n = 600_000  # past pandas' chunk size for a narrow table
+    path = tmp_path / "train_imputed.csv"
+    pd.DataFrame({"c": ["1"] * n + ["Unknown"] * 10}).to_csv(path, index=False)
+    column = _read_table(path)["c"]
+    assert column.map(type).nunique() == 1
+    np.unique(column.to_numpy())  # what synthcity's encoders do; raised TypeError before

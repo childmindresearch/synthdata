@@ -68,6 +68,9 @@ GPU_MODELS = frozenset(PRIOR_SECONDS_PER_EPOCH)
 #: Seconds between checks while waiting for a slot.
 POLL_SECONDS = 2.0
 
+#: Attempts at reading the slot table before a parse error is raised.
+READ_RETRIES = 5
+
 
 #: ``slots`` value of a table without a limit per GPU.
 UNLIMITED = 0
@@ -85,7 +88,7 @@ def setup(folder: Path, n_gpus: int, fits_per_gpu: int) -> None:
     folder.mkdir(parents=True, exist_ok=True)
     table = {"slots": fits_per_gpu, "gpus": {str(i): [] for i in range(n_gpus)}, "waiting": {}}
     with FileLock(str(folder / "table.lock")):
-        (folder / "table.json").write_text(json.dumps(table))
+        _write_table(folder / "table.json", table)
     os.environ[SLOTS_ENV_VAR] = str(folder)
 
 
@@ -133,16 +136,45 @@ def _alive(pid: int) -> bool:
         return False
 
 
+def _write_table(path: Path, table: dict) -> None:
+    """Replace the table in one step, so no reader ever sees it half written.
+
+    Writing in place truncates the file first; a worker killed between the
+    truncate and the write (a stage time limit, an out-of-memory kill) left an
+    empty table that every other worker then failed to parse.
+    """
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(table))
+    os.replace(tmp, path)
+
+
+def _read_table(path: Path) -> dict:
+    """Read the table, retrying a read that comes back empty or cut short.
+
+    On a network file system (NFS) a reader can briefly see a stale or
+    partial copy even after an atomic replace; a few short retries ride
+    that out before the error is raised.
+    """
+    for attempt in range(READ_RETRIES):
+        try:
+            return json.loads(path.read_text())
+        except (json.JSONDecodeError, FileNotFoundError):
+            if attempt == READ_RETRIES - 1:
+                raise
+            time.sleep(0.2 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
 def _update(folder: Path, change):
     """Apply ``change(table)`` under the lock, after freeing dead processes' slots."""
     with FileLock(str(folder / "table.lock")):
         path = folder / "table.json"
-        table = json.loads(path.read_text())
+        table = _read_table(path)
         for gpu, holders in table["gpus"].items():
             table["gpus"][gpu] = [h for h in holders if _alive(h["pid"])]
         table["waiting"] = {key: w for key, w in table["waiting"].items() if _alive(w["pid"])}
         result = change(table)
-        path.write_text(json.dumps(table))
+        _write_table(path, table)
         return result
 
 
