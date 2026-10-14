@@ -407,7 +407,7 @@ uv run python scripts/gpu_concurrency.py --csv <train_imputed.csv> --model ddpm 
     --background ctgan --background-epochs 40
 ```
 
-None of this changes what a fit computes (same seeds and settings), only when and on which GPU it runs. Every fit is listed in `<generation dir>/gpu_slots/fits.csv` (model, kind, GPU, epochs, when it started, seconds it waited and seconds it trained), and a fit that waited more than a minute for a place is logged.
+None of this changes what a fit computes (same seeds and settings), only when and on which GPU it runs. Every fit is listed in `<generation dir>/gpu_slots/fits.csv` (model, kind, GPU, epochs, when it started, seconds it waited and seconds it trained), and a fit that waited more than a minute for a place is logged. The table of who holds which GPU lives in a temporary folder on local disk (under `TMPDIR`), not in the output folder, because file locks are unreliable on network drives.
 
 ### How the hyperparameter search works
 
