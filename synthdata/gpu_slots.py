@@ -23,16 +23,23 @@ model, then the speed measured on its own finished fits. Nothing waits for a
 measurement. Slots never change what a fit computes (same seeds and
 settings), only when and on which GPU it runs.
 
-The parent sets :data:`SLOTS_ENV_VAR` to a folder its worker processes
-share; the slot table there is guarded by a file lock, and slots held by a
-process that died are freed. Each fit is recorded in ``fits.csv`` in that
-folder (model, kind, GPU, epochs, seconds waited and held).
+The parent keeps the slot table in a temporary folder on local disk (under
+``TMPDIR``) and sets :data:`SLOTS_ENV_VAR` to it for its worker processes,
+which all run on the same machine; the table is guarded by a file lock, and
+slots held by a process that died are freed. It is not kept in the output
+folder because that is often a network drive, where file locks and
+just-written files are not reliably seen by other processes (a worker's
+entry could vanish from the table). Each fit is recorded in ``fits.csv`` in
+the output folder (:data:`RECORDS_ENV_VAR`): model, kind, GPU, epochs,
+seconds waited and held.
 """
 
 import contextlib
 import csv
 import json
 import os
+import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -45,6 +52,9 @@ logger = get_logger(__name__)
 
 #: Folder of the shared slot table; set by the parent for its workers.
 SLOTS_ENV_VAR = "SYNTHDATA_GPU_SLOTS"
+
+#: Folder of ``fits.csv``; set by the parent for its workers.
+RECORDS_ENV_VAR = "SYNTHDATA_GPU_SLOTS_RECORDS"
 
 #: Rough seconds per training epoch (PATE-GAN: per iteration) used until a
 #: model's own fits are measured. From profiling on the 682-column
@@ -83,17 +93,26 @@ def resolve_fits_per_gpu(value) -> int | None:
     return int(value) if value else None
 
 
-def setup(folder: Path, n_gpus: int, fits_per_gpu: int) -> None:
-    """Create the slot table for ``n_gpus`` GPUs and point worker processes at it."""
-    folder.mkdir(parents=True, exist_ok=True)
+def setup(records: Path, n_gpus: int, fits_per_gpu: int) -> None:
+    """Create the slot table for ``n_gpus`` GPUs and point worker processes at it.
+
+    The table goes in a new local temporary folder; ``records`` is where
+    ``fits.csv`` is written.
+    """
+    records.mkdir(parents=True, exist_ok=True)
+    folder = Path(tempfile.mkdtemp(prefix="synthdata_gpu_slots_"))
     table = {"slots": fits_per_gpu, "gpus": {str(i): [] for i in range(n_gpus)}, "waiting": {}}
     with FileLock(str(folder / "table.lock")):
         _write_table(folder / "table.json", table)
     os.environ[SLOTS_ENV_VAR] = str(folder)
+    os.environ[RECORDS_ENV_VAR] = str(records)
 
 
 def teardown() -> None:
-    os.environ.pop(SLOTS_ENV_VAR, None)
+    folder = os.environ.pop(SLOTS_ENV_VAR, None)
+    os.environ.pop(RECORDS_ENV_VAR, None)
+    if folder:
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 class WorkPlan:
@@ -178,8 +197,14 @@ def _update(folder: Path, change):
         return result
 
 
-def _try_take(table: dict, key: str, priority: float) -> str | None:
-    """Take a slot on the least busy GPU if one is free and no one ahead is waiting."""
+def _try_take(table: dict, key: str, priority: float, entry: dict | None = None) -> str | None:
+    """Take a slot on the least busy GPU if one is free and no one ahead is waiting.
+
+    ``entry`` is the waiting entry to put back if it went missing from the
+    table, so a lost entry costs a place in the queue rather than the fit.
+    """
+    if entry is not None:
+        table["waiting"].setdefault(key, dict(entry))
     table["waiting"][key]["priority"] = priority
     if table["slots"] == UNLIMITED:
         gpu = min(table["gpus"], key=lambda g: (len(table["gpus"][g]), int(g)))
@@ -223,21 +248,18 @@ def gpu_slot(model: str, kind: str, epochs: float, device: str | None):
     folder = Path(folder)
     key = f"{os.getpid()}:{kind}:{time.monotonic_ns()}"
     asked = time.time()
-    _update(
-        folder,
-        lambda table: table["waiting"].__setitem__(
-            key,
-            {
-                "pid": os.getpid(),
-                "model": model,
-                "kind": kind,
-                "priority": work.seconds_left(),
-                "since": asked,
-            },
-        ),
-    )
+    entry = {
+        "pid": os.getpid(),
+        "model": model,
+        "kind": kind,
+        "priority": work.seconds_left(),
+        "since": asked,
+    }
+    _update(folder, lambda table: table["waiting"].__setitem__(key, dict(entry)))
     try:
-        while (gpu := _update(folder, lambda t: _try_take(t, key, work.seconds_left()))) is None:
+        while (
+            gpu := _update(folder, lambda t: _try_take(t, key, work.seconds_left(), entry))
+        ) is None:
             time.sleep(POLL_SECONDS)
     except BaseException:
         _update(folder, lambda table: table["waiting"].pop(key, None))
@@ -260,10 +282,14 @@ def gpu_slot(model: str, kind: str, epochs: float, device: str | None):
 
         _update(folder, release)
         work.done(epochs, held)
-        _record(folder, model, kind, gpu, epochs, waited, held, asked)
+        _record(model, kind, gpu, epochs, waited, held, asked)
 
 
-def _record(folder, model, kind, gpu, epochs, waited, held, asked) -> None:
+def _record(model, kind, gpu, epochs, waited, held, asked) -> None:
+    records = os.environ.get(RECORDS_ENV_VAR)
+    if not records:
+        return
+    folder = Path(records)
     path = folder / "fits.csv"
     row = {
         "model": model,

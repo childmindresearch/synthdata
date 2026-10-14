@@ -5,6 +5,7 @@ import json
 import os
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -16,14 +17,21 @@ def slots(tmp_path, monkeypatch):
     monkeypatch.setattr(gpu_slots, "POLL_SECONDS", 0.01)
     monkeypatch.setattr(gpu_slots, "_PLANS", {})
     monkeypatch.delenv(gpu_slots.SLOTS_ENV_VAR, raising=False)
-    folder = tmp_path / "gpu_slots"
+    monkeypatch.delenv(gpu_slots.RECORDS_ENV_VAR, raising=False)
+    (tmp_path / "local").mkdir()
+    monkeypatch.setattr(gpu_slots.tempfile, "tempdir", str(tmp_path / "local"))
 
     def make(n_gpus=1, fits_per_gpu=1):
-        gpu_slots.setup(folder, n_gpus, fits_per_gpu)
-        return folder
+        """Set up slots; returns the (local) folder of the slot table."""
+        gpu_slots.setup(tmp_path / "gpu_slots", n_gpus, fits_per_gpu)
+        return Path(os.environ[gpu_slots.SLOTS_ENV_VAR])
 
     yield make
     gpu_slots.teardown()
+
+
+def _records():
+    return Path(os.environ[gpu_slots.RECORDS_ENV_VAR])
 
 
 def _table(folder):
@@ -116,7 +124,7 @@ def test_waiting_process_gets_slot_after_release_and_fits_are_recorded(slots):
         assert got == []  # the only slot is held
     thread.join(timeout=10)
     assert got == ["cuda:0"]
-    with open(folder / "fits.csv", newline="") as f:
+    with open(_records() / "fits.csv", newline="") as f:
         rows = list(csv.DictReader(f))
     assert [(r["model"], r["kind"], r["gpu"]) for r in rows] == [
         ("ctgan", "untuned", "0"),
@@ -134,13 +142,13 @@ def test_failed_fit_still_releases_its_slot(slots):
 
 
 def test_cpu_models_never_wait_for_a_slot(slots):
-    folder = slots(n_gpus=1, fits_per_gpu=1)
+    slots(n_gpus=1, fits_per_gpu=1)
     with (
         gpu_slots.gpu_slot("ctgan", "trial", 5, "cuda"),
         gpu_slots.gpu_slot("arf", "untuned", 0, "cuda") as device,
     ):
         assert device == "cuda"
-    with open(folder / "fits.csv", newline="") as f:
+    with open(_records() / "fits.csv", newline="") as f:
         assert [r["model"] for r in csv.DictReader(f)] == ["ctgan"]
 
 
@@ -191,3 +199,22 @@ def test_unreadable_table_still_raises(slots, monkeypatch):
     (folder / "table.json").write_text("")
     with pytest.raises(json.JSONDecodeError):
         gpu_slots._update(folder, lambda table: None)
+
+
+def test_table_is_local_and_removed_at_teardown(slots, tmp_path):
+    """The table stays off the output folder (often a network drive)."""
+    folder = slots()
+    assert folder.parent == tmp_path / "local"
+    assert not (tmp_path / "gpu_slots" / "table.json").exists()
+    gpu_slots.teardown()
+    assert not folder.exists()
+
+
+def test_lost_waiting_entry_is_put_back():
+    """A waiter whose entry vanished from the table keeps waiting instead of failing."""
+    table = {"slots": 1, "gpus": {"0": [_waiter(os.getpid(), 1, 0.0)]}, "waiting": {}}
+    entry = _waiter(os.getpid(), 5, 1.0)
+    assert gpu_slots._try_take(table, "me", 5, entry) is None
+    assert table["waiting"]["me"]["since"] == 1.0
+    table["gpus"]["0"] = []
+    assert gpu_slots._try_take(table, "me", 5, entry) == "0"
