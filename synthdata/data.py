@@ -16,8 +16,10 @@ import hashlib
 import json
 import re
 import types
+from collections.abc import Hashable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -1357,7 +1359,7 @@ def read_like(path: Path, reference: pd.DataFrame) -> pd.DataFrame:
     'int' and 'str'``. Reading in one pass with the reference's non-numeric
     columns as ``str`` gives back exactly the values that were written.
     """
-    text = {
+    text: dict[Hashable, Any] = {
         column: str
         for column in reference.columns
         if not pd.api.types.is_numeric_dtype(reference[column])
