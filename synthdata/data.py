@@ -1343,6 +1343,18 @@ def migrate_legacy_imputation_layout(dataset: Dataset) -> None:
         )
 
 
+def _read_table(path: Path) -> pd.DataFrame:
+    """Read a data CSV in one pass, as :func:`load_dataframe` does.
+
+    pandas' default chunked read infers each chunk's dtype on its own, so a
+    categorical column of codes and labels ("1", "2", "Unknown") can come back
+    as Python ints in one chunk and strings in another; sorting such a column
+    (synthcity's encoders do) then raises ``'<' not supported between 'int'
+    and 'str'``.
+    """
+    return pd.read_csv(path, low_memory=False)
+
+
 def load_imputed_splits(dataset: Dataset) -> Dataset:
     """Attach imputed CSVs only when their source and split provenance still matches."""
     migrate_legacy_imputation_layout(dataset)
@@ -1397,7 +1409,7 @@ def load_imputed_splits(dataset: Dataset) -> Dataset:
         )
         return dataset
 
-    frames = {name: pd.read_csv(path) for name, path in imputed_paths.items()}
+    frames = {name: _read_table(path) for name, path in imputed_paths.items()}
     expected_columns = dataset.full_df.columns.tolist()
     recorded_row_counts = provenance.get("imputed_row_counts")
     if isinstance(recorded_row_counts, dict) and all(
@@ -1436,7 +1448,7 @@ def load_imputed_splits(dataset: Dataset) -> Dataset:
                 paths["search_imputed"].name,
             )
             return dataset
-        search_imputed = pd.read_csv(paths["search_imputed"])
+        search_imputed = _read_table(paths["search_imputed"])
         if len(search_imputed) != len(dataset.train_df) or (
             search_imputed.columns.tolist() != expected_columns
         ):

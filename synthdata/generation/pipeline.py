@@ -317,7 +317,7 @@ def run_generation(
         path = output_dir / f"{name}.csv"
         if path.exists() and not gen_cfg.force_retrain:
             logger.info("[%s] using cached synthetic data at %s", name, path)
-            df = pd.read_csv(path)
+            df = pd.read_csv(path, low_memory=False)
             synthetic_datasets[name] = df
             _write_released(name, df, overwrite=False, replicate_seed=replicate_seed)
             return df

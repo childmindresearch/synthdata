@@ -153,3 +153,41 @@ def test_without_a_limit_fits_never_wait_and_spread_over_gpus(slots):
     ):
         assert [a, b, c] == ["cuda:0", "cuda:1", "cuda:0"]
         assert [len(h) for h in _table(folder)["gpus"].values()] == [2, 1]
+
+
+def test_table_write_is_atomic(slots, monkeypatch):
+    """A writer dying mid-write never leaves an empty table behind."""
+    folder = slots()
+    before = _table(folder)
+
+    def die(self, *args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(type(folder), "write_text", die)
+    with pytest.raises(KeyboardInterrupt):
+        gpu_slots._update(folder, lambda table: None)
+    monkeypatch.undo()
+    assert _table(folder) == before
+
+
+def test_torn_read_is_retried(slots, monkeypatch):
+    folder = slots()
+    monkeypatch.setattr(gpu_slots.time, "sleep", lambda s: None)
+    real = type(folder).read_text
+    reads = []
+
+    def flaky(self, *args, **kwargs):
+        reads.append(self.name)
+        return "" if len(reads) < 3 else real(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(folder), "read_text", flaky)
+    assert gpu_slots._update(folder, lambda table: table["slots"]) == 1
+    assert len(reads) == 3
+
+
+def test_unreadable_table_still_raises(slots, monkeypatch):
+    folder = slots()
+    monkeypatch.setattr(gpu_slots.time, "sleep", lambda s: None)
+    (folder / "table.json").write_text("")
+    with pytest.raises(json.JSONDecodeError):
+        gpu_slots._update(folder, lambda table: None)
