@@ -67,19 +67,11 @@ def _weak_frame(n, seed):
     )
 
 
-def test_weighted_fit_predicts_the_minority_class():
-    """Class weights lift balanced accuracy where the plain fit predicts the majority."""
+def test_class_weights_make_the_fit_predict_the_minority_class():
+    """Balanced class weights lift balanced accuracy where an unweighted fit
+    predicts the majority (balanced accuracy about 0.5)."""
     fit, score = _weak_frame(2000, 0), _weak_frame(2000, 1)
-    scores = tstr_scores(fit, score, "y", ["site"], ["common", "rare"], [0, 1], weighted=True)
-    assert scores.balanced_accuracy < 0.55
-    assert scores.weighted_balanced_accuracy > scores.balanced_accuracy + 0.05
-    assert set(scores.seed_sd) == {
-        "macro_f1",
-        "macro_auprc",
-        "macro_auroc",
-        "balanced_accuracy",
-        "weighted_macro_f1",
-        "weighted_balanced_accuracy",
-    }
-    plain = tstr_scores(fit, score, "y", ["site"], ["common", "rare"], [0])
-    assert plain.weighted_macro_f1 is None and "weighted_macro_f1" not in plain.seed_sd
+    scores = tstr_scores(fit, score, "y", ["site"], ["common", "rare"], [0, 1])
+    assert scores.balanced_accuracy > 0.6
+    assert scores.per_class_f1["rare"] > 0.2
+    assert set(scores.seed_sd) == {"macro_f1", "macro_auprc", "macro_auroc", "balanced_accuracy"}

@@ -105,7 +105,7 @@ generation:
     # start-up trials wins. On the sim run macro-F1 had no headroom (real
     # 0.305 vs always-majority 0.303), see docs/verification.md.
     objective: auto
-    objective_candidates: [tstr_macro_auprc, tstr_macro_auroc, tstr_weighted_macro_f1, tstr_macro_f1]
+    objective_candidates: [tstr_macro_auprc, tstr_macro_auroc, tstr_macro_f1]
     # Screens a trial must pass to be chosen as best. Category coverage is the
     # minimum over all categorical columns; the protected columns are held to
     # full coverage and their group shares to within 0.05 of the real ones.

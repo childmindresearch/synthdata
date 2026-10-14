@@ -93,7 +93,6 @@ def test_eval_fn_reports_headroom_per_candidate_objective():
     assert set(eval_fn.headroom) == {
         "tstr_macro_auprc",
         "tstr_macro_auroc",
-        "tstr_weighted_macro_f1",
         "tstr_macro_f1",
     }
     auroc = eval_fn.headroom["tstr_macro_auroc"]

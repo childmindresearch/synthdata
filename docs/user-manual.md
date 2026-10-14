@@ -415,7 +415,7 @@ For each model, [Optuna](https://optuna.org/) tries a number of settings ("trial
 
 1. Fit the model on search-train with the trial's settings.
 2. Generate synthetic rows, class by class, to the search-train class shares (as described above).
-3. Train a fixed XGBoost classifier on the synthetic rows and test it on the real tuning rows (**TSTR**, train on synthetic, test on real). Every trial logs macro AUPRC, macro AUROC, macro-F1 and macro-F1 of a class-weighted fit, each with a bootstrap standard error (how much the score would move with a different sample of tuning rows), plus the same scores for the classifier trained on real rows (**TRTR**, the ceiling). It also logs the worst protected group's AUPRC and three fidelity scores (`fid_marginal`, `fid_association`, `fid_detection_auc`; lower is closer to the real data), which are never optimized.
+3. Train a fixed XGBoost classifier on the synthetic rows and test it on the real tuning rows (**TSTR**, train on synthetic, test on real). The classifier weights rows by inverse class frequency, so every class counts equally in training, here and in evaluation. Every trial logs macro AUPRC, macro AUROC and macro-F1, each with a bootstrap standard error (how much the score would move with a different sample of tuning rows), plus the same scores for the classifier trained on real rows (**TRTR**, the ceiling). It also logs the worst protected group's AUPRC and three fidelity scores (`fid_marginal`, `fid_association`, `fid_detection_auc`; lower is closer to the real data), which are never optimized.
 4. Check the screens in `hpo.constraints`. A trial that copies training rows (`copy_margin`), drops categories (`min_category_coverage`, the worst categorical column) or classes, produces out-of-range values (`max_out_of_range`), leaves a class short (`max_class_share_gap`), drops a protected group (`min_protected_coverage`, 1.0 = every gender, age-quartile and ethnicity group with at least 1% of the rows), shifts the protected group shares by more than the same number of real rows would (`max_protected_share_gap`), or sits closer to the training rows than to unseen rows (`max_dcr_closer_to_train`; 0.5 means no memorization) is marked infeasible and cannot be chosen as best.
 
 **Which score is optimized** (`hpo.objective`). The default, `auto`, decides per model with a rule fixed in advance, so the choice can't be tuned to the results:
@@ -525,7 +525,7 @@ Both libraries run from our pinned forks, which fix the bugs listed in [verifica
 
 ### Utility: holdout TSTR
 
-The same XGBoost classifier used in HPO is trained on each synthetic dataset and tested on the holdout. `tstr_holdout.csv` reports macro-F1, balanced accuracy, macro AUPRC and per-class F1, next to the score of the same classifier trained on the real train data (the ceiling).
+The same XGBoost classifier used in HPO, with the same class-balanced row weights, is trained on each synthetic dataset and tested on the holdout. `tstr_holdout.csv` reports macro-F1, balanced accuracy, macro AUPRC and per-class F1, next to the score of the same classifier trained on the real train data (the ceiling).
 
 For a target with 3 or more classes, metrics that need two classes (AUROC difference, subgroup gaps) run once per class against the rest and are averaged with equal weight (`evaluation.class_averaging: ovr_macro`, per-class values in `ovr_per_class.csv`). Alternatively, set `class_averaging: binary` and define which classes count as positive in `evaluation.binary_target` (see `config_loris.yaml`).
 

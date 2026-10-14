@@ -486,7 +486,6 @@ def build_hpo_eval_fn(
             nominal_columns,
             classes,
             seeds,
-            weighted=True,
             n_bootstrap=hpo_cfg.n_bootstrap,
             groups=tuning_groups,
         )
@@ -503,7 +502,6 @@ def build_hpo_eval_fn(
         for objective in (
             "tstr_macro_auprc",
             "tstr_macro_auroc",
-            "tstr_weighted_macro_f1",
             "tstr_macro_f1",
         ):
             metric = objective.removeprefix("tstr_")
@@ -639,8 +637,6 @@ def build_hpo_eval_fn(
                 "tstr_macro_auprc": scores.macro_auprc,
                 "tstr_macro_auroc": scores.macro_auroc,
                 "tstr_balanced_accuracy": scores.balanced_accuracy,
-                "tstr_weighted_macro_f1": scores.weighted_macro_f1,
-                "tstr_weighted_balanced_accuracy": scores.weighted_balanced_accuracy,
                 "tstr_per_class_f1": scores.per_class_f1,
                 "tstr_seed_sd": scores.seed_sd,
                 "tstr_boot_se": scores.boot_se,
@@ -650,8 +646,6 @@ def build_hpo_eval_fn(
                 "trtr_macro_auprc": trtr.macro_auprc,
                 "trtr_macro_auroc": trtr.macro_auroc,
                 "trtr_balanced_accuracy": trtr.balanced_accuracy,
-                "trtr_weighted_macro_f1": trtr.weighted_macro_f1,
-                "trtr_weighted_balanced_accuracy": trtr.weighted_balanced_accuracy,
                 "trtr_worst_group_auprc": _worst_group(trtr),
             }
         if tstr:
