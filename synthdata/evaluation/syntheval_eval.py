@@ -38,8 +38,9 @@ _RANK_COLUMNS = {"rank", "u_rank", "p_rank", "f_rank"}
 #: typed categorical on Windows, so classification and fairness metrics run;
 #: v6: q_mse, mi_diff and statistical parity fixes from the known-answer checks;
 #: v7: q_mse preset compares categorical columns too; v8: Cramér's V square
-#: root and auroc scored by agreement, 1 - |diff|).
-_CHECKPOINT_SCHEMA_VERSION = 8
+#: root and auroc scored by agreement, 1 - |diff|; v9: class-balanced
+#: classifier fits in cls_acc, auroc_diff and the fairness metrics).
+_CHECKPOINT_SCHEMA_VERSION = 9
 
 #: SynthEval tags every result row it returns with a ``dim`` of "u", "p" or "f"
 #: (see each metric's ``normalize_output``). That tag, not the preset key the

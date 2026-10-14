@@ -74,4 +74,36 @@ def test_class_weights_make_the_fit_predict_the_minority_class():
     scores = tstr_scores(fit, score, "y", ["site"], ["common", "rare"], [0, 1])
     assert scores.balanced_accuracy > 0.6
     assert scores.per_class_f1["rare"] > 0.2
-    assert set(scores.seed_sd) == {"macro_f1", "macro_auprc", "macro_auroc", "balanced_accuracy"}
+    assert set(scores.seed_sd) == {
+        "macro_f1",
+        "macro_auprc",
+        "macro_auroc",
+        "balanced_accuracy",
+        "kappa",
+    }
+
+
+def test_kappa_matches_sklearn_and_weights_ordinal_errors_by_distance():
+    """Kappa is scikit-learn's; quadratic weights forgive a near miss on an
+    ordinal target more than a far one."""
+    from sklearn.metrics import cohen_kappa_score
+
+    from synthdata.evaluation.tstr import _kappa
+
+    y_true = np.array([0, 0, 1, 1, 2, 2, 2, 0])
+    near = np.array([0, 1, 1, 2, 2, 1, 2, 0])
+    far = np.array([0, 2, 1, 0, 2, 0, 2, 0])
+    assert _kappa(y_true, near, 3, False) == pytest.approx(cohen_kappa_score(y_true, near))
+    assert _kappa(y_true, near, 3, True) == pytest.approx(
+        cohen_kappa_score(y_true, near, weights="quadratic")
+    )
+    assert _kappa(y_true, near, 3, True) > _kappa(y_true, far, 3, True)
+    assert _kappa(np.zeros(5, int), np.zeros(5, int), 2, False) == 0.0
+
+
+def test_target_classes_orders_an_ordinal_target_numerically():
+    from synthdata.evaluation.tstr import target_classes
+
+    codes = pd.Series([10, 2, 1, 2, None])
+    assert target_classes(codes, ordinal=True) == [1, 2, 10]
+    assert target_classes(pd.Series(["b", "a"])) == ["a", "b"]

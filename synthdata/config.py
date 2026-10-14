@@ -522,8 +522,9 @@ class HPOConfig:
     enabled: bool = True
     #: What a trial optimizes, scored on the tuning split by a fixed XGBoost
     #: trained on the synthetic rows (train on synthetic, test on real):
-    #: "tstr_macro_auprc", "tstr_macro_auroc", "tstr_macro_f1"; all are logged
-    #: on every trial. The XGBoost weights rows by inverse class frequency, as
+    #: "tstr_macro_auprc", "tstr_macro_auroc", "tstr_macro_f1", "tstr_kappa"
+    #: (Cohen's kappa, quadratic-weighted for an ordinal target); all are
+    #: logged on every trial. The XGBoost weights rows by inverse class frequency, as
     #: in every predictive fit of the pipeline.
     #: "auto" (default) picks one of ``objective_candidates`` per model by a
     #: fixed rule (see ``synthdata.generation.hpo.choose_objective``): drop
@@ -1148,6 +1149,7 @@ TSTR_OBJECTIVES = (
     "tstr_macro_auprc",
     "tstr_macro_auroc",
     "tstr_macro_f1",
+    "tstr_kappa",
 )
 HPO_OBJECTIVES = (*TSTR_OBJECTIVES, "auto", "synthcity_composite")
 HPO_PRUNERS = ("median", None)
