@@ -37,8 +37,8 @@ from synthdata.generation.hpo import STUDY_OBJECTIVE_ATTR, _feasible
 COMPARED = (
     "tstr_macro_auprc",
     "tstr_macro_auroc",
-    "tstr_weighted_macro_f1",
     "tstr_macro_f1",
+    "tstr_kappa",
     "tstr_worst_group_auprc",
     "fid_marginal",
     "fid_association",

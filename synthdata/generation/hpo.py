@@ -32,7 +32,13 @@ import pandas as pd
 from filelock import FileLock
 
 from synthdata.config import HPOConfig, HPOConstraintsConfig
-from synthdata.evaluation.tstr import XGB_PARAMS, _encode, chance_scores, tstr_scores
+from synthdata.evaluation.tstr import (
+    XGB_PARAMS,
+    _encode,
+    chance_scores,
+    target_classes,
+    tstr_scores,
+)
 from synthdata.utils import ensure_dir, get_logger, load_json, save_json
 
 logger = get_logger(__name__)
@@ -452,6 +458,7 @@ def build_hpo_eval_fn(
     match_prior: bool = True,
     workspace: str | Path | None = None,
     protected_columns: Sequence[str] = (),
+    ordinal_target: bool = False,
 ) -> HPOEvalFn:
     """Build a ``synthetic_df -> TrialScore`` function scored on the tuning split.
 
@@ -473,7 +480,7 @@ def build_hpo_eval_fn(
             "synthcity_composite for a numeric target"
         )
     prior = search_train_df[target_column].value_counts(normalize=True)
-    classes = sorted(prior.index, key=str)
+    classes = target_classes(pd.Series(prior.index), ordinal_target)
     seeds = [seed + i for i in range(hpo_cfg.tstr_seeds)]
     groupers = protected_groups(search_train_df, list(protected_columns))
     tuning_groups = {column: grouper(tuning_df) for column, grouper in groupers.items()}
@@ -486,9 +493,9 @@ def build_hpo_eval_fn(
             nominal_columns,
             classes,
             seeds,
-            weighted=True,
             n_bootstrap=hpo_cfg.n_bootstrap,
             groups=tuning_groups,
+            ordinal=ordinal_target,
         )
 
     def _worst_group(scores):
@@ -503,8 +510,8 @@ def build_hpo_eval_fn(
         for objective in (
             "tstr_macro_auprc",
             "tstr_macro_auroc",
-            "tstr_weighted_macro_f1",
             "tstr_macro_f1",
+            "tstr_kappa",
         ):
             metric = objective.removeprefix("tstr_")
             value = getattr(trtr, metric)
@@ -639,8 +646,7 @@ def build_hpo_eval_fn(
                 "tstr_macro_auprc": scores.macro_auprc,
                 "tstr_macro_auroc": scores.macro_auroc,
                 "tstr_balanced_accuracy": scores.balanced_accuracy,
-                "tstr_weighted_macro_f1": scores.weighted_macro_f1,
-                "tstr_weighted_balanced_accuracy": scores.weighted_balanced_accuracy,
+                "tstr_kappa": scores.kappa,
                 "tstr_per_class_f1": scores.per_class_f1,
                 "tstr_seed_sd": scores.seed_sd,
                 "tstr_boot_se": scores.boot_se,
@@ -650,8 +656,7 @@ def build_hpo_eval_fn(
                 "trtr_macro_auprc": trtr.macro_auprc,
                 "trtr_macro_auroc": trtr.macro_auroc,
                 "trtr_balanced_accuracy": trtr.balanced_accuracy,
-                "trtr_weighted_macro_f1": trtr.weighted_macro_f1,
-                "trtr_weighted_balanced_accuracy": trtr.weighted_balanced_accuracy,
+                "trtr_kappa": trtr.kappa,
                 "trtr_worst_group_auprc": _worst_group(trtr),
             }
         if tstr:

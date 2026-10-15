@@ -522,8 +522,10 @@ class HPOConfig:
     enabled: bool = True
     #: What a trial optimizes, scored on the tuning split by a fixed XGBoost
     #: trained on the synthetic rows (train on synthetic, test on real):
-    #: "tstr_macro_auprc", "tstr_macro_auroc", "tstr_weighted_macro_f1"
-    #: (class-weighted fit), "tstr_macro_f1"; all are logged on every trial.
+    #: "tstr_macro_auprc", "tstr_macro_auroc", "tstr_macro_f1", "tstr_kappa"
+    #: (Cohen's kappa, quadratic-weighted for an ordinal target); all are
+    #: logged on every trial. The XGBoost weights rows by inverse class frequency, as
+    #: in every predictive fit of the pipeline.
     #: "auto" (default) picks one of ``objective_candidates`` per model by a
     #: fixed rule (see ``synthdata.generation.hpo.choose_objective``): drop
     #: candidates whose real-data headroom over chance is under
@@ -537,7 +539,6 @@ class HPOConfig:
         default_factory=lambda: [
             "tstr_macro_auprc",
             "tstr_macro_auroc",
-            "tstr_weighted_macro_f1",
             "tstr_macro_f1",
         ]
     )
@@ -1147,8 +1148,8 @@ def _validate_split(cfg: Config) -> None:
 TSTR_OBJECTIVES = (
     "tstr_macro_auprc",
     "tstr_macro_auroc",
-    "tstr_weighted_macro_f1",
     "tstr_macro_f1",
+    "tstr_kappa",
 )
 HPO_OBJECTIVES = (*TSTR_OBJECTIVES, "auto", "synthcity_composite")
 HPO_PRUNERS = ("median", None)

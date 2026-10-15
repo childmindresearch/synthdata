@@ -5,7 +5,10 @@ training data rather than the classifier (ported from the core of
 ``feat/final-release-evaluation``'s ``tstr.py``, without its provenance layer).
 Scores are averaged over the given XGBoost seeds; with ``subsample`` and
 ``colsample_bytree`` at 1 the classifier is deterministic, so one seed is
-enough and the seeds add no noise estimate. The score's sampling noise comes
+enough and the seeds add no noise estimate. Every fit weights its rows by
+inverse class frequency (scikit-learn's ``compute_sample_weight("balanced")``),
+so each class contributes equally to the loss and an imbalanced target is
+handled the same way in HPO, the TRTR ceiling and holdout evaluation. The score's sampling noise comes
 instead from a stratified bootstrap of the scored rows (``n_bootstrap``).
 Fitting the same classifier on real training rows (train-on-real,
 test-on-real, TRTR) gives the ceiling a synthetic dataset can be compared
@@ -19,6 +22,7 @@ import pandas as pd
 from sklearn.metrics import (
     average_precision_score,
     balanced_accuracy_score,
+    cohen_kappa_score,
     f1_score,
     roc_auc_score,
 )
@@ -46,16 +50,15 @@ class TSTRScores:
     macro_auprc: float
     balanced_accuracy: float
     per_class_f1: dict
-    #: The same scores from a second fit with rows weighted by inverse class
-    #: frequency (``weighted=True`` only), so the classifier predicts the
-    #: minority classes; logged to compare objectives, not used to rank.
-    weighted_macro_f1: float | None = None
-    weighted_balanced_accuracy: float | None = None
     #: Standard deviation of each score across seeds (0 for the deterministic
     #: fixed classifier).
     seed_sd: dict = dataclasses.field(default_factory=dict)
     #: Macro one-vs-rest AUROC (threshold-free; chance 0.5 whatever the class shares).
     macro_auroc: float | None = None
+    #: Cohen's kappa: agreement with the true labels beyond chance (0 = no
+    #: better than chance, 1 = perfect). Quadratic-weighted when the target is
+    #: ordinal, so a prediction one class off costs less than one far off.
+    kappa: float | None = None
     #: Bootstrap standard error of each score over the scored rows (first
     #: seed's predictions; ``n_bootstrap`` > 0 only): the evaluation's
     #: sampling noise, against which a difference between candidates is judged.
@@ -87,12 +90,23 @@ def _macro_f1(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int) -> float:
     )
 
 
+def _kappa(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int, ordinal: bool) -> float:
+    if len(np.unique(np.r_[y_true, y_pred])) < 2:
+        # Both sides constant and equal: kappa is 0/0; no agreement beyond chance.
+        return 0.0
+    return float(
+        cohen_kappa_score(
+            y_true, y_pred, labels=range(n_classes), weights="quadratic" if ordinal else None
+        )
+    )
+
+
 def chance_scores(score_df: pd.DataFrame, target_column: str, classes: list) -> dict:
     """Each score of a classifier with no information, on ``score_df``.
 
-    macro-F1 (also class-weighted): always predicting the most frequent class.
+    macro-F1: always predicting the most frequent class.
     Macro AUPRC: the mean class prevalence. Macro AUROC: 0.5. Balanced
-    accuracy: 1 / number of classes present.
+    accuracy: 1 / number of classes present. Cohen's kappa: 0 by construction.
     """
     y_true = _label_codes(score_df[target_column], classes).astype(int).to_numpy()
     majority = np.full_like(y_true, np.bincount(y_true).argmax())
@@ -100,20 +114,24 @@ def chance_scores(score_df: pd.DataFrame, target_column: str, classes: list) -> 
     constant_f1 = _macro_f1(y_true, majority, len(classes))
     return {
         "macro_f1": constant_f1,
-        "weighted_macro_f1": constant_f1,
         "macro_auprc": float(np.mean([(y_true == i).mean() for i in present])),
         "macro_auroc": 0.5,
         "balanced_accuracy": 1.0 / len(present),
+        "kappa": 0.0,
     }
 
 
-def _bootstrap_se(y_true, proba, weighted_pred, n_classes, n_bootstrap, seed) -> dict:
+def _bootstrap_se(y_true, proba, n_classes, n_bootstrap, seed, ordinal=False) -> dict:
     """Stratified bootstrap standard errors of the threshold and ranking scores."""
     rng = np.random.default_rng(seed)
     by_class = [np.flatnonzero(y_true == i) for i in np.unique(y_true)]
-    draws = {"macro_f1": [], "macro_auprc": [], "macro_auroc": [], "balanced_accuracy": []}
-    if weighted_pred is not None:
-        draws["weighted_macro_f1"] = []
+    draws = {
+        "macro_f1": [],
+        "macro_auprc": [],
+        "macro_auroc": [],
+        "balanced_accuracy": [],
+        "kappa": [],
+    }
     y_pred = proba.argmax(axis=1)
     for _ in range(n_bootstrap):
         idx = np.concatenate([rng.choice(rows, len(rows)) for rows in by_class])
@@ -122,8 +140,7 @@ def _bootstrap_se(y_true, proba, weighted_pred, n_classes, n_bootstrap, seed) ->
         draws["macro_auprc"].append(_macro_auprc(y, p))
         draws["macro_auroc"].append(_macro_auroc(y, p))
         draws["balanced_accuracy"].append(balanced_accuracy_score(y, y_pred[idx]))
-        if weighted_pred is not None:
-            draws["weighted_macro_f1"].append(_macro_f1(y, weighted_pred[idx], n_classes))
+        draws["kappa"].append(_kappa(y, y_pred[idx], n_classes, ordinal))
     return {name: float(np.nanstd(values, ddof=1)) for name, values in draws.items()}
 
 
@@ -152,6 +169,15 @@ def _encode(
     return x_train.astype(float), x_test.astype(float)
 
 
+def target_classes(values: pd.Series, ordinal: bool = False) -> list:
+    """The target's classes in a fixed order: low to high for an ordinal
+    target (stored as integer codes in its declared order), else by label."""
+    present = values.dropna().unique().tolist()
+    if ordinal:
+        return sorted(present, key=float)
+    return sorted(present, key=str)
+
+
 def _label_codes(values: pd.Series, classes: list) -> pd.Series:
     """Map target values to class indices; numeric labels match as numbers (1 == 1.0)."""
     if all(isinstance(c, (int, float, np.number)) for c in classes):
@@ -167,18 +193,20 @@ def tstr_scores(
     nominal_columns: list,
     classes: list,
     seeds: list,
-    weighted: bool = False,
     n_bootstrap: int = 0,
     groups: dict | None = None,
+    ordinal: bool = False,
 ) -> TSTRScores:
     """Fit the fixed XGBoost on ``fit_df`` once per seed and score on ``score_df``.
 
     ``classes`` fixes the label set (the real training classes), so a fit set
     that lacks a class still yields a model scored over every class: that
     class's F1 is then 0. Rows of ``fit_df`` with a label outside ``classes``
-    are dropped. ``weighted`` adds a fit with ``sample_weight`` balanced by
-    class (scikit-learn's ``compute_sample_weight("balanced")``).
+    are dropped. Rows are weighted by inverse class frequency
+    (``compute_sample_weight("balanced")``), so every class counts equally.
     ``n_bootstrap`` > 0 adds bootstrap standard errors (``boot_se``).
+    ``ordinal``: the target's classes are ordered and ``classes`` lists them
+    low to high, so kappa uses quadratic weights.
     ``groups`` (``{column: labels aligned with score_df}``) adds the macro
     AUPRC within each group (``group_auprc``), from the first seed's fit.
     """
@@ -203,7 +231,9 @@ def tstr_scores(
         raise ValueError(f"fit set has no rows with a target in {classes}")
     to_local = {c: i for i, c in enumerate(present)}
 
-    def predict_proba(seed, sample_weight=None):
+    sample_weight = compute_sample_weight("balanced", y_fit)
+
+    def predict_proba(seed):
         proba = np.zeros((len(x_score), len(classes)))
         if len(present) == 1:
             # A collapsed fit set can only ever predict its one class.
@@ -214,9 +244,8 @@ def tstr_scores(
             proba[:, present] = model.predict_proba(x_score)
         return proba
 
-    f1s, auprcs, aurocs, balanced, per_class = [], [], [], [], []
-    weighted_f1s, weighted_balanced = [], []
-    first_proba = first_weighted = None
+    f1s, auprcs, aurocs, balanced, kappas, per_class = [], [], [], [], [], []
+    first_proba = None
     for seed in seeds:
         proba = predict_proba(seed)
         y_pred = proba.argmax(axis=1)
@@ -225,20 +254,16 @@ def tstr_scores(
             f1_score(y_true, y_pred, labels=range(len(classes)), average=None, zero_division=0)
         )
         balanced.append(balanced_accuracy_score(y_true, y_pred))
+        kappas.append(_kappa(y_true, y_pred, len(classes), ordinal))
         auprcs.append(_macro_auprc(y_true, proba))
         aurocs.append(_macro_auroc(y_true, proba))
-        w_pred = None
-        if weighted:
-            w_pred = predict_proba(seed, compute_sample_weight("balanced", y_fit)).argmax(axis=1)
-            weighted_f1s.append(_macro_f1(y_true, w_pred, len(classes)))
-            weighted_balanced.append(balanced_accuracy_score(y_true, w_pred))
         if first_proba is None:
-            first_proba, first_weighted = proba, w_pred
+            first_proba = proba
     if first_proba is None:
         raise ValueError("TSTR needs at least one seed")
 
     boot_se = (
-        _bootstrap_se(y_true, first_proba, first_weighted, len(classes), n_bootstrap, seeds[0])
+        _bootstrap_se(y_true, first_proba, len(classes), n_bootstrap, seeds[0], ordinal)
         if n_bootstrap > 0
         else {}
     )
@@ -258,11 +283,10 @@ def tstr_scores(
         boot_se=boot_se,
         group_auprc=group_auprc,
         balanced_accuracy=float(np.mean(balanced)),
+        kappa=float(np.mean(kappas)),
         per_class_f1={
             str(c): float(v) for c, v in zip(classes, np.mean(per_class, axis=0), strict=True)
         },
-        weighted_macro_f1=float(np.mean(weighted_f1s)) if weighted else None,
-        weighted_balanced_accuracy=float(np.mean(weighted_balanced)) if weighted else None,
         seed_sd={
             name: float(np.std(values))
             for name, values in {
@@ -270,8 +294,7 @@ def tstr_scores(
                 "macro_auprc": auprcs,
                 "macro_auroc": aurocs,
                 "balanced_accuracy": balanced,
-                "weighted_macro_f1": weighted_f1s,
-                "weighted_balanced_accuracy": weighted_balanced,
+                "kappa": kappas,
             }.items()
             if values
         },

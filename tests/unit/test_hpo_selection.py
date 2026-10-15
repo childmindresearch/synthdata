@@ -75,7 +75,13 @@ def test_bootstrap_se_auroc_and_group_auprc_are_reported():
         fit, score, "y", ["sex"], ["high", "low"], [0], n_bootstrap=50, groups=groups
     )
     assert scores.macro_auroc > 0.8
-    assert set(scores.boot_se) == {"macro_f1", "macro_auprc", "macro_auroc", "balanced_accuracy"}
+    assert set(scores.boot_se) == {
+        "macro_f1",
+        "macro_auprc",
+        "macro_auroc",
+        "balanced_accuracy",
+        "kappa",
+    }
     assert all(0 < se < 0.1 for se in scores.boot_se.values())
     assert set(scores.group_auprc["sex"]) == {"f", "m"}
     # Same seed, same rows: the bootstrap is reproducible.
@@ -93,8 +99,8 @@ def test_eval_fn_reports_headroom_per_candidate_objective():
     assert set(eval_fn.headroom) == {
         "tstr_macro_auprc",
         "tstr_macro_auroc",
-        "tstr_weighted_macro_f1",
         "tstr_macro_f1",
+        "tstr_kappa",
     }
     auroc = eval_fn.headroom["tstr_macro_auroc"]
     assert auroc["chance"] == 0.5 and auroc["z"] > 2

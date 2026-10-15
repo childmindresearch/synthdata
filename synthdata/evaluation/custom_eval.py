@@ -11,6 +11,8 @@ imbalance-aware scores (macro-F1, balanced accuracy, macro AUPRC, per-class
 F1) that the libraries' own classifier metrics do not.
 """
 
+import functools
+
 import pandas as pd
 
 from synthdata.compute import run_per_model
@@ -22,7 +24,7 @@ from synthdata.evaluation.privacy_attacks import (
     HOLDOUT_DISTANCE_NAME,
     run_privacy_attack_evaluation,
 )
-from synthdata.evaluation.tstr import tstr_scores
+from synthdata.evaluation.tstr import target_classes, tstr_scores
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -154,14 +156,17 @@ def run_tstr_evaluation(
     target = dataset.target_column
     train_df = dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df")
     test_df = dataset.test_imputed_df
-    classes = sorted(train_df[target].dropna().unique().tolist(), key=str)
+    ordinal = target in dataset.ordinal_columns
+    classes = target_classes(train_df[target], ordinal)
     seeds = [seed + i for i in range(n_seeds)]
 
     trtr_df = train_df
     if n_samples is not None and n_samples < len(train_df):
         trtr_df = train_df.sample(n=n_samples, random_state=seed)
         logger.info("[custom] holdout TRTR fitted on %d of %d train rows", n_samples, len(train_df))
-    trtr = tstr_scores(trtr_df, test_df, target, dataset.nominal_columns, classes, seeds)
+    trtr = tstr_scores(
+        trtr_df, test_df, target, dataset.nominal_columns, classes, seeds, ordinal=ordinal
+    )
     logger.info(
         "[custom] holdout TRTR ceiling: macro-F1=%.4f balanced-accuracy=%.4f macro-AUPRC=%.4f",
         trtr.macro_f1,
@@ -171,7 +176,7 @@ def run_tstr_evaluation(
     # Models are scored in parallel processes per compute_cfg; a failed one
     # is logged there and left out.
     run = run_per_model(
-        tstr_scores,
+        functools.partial(tstr_scores, ordinal=ordinal),
         {
             name: (
                 syn_df[train_df.columns],
@@ -203,6 +208,7 @@ def build_tstr_table(tstr_result: dict) -> pd.DataFrame:
             "tstr_macro_f1": s.macro_f1,
             "tstr_balanced_accuracy": s.balanced_accuracy,
             "tstr_macro_auprc": s.macro_auprc,
+            "tstr_kappa": s.kappa,
             **{f"f1_{c}": v for c, v in s.per_class_f1.items()},
         }
 
