@@ -194,16 +194,16 @@ While it runs, `synthdata-run` rewrites `<UTC time>_dashboard.html` next to the 
 
 - whether the run is running, finished, failed or stopped (the runner process is gone without logging an end), with elapsed time and a note when the log has been quiet for 20 minutes;
 - each stage's status, duration and peak resource use;
-- a timeline with one bar per model: each parallel step (generation, SynthEval, synthcity, TSTR, privacy attacks) is a colored segment on it, replicates folded together, with clock-time ticks, the pipeline stages above and the error of a failed model;
-- each HPO study's objective, its trials against its budget, how many trials failed each sanity screen, best score so far (trials that fail a screen don't count), a plot of every trial's score and the best so far (hover a dot to see which screens that trial failed, with its value and the limit), median trial time and an estimate of the time left;
+- a timeline with one bar per model: each parallel step (generation, SynthEval, synthcity, TSTR, privacy attacks) is a colored segment on it, replicates folded together, with clock-time ticks, the pipeline stages above and the error of a failed model. A model whose step finished but lost some metrics has an amber outline and lists the failed-metric count per step. A fit in the runner's own process (TabPFN, which logs nothing until its fit ends) gets a row of its own under *generation (main process)*;
+- each HPO study's objective, its status (*running* only while its own generation worker is; *stopped* when it ended short of its budget; *none passed, defaults used* when no trial passed the screens), its trials against its budget, how many trials failed each sanity screen, best score so far (trials that fail a screen don't count), a plot of every trial's score and the best so far (hover a dot to see which screens that trial failed, with its value and the limit), median trial time and an estimate of the time left;
 - RAM, CPU, GPU utilization and GPU memory over time, and use by model, grouped by step or by model;
-- errors and warnings from the log, repeated ones folded together, each with its traceback; a metric that synthcity or SynthEval caught and left out of its results counts as an error, folded across models with the models listed;
+- errors and warnings from the log, repeated ones folded together, each with its traceback; a metric that synthcity or SynthEval caught and left out of its results counts as an error, and so does a model whose worker failed; the same failure on several models folds into one entry that lists them;
 - once evaluation is done, the ranking with each model's 95% interval drawn as a bar, whether it is statistically tied with the best, how many output checks passed and a link to `report.md`;
 - the whole log (up to 20,000 lines), filterable by model and by text.
 
 When its output goes to a file rather than a terminal (always with `--detach`), `synthdata-run` turns off progress bars (`TQDM_DISABLE=1`), since each redraw would be a line of its own in the log. Set `TQDM_DISABLE=0` to keep them.
 
-Per-model rows appear only when `compute.workers` is more than 1, because only then does each model run in its own process. `--dashboard-interval 60` rewrites the page every minute, and `--dashboard-interval 0` turns it off.
+Per-model rows for parallel steps appear only when `compute.workers` is more than 1, because only then does each model run in its own process; with one worker, each generation fit shows under *generation (main process)*. `--dashboard-interval 60` rewrites the page every minute, and `--dashboard-interval 0` turns it off.
 
 To watch a run on a remote machine from your own computer, serve the page there and forward the port over SSH:
 

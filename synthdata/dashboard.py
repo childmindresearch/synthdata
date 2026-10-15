@@ -87,6 +87,12 @@ _TASK_END = re.compile(
 )
 _TASK_FAIL = re.compile(r"^\[(?P<label>[^\]]+)\] (?P<model>\S+) failed: (?P<why>.*)")
 _EXPERIMENT = re.compile(r"^Experiment '(?P<id>[^']+)' \(tag=")
+#: A fit in the runner's own process (TabPFN, or every model when
+#: ``compute.workers`` is 1): no worker pool logs its start or end.
+_MAIN_FIT = re.compile(r"^\[(?P<model>[^\]\s]+)\] generating synthetic data \(n_samples=")
+_GENERATED = re.compile(r"^Generated/loaded \d+ synthetic datasets")
+#: Step label for fits in the runner's own process.
+MAIN_STEP = "generation (main process)"
 _HPO_START = re.compile(
     r"^\[(?P<study>[^\]]+)\] starting hyperparameter optimization(?: of (?P<objective>\S+))?: "
     r"\d+ trial\(s\) remaining "
@@ -189,6 +195,11 @@ def parse_log(lines: list[str]) -> dict:
     outcome = None
     current_problem: dict | None = None
 
+    def close_main_fits(moment, status="done"):
+        for entry in tasks.values():
+            if entry["step"] == MAIN_STEP and entry["status"] == "running":
+                entry.update(status=status, end=moment)
+
     for raw in lines:
         line = raw.rstrip("\n")
         if not line.strip():
@@ -207,10 +218,12 @@ def parse_log(lines: list[str]) -> dict:
                 )
             elif m := _STAGE_DONE.match(msg):
                 stages.setdefault(m["stage"], {}).update(status="done", end=moment)
+                close_main_fits(moment)
             elif m := _STAGE_FAILED.match(msg):
                 stages.setdefault(m["stage"], {}).update(
                     status="failed", end=moment, code=int(m["code"])
                 )
+                close_main_fits(moment, "failed")
                 problems.append(
                     {
                         "level": "error",
@@ -235,8 +248,15 @@ def parse_log(lines: list[str]) -> dict:
             task, body = prefix["task"], line[prefix.end() :]
         logline = _LOGLINE.match(body)
         if not logline:
+            # A Python warning or a metric failure starts its own problem;
+            # other raw lines (a traceback, a warning's source line) are
+            # context for the problem above them.
+            starts_problem = _METRIC_FAIL.match(body) or (
+                _PY_WARNING.search(body) and not _in_traceback(current_problem)
+            )
             if (
-                current_problem is not None
+                not starts_problem
+                and current_problem is not None
                 and len(current_problem["context"]) < 25
                 and not _TQDM.search(body)
                 and (task is None or task == current_problem["task"])
@@ -309,6 +329,20 @@ def parse_log(lines: list[str]) -> dict:
                 {"step": m["label"], "model": m["model"], "start": None, "pid": None, "order": 0},
             )
             entry.update(status="failed" if m["outcome"] == "failed" else "done", end=moment)
+        elif task is None and (m := _MAIN_FIT.match(msg)):
+            close_main_fits(moment)
+            pools.setdefault(MAIN_STEP, {})
+            tasks[(MAIN_STEP, m["model"])] = {
+                "step": MAIN_STEP,
+                "model": m["model"],
+                "status": "running",
+                "start": moment,
+                "end": None,
+                "pid": None,
+                "order": sum(t["step"] == MAIN_STEP for t in tasks.values()) + 1,
+            }
+        elif task is None and _GENERATED.match(msg):
+            close_main_fits(moment)
         elif m := _HPO_START.match(msg):
             timeout = m["timeout"]
             hpo_budget[m["study"]] = {
@@ -318,7 +352,12 @@ def parse_log(lines: list[str]) -> dict:
                 "objective": m["objective"],
             }
         if level in ("ERROR", "CRITICAL", "WARNING"):
+            failed_model = None
             if level != "WARNING" and (m := _TASK_FAIL.match(msg)):
+                failed_model = m["model"]
+                # Without the model's name, the same failure on many models
+                # folds into one problem that lists them.
+                msg = f"[{m['label']}] failed: {m['why']}"
                 entry = tasks.setdefault(
                     (m["label"], m["model"]),
                     {
@@ -337,6 +376,7 @@ def parse_log(lines: list[str]) -> dict:
                 "time": moment,
                 "source": task or logline["logger"],
                 "task": task,
+                "model": failed_model,
                 "text": msg,
                 "context": [],
             }
@@ -353,6 +393,14 @@ def parse_log(lines: list[str]) -> dict:
         "experiment": experiment,
         "latest": clock.latest,
     }
+
+
+def _in_traceback(problem: dict | None) -> bool:
+    """Whether ``problem`` is collecting a traceback (whose last line may name a warning)."""
+    return problem is not None and (
+        problem["text"].startswith("Traceback")
+        or any(line.startswith("Traceback") for line in problem["context"])
+    )
 
 
 def _models_line(models: list[str]) -> list[str]:
@@ -389,7 +437,7 @@ def _group_problems(problems: list[dict], limit: int = 40) -> list[dict]:
             "level": g["level"],
             "source": g["source"],
             "text": g["text"],
-            "context": g["context"] or _models_line(models[g["key"]]),
+            "context": _models_line(models[g["key"]]) + g["context"],
             "count": g["count"],
             "first": _iso(g["first"]),
             "last": _iso(g["time"]),
@@ -797,7 +845,12 @@ def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
     generation_dir, evaluation_dir = experiment_dirs(cfg, experiment)
     hpo, hpo_error = read_hpo(_hpo_db(cfg, generation_dir), parsed["hpo_budget"], now)
 
-    tasks = []
+    metric_failures: dict[str, int] = {}
+    for problem in parsed["problems"]:
+        if problem.get("task") and problem["text"].startswith("metric '"):
+            metric_failures[problem["task"]] = metric_failures.get(problem["task"], 0) + 1
+
+    tasks: list[dict] = []
     for task in parsed["tasks"]:
         status = task["status"]
         if status == "running" and state in ("stopped", "failed", "finished"):
@@ -815,6 +868,7 @@ def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
                 else None,
                 "order": task.get("order", 0),
                 "error": task.get("error"),
+                "metric_failures": metric_failures.get(f"{task['step']}: {task['model']}", 0),
             }
         )
     steps = []
@@ -829,8 +883,22 @@ def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
                 "done": sum(t["status"] == "done" for t in mine),
                 "failed": sum(t["status"] == "failed" for t in mine),
                 "running": sum(t["status"] == "running" for t in mine),
+                "with_metric_failures": sum(bool(t["metric_failures"]) for t in mine),
             }
         )
+    main_fit = next(
+        (t["model"] for t in tasks if t["step"] == MAIN_STEP and t["status"] == "running"), None
+    )
+    if note and main_fit:
+        note += (
+            f" {main_fit} is fitting in the runner's own process, which logs nothing "
+            "until the fit ends."
+        )
+    generate = next((s for s in stages if s["name"] == "generate"), None)
+    generating = state == "running" and generate is not None and generate["status"] == "running"
+    gen_status = {t["model"]: t["status"] for t in tasks if t["step"] == "generation"}
+    for study in hpo:
+        study["status"] = hpo_status(study, generating, gen_status.get(study["model"]))
 
     resources = read_resources(log_path)
     machine = {}
@@ -889,6 +957,31 @@ def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
         "log_progress_dropped": n_progress,
         "log_tasks": sorted({m["task"] for line in log_lines if (m := _TASK_PREFIX.match(line))}),
     }
+
+
+def hpo_status(study: dict, generating: bool, worker: str | None) -> str:
+    """One word for where an HPO study stands.
+
+    ``generating`` is whether the generate stage is running now, and
+    ``worker`` the status of the model's generation worker in this run (None
+    if it has not started). A study is only "running" while its own
+    generation worker is: evaluation workers for the same model are not HPO.
+    """
+    n, target = study["complete"] + study["pruned"], study["target"]
+    reached = bool(target) and n >= target
+    if generating:
+        if worker == "running" and (study["running"] or not reached):
+            return "running"
+        if worker is None and not reached:
+            return "queued" if n == 0 else "paused"
+    if n == 0:
+        return "not run"
+    feasible = study["complete"] - study.get("infeasible", 0)
+    if study["complete"] and feasible <= 0:
+        return "no pass"
+    if target and not reached:
+        return "stopped"
+    return "done"
 
 
 def log_excerpt(lines: list[str]) -> tuple[list[str], int]:

@@ -242,8 +242,14 @@ def test_collect_reads_stages_models_hpo_resources_and_problems(tmp_path):
             "done": 1,
             "failed": 1,
             "running": 1,
+            "with_metric_failures": 2,
         }
     ]
+    assert {t["model"]: t["metric_failures"] for t in d["tasks"]} == {
+        "ctgan": 1,
+        "tvae": 0,
+        "arf": 1,
+    }
 
     (study,) = d["hpo"]
     assert (study["model"], study["complete"], study["failed"], study["target"]) == (
@@ -253,6 +259,7 @@ def test_collect_reads_stages_models_hpo_resources_and_problems(tmp_path):
         10,
     )
     assert study["best"] == 0.7  # the 0.9 trial failed a screen
+    assert study["status"] == "running"  # its generation worker is running
     assert study["timeout"] == 7200
     assert study["objective"] == "tstr_macro_auprc"
     assert study["infeasible"] == 1 and study["screen_fails"] == {"protected_share_gap": 1}
@@ -278,7 +285,10 @@ def test_collect_reads_stages_models_hpo_resources_and_problems(tmp_path):
     # The two printed metric failures fold into one error naming both models.
     assert d["n_errors"] == 3 and d["n_warnings"] == 2
     error, metric, warning = d["problems"]
-    assert error["level"] == "error" and "Traceback" in error["context"][0]
+    # A worker failure names its model in the context, so the same failure
+    # on several models folds into one entry.
+    assert error["text"] == "[generation] failed: RuntimeError: CUDA out of memory"
+    assert error["context"][0] == "1 model(s): tvae" and "Traceback" in error["context"][1]
     assert metric["text"] == "metric 'stats.prdc' failed: empty array"
     assert metric["count"] == 2 and metric["source"] == "generation"
     assert metric["context"] == ["2 model(s): ctgan, arf"]
@@ -427,3 +437,94 @@ def test_tuned_model_row_sits_under_its_untuned_one(tmp_path):
     page = dashboard.build(log, cfg)
     order = [m.split("</span>")[0] for m in page.split('<span class="model">')[1:]]
     assert order.index("ctgan_hpo") == order.index("ctgan") + 1
+
+
+def _study(**kw) -> dict:
+    return {"complete": 5, "pruned": 0, "target": 10, "running": 0, "infeasible": 0, **kw}
+
+
+@pytest.mark.parametrize(
+    ("study", "generating", "worker", "expected"),
+    [
+        (_study(), True, "running", "running"),
+        (_study(complete=10), True, "running", "done"),  # final fits after the search
+        (_study(complete=0), True, None, "queued"),
+        (_study(), True, None, "paused"),
+        # A later stage evaluating the same model is not HPO.
+        (_study(), False, None, "stopped"),
+        (_study(complete=10), False, None, "done"),
+        (_study(complete=0), False, None, "not run"),
+        (_study(infeasible=5), False, None, "no pass"),
+        (_study(target=None), False, None, "done"),
+    ],
+)
+def test_hpo_status(study, generating, worker, expected):
+    assert dashboard.hpo_status(study, generating, worker) == expected
+
+
+def test_main_process_fit_is_a_model_row_and_explains_a_quiet_log(tmp_path):
+    log = tmp_path / "20261010T220000Z_run.log"
+    log.write_text(
+        _runner(T0, "synthdata-run: stages generate, pid 1, host other-host")
+        + _runner(T0, "=== generate: -m scripts.run_generation")
+        + _logline(
+            _minutes(1),
+            "synthdata.compute",
+            "INFO",
+            "[generation] 1 models, 1 at a time with 4 CPU threads each",
+        )
+        + _logline(
+            _minutes(1), "synthdata.compute", "INFO", "[generation] started ctgan (pid 11; 1 of 1)"
+        )
+        + _logline(
+            _minutes(5),
+            "synthdata.compute",
+            "INFO",
+            "[generation] ctgan finished after 4 min; 1 of 1 done",
+        )
+        + _logline(
+            _minutes(6),
+            "synthdata.generation.pipeline",
+            "INFO",
+            "[tabpfn_standard] generating synthetic data (n_samples=100, seed=42)",
+        ),
+        encoding="utf-8",
+    )
+    os.utime(log, (_minutes(6).timestamp(), _minutes(6).timestamp()))
+    d = dashboard.collect(log, None, now=_minutes(120))
+    main = next(t for t in d["tasks"] if t["step"] == dashboard.MAIN_STEP)
+    assert (main["model"], main["status"]) == ("tabpfn_standard", "running")
+    assert [s["label"] for s in d["steps"]] == ["generation", dashboard.MAIN_STEP]
+    assert "tabpfn_standard is fitting in the runner's own process" in d["run"]["note"]
+
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(
+            _logline(
+                _minutes(130),
+                "synthdata.generation.pipeline",
+                "INFO",
+                "Generated/loaded 2 synthetic datasets: ['ctgan', 'tabpfn_standard']",
+            )
+        )
+    parsed = dashboard.parse_log(log.read_text(encoding="utf-8").splitlines())
+    (main,) = [t for t in parsed["tasks"] if t["step"] == dashboard.MAIN_STEP]
+    assert main["status"] == "done" and main["end"] is not None
+
+
+def test_a_python_warning_is_its_own_problem_not_context():
+    lines = [
+        _logline(
+            T0, "synthdata.data", "WARNING", "1 feature column(s) look like direct identifiers"
+        ),
+        "/x/sklearn/_split.py:1036: UserWarning: The least populated class in y has only 1 members\n",
+        "  warnings.warn(\n",
+        "[synthcity: a] [synthcity] 'stats.prdc' failed after 0.1s: empty array\n",
+    ]
+    problems = dashboard.parse_log(lines)["problems"]
+    assert [p["text"][:20] for p in problems] == [
+        "1 feature column(s) ",
+        "/x/sklearn/_split.py",
+        "metric 'stats.prdc' ",
+    ]
+    assert problems[0]["context"] == []
+    assert problems[1]["context"] == ["  warnings.warn("]
