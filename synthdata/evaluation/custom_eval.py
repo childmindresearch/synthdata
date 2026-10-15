@@ -72,11 +72,16 @@ def run_log_disparity_evaluation(
         logger.warning("[custom] log_disparity requires protected columns; skipping")
         return {}
 
+    # The imputed train split, which generators learn from and the train copy
+    # repeats: against the raw split, a missing protected value is a subgroup
+    # ("nan") that no imputed dataset can contain, so even a copy of train
+    # scored about half its subgroups as misrepresented.
+    real = dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df")
     reports = {}
     for name, syn_df in synthetic_datasets.items():
         try:
             reports[name] = compute_log_disparity_report(
-                real_data=dataset.train_df,
+                real_data=real,
                 synth_data=syn_df,
                 target_col=dataset.target_column,
                 protected_cols=protected_cols,

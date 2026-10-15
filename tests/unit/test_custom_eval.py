@@ -1,5 +1,6 @@
 """Unit tests for synthdata.evaluation.custom_eval."""
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -23,12 +24,38 @@ def fairness_dataset(make_dataset):
             "target": [0, 1, 0, 1, 1, 0, 1, 0],
         }
     )
-    return make_dataset(
+    dataset = make_dataset(
         df=df, target_column="target", sensitive_columns=["age"], protected_columns=["sex"]
     )
+    dataset.train_imputed_df = dataset.train_df
+    return dataset
 
 
 class TestRunLogDisparityEvaluation:
+    def test_copy_of_imputed_train_is_not_misrepresented(self, make_dataset):
+        # A missing protected value is its own "nan" subgroup in the raw
+        # split; no imputed dataset has it, so comparing with the raw split
+        # flagged a copy of train as misrepresented.
+        rng = np.random.default_rng(0)
+        n = 600
+        df = pd.DataFrame(
+            {
+                "sex": rng.choice(["F", "M"], n),
+                "eth": rng.choice(["a", "b", "c"], n, p=[0.6, 0.3, 0.1]),
+                "target": rng.choice([0, 1], n),
+            }
+        )
+        df.loc[rng.random(n) < 0.15, "eth"] = np.nan
+        dataset = make_dataset(df=df, protected_columns=["sex", "eth"])
+        dataset.train_imputed_df = dataset.train_df.fillna({"eth": "a"})
+        reports = run_log_disparity_evaluation(
+            {"copy": dataset.train_imputed_df.copy()},
+            dataset,
+            LogDisparityConfig(),
+            FrameworkSelectionConfig(enabled=True),
+        )
+        assert reports["copy"]["summary_stats"]["share_significant_bh"] == 0
+
     def test_disabled_selection_returns_empty(self, fairness_dataset):
         reports = run_log_disparity_evaluation(
             {"model_a": fairness_dataset.train_df},
