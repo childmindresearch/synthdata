@@ -71,11 +71,14 @@ def _write_run(tmp_path, finished: bool = False, host: str | None = None):
             _minutes(6.5),
             "synthdata.generation.hpo",
             "INFO",
-            "[hpo_ctgan] starting hyperparameter optimization: 10 trial(s) remaining "
+            "[hpo_ctgan] starting hyperparameter optimization of tstr_macro_auprc: 10 trial(s) remaining "
             "(0 already finished, target=10, timeout=7200s)",
             task="generation: ctgan",
         ),
         "[generation: ctgan] Epochs:  40%|####      | 40/100 [00:30<00:45, 1.3it/s]\n",
+        # Printed by synthcity itself, outside the logging format.
+        "[generation: ctgan] [synthcity] 'stats.prdc' failed after 0.1s: empty array\n",
+        "[generation: arf] [synthcity] 'stats.prdc' failed after 0.2s: empty array\n",
         _logline(
             _minutes(7),
             "py.warnings",
@@ -171,6 +174,7 @@ def _write_run(tmp_path, finished: bool = False, host: str | None = None):
     gen_dir.mkdir(parents=True)
     storage = f"sqlite:///{(gen_dir / 'optuna_studies.db').as_posix()}"
     study = optuna.create_study(study_name="hpo_ctgan", direction="maximize", storage=storage)
+    study.set_user_attr("objective", "tstr_macro_auprc")
     for value in (0.5, 0.7, 0.6):
         study.add_trial(
             optuna.trial.create_trial(
@@ -180,7 +184,16 @@ def _write_run(tmp_path, finished: bool = False, host: str | None = None):
     # Infeasible: a better value that fails a screen must not count as best.
     study.add_trial(
         optuna.trial.create_trial(
-            params={}, distributions={}, value=0.9, user_attrs={"constraints": [1.0]}
+            params={},
+            distributions={},
+            value=0.9,
+            user_attrs={
+                "constraints": [1.0],
+                "screens": {"copies": -0.1, "protected_share_gap": 0.04},
+                "screen_details": {
+                    "protected_share_gap": {"value": 0.15, "limit": 0.11, "bound": "max"}
+                },
+            },
         )
     )
     study.add_trial(
@@ -241,6 +254,17 @@ def test_collect_reads_stages_models_hpo_resources_and_problems(tmp_path):
     )
     assert study["best"] == 0.7  # the 0.9 trial failed a screen
     assert study["timeout"] == 7200
+    assert study["objective"] == "tstr_macro_auprc"
+    assert study["infeasible"] == 1 and study["screen_fails"] == {"protected_share_gap": 1}
+    assert study["curve"][3][4] == [
+        {
+            "name": "protected_share_gap",
+            "violation": 0.04,
+            "value": 0.15,
+            "limit": 0.11,
+            "bound": "max",
+        }
+    ]
 
     series = d["resources"]["series"]
     assert len(series["t"]) == 31 and series["pipeline_ram_gib"][-1] == 5.0
@@ -251,9 +275,13 @@ def test_collect_reads_stages_models_hpo_resources_and_problems(tmp_path):
 
     # The two warnings differ only in a number: one entry with a count; the
     # error keeps its traceback.
-    assert d["n_errors"] == 1 and d["n_warnings"] == 2
-    error, warning = d["problems"]
+    # The two printed metric failures fold into one error naming both models.
+    assert d["n_errors"] == 3 and d["n_warnings"] == 2
+    error, metric, warning = d["problems"]
     assert error["level"] == "error" and "Traceback" in error["context"][0]
+    assert metric["text"] == "metric 'stats.prdc' failed: empty array"
+    assert metric["count"] == 2 and metric["source"] == "generation"
+    assert metric["context"] == ["2 model(s): ctgan, arf"]
     assert warning["count"] == 2 and warning["source"] == "generation: tvae"
     assert d["results"] == {}
     assert "generation: ctgan" in d["log_tasks"]

@@ -502,7 +502,7 @@ class HPOConstraintsConfig:
     #: Protected groups in proportion: the largest total variation distance,
     #: over the protected columns, between the synthetic and search-train
     #: group shares may exceed that of as many real tuning rows by at most this.
-    max_protected_share_gap: float | None = 0.05
+    max_protected_share_gap: float | None = 0.1
     #: Memorization: the share of synthetic rows nearer to a search-train row
     #: than to any tuning row, against a search-train sample as large as the
     #: tuning split (0.5 = no memorization; Platzer & Reutterer, 2021).

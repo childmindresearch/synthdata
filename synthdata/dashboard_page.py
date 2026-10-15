@@ -126,7 +126,9 @@ def _tiles(d: dict) -> str:
         target = sum(s["target"] or 0 for s in hpo)
         hpo_value = f"{trials_done}" + (f" / {target}" if target else "")
         hpo_sub = (
-            f"{sum(s['running'] for s in hpo)} running, {sum(s['failed'] for s in hpo)} failed"
+            f"{sum(s['running'] for s in hpo)} running, "
+            f"{sum(s.get('infeasible', 0) for s in hpo)} failed a screen, "
+            f"{sum(s['failed'] for s in hpo)} errored"
         )
     else:
         hpo_value, hpo_sub = "-", "no HPO study yet"
@@ -331,10 +333,30 @@ def _timeline(d: dict) -> str:
     )
 
 
+def _screen_text(screen: dict) -> str:
+    """One failed screen for a tooltip: value against its limit when recorded."""
+    if screen.get("value") is not None and screen.get("limit") is not None:
+        bound = "at most" if screen.get("bound") == "max" else "at least"
+        return f"{screen['name']}: {screen['value']:.3g} (needs {bound} {screen['limit']:.3g})"
+    return f"{screen['name']}: off by {screen['violation']:.3g}"
+
+
+def _trial_tip(c: list) -> str:
+    lines = [f"trial {c[0]}: {c[1]:.4g}"]
+    failed = c[4] if len(c) > 4 else []
+    if failed:
+        lines += ["failed " + _screen_text(f) for f in failed]
+    elif not c[3]:
+        lines.append("failed a sanity screen")
+    else:
+        lines.append("passed every sanity screen")
+    return "\n".join(lines)
+
+
 def _sparkline(curve: list, maximize: bool) -> str:
     if len(curve) < 2:
         return '<span class="muted small">-</span>'
-    w, h, pad = 150, 32, 3
+    w, h, pad = 220, 56, 4
     xs = [c[0] for c in curve]
     values = [c[1] for c in curve if c[1] is not None]
     lo, hi = min(values), max(values)
@@ -348,8 +370,10 @@ def _sparkline(curve: list, maximize: bool) -> str:
     def py(y):
         return h - pad - (y - lo) / (hi - lo) * (h - 2 * pad)
 
+    # Each dot's <title> is the browser's own hover tooltip: no script needed.
     dots = "".join(
-        f'<circle cx="{px(c[0]):.1f}" cy="{py(c[1]):.1f}" r="1.6" class="{"dot" if c[3] else "dot off"}"/>'
+        f'<circle cx="{px(c[0]):.1f}" cy="{py(c[1]):.1f}" r="2.6" class="{"dot" if c[3] else "dot off"}">'
+        f"<title>{_e(_trial_tip(c))}</title></circle>"
         for c in curve
     )
     best = [c for c in curve if c[2] is not None]
@@ -362,7 +386,7 @@ def _sparkline(curve: list, maximize: bool) -> str:
     label = f"best so far by trial ({'higher' if maximize else 'lower'} is better)"
     return (
         f'<svg class="spark" width="{w}" height="{h}" viewBox="0 0 {w} {h}" role="img" aria-label="{label}">'
-        f'<title>{label}</title>{dots}<path d="{path}" class="best"/></svg>'
+        f'<title>{label}</title><path d="{path}" class="best"/>{dots}</svg>'
     )
 
 
@@ -389,7 +413,17 @@ def _hpo(d: dict) -> str:
             pct = min(n / target * 100, 100) if target else 0
             prog = f'<div class="prog"><div style="width:{pct:.1f}%"></div></div>' if target else ""
             counts = f"{n}{f' / {target}' if target else ''}"
-            detail = f"{s['complete']} complete, {s['pruned']} pruned, {s['failed']} failed"
+            detail = (
+                f"{s['complete'] - s.get('infeasible', 0)} passed the screens, "
+                f"{s.get('infeasible', 0)} failed a screen, {s['failed']} errored"
+            )
+            fails = s.get("screen_fails") or {}
+            screens = (
+                "<br>".join(f"{_e(name)} <b>{count}</b>" for name, count in fails.items())
+                if fails
+                else '<span class="muted small">none failed</span>'
+            )
+            objective = _e(s.get("objective") or "-")
             err = (
                 f'<details><summary class="small">last failure</summary><pre>{_e(s["last_error"])}</pre></details>'
                 if s["last_error"]
@@ -397,15 +431,18 @@ def _hpo(d: dict) -> str:
             )
             eta = _duration(s["eta_s"]) if s["eta_s"] is not None and status == "running" else "-"
             rows.append(
-                f'<tr><td class="model">{_e(s["model"])}</td><td>{_badge(status)}</td>'
+                f'<tr><td class="model">{_e(s["model"])}</td><td class="small">{objective}</td>'
+                f"<td>{_badge(status)}</td>"
                 f'<td><div class="tnum">{counts}</div>{prog}<div class="muted small">{detail}</div></td>'
+                f'<td class="small">{screens}</td>'
                 f'<td class="num">{_num(s["best"])}</td><td>{_sparkline(s["curve"], s["maximize"])}</td>'
                 f'<td class="num">{_e(_duration(s["median_trial_s"]))}</td><td class="num">{_e(eta)}</td>'
                 f"<td>{err}</td></tr>"
             )
         body = (
-            '<div class="scroll"><table><thead><tr><th>Model</th><th>Status</th><th>Trials</th>'
-            '<th class="num">Best</th><th>Best so far</th><th class="num">Median trial</th>'
+            '<div class="scroll"><table><thead><tr><th>Model</th><th>Objective</th><th>Status</th>'
+            "<th>Trials</th><th>Failed screens (trials)</th>"
+            '<th class="num">Best</th><th>Trials and best so far</th><th class="num">Median trial</th>'
             '<th class="num">Time left</th><th></th></tr></thead><tbody>'
             + "".join(rows)
             + "</tbody></table></div>"
@@ -415,7 +452,8 @@ def _hpo(d: dict) -> str:
             '<span class="legend"><svg class="spark" width="10" height="10"><circle cx="5" cy="5" r="2.6" class="dot off"/></svg>'
             "trial that failed a sanity screen (never chosen)</span>"
             '<span class="legend"><i style="border-color:var(--s1)"></i>best passing score so far</span>'
-            '<span class="muted">x: trial number, y: the HPO objective</span></p>'
+            '<span class="muted">x: trial number, y: the HPO objective; hover a dot for its '
+            "screens</span></p>"
             '<p class="muted small">Best counts only trials that pass the sanity screens. '
             "Time left is remaining trials times the median of the last ten, capped by the study's timeout.</p>"
         )

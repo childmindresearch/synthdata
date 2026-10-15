@@ -125,11 +125,20 @@ def test_screens_flag_copies_collapse_and_out_of_range():
     )
 
     collapsed = train.assign(color="red", target=0)
+    details: dict = {}
     violations = screen_violations(
-        collapsed, train, tuning, "target", ["color"], HPOConstraintsConfig()
+        collapsed, train, tuning, "target", ["color"], HPOConstraintsConfig(), details
     )
     assert violations["missing_classes"] == 2
     assert violations["category_coverage"] > 0
+    # The dashboard shows each failed screen's value against its limit.
+    coverage = details["category_coverage"]
+    assert coverage["bound"] == "min" and coverage["value"] == pytest.approx(1 / 3)
+    assert coverage["limit"] - coverage["value"] == pytest.approx(violations["category_coverage"])
+    assert details["missing_classes"] == {"value": 2.0, "limit": 0.0, "bound": "max"}
+    for name in ("copies", "out_of_range"):
+        detail = details[name]
+        assert detail["value"] - detail["limit"] == pytest.approx(violations[name])
 
     wild = train.assign(x=train["x"] * 100)
     assert (

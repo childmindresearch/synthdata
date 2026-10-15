@@ -56,6 +56,14 @@ _LOGLINE = re.compile(
     r"(?P<level>DEBUG|INFO|WARNING|ERROR|CRITICAL): (?P<msg>.*)$"
 )
 _PY_WARNING = re.compile(r"\b\w*Warning: ")
+#: A metric that synthcity or SynthEval caught and left out of its results;
+#: both print this line themselves, outside the logging format.
+_METRIC_FAIL = re.compile(
+    r"^\[(?:synthcity|syntheval[^\]]*)\] '(?P<metric>[^']+)' failed after [\d.]+s: (?P<why>.*)$"
+)
+#: Native-library failures printed outside the logging format (a C compiler
+#: behind KeOps, LightGBM).
+_NATIVE_FAIL = re.compile(r"fatal error: |^\[LightGBM\] \[Fatal\]")
 _TQDM = re.compile(r"\d+%\||it/s\]|s/it\]")
 _REPLICATE = re.compile(r"__rep\d+$")
 
@@ -80,7 +88,8 @@ _TASK_END = re.compile(
 _TASK_FAIL = re.compile(r"^\[(?P<label>[^\]]+)\] (?P<model>\S+) failed: (?P<why>.*)")
 _EXPERIMENT = re.compile(r"^Experiment '(?P<id>[^']+)' \(tag=")
 _HPO_START = re.compile(
-    r"^\[(?P<study>[^\]]+)\] starting hyperparameter optimization: \d+ trial\(s\) remaining "
+    r"^\[(?P<study>[^\]]+)\] starting hyperparameter optimization(?: of (?P<objective>\S+))?: "
+    r"\d+ trial\(s\) remaining "
     r"\(\d+ already finished, target=(?P<target>\d+), timeout=(?P<timeout>\w+)s\)"
 )
 
@@ -234,6 +243,21 @@ def parse_log(lines: list[str]) -> dict:
             ):
                 current_problem["context"].append(body)
                 continue
+            if m := _METRIC_FAIL.match(body):
+                step, _, model = (task or "").partition(": ")
+                current_problem = None
+                problems.append(
+                    {
+                        "level": "error",
+                        "time": clock.latest,
+                        "source": step,
+                        "task": task,
+                        "model": model or None,
+                        "text": f"metric '{m['metric']}' failed: {m['why']}",
+                        "context": [],
+                    }
+                )
+                continue
             if body.startswith("Traceback (most recent call last)") or _PY_WARNING.search(body):
                 level = "error" if body.startswith("Traceback") else "warning"
                 current_problem = {
@@ -242,6 +266,18 @@ def parse_log(lines: list[str]) -> dict:
                     "source": task or "",
                     "task": task,
                     "text": body,
+                    "context": [],
+                }
+                problems.append(current_problem)
+            elif _NATIVE_FAIL.search(body):
+                step, _, model = (task or "").partition(": ")
+                current_problem = {
+                    "level": "warning",
+                    "time": clock.latest,
+                    "source": step,
+                    "model": model or None,
+                    "task": task,
+                    "text": body.strip(),
                     "context": [],
                 }
                 problems.append(current_problem)
@@ -279,6 +315,7 @@ def parse_log(lines: list[str]) -> dict:
                 "target": int(m["target"]),
                 "timeout": int(timeout) if timeout.isdigit() else None,
                 "session_start": moment,
+                "objective": m["objective"],
             }
         if level in ("ERROR", "CRITICAL", "WARNING"):
             if level != "WARNING" and (m := _TASK_FAIL.match(msg)):
@@ -318,9 +355,14 @@ def parse_log(lines: list[str]) -> dict:
     }
 
 
+def _models_line(models: list[str]) -> list[str]:
+    return [f"{len(models)} model(s): {', '.join(models)}"] if models else []
+
+
 def _group_problems(problems: list[dict], limit: int = 40) -> list[dict]:
     """Errors first, newest first; repeated messages folded into one entry with a count."""
     groups: dict[tuple, dict] = {}
+    models: dict[tuple, list[str]] = {}
     for problem in problems:
         key = (
             problem["level"],
@@ -329,12 +371,15 @@ def _group_problems(problems: list[dict], limit: int = 40) -> list[dict]:
         )
         group = groups.get(key)
         if group is None:
-            groups[key] = {**problem, "count": 1, "first": problem["time"]}
+            group = groups[key] = {**problem, "count": 1, "first": problem["time"], "key": key}
         else:
             group["count"] += 1
             group["time"] = problem["time"] or group["time"]
             if problem["context"]:
                 group["context"] = problem["context"]
+        named = models.setdefault(key, [])
+        if problem.get("model") and problem["model"] not in named:
+            named.append(problem["model"])
     ordered = sorted(
         groups.values(),
         key=lambda g: (g["level"] != "error", -(g["time"].timestamp() if g["time"] else 0)),
@@ -344,7 +389,7 @@ def _group_problems(problems: list[dict], limit: int = 40) -> list[dict]:
             "level": g["level"],
             "source": g["source"],
             "text": g["text"],
-            "context": g["context"],
+            "context": g["context"] or _models_line(models[g["key"]]),
             "count": g["count"],
             "first": _iso(g["first"]),
             "last": _iso(g["time"]),
@@ -445,6 +490,22 @@ def read_hpo(db_path: Path | None, budgets: dict, now: datetime) -> tuple[list[d
                 "SELECT trial_id, value_json FROM trial_user_attributes WHERE key = 'constraints'"
             )
         )
+        screens = dict(
+            con.execute(
+                "SELECT trial_id, value_json FROM trial_user_attributes WHERE key = 'screens'"
+            )
+        )
+        screen_details = dict(
+            con.execute(
+                "SELECT trial_id, value_json FROM trial_user_attributes "
+                "WHERE key = 'screen_details'"
+            )
+        )
+        objectives = dict(
+            con.execute(
+                "SELECT study_id, value_json FROM study_user_attributes WHERE key = 'objective'"
+            )
+        )
         fail_reasons = dict(
             con.execute(
                 "SELECT trial_id, value_json FROM trial_system_attributes WHERE key = 'fail_reason'"
@@ -469,6 +530,10 @@ def read_hpo(db_path: Path | None, budgets: dict, now: datetime) -> tuple[list[d
         elif name + "_probe" in by_name and study_id not in with_trials:
             continue
         maximize = str(directions.get(study_id, "MAXIMIZE")).upper().endswith("MAXIMIZE")
+        objective = _json(objectives.get(study_id)) or _json(
+            objectives.get(by_name.get(name + "_probe"))
+        )
+        screen_fails: dict[str, int] = {}
         rows = [t for t in trials if t[1] == study_id]
         counts = {"COMPLETE": 0, "PRUNED": 0, "FAIL": 0, "RUNNING": 0}
         best = None
@@ -497,9 +562,16 @@ def read_hpo(db_path: Path | None, budgets: dict, now: datetime) -> tuple[list[d
             if trial_id in constraints:
                 with contextlib.suppress(ValueError, TypeError):
                     feasible = all(c <= 0 for c in json.loads(constraints[trial_id]))
+            failed = _failed_screens(
+                _json(screens.get(trial_id)), _json(screen_details.get(trial_id))
+            )
+            for screen in failed:
+                screen_fails[screen["name"]] = screen_fails.get(screen["name"], 0) + 1
+            if failed:
+                feasible = False
             if feasible and (best is None or (value > best if maximize else value < best)):
                 best = value
-            curve.append([number, value, best, feasible])
+            curve.append([number, value, best, feasible, failed])
         model = name.removeprefix("hpo_")
         budget = budgets.get(name, {})
         target = budget.get("target")
@@ -516,8 +588,11 @@ def read_hpo(db_path: Path | None, budgets: dict, now: datetime) -> tuple[list[d
                 "study": name,
                 "model": model,
                 "maximize": maximize,
+                "objective": objective or budgets.get(name, {}).get("objective"),
                 "complete": counts["COMPLETE"],
                 "pruned": counts["PRUNED"],
+                "infeasible": sum(1 for c in curve if not c[3]),
+                "screen_fails": dict(sorted(screen_fails.items(), key=lambda kv: -kv[1])),
                 "failed": counts["FAIL"],
                 "running": counts["RUNNING"],
                 "target": target,
@@ -532,6 +607,40 @@ def read_hpo(db_path: Path | None, budgets: dict, now: datetime) -> tuple[list[d
         )
     out.sort(key=lambda s: (-int(s["running"]), s["model"]))
     return out, None
+
+
+def _json(text):
+    """A JSON value from the Optuna database, or None."""
+    if text is None:
+        return None
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return None
+
+
+def _failed_screens(violations, details) -> list[dict]:
+    """The screens one trial failed: name, measured value and limit when recorded.
+
+    ``violations`` maps screen name to violation size (above 0 = failed);
+    ``details`` (trials stored since 2026-10-15) adds the measured value, the
+    limit and whether it is a maximum or a minimum.
+    """
+    if not isinstance(violations, dict):
+        return []
+    details = details if isinstance(details, dict) else {}
+    failed = []
+    for name, violation in violations.items():
+        if not isinstance(violation, (int, float)) or violation <= 0:
+            continue
+        entry = {"name": name, "violation": float(violation)}
+        detail = details.get(name)
+        if isinstance(detail, dict):
+            entry.update(
+                value=detail.get("value"), limit=detail.get("limit"), bound=detail.get("bound")
+            )
+        failed.append(entry)
+    return failed
 
 
 # ---------------------------------------------------------------- results

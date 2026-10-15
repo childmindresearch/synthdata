@@ -371,8 +371,13 @@ def screen_violations(
     target_column: str,
     categorical_columns: list,
     constraints: HPOConstraintsConfig,
+    details: dict | None = None,
 ) -> dict:
     """Lenient sanity screens; each value is a violation size (<= 0 is feasible).
+
+    ``details``, when given, receives ``{screen: {"value", "limit", "bound"}}``
+    for every screen that ran: the measured value, the limit it was held to
+    and whether that limit is a "max" or a "min" (read by the run dashboard).
 
     - ``copies``: exact-match rate of synthetic rows against search-train,
       minus that of the real tuning rows, minus ``copy_margin``. Calibrating
@@ -390,12 +395,13 @@ def screen_violations(
     A screen turned off in the config reports -1.
     """
     violations = dict.fromkeys(SCREENS, -1.0)
+    details = {} if details is None else details
 
     if constraints.copy_margin is not None:
         baseline = exact_match_rate(tuning_df, search_train_df)
-        violations["copies"] = (
-            exact_match_rate(synthetic_df, search_train_df) - baseline - constraints.copy_margin
-        )
+        rate = exact_match_rate(synthetic_df, search_train_df)
+        violations["copies"] = rate - baseline - constraints.copy_margin
+        details["copies"] = screen_detail(rate, baseline + constraints.copy_margin, "max")
 
     if constraints.min_category_coverage is not None:
         real_classes = set(_comparable(search_train_df[target_column]).dropna())
@@ -404,6 +410,7 @@ def screen_violations(
         else:
             synthetic_classes = set()
         violations["missing_classes"] = float(len(real_classes - synthetic_classes)) or -1.0
+        details["missing_classes"] = screen_detail(len(real_classes - synthetic_classes), 0, "max")
         coverages = []
         for column in categorical_columns:
             if column not in synthetic_df or column not in search_train_df:
@@ -415,6 +422,9 @@ def screen_violations(
                 coverages.append(len(required & present) / len(required))
         if coverages:
             violations["category_coverage"] = constraints.min_category_coverage - min(coverages)
+            details["category_coverage"] = screen_detail(
+                min(coverages), constraints.min_category_coverage, "min"
+            )
 
     if constraints.max_out_of_range is not None:
         numeric = [
@@ -426,13 +436,19 @@ def screen_violations(
             and pd.api.types.is_numeric_dtype(search_train_df[c])
         ]
         if numeric:
-            violations["out_of_range"] = (
-                out_of_range_share(synthetic_df, search_train_df, numeric)
-                - out_of_range_share(tuning_df, search_train_df, numeric)
-                - constraints.max_out_of_range
+            share = out_of_range_share(synthetic_df, search_train_df, numeric)
+            limit = out_of_range_share(tuning_df, search_train_df, numeric) + (
+                constraints.max_out_of_range
             )
+            violations["out_of_range"] = share - limit
+            details["out_of_range"] = screen_detail(share, limit, "max")
 
     return violations
+
+
+def screen_detail(value: float, limit: float, bound: str) -> dict:
+    """One screen's measured value and the limit it is held to ("max" or "min")."""
+    return {"value": float(value), "limit": float(limit), "bound": bound}
 
 
 def class_share_gap(labels: pd.Series, prior: pd.Series) -> float:
@@ -598,6 +614,7 @@ def build_hpo_eval_fn(
     )
 
     def eval_fn(synthetic_df: pd.DataFrame) -> TrialScore:
+        details: dict = {}
         violations = screen_violations(
             synthetic_df,
             search_train_df,
@@ -605,15 +622,16 @@ def build_hpo_eval_fn(
             target_column,
             categorical_columns,
             constraints,
+            details,
         )
         if not target_is_categorical:
             violations["missing_classes"] = -1.0
+            details.pop("missing_classes", None)
         elif match_prior and constraints.max_class_share_gap is not None:
-            violations["class_share_gap"] = (
-                class_share_gap(synthetic_df[target_column], prior)
-                - constraints.max_class_share_gap
-            )
-        attrs = {"screens": violations}
+            gap = class_share_gap(synthetic_df[target_column], prior)
+            violations["class_share_gap"] = gap - constraints.max_class_share_gap
+            details["class_share_gap"] = screen_detail(gap, constraints.max_class_share_gap, "max")
+        attrs = {"screens": violations, "screen_details": details}
         if groupers:
             protected = protected_scores(synthetic_df, search_train_df, target_column, groupers)
             attrs["protected_target_gap"] = protected["protected_target_gap"]
@@ -622,18 +640,24 @@ def build_hpo_eval_fn(
                 violations["protected_coverage"] = (
                     constraints.min_protected_coverage - protected["protected_coverage"]
                 )
+                details["protected_coverage"] = screen_detail(
+                    protected["protected_coverage"], constraints.min_protected_coverage, "min"
+                )
             if constraints.max_protected_share_gap is not None:
                 # Calibrated like the copy screen: fresh real rows of the same
                 # size also miss the train shares by sampling noise.
-                violations["protected_share_gap"] = (
-                    protected["protected_share_gap"]
-                    - _real_share_gap(len(synthetic_df))
-                    - constraints.max_protected_share_gap
+                limit = _real_share_gap(len(synthetic_df)) + constraints.max_protected_share_gap
+                violations["protected_share_gap"] = protected["protected_share_gap"] - limit
+                details["protected_share_gap"] = screen_detail(
+                    protected["protected_share_gap"], limit, "max"
                 )
         if dcr_reference is not None:
             closer = _dcr_closer_to_train(synthetic_df)
             attrs["dcr_closer_to_train"] = closer
             violations["dcr_closer_to_train"] = closer - constraints.max_dcr_closer_to_train
+            details["dcr_closer_to_train"] = screen_detail(
+                closer, constraints.max_dcr_closer_to_train, "max"
+            )
         if hpo_cfg.log_fidelity:
             attrs |= fidelity_scores(
                 synthetic_df, tuning_df, categorical_columns, nominal_columns, seed

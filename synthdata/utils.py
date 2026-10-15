@@ -203,3 +203,44 @@ def save_json(path: str | Path, data: dict) -> None:
     ensure_dir(p.parent)
     with open(p, "w") as f:
         json.dump(data, f, indent=2)
+
+
+#: Characters some libraries reject in column names, each with a readable
+#: stand-in: LightGBM refuses ``[ ] { } " : ,`` (SynthEval's MIA fits it) and
+#: XGBoost refuses ``[ ] <``.
+_UNSAFE_NAME_CHARACTERS = {
+    "[": "(",
+    "]": ")",
+    "{": "(",
+    "}": ")",
+    '"': "'",
+    ":": " -",
+    ",": ";",
+    "<": "lt",
+}
+
+
+def library_safe_names(columns) -> dict:
+    """``{name: safe name}`` for the columns whose names a library would reject.
+
+    Each unsafe character becomes a readable stand-in (``"BP [mmHg]"`` ->
+    ``"BP (mmHg)"``), so the renamed column is still recognisable. A safe name
+    that would collide with another column, or with another renamed one, gets
+    a ``__2``, ``__3``... suffix, so the mapping is always one to one and can be
+    inverted. Columns that need no change are left out.
+    """
+    names = [str(c) for c in columns]
+    taken = set(names)
+    mapping = {}
+    for name in names:
+        safe = name
+        for char, stand_in in _UNSAFE_NAME_CHARACTERS.items():
+            safe = safe.replace(char, stand_in)
+        if safe == name:
+            continue
+        candidate, k = safe, 2
+        while candidate in taken:
+            candidate, k = f"{safe}__{k}", k + 1
+        taken.add(candidate)
+        mapping[name] = candidate
+    return mapping
