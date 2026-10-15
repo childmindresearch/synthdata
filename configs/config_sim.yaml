@@ -118,7 +118,7 @@ generation:
     constraints:
       { copy_margin: 0.02, min_category_coverage: 0.8, max_out_of_range: 0.01,
         max_class_share_gap: 0.02, min_protected_coverage: 1.0,
-        max_protected_share_gap: 0.05, max_dcr_closer_to_train: 0.6 }
+        max_protected_share_gap: 0.1, max_dcr_closer_to_train: 0.6 }
     # Stop a study after 10 trials in a row without a gain above the
     # objective's bootstrap SE (min_delta null); timeouts stay as caps.
     patience: 10

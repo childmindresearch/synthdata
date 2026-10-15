@@ -515,3 +515,46 @@ class TestRunOvrMacro:
 
 def test_cls_acc_reports_macro_f1():
     assert SYNTHEVAL_PRESET["cls_acc"]["F1_type"] == "macro"
+
+
+def test_column_names_lightgbm_rejects_still_get_an_mia_score(tmp_path):
+    """SynthEval's MIA fits LightGBM, which refuses names with , : [ ] { } and quotes."""
+    from synthdata.evaluation.syntheval_eval import _checkpoint_paths, _model_worker
+
+    rng = np.random.default_rng(0)
+
+    def frame(n):
+        return pd.DataFrame(
+            {
+                "BP [mmHg]": rng.normal(120, 10, n),
+                "Social/Family, Functioning": rng.integers(0, 3, n),
+                "ward: name": rng.choice(["a", "b"], n),
+                "y": rng.integers(0, 2, n),
+            }
+        )
+
+    real, holdout, synthetic = frame(120), frame(60), frame(120)
+    preset = tmp_path / "preset.json"
+    preset.write_text(json.dumps({"mia": {"num_eval_iter": 2}}))
+    _model_worker(
+        "m",
+        synthetic,
+        real,
+        holdout,
+        ["Social/Family, Functioning", "ward: name", "y"],
+        "y",
+        ["ward: name"],
+        [],
+        str(preset),
+        str(tmp_path / "ckpt"),
+        "main",
+        "ctx",
+        "model",
+        None,
+        1,
+        0,
+    )
+    _, status_path, result_path = _checkpoint_paths(tmp_path / "ckpt", "main", "m")
+    status = json.loads(status_path.read_text())
+    assert status["state"] == "succeeded" and status["failed_metrics"] == []
+    assert pd.read_parquet(result_path)["metric"].str.contains("mia|MIA").any()

@@ -27,6 +27,8 @@ STATUS_LABEL = {
     "pending": ("pending", "muted"),
     "queued": ("queued", "muted"),
     "paused": ("paused", "warn"),
+    "not run": ("no trials", "muted"),
+    "no pass": ("none passed, defaults used", "warn"),
 }
 #: Categorical colors for the steps on the model timeline (--k1 ...).
 STEP_COLORS = 7
@@ -114,8 +116,14 @@ def _tiles(d: dict) -> str:
     )
     if step:
         models_value = f"{step['done']} / {step['total']}"
-        models_sub = f"{step['label']}: {step['running']} running" + (
-            f", {step['failed']} failed" if step["failed"] else ""
+        models_sub = (
+            f"{step['label']}: {step['running']} running"
+            + (f", {step['failed']} failed" if step["failed"] else "")
+            + (
+                f", {step['with_metric_failures']} with failed metrics"
+                if step.get("with_metric_failures")
+                else ""
+            )
         )
     else:
         models_value, models_sub = "-", "no per-model workers yet"
@@ -126,7 +134,9 @@ def _tiles(d: dict) -> str:
         target = sum(s["target"] or 0 for s in hpo)
         hpo_value = f"{trials_done}" + (f" / {target}" if target else "")
         hpo_sub = (
-            f"{sum(s['running'] for s in hpo)} running, {sum(s['failed'] for s in hpo)} failed"
+            f"{sum(s['running'] for s in hpo)} running, "
+            f"{sum(s.get('infeasible', 0) for s in hpo)} failed a screen, "
+            f"{sum(s['failed'] for s in hpo)} errored"
         )
     else:
         hpo_value, hpo_sub = "-", "no HPO study yet"
@@ -219,6 +229,37 @@ def _segments(tasks: list[dict], t1: float) -> list[dict]:
     return out
 
 
+PHASE_LABEL = {"fit": "untuned fits", "HPO": "HPO search", "tuned fit": "tuned fits"}
+
+
+def _phases(tasks: list[dict], t1: float, pct, model: str) -> list[str]:
+    """Shading over a generation worker's bar: its HPO search and its tuned fits.
+
+    Consecutive fits of one kind (a model's replicates) merge into one span.
+    """
+    spans: list[list] = []
+    for t in tasks:
+        for phase in t.get("phases") or []:
+            start, end = _at(phase["start"], t1), _at(phase["end"], t1)
+            if spans and spans[-1][0] == phase["kind"]:
+                spans[-1][2] = end
+                spans[-1][3] += 1
+            else:
+                spans.append([phase["kind"], start, end, 1])
+    out = []
+    for kind, start, end, n in spans:
+        if kind == "fit":
+            continue  # the bar itself is untuned fitting
+        what = PHASE_LABEL[kind] + (f" ({n})" if kind != "HPO" else "")
+        tip = f"{model} · generation · {what} · {_duration(end - start)}"
+        cls = "hpo" if kind == "HPO" else "tuned"
+        out.append(
+            f'<div class="phase {cls}" style="left:{pct(start):.2f}%;'
+            f'width:{max(pct(end) - pct(start), 0.3):.2f}%" title="{_e(tip)}"></div>'
+        )
+    return out
+
+
 def _timeline(d: dict) -> str:
     tasks = d["tasks"]
     if not d["steps"] and not tasks:
@@ -258,11 +299,16 @@ def _timeline(d: dict) -> str:
             n = len(s["tasks"])
             what = f"{n} replicates" if n > 1 else s["tasks"][0]["model"]
             tip = f"{model} · {s['step']} · {what} · {s['status']} · {_duration(s['end'] - s['start'])}"
+            n_failed = sum(t.get("metric_failures", 0) for t in s["tasks"])
+            if n_failed:
+                tip += f" · {n_failed} metric failure{'s' * (n_failed != 1)}"
+            partial = " partial" if n_failed and s["status"] == "done" else ""
             segs.append(
-                f'<div class="seg {s["status"]}" style="left:{pct(s["start"]):.2f}%;'
+                f'<div class="seg {s["status"]}{partial}" style="left:{pct(s["start"]):.2f}%;'
                 f'width:{max(pct(s["end"]) - pct(s["start"]), 0.4):.2f}%;background:{color[s["step"]]}" '
                 f'title="{_e(tip)}"></div>'
             )
+        segs += _phases(mine, t1, pct, model)
         statuses = {t["status"] for t in mine}
         status = next((s for s in ("failed", "running", "stopped") if s in statuses), "done")
         starts = [_at(t["start"], t1) for t in mine if t["start"]]
@@ -276,6 +322,13 @@ def _timeline(d: dict) -> str:
             extra = f'<span class="muted small">HPO {study["complete"] + study["pruned"]}/{study["target"]}</span>'
         errors = [f"{t['step']}: {t['error']}" for t in mine if t.get("error")]
         err = f'<div class="row-error">{_e(errors[-1])}</div>' if errors else ""
+        metric_steps = {}
+        for t in mine:
+            if t.get("metric_failures"):
+                metric_steps[t["step"]] = metric_steps.get(t["step"], 0) + t["metric_failures"]
+        if metric_steps:
+            listed = ", ".join(f"{step} {count}" for step, count in metric_steps.items())
+            err += f'<div class="row-warn">failed metrics: {_e(listed)}</div>'
         rows.append(
             f'<div class="g-row"><div class="g-name"><span class="model">{_e(model)}</span>'
             f"{_badge(status)}{dur}{extra}{err}</div>"
@@ -311,6 +364,8 @@ def _timeline(d: dict) -> str:
             text += f", {step['failed']} failed"
         if step["running"]:
             text += f", {step['running']} running"
+        if step.get("with_metric_failures"):
+            text += f", {step['with_metric_failures']} with failed metrics"
         if queued > 0:
             text += f", {queued} waiting"
         if step.get("workers"):
@@ -323,7 +378,9 @@ def _timeline(d: dict) -> str:
         f'<ul class="steps-legend">{"".join(summary)}</ul>'
         '<p class="muted small">One bar per model; each colored segment is one step, from its '
         "first replicate's start to its last one's finish. Hover a segment for details. "
-        "Striped: running; red outline: failed.</p>"
+        "Striped: running; red outline: failed; amber outline: finished, but some metrics failed "
+        "(listed under Problems). On a generation bar, the plain part is the untuned fits, "
+        "the light part the HPO search and the dark part the tuned fits.</p>"
     )
     return (
         f'<section class="card"><h2>Models</h2>{legend}'
@@ -331,10 +388,30 @@ def _timeline(d: dict) -> str:
     )
 
 
+def _screen_text(screen: dict) -> str:
+    """One failed screen for a tooltip: value against its limit when recorded."""
+    if screen.get("value") is not None and screen.get("limit") is not None:
+        bound = "at most" if screen.get("bound") == "max" else "at least"
+        return f"{screen['name']}: {screen['value']:.3g} (needs {bound} {screen['limit']:.3g})"
+    return f"{screen['name']}: off by {screen['violation']:.3g}"
+
+
+def _trial_tip(c: list) -> str:
+    lines = [f"trial {c[0]}: {c[1]:.4g}"]
+    failed = c[4] if len(c) > 4 else []
+    if failed:
+        lines += ["failed " + _screen_text(f) for f in failed]
+    elif not c[3]:
+        lines.append("failed a sanity screen")
+    else:
+        lines.append("passed every sanity screen")
+    return "\n".join(lines)
+
+
 def _sparkline(curve: list, maximize: bool) -> str:
     if len(curve) < 2:
         return '<span class="muted small">-</span>'
-    w, h, pad = 150, 32, 3
+    w, h, pad = 220, 56, 4
     xs = [c[0] for c in curve]
     values = [c[1] for c in curve if c[1] is not None]
     lo, hi = min(values), max(values)
@@ -348,8 +425,10 @@ def _sparkline(curve: list, maximize: bool) -> str:
     def py(y):
         return h - pad - (y - lo) / (hi - lo) * (h - 2 * pad)
 
+    # Each dot's <title> is the browser's own hover tooltip: no script needed.
     dots = "".join(
-        f'<circle cx="{px(c[0]):.1f}" cy="{py(c[1]):.1f}" r="1.6" class="{"dot" if c[3] else "dot off"}"/>'
+        f'<circle cx="{px(c[0]):.1f}" cy="{py(c[1]):.1f}" r="2.6" class="{"dot" if c[3] else "dot off"}">'
+        f"<title>{_e(_trial_tip(c))}</title></circle>"
         for c in curve
     )
     best = [c for c in curve if c[2] is not None]
@@ -362,7 +441,7 @@ def _sparkline(curve: list, maximize: bool) -> str:
     label = f"best so far by trial ({'higher' if maximize else 'lower'} is better)"
     return (
         f'<svg class="spark" width="{w}" height="{h}" viewBox="0 0 {w} {h}" role="img" aria-label="{label}">'
-        f'<title>{label}</title>{dots}<path d="{path}" class="best"/></svg>'
+        f'<title>{label}</title><path d="{path}" class="best"/>{dots}</svg>'
     )
 
 
@@ -372,40 +451,49 @@ def _hpo(d: dict) -> str:
     elif not d["hpo"]:
         body = '<p class="empty">No HPO study has started for this experiment.</p>'
     else:
-        running_models = {t["model"] for t in d["tasks"] if t["status"] == "running"}
         rows = []
         for s in d["hpo"]:
             n = s["complete"] + s["pruned"]
             target = s["target"]
-            between_trials = s["model"] in running_models and not (target and n >= target)
-            if s["running"] or (between_trials and d["run"]["state"] == "running"):
-                status = "running"
-            elif target and n >= target:
-                status = "done"
-            elif d["run"]["state"] == "running" and s["model"] not in running_models:
-                status = "paused" if n else "queued"
-            else:
-                status = "done" if not target else "stopped"
+            status = s.get("status") or "done"
             pct = min(n / target * 100, 100) if target else 0
             prog = f'<div class="prog"><div style="width:{pct:.1f}%"></div></div>' if target else ""
             counts = f"{n}{f' / {target}' if target else ''}"
-            detail = f"{s['complete']} complete, {s['pruned']} pruned, {s['failed']} failed"
+            detail = (
+                f"{s['complete'] - s.get('infeasible', 0)} passed the screens, "
+                f"{s.get('infeasible', 0)} failed a screen, {s['failed']} errored"
+            )
+            fails = s.get("screen_fails") or {}
+            screens = (
+                "<br>".join(f"{_e(name)} <b>{count}</b>" for name, count in fails.items())
+                if fails
+                else '<span class="muted small">none failed</span>'
+            )
+            objective = _e(s.get("objective") or "-")
             err = (
                 f'<details><summary class="small">last failure</summary><pre>{_e(s["last_error"])}</pre></details>'
                 if s["last_error"]
                 else ""
             )
+            best = (
+                '<span class="muted small">none passed</span>'
+                if s["best"] is None and s["complete"] and s.get("infeasible", 0) >= s["complete"]
+                else _num(s["best"])
+            )
             eta = _duration(s["eta_s"]) if s["eta_s"] is not None and status == "running" else "-"
             rows.append(
-                f'<tr><td class="model">{_e(s["model"])}</td><td>{_badge(status)}</td>'
+                f'<tr><td class="model">{_e(s["model"])}</td><td class="small">{objective}</td>'
+                f"<td>{_badge(status)}</td>"
                 f'<td><div class="tnum">{counts}</div>{prog}<div class="muted small">{detail}</div></td>'
-                f'<td class="num">{_num(s["best"])}</td><td>{_sparkline(s["curve"], s["maximize"])}</td>'
+                f'<td class="small">{screens}</td>'
+                f'<td class="num">{best}</td><td>{_sparkline(s["curve"], s["maximize"])}</td>'
                 f'<td class="num">{_e(_duration(s["median_trial_s"]))}</td><td class="num">{_e(eta)}</td>'
                 f"<td>{err}</td></tr>"
             )
         body = (
-            '<div class="scroll"><table><thead><tr><th>Model</th><th>Status</th><th>Trials</th>'
-            '<th class="num">Best</th><th>Best so far</th><th class="num">Median trial</th>'
+            '<div class="scroll"><table><thead><tr><th>Model</th><th>Objective</th><th>Status</th>'
+            "<th>Trials</th><th>Failed screens (trials)</th>"
+            '<th class="num">Best</th><th>Trials and best so far</th><th class="num">Median trial</th>'
             '<th class="num">Time left</th><th></th></tr></thead><tbody>'
             + "".join(rows)
             + "</tbody></table></div>"
@@ -415,9 +503,11 @@ def _hpo(d: dict) -> str:
             '<span class="legend"><svg class="spark" width="10" height="10"><circle cx="5" cy="5" r="2.6" class="dot off"/></svg>'
             "trial that failed a sanity screen (never chosen)</span>"
             '<span class="legend"><i style="border-color:var(--s1)"></i>best passing score so far</span>'
-            '<span class="muted">x: trial number, y: the HPO objective</span></p>'
+            '<span class="muted">x: trial number, y: the HPO objective; hover a dot for its '
+            "screens</span></p>"
             '<p class="muted small">Best counts only trials that pass the sanity screens. '
-            "Time left is remaining trials times the median of the last ten, capped by the study's timeout.</p>"
+            "Time left is remaining trials times the median of the last ten, capped by the study's timeout. "
+            "When no trial passes the screens, the model is fitted with synthcity's defaults.</p>"
         )
     return f'<section class="card"><h2>Hyperparameter search</h2>{body}</section>'
 
@@ -704,7 +794,11 @@ button{font:inherit;font-size:12px;padding:4px 10px;border-radius:6px;border:1px
 .seg{position:absolute;top:3px;bottom:3px;border-radius:3px;min-width:2px}
 .seg.running{background-image:repeating-linear-gradient(-45deg,transparent 0 5px,rgba(255,255,255,.4) 5px 10px)!important;background-size:28px 100%;animation:slide 1.2s linear infinite}
 .seg.failed,.seg.stopped{outline:2px solid var(--bad);outline-offset:1px}
+.seg.partial{outline:2px solid var(--warn);outline-offset:1px}
 .seg.stopped{opacity:.55}
+.phase{position:absolute;top:3px;bottom:3px;pointer-events:auto}
+.phase.hpo{background:rgba(255,255,255,.55)}
+.phase.tuned{background:rgba(0,0,0,.35)}
 @keyframes slide{to{background-position:28px 0}}
 .g-stages .g-track{background:none}
 .band{position:absolute;top:1px;bottom:1px;border:1px solid var(--axis);border-radius:3px;background:var(--page);font-size:11px;color:var(--ink2);overflow:hidden;white-space:nowrap}
@@ -720,6 +814,7 @@ button{font:inherit;font-size:12px;padding:4px 10px;border-radius:6px;border:1px
 tr.group th{background:var(--track);color:var(--ink);font-size:13px}td.indent{padding-left:20px}
 .filters.inline{display:inline-flex;margin:0 0 0 12px;font-weight:400;color:var(--ink2)}
 .row-error{flex-basis:100%;font-size:12px;color:var(--bad);overflow-wrap:anywhere}
+.row-warn{flex-basis:100%;font-size:12px;color:var(--warn-ink);overflow-wrap:anywhere}
 .scroll{overflow-x:auto}table{border-collapse:collapse;width:100%}
 th,td{padding:6px 8px;border-bottom:1px solid var(--grid);text-align:left;vertical-align:middle}
 th{font-size:12px;font-weight:600;color:var(--muted)}tr.baseline td{color:var(--ink2)}td.model{white-space:nowrap}

@@ -194,16 +194,16 @@ While it runs, `synthdata-run` rewrites `<UTC time>_dashboard.html` next to the 
 
 - whether the run is running, finished, failed or stopped (the runner process is gone without logging an end), with elapsed time and a note when the log has been quiet for 20 minutes;
 - each stage's status, duration and peak resource use;
-- a timeline with one bar per model: each parallel step (generation, SynthEval, synthcity, TSTR, privacy attacks) is a colored segment on it, replicates folded together, with clock-time ticks, the pipeline stages above and the error of a failed model;
-- each HPO study's trials against its budget, best score so far (trials that fail a sanity screen don't count), a plot of every trial's score and the best so far, median trial time and an estimate of the time left;
+- a timeline with one bar per model: each parallel step (generation, SynthEval, synthcity, TSTR, privacy attacks) is a colored segment on it, replicates folded together, with clock-time ticks, the pipeline stages above and the error of a failed model. A generation bar is shaded by phase: plain for the untuned fits, light for the HPO search, dark for the tuned fits (hover for each phase's length). A model whose step finished but lost some metrics has an amber outline and lists the failed-metric count per step. A fit in the runner's own process (TabPFN, which logs nothing until its fit ends) gets a row of its own under *generation (main process)*;
+- each HPO study's objective, its status (*running* only while its own generation worker is; *stopped* when it ended short of its budget; *none passed, defaults used* when no trial passed the screens), its trials against its budget, how many trials failed each sanity screen, best score so far (trials that fail a screen don't count), a plot of every trial's score and the best so far (hover a dot to see which screens that trial failed, with its value and the limit), median trial time and an estimate of the time left;
 - RAM, CPU, GPU utilization and GPU memory over time, and use by model, grouped by step or by model;
-- errors and warnings from the log, repeated ones folded together, each with its traceback;
+- errors and warnings from the log, repeated ones folded together, each with its traceback; a metric that synthcity or SynthEval caught and left out of its results counts as an error, and so does a model whose worker failed; the same failure on several models folds into one entry that lists them;
 - once evaluation is done, the ranking with each model's 95% interval drawn as a bar, whether it is statistically tied with the best, how many output checks passed and a link to `report.md`;
 - the whole log (up to 20,000 lines), filterable by model and by text.
 
 When its output goes to a file rather than a terminal (always with `--detach`), `synthdata-run` turns off progress bars (`TQDM_DISABLE=1`), since each redraw would be a line of its own in the log. Set `TQDM_DISABLE=0` to keep them.
 
-Per-model rows appear only when `compute.workers` is more than 1, because only then does each model run in its own process. `--dashboard-interval 60` rewrites the page every minute, and `--dashboard-interval 0` turns it off.
+Per-model rows for parallel steps appear only when `compute.workers` is more than 1, because only then does each model run in its own process; with one worker, each generation fit shows under *generation (main process)*. `--dashboard-interval 60` rewrites the page every minute, and `--dashboard-interval 0` turns it off.
 
 To watch a run on a remote machine from your own computer, serve the page there and forward the port over SSH:
 
@@ -637,7 +637,7 @@ Each operating system and device (CPU or CUDA) keeps its own reference, because 
 8. **Profile and set HPO budgets** ([section 7](#setting-hpo-budgets)), then run the full search under a new experiment id.
 9. **Set `n_replicates` to 3 or more** for the run whose results you will report.
 
-When the data loads, the pipeline warns about any feature column that looks like a direct identifier: a name such as `mrn`, `dob`, `zip` or `patient_id`, or a categorical or text column that is unique on almost every row. A generator can copy such values into synthetic rows. Drop them with `data.drop_columns` (and put the patient ID in `data.patient_id_column`) unless you mean to model them.
+The data-readiness check (`identifier_like` in `data_readiness.csv`) flags any feature column that looks like a direct identifier: a name such as `mrn`, `dob`, `zip`, `patient_id` or `patient_name` (a column called just `name` counts, but `location_name` does not), or a categorical or text column that is unique on almost every row. A generator can copy such values into synthetic rows. Drop them with `data.drop_columns` (and put the patient ID in `data.patient_id_column`) unless you mean to model them.
 
 ### What is safe to share
 

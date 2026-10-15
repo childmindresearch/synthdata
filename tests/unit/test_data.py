@@ -14,6 +14,7 @@ from synthdata.data import (
     decode_label_encoded_columns,
     decode_ordinal_columns,
     encode_ordinal_columns,
+    identifier_like_columns,
     label_encode_non_numeric_columns,
     load_dataset,
     load_variable_schema,
@@ -22,7 +23,6 @@ from synthdata.data import (
     schema_column_roles,
     split_by_patient,
     stratification_key,
-    warn_identifier_like_feature_columns,
     warn_non_numeric_feature_columns,
 )
 
@@ -555,7 +555,7 @@ class TestLoadLocalFile:
             _load_local_file(self._cfg(path))
 
 
-class TestWarnIdentifierLikeFeatureColumns:
+class TestIdentifierLikeColumns:
     def test_flags_identifier_names_and_near_unique_categoricals(self):
         n = 60
         df = pd.DataFrame(
@@ -566,16 +566,20 @@ class TestWarnIdentifierLikeFeatureColumns:
                 "lab": np.linspace(0, 1, n),  # unique but continuous: a measurement
                 "sex": [0, 1] * (n // 2),
                 "VALID": [1] * n,  # "id" inside a word is not an identifier
+                # names a place, not a person
+                "encounter_location_name": ["ward a", "ward b", "clinic"] * (n // 3),
+                "patient_name": ["x"] * n,
+                "name": ["x"] * n,
             }
         )
-        flagged = warn_identifier_like_feature_columns(
-            df, list(df.columns), ["visit_code", "sex", "VALID"]
+        flagged = identifier_like_columns(
+            df, list(df.columns), ["visit_code", "sex", "VALID", "encounter_location_name"]
         )
-        assert flagged == ["MRN", "visit_code", "zip_code"]
+        assert flagged == ["MRN", "visit_code", "zip_code", "patient_name", "name"]
 
     def test_small_tables_are_not_flagged_on_cardinality(self):
         df = pd.DataFrame({"code": ["a", "b", "c"]})
-        assert warn_identifier_like_feature_columns(df, ["code"], ["code"]) == []
+        assert identifier_like_columns(df, ["code"], ["code"]) == []
 
 
 def test_imputed_csv_read_keeps_one_type_per_column(tmp_path):

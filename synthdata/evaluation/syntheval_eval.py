@@ -27,7 +27,7 @@ from synthdata.evaluation.catalog import (
     SYNTHEVAL_PRESET,
     resolve_selection,
 )
-from synthdata.utils import ensure_dir, get_logger, save_json
+from synthdata.utils import ensure_dir, get_logger, library_safe_names, save_json
 
 logger = get_logger(__name__)
 
@@ -290,6 +290,26 @@ def _model_worker(
     original_dir = Path.cwd()
     try:
         from syntheval import AnalysisConfig, SynthEval
+
+        # Column names that LightGBM (SynthEval's MIA) or XGBoost reject get a
+        # readable stand-in for SynthEval only; its results name metrics, not
+        # columns, so nothing needs mapping back.
+        renames = library_safe_names(real_frame.columns)
+        if renames:
+            logger.info(
+                "[syntheval] %s: renamed %d column(s) for SynthEval: %s",
+                model_name,
+                len(renames),
+                renames,
+            )
+            real_frame = real_frame.rename(columns=renames)
+            synthetic_frame = synthetic_frame.rename(columns=renames)
+            if holdout_frame is not None:
+                holdout_frame = holdout_frame.rename(columns=renames)
+            cat_cols = [renames.get(c, c) for c in cat_cols]
+            target_column = renames.get(target_column, target_column)
+            sensitive_columns = [renames.get(c, c) for c in sensitive_columns]
+            protected_columns = [renames.get(c, c) for c in protected_columns]
 
         analysis_configs = {
             role: AnalysisConfig(
