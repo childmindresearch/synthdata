@@ -87,10 +87,13 @@ _TASK_END = re.compile(
 )
 _TASK_FAIL = re.compile(r"^\[(?P<label>[^\]]+)\] (?P<model>\S+) failed: (?P<why>.*)")
 _EXPERIMENT = re.compile(r"^Experiment '(?P<id>[^']+)' \(tag=")
-#: A fit in the runner's own process (TabPFN, or every model when
-#: ``compute.workers`` is 1): no worker pool logs its start or end.
-_MAIN_FIT = re.compile(r"^\[(?P<model>[^\]\s]+)\] generating synthetic data \(n_samples=")
+#: The start of a final fit (not an HPO trial). In the runner's own process
+#: (TabPFN, or every model when ``compute.workers`` is 1) no worker pool logs
+#: its start or end, so this line is its only trace.
+_FIT_START = re.compile(r"^\[(?P<model>[^\]\s]+)\] generating synthetic data \(n_samples=")
 _GENERATED = re.compile(r"^Generated/loaded \d+ synthetic datasets")
+#: Any line of an HPO study's own ("[hpo_ctgan] trial 3 ...", "[hpo_ctgan_probe] ...").
+_HPO_LINE = re.compile(r"^\[hpo_[^\]]+\] ")
 #: Step label for fits in the runner's own process.
 MAIN_STEP = "generation (main process)"
 _HPO_START = re.compile(
@@ -308,6 +311,8 @@ def parse_log(lines: list[str]) -> dict:
         current_problem = None
         moment = clock.local(logline["hms"])
         msg, level = logline["msg"], logline["level"]
+        if task is not None:
+            _track_phase(tasks, task, msg, moment)
         if m := _EXPERIMENT.match(msg):
             experiment = m["id"]
         elif m := _POOL.match(msg):
@@ -329,7 +334,8 @@ def parse_log(lines: list[str]) -> dict:
                 {"step": m["label"], "model": m["model"], "start": None, "pid": None, "order": 0},
             )
             entry.update(status="failed" if m["outcome"] == "failed" else "done", end=moment)
-        elif task is None and (m := _MAIN_FIT.match(msg)):
+            _close_phase(entry, moment)
+        elif task is None and (m := _FIT_START.match(msg)):
             close_main_fits(moment)
             pools.setdefault(MAIN_STEP, {})
             tasks[(MAIN_STEP, m["model"])] = {
@@ -393,6 +399,42 @@ def parse_log(lines: list[str]) -> dict:
         "experiment": experiment,
         "latest": clock.latest,
     }
+
+
+def _close_phase(entry: dict, moment) -> None:
+    phases = entry.get("phases")
+    if phases and phases[-1]["end"] is None:
+        phases[-1]["end"] = moment
+
+
+def _track_phase(tasks: dict, task: str, msg: str, moment) -> None:
+    """Split a generation worker's time into untuned fits, HPO and tuned fits.
+
+    The worker logs "[name] generating synthetic data" before each final fit
+    and "[hpo_...]" lines while it searches; a phase lasts until the next one
+    starts or the worker ends.
+    """
+    label, _, model = task.partition(": ")
+    if label != "generation":
+        return
+    entry = tasks.get((label, model))
+    if entry is None:
+        return
+    phases = entry.setdefault("phases", [])
+    current = phases[-1] if phases and phases[-1]["end"] is None else None
+    if m := _FIT_START.match(msg):
+        kind, name = ("tuned fit" if "_hpo" in m["model"] else "fit"), m["model"]
+    elif _HPO_LINE.match(msg):
+        if current is not None and current["kind"] == "HPO":
+            return
+        kind, name = "HPO", "search"
+    elif _GENERATED.match(msg):
+        _close_phase(entry, moment)
+        return
+    else:
+        return
+    _close_phase(entry, moment)
+    phases.append({"kind": kind, "name": name, "start": moment, "end": None})
 
 
 def _in_traceback(problem: dict | None) -> bool:
@@ -869,6 +911,10 @@ def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
                 "order": task.get("order", 0),
                 "error": task.get("error"),
                 "metric_failures": metric_failures.get(f"{task['step']}: {task['model']}", 0),
+                "phases": [
+                    {**phase, "start": _iso(phase["start"]), "end": _iso(phase["end"])}
+                    for phase in task.get("phases", [])
+                ],
             }
         )
     steps = []

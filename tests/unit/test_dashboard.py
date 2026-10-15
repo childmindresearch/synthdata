@@ -528,3 +528,51 @@ def test_a_python_warning_is_its_own_problem_not_context():
     ]
     assert problems[0]["context"] == []
     assert problems[1]["context"] == ["  warnings.warn("]
+
+
+def test_generation_worker_splits_into_untuned_fits_hpo_and_tuned_fits():
+    task = "generation: ctgan"
+    lines = [
+        _runner(T0, "=== generate: -m scripts.run_generation"),
+        _logline(T0, "synthdata.compute", "INFO", "[generation] started ctgan (pid 11; 1 of 1)"),
+        _logline(
+            _minutes(1),
+            "synthdata.generation.pipeline",
+            "INFO",
+            "[ctgan] generating synthetic data (n_samples=100, seed=42)",
+            task=task,
+        ),
+        _logline(
+            _minutes(5),
+            "synthdata.generation.hpo",
+            "INFO",
+            "[hpo_ctgan_probe] trial 0 tstr_macro_auprc=0.3 after 2 min (1 of 2 done)",
+            task=task,
+        ),
+        _logline(
+            _minutes(9),
+            "synthdata.generation.hpo",
+            "INFO",
+            "[hpo_ctgan] trial 1 tstr_macro_auprc=0.4 after 2 min (2 of 2 done)",
+            task=task,
+        ),
+        _logline(
+            _minutes(10),
+            "synthdata.generation.pipeline",
+            "INFO",
+            "[ctgan_hpo] generating synthetic data (n_samples=100, seed=42)",
+            task=task,
+        ),
+        _logline(
+            _minutes(12),
+            "synthdata.compute",
+            "INFO",
+            "[generation] ctgan finished after 12 min; 1 of 1 done",
+        ),
+    ]
+    (worker,) = dashboard.parse_log(lines)["tasks"]
+    assert [(p["kind"], p["start"], p["end"]) for p in worker["phases"]] == [
+        ("fit", _minutes(1).replace(microsecond=0), _minutes(5).replace(microsecond=0)),
+        ("HPO", _minutes(5).replace(microsecond=0), _minutes(10).replace(microsecond=0)),
+        ("tuned fit", _minutes(10).replace(microsecond=0), _minutes(12).replace(microsecond=0)),
+    ]

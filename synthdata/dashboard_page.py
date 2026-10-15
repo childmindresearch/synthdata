@@ -229,6 +229,37 @@ def _segments(tasks: list[dict], t1: float) -> list[dict]:
     return out
 
 
+PHASE_LABEL = {"fit": "untuned fits", "HPO": "HPO search", "tuned fit": "tuned fits"}
+
+
+def _phases(tasks: list[dict], t1: float, pct, model: str) -> list[str]:
+    """Shading over a generation worker's bar: its HPO search and its tuned fits.
+
+    Consecutive fits of one kind (a model's replicates) merge into one span.
+    """
+    spans: list[list] = []
+    for t in tasks:
+        for phase in t.get("phases") or []:
+            start, end = _at(phase["start"], t1), _at(phase["end"], t1)
+            if spans and spans[-1][0] == phase["kind"]:
+                spans[-1][2] = end
+                spans[-1][3] += 1
+            else:
+                spans.append([phase["kind"], start, end, 1])
+    out = []
+    for kind, start, end, n in spans:
+        if kind == "fit":
+            continue  # the bar itself is untuned fitting
+        what = PHASE_LABEL[kind] + (f" ({n})" if kind != "HPO" else "")
+        tip = f"{model} · generation · {what} · {_duration(end - start)}"
+        cls = "hpo" if kind == "HPO" else "tuned"
+        out.append(
+            f'<div class="phase {cls}" style="left:{pct(start):.2f}%;'
+            f'width:{max(pct(end) - pct(start), 0.3):.2f}%" title="{_e(tip)}"></div>'
+        )
+    return out
+
+
 def _timeline(d: dict) -> str:
     tasks = d["tasks"]
     if not d["steps"] and not tasks:
@@ -277,6 +308,7 @@ def _timeline(d: dict) -> str:
                 f'width:{max(pct(s["end"]) - pct(s["start"]), 0.4):.2f}%;background:{color[s["step"]]}" '
                 f'title="{_e(tip)}"></div>'
             )
+        segs += _phases(mine, t1, pct, model)
         statuses = {t["status"] for t in mine}
         status = next((s for s in ("failed", "running", "stopped") if s in statuses), "done")
         starts = [_at(t["start"], t1) for t in mine if t["start"]]
@@ -347,7 +379,8 @@ def _timeline(d: dict) -> str:
         '<p class="muted small">One bar per model; each colored segment is one step, from its '
         "first replicate's start to its last one's finish. Hover a segment for details. "
         "Striped: running; red outline: failed; amber outline: finished, but some metrics failed "
-        "(listed under Problems).</p>"
+        "(listed under Problems). On a generation bar, the plain part is the untuned fits, "
+        "the light part the HPO search and the dark part the tuned fits.</p>"
     )
     return (
         f'<section class="card"><h2>Models</h2>{legend}'
@@ -763,6 +796,9 @@ button{font:inherit;font-size:12px;padding:4px 10px;border-radius:6px;border:1px
 .seg.failed,.seg.stopped{outline:2px solid var(--bad);outline-offset:1px}
 .seg.partial{outline:2px solid var(--warn);outline-offset:1px}
 .seg.stopped{opacity:.55}
+.phase{position:absolute;top:3px;bottom:3px;pointer-events:auto}
+.phase.hpo{background:rgba(255,255,255,.55)}
+.phase.tuned{background:rgba(0,0,0,.35)}
 @keyframes slide{to{background-position:28px 0}}
 .g-stages .g-track{background:none}
 .band{position:absolute;top:1px;bottom:1px;border:1px solid var(--axis);border-radius:3px;background:var(--page);font-size:11px;color:var(--ink2);overflow:hidden;white-space:nowrap}
