@@ -189,12 +189,12 @@ evaluation:
     positive_classes: [0, 1]
     negative_classes: [2]
   # Custom privacy metrics (Anonymeter, holdout-referenced DCR/NNDR).
-  # unit: patient = attacks target one encounter per patient and the distance
-  # membership check scores each patient by their closest encounter; row = every
-  # row is an individual. Anonymeter uses the QIs as attacker knowledge and the
+  # unit: row = every row is an individual (each synthetic row is released as its
+  # own record); patient = attacks target one encounter per patient and the
+  # distance membership check scores each patient by their closest encounter. Anonymeter uses the QIs as attacker knowledge and the
   # sensitive columns as secrets, with the test split as its control set.
   privacy_attacks:
-    unit: patient
+    unit: row
     anonymeter: { n_attacks: 500 }
 
 

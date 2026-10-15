@@ -775,10 +775,11 @@ class PrivacyAttacksConfig:
     """Custom privacy metrics: Anonymeter attacks and holdout-referenced
     distance heuristics (DCR/NNDR; see synthdata.evaluation.privacy_attacks)."""
 
-    #: "patient": attacks target one encounter per patient and the distance
-    #: membership check scores each patient by their closest encounter, so a
-    #: frequent attender counts once; "row": every row is an individual.
-    unit: str = "patient"
+    #: "row" (default): every row is an individual, as each synthetic row is
+    #: released as its own record. "patient": attacks target one encounter
+    #: per patient and the distance membership check scores each patient by
+    #: their closest encounter, so a frequent attender counts once.
+    unit: str = "row"
     #: Anonymeter attack settings (see AnonymeterConfig).
     anonymeter: AnonymeterConfig = dataclasses.field(default_factory=AnonymeterConfig)
 

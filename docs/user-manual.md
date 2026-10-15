@@ -541,7 +541,9 @@ Privacy is reported as evidence next to the baselines. There is no pass/fail gat
   - *Inference*: knowing a person's quasi-identifiers, can the attacker guess their sensitive columns?
 - **Holdout distance checks**: are synthetic rows closer to training rows than to unseen real rows? (`dcr_*`, `nndr_*`, `distance_mia_auc`).
 
-With `evaluation.privacy_attacks.unit: patient` (the default), each patient counts once, even if they had many visits. Settings for the attacks are under `evaluation.privacy_attacks.anonymeter`.
+With `evaluation.privacy_attacks.unit: row` (the default), every row counts as an individual, since each synthetic row is released as a record of its own. With `unit: patient`, each patient counts once, even if they had many visits. Settings for the attacks are under `evaluation.privacy_attacks.anonymeter`.
+
+Singling-out risk reads low even for `baseline_train_copy`. Anonymeter compares the attack on the training rows with the same attack on the test split, and the two must be the same size, so the targets are a random subsample of train as large as the test split (a quarter of train with the default split). A copy of train holds every training row, so most of the records it singles out are not targets and don't count. Read singling out as a lower bound; linkability and the holdout distance checks are what catch a copy. Details: [verification.md](verification.md).
 
 ### Fairness
 

@@ -572,6 +572,11 @@ def _privacy_section(cfg, combined, extras, paths: _Paths, links: _Links) -> str
             "- `dcr_holdout_ratio`, `nndr_holdout_ratio`: near or above 1 when synthetic rows "
             "keep the same distance from training rows as unseen real rows do; below 1 means "
             "closer.",
+            "- Singling-out risk is diluted, even for `baseline_train_copy`: Anonymeter's "
+            "targets are subsampled to the size of the test split (its control set), so most "
+            "records a released copy of train singles out are not among the targets and do "
+            "not count. Read it as a lower bound; linkability and the distance checks are the "
+            "copy-sensitive evidence (see docs/verification.md).",
             "",
             _dataframe_to_markdown(table.reset_index()),
             "",
