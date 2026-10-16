@@ -103,8 +103,19 @@ class DataConfig:
     #: Secret attributes privacy metrics try to infer (see above).
     sensitive_columns: list = dataclasses.field(default_factory=list)
     #: Fairness groups (see above); also the default for
-    #: ``evaluation.log_disparity.protected_columns``.
+    #: ``evaluation.log_disparity.protected_columns``. SynthEval's gap
+    #: metrics compare each group holding at least 5% of the rows with the
+    #: rest. A numeric column (e.g. age, birth year) needs its groups set in
+    #: ``protected_bins``; without them it is left out of those metrics.
     protected_columns: list | None = None
+    #: Bin edges that turn a numeric protected column into groups,
+    #: ``{column: [edges]}`` in ascending order, e.g.
+    #: ``{age: [0, 18, 30, 45, 60, 200]}``. Bins include their upper edge
+    #: (the first also its lower edge); values outside every bin belong to
+    #: no group. Used by SynthEval's fairness metrics, the HPO protected-group
+    #: screens (which fall back to train quartiles without bins) and, unless
+    #: ``evaluation.log_disparity.protected_bins`` is set, by log disparity.
+    protected_bins: dict = dataclasses.field(default_factory=dict)
     #: Columns to drop entirely before any modeling (e.g. free-text/ID columns).
     drop_columns: list = dataclasses.field(default_factory=list)
     #: Column identifying the patient (or other independent unit) each row
@@ -497,7 +508,8 @@ class HPOConstraintsConfig:
     max_class_share_gap: float | None = 0.02
     #: Protected groups present: for every ``data.protected_columns`` column,
     #: the share of its groups (at least 1% frequency in train; numeric
-    #: columns in train quartiles) the synthetic data contains.
+    #: columns in ``data.protected_bins``, or train quartiles without them)
+    #: the synthetic data contains.
     min_protected_coverage: float | None = 1.0
     #: Protected groups in proportion: the largest total variation distance,
     #: over the protected columns, between the synthetic and search-train
@@ -572,9 +584,12 @@ class HPOConfig:
     timeout_seconds_per_model: dict = dataclasses.field(default_factory=dict)
     #: Wall-clock hours for the whole generation stage, counted from its start
     #: (None = no limit). Every model's search stops starting trials early
-    #: enough to leave time for its tuned fit and replicates, so the stage
-    #: ends near this limit with every model finished. Meant as a safety net
-    #: just under a cluster job's time limit; per-model timeouts still apply.
+    #: enough to leave time for the refits of its top trials (``refit_top_k``
+    #: x ``refit_seeds``, each counted as its longest trial) and its tuned fit
+    #: and replicates (counted as long as its untuned fits), so the stage
+    #: ends near this limit with every model finished. Imputation and
+    #: evaluation are not included: on a cluster, set it to the job's time
+    #: limit minus the time those take. Per-model timeouts still apply.
     stage_time_limit_hours: float | None = None
     #: Training length searched per model as ``[low, high, step]`` (synthcity
     #: ``n_iter`` epochs, TabPFGen SGLD steps). Unlisted models use their
@@ -599,8 +614,10 @@ class HPOConfig:
     #: hyperparameters, such as learning rate and batch size.
     multivariate: bool = True
     #: Stop a study once this many finished trials in a row failed to improve
-    #: the best feasible value by more than ``min_delta`` (never before
-    #: ``n_startup_trials`` trials). null = off; timeouts stay as caps.
+    #: the best feasible value by more than ``min_delta``. The first
+    #: ``n_startup_trials`` trials set the value to beat but don't count, so
+    #: TPE always gets ``patience`` trials of its own. null = off; timeouts
+    #: stay as caps.
     patience: int | None = 10
     #: Improvement that resets ``patience``. null = the median bootstrap
     #: standard error of the objective over the trials so far.
@@ -663,7 +680,7 @@ class GenerationConfig:
     #: keeps TSTR comparable with the real-data ceiling, and adds no rows that
     #: carry no new signal but more chances to leak a memorized record. An
     #: integer fixes the count instead (e.g. to cap a slow generator); the
-    #: holdout TRTR ceiling is then fitted on that many real train rows.
+    #: ``baseline_train_copy`` reference then holds that many real train rows.
     n_samples: int | None = None
     #: Times each model is fitted and sampled, with seeds seed, seed+1, ...
     #: Replicate r > 0 is saved as "<model>__rep<r>". With 2 or more, the
@@ -735,8 +752,8 @@ class LogDisparityConfig:
     #: ``protected_columns`` (null entries keep the raw values).
     protected_map: list | None = None
     #: Bin edges per protected column, aligned with ``protected_columns``
-    #: (null = use the values as groups); needed for continuous columns
-    #: such as age, e.g. ``[null, [0, 18, 30, 45, 60, 200]]``.
+    #: (null = use the values as groups), e.g. ``[null, [0, 18, 30, 60, 200]]``.
+    #: Leave null to use ``data.protected_bins``, which most configs should.
     protected_bins: list | None = None
 
 
@@ -1265,6 +1282,21 @@ def _validate_column_roles(data: DataConfig) -> None:
         ):
             if reserved is not None and reserved in columns:
                 raise ValueError(f"data.{key} must not contain {label} ({reserved!r})")
+    for column, edges in (data.protected_bins or {}).items():
+        if column not in roles["protected_columns"]:
+            raise ValueError(
+                f"data.protected_bins names {column!r}, which is not in data.protected_columns"
+            )
+        if (
+            not isinstance(edges, list)
+            or len(edges) < 2
+            or not all(isinstance(e, int | float) and not isinstance(e, bool) for e in edges)
+            or any(b <= a for a, b in zip(edges, edges[1:], strict=False))
+        ):
+            raise ValueError(
+                f"data.protected_bins[{column!r}] must be at least two increasing numbers, "
+                f"got {edges!r}"
+            )
     overlap = sorted(set(roles["quasi_identifier_columns"]) & set(roles["sensitive_columns"]))
     if overlap:
         raise ValueError(

@@ -128,3 +128,13 @@ def test_report_is_written_and_can_be_turned_off(make_config, make_dataset):
     assert len(written) == 1
     cfg.data.readiness.enabled = False
     assert save_readiness_report(cfg, dataset) is None
+
+
+def test_missingness_indicators_are_left_out(make_dataset):
+    df = _frame()
+    df["ind_a__missing"] = (np.arange(N) % 7 == 0).astype(int)
+    df["ind_b__missing"] = df["ind_a__missing"]  # missing together: identical indicators
+    dataset = make_dataset(df=df, nominal_columns=["cat", "ind_a__missing", "ind_b__missing"])
+    dataset.missing_indicator_columns = {"ind_a__missing": "a", "ind_b__missing": "b"}
+    findings = assess(dataset, DataReadinessConfig(min_rows_per_column=None))
+    assert not set(findings["column"]) & {"ind_a__missing", "ind_b__missing"}

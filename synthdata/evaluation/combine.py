@@ -153,20 +153,36 @@ def _log_disparity_frames(
 def _tstr_frames(
     tstr_result: dict | None, model_names: list
 ) -> "tuple[pd.DataFrame, pd.DataFrame]":
-    """Holdout TSTR macro scores as custom utility columns (all higher-is-better)."""
+    """Holdout TSTR macro scores as custom utility columns (all higher-is-better).
+
+    TSTS scores (train and test on synthetic rows) are reported next to them
+    but unranked: a high TSTS is not better in itself, only its gap to TSTR
+    says something (docs/verification.md).
+    """
     scores = (tstr_result or {}).get("scores") or {}
     if not scores:
         empty = pd.DataFrame(index=model_names)
         return empty, empty
-    raw = pd.DataFrame(
-        {
-            "tstr_macro_f1": {m: s.macro_f1 for m, s in scores.items()},
-            "tstr_balanced_accuracy": {m: s.balanced_accuracy for m, s in scores.items()},
-            "tstr_macro_auprc": {m: s.macro_auprc for m, s in scores.items()},
+    tsts = (tstr_result or {}).get("tsts") or {}
+
+    def _scores(prefix: str, results: dict) -> dict:
+        return {
+            f"{prefix}_macro_f1": {m: s.macro_f1 for m, s in results.items()},
+            f"{prefix}_balanced_accuracy": {m: s.balanced_accuracy for m, s in results.items()},
+            f"{prefix}_macro_auprc": {m: s.macro_auprc for m, s in results.items()},
         }
-    ).reindex(index=model_names, columns=list(TSTR_METRICS))
+
+    oriented = pd.DataFrame(_scores("tstr", scores)).reindex(
+        index=model_names, columns=list(TSTR_METRICS)
+    )
+    raw = oriented.copy()
+    if tsts:
+        raw = pd.concat([raw, pd.DataFrame(_scores("tsts", tsts)).reindex(model_names)], axis=1)
     raw.columns = pd.MultiIndex.from_tuples([("custom", "utility", c) for c in raw.columns])
-    return raw, raw.copy()
+    oriented.columns = pd.MultiIndex.from_tuples(
+        [("custom", "utility", c) for c in oriented.columns]
+    )
+    return raw, oriented
 
 
 def _privacy_attack_frames(
@@ -237,6 +253,64 @@ DEFAULT_RANK_WEIGHTS = {"utility": 1.0, "privacy": 1.0, "fairness": 1.0}
 #: worst on every metric of one type (scaled score 0) is still ordered by its
 #: other types instead of collapsing to an overall score of 0.
 GEOMETRIC_FLOOR = 0.01
+
+
+#: File (in the evaluation folder) with each metric's direction and ideal value.
+METRIC_DIRECTIONS_FILENAME = "metric_directions.csv"
+
+#: Values that mean "no privacy loss" for the custom privacy metrics: an
+#: attack no better than its baseline, synthetic rows no closer to the
+#: training rows than to unseen real rows.
+_KNOWN_IDEALS = {
+    **{name: 0.0 for name in ANONYMETER_METRICS},
+    "dcr_closer_to_train_share": 0.5,
+    "distance_mia_auc": 0.5,
+    "dcr_holdout_ratio": 1.0,
+    "nndr_holdout_ratio": 1.0,
+    **{name: 0.0 for name in LOG_DISPARITY_METRICS},
+}
+
+
+def metric_directions(raw: pd.DataFrame, oriented: pd.DataFrame) -> pd.DataFrame:
+    """Which way each raw metric is better, read from how it was oriented for ranking.
+
+    ``direction`` is "higher" or "lower" (the oriented score rises or falls
+    with the raw value, by Spearman correlation across models), "closer to 0"
+    (a signed gap scored as 1 - |value| or -|value|) or "unranked" (reported,
+    not ranked). ``ideal`` is the value that means perfect or no risk where
+    one exists, else NaN. Index: the raw table's ``(framework, type, metric)``.
+    """
+    rows = []
+    for column in raw.columns:
+        ideal = _KNOWN_IDEALS.get(column[2], np.nan)
+        if column not in oriented.columns:
+            rows.append({"direction": "unranked", "ideal": ideal})
+            continue
+        pair = pd.concat([raw[column], oriented[column]], axis=1).dropna().astype(float)
+        r, o = pair.iloc[:, 0].to_numpy(), pair.iloc[:, 1].to_numpy()
+        signed = len(r) and (r < 0).any() and (r > 0).any()
+        if signed and (np.allclose(o, 1 - np.abs(r)) or np.allclose(o, -np.abs(r))):
+            rows.append({"direction": "closer to 0", "ideal": 0.0})
+            continue
+        rho = stats.spearmanr(r, o).statistic if len(r) > 2 and np.ptp(r) > 0 else np.nan
+        if np.isnan(rho):
+            # Too few distinct values to tell: identity or negation decides.
+            rho = 1.0 if np.allclose(o, r) else -1.0 if np.allclose(o, -r) else np.nan
+        direction = "higher" if rho > 0 else "lower" if rho < 0 else "unknown"
+        rows.append({"direction": direction, "ideal": ideal})
+    table = pd.DataFrame(rows, index=raw.columns)
+    table.index = pd.MultiIndex.from_tuples(table.index, names=["framework", "type", "metric"])
+    return table
+
+
+def load_metric_directions(evaluation_dir) -> "pd.DataFrame | None":
+    """Read :data:`METRIC_DIRECTIONS_FILENAME` from ``evaluation_dir``, or None."""
+    from pathlib import Path
+
+    path = Path(evaluation_dir) / METRIC_DIRECTIONS_FILENAME
+    if not path.exists():
+        return None
+    return pd.read_csv(path, index_col=[0, 1, 2])
 
 
 def build_combined_table(
@@ -345,6 +419,7 @@ def build_combined_table(
     )
     combined = combined.sort_values((_ALL, "overall", _RANK), ascending=False)
     combined.index.name = "model"
+    combined.attrs["metric_directions"] = metric_directions(raw_df, oriented_df)
     return combined
 
 
@@ -381,7 +456,7 @@ CONFIDENCE = 0.95
 _SUMMARY_DIMS = ("overall", "utility", "privacy", "fairness")
 
 
-def _mean_and_interval(values: pd.Series, confidence: float) -> tuple[float, float, float]:
+def mean_and_interval(values: pd.Series, confidence: float) -> tuple[float, float, float]:
     """Mean and Student-t confidence interval; the interval is NaN below 2 values."""
     values = values.dropna()
     mean = values.mean() if len(values) else np.nan
@@ -434,7 +509,7 @@ def summarize_replicates(combined: pd.DataFrame, confidence: float = CONFIDENCE)
     for model, names in models.groupby(models, sort=False).groups.items():
         row: dict = {"n_replicates": len(names), "baseline": is_baseline(str(model))}
         for dim in dims:
-            mean, low, high = _mean_and_interval(scores[dim][names], confidence)
+            mean, low, high = mean_and_interval(scores[dim][names], confidence)
             row[f"{dim}_mean"] = mean
             row[f"{dim}_ci_low"] = low
             row[f"{dim}_ci_high"] = high

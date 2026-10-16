@@ -94,10 +94,14 @@ def main() -> None:
     if args.plot:
         from synthdata.plotting.evaluation_plots import (
             save_log_disparity_plots,
+            save_metric_overview_plots,
             save_rank_tradeoff_plots,
         )
 
         save_rank_tradeoff_plots(cfg, combined, cfg.plots.output_dir)
+        save_metric_overview_plots(
+            cfg, combined, combined.attrs.get("metric_directions"), cfg.plots.output_dir
+        )
         save_log_disparity_plots(extras["log_disparity_reports"], cfg.plots.output_dir)
         # Native per-model SynthEval plots (SE_*.png) are produced as a side effect of
         # run_evaluation()'s syntheval benchmark pass above (via enable_syntheval_plots),

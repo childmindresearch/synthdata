@@ -10,6 +10,7 @@ from synthdata.evaluation.custom_eval import (
     build_tstr_table,
     run_log_disparity_evaluation,
     run_tstr_evaluation,
+    tstr_and_tsts_scores,
 )
 
 pytestmark = pytest.mark.unit
@@ -171,32 +172,32 @@ class TestRunTstrEvaluation:
         dataset.train_imputed_df, dataset.test_imputed_df = dataset.train_df, dataset.test_df
         return dataset
 
-    def test_scores_each_model_on_the_test_split_with_a_trtr_ceiling(self, tstr_dataset):
+    def test_scores_each_model_on_the_test_split_and_inside_its_own_rows(self, tstr_dataset):
         real = tstr_dataset.train_imputed_df
         noise = real.assign(target=real["target"].sample(frac=1, random_state=0).to_numpy())
         result = run_tstr_evaluation(
             {"copy": real, "noise": noise}, tstr_dataset, FrameworkSelectionConfig(), 2, 0
         )
         assert result["classes"] == ["0", "1", "2"]
-        assert result["scores"]["copy"] == result["trtr"]
+        assert "trtr" not in result
         assert result["scores"]["noise"].macro_f1 < result["scores"]["copy"].macro_f1
+        # TSTS: the shuffled target is unlearnable inside its own rows too.
+        assert result["tsts"]["noise"].macro_f1 < result["tsts"]["copy"].macro_f1
 
         table = build_tstr_table(result)
-        assert list(table.index) == ["copy", "noise", "trtr (real train)"]
+        assert list(table.index) == ["copy", "noise"]
         assert {"tstr_macro_f1", "tstr_balanced_accuracy", "tstr_macro_auprc"} <= set(table.columns)
+        assert {"tsts_macro_f1", "tsts_balanced_accuracy", "tsts_macro_auprc"} <= set(table.columns)
         assert {"f1_0", "f1_1", "f1_2"} <= set(table.columns)
 
-    def test_trtr_ceiling_uses_as_many_real_rows_as_n_samples(self, tstr_dataset):
+    def test_tsts_splits_a_synthetic_set_missing_a_class(self, tstr_dataset):
         real = tstr_dataset.train_imputed_df
-        full = run_tstr_evaluation({}, tstr_dataset, FrameworkSelectionConfig(), 1, 0)
-        same = run_tstr_evaluation(
-            {}, tstr_dataset, FrameworkSelectionConfig(), 1, 0, n_samples=len(real)
+        lone = pd.concat([real[real["target"] != 2], real[real["target"] == 2].head(1)])
+        tstr, tsts = tstr_and_tsts_scores(
+            lone, tstr_dataset.test_imputed_df, "target", [], [0, 1, 2], [0]
         )
-        fewer = run_tstr_evaluation(
-            {}, tstr_dataset, FrameworkSelectionConfig(), 1, 0, n_samples=30
-        )
-        assert same["trtr"] == full["trtr"]
-        assert fewer["trtr"] != full["trtr"]
+        assert tsts is not None
+        assert tsts.per_class_f1["2"] == 0
 
     def test_deselected_returns_empty(self, tstr_dataset):
         selection = FrameworkSelectionConfig(categories=["fairness"])

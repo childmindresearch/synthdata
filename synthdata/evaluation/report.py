@@ -17,10 +17,14 @@ import pandas as pd
 from synthdata.config import Config
 from synthdata.data import Dataset
 from synthdata.evaluation.baselines import is_baseline
-from synthdata.evaluation.combine import simple_rank_summary, summarize_replicates
+from synthdata.evaluation.combine import (
+    mean_and_interval,
+    simple_rank_summary,
+    summarize_replicates,
+)
 from synthdata.evaluation.privacy_attacks import ANONYMETER_METRICS, HOLDOUT_DISTANCE_METRICS
 from synthdata.experiment import dataset_version_scope
-from synthdata.utils import get_logger
+from synthdata.utils import get_logger, split_replicate_name
 
 logger = get_logger(__name__)
 
@@ -135,8 +139,13 @@ class _Paths:
             self.dataset_plots = self.plots / dataset_version_scope(cfg) / "dataset"
         data_dir = getattr(dataset, "data_dir", None)
         self.data = Path(data_dir) if data_dir else None
+        # The scripts nest generation.output_dir under the experiment before
+        # evaluating, so the folder is taken from the experiment when it has one.
+        imputation_dir = getattr(experiment, "imputation_dir", None)
         self.imputation = (
-            Path(cfg.generation.output_dir).parent / "imputation" / dataset_version_scope(cfg)
+            Path(imputation_dir)
+            if imputation_dir
+            else Path(cfg.generation.output_dir).parent / "imputation" / dataset_version_scope(cfg)
         )
         manifest = getattr(experiment, "manifest_path", None)
         self.manifest = Path(manifest) if manifest else None
@@ -187,6 +196,52 @@ def _has_replicates(ranking_summary) -> bool:
         and "overall_mean" in ranking_summary.columns
         and ranking_summary["n_replicates"].max() >= 2
     )
+
+
+def _collapse_replicates(table: pd.DataFrame) -> pd.DataFrame:
+    """One row per model: seed replicates (``<model>__rep<r>``) folded together.
+
+    Numeric columns become ``mean [95% interval]`` over the replicates (the
+    plain value for a single seed); other columns keep the first replicate's
+    value. A ``seeds`` column counts the rows folded into each. Rows keep the
+    order of each model's first appearance.
+    """
+    if table.empty:
+        return table
+    models = pd.Series([split_replicate_name(str(m))[0] for m in table.index], index=table.index)
+    if models.nunique() == len(models):
+        return table
+    rows = {}
+    for model, names in models.groupby(models, sort=False).groups.items():
+        group = table.loc[names]
+        row: dict = {"seeds": len(group)}
+        for column in table.columns:
+            values = pd.to_numeric(group[column], errors="coerce")
+            if pd.api.types.is_numeric_dtype(table[column]) and values.notna().any():
+                mean, low, high = mean_and_interval(values, 0.95)
+                row[column] = (
+                    _fmt_metric(mean) if pd.isna(low) else f"{mean:.3f} [{low:.3f}, {high:.3f}]"
+                )
+            else:
+                row[column] = group[column].iloc[0]
+        rows[model] = row
+    collapsed = pd.DataFrame.from_dict(rows, orient="index")
+    collapsed.index.name = table.index.name
+    return collapsed
+
+
+def _metric_plots(paths: "_Paths", links: "_Links", metric_type: str) -> list[str]:
+    """The metric overview figure of one type (plotting.save_metric_overview_plots)."""
+    plots = links.plots(paths.evaluation_plots, f"metrics_{metric_type}.*")
+    if not plots:
+        return ["_Metric overview plot not rendered yet: run `synthdata-plot`._"]
+    return [
+        f"Every {metric_type} metric, one panel each: the dot is the mean over seeds, the bar "
+        "its 95% interval, the title says which direction is better, a green dashed line marks "
+        "the ideal value where one exists, and grey rows are the baselines.",
+        "",
+        *plots,
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -488,15 +543,17 @@ def _utility_section(cfg, extras, paths: _Paths, links: _Links) -> str:
     lines += ["", "### Train on synthetic, test on real (holdout, imbalance-aware)", ""]
     tstr_table = extras.get("tstr_table")
     if tstr_table is not None and not tstr_table.empty:
-        table = tstr_table.reset_index()
+        table = _collapse_replicates(tstr_table).reset_index()
         table = table.rename(columns={table.columns[0]: "model"})
         lines += [
             "A fixed XGBoost classifier is fitted on each dataset and scored on the held-out "
             "test split. Macro-F1 and balanced accuracy weigh every class equally, so a minority "
             "class the synthetic data gets wrong pulls them down; `f1_<class>` shows which "
-            "class. The `trtr (real train)` row is the same classifier fitted on the real "
-            "training rows (as many as each synthetic dataset when `n_samples` is below "
-            "the train size): the ceiling.",
+            "class. The `baseline_train_copy` rows are the same classifier fitted on real "
+            "training rows (train on real, test on real): the ceiling. `tsts_*` columns fit "
+            "and score the classifier inside each synthetic dataset (80/20 split): a TSTS far "
+            "above TSTR means the synthetic data holds a signal that does not carry over to "
+            "real rows; TSTS is reported, not ranked.",
             "",
             _dataframe_to_markdown(table),
             "",
@@ -509,6 +566,7 @@ def _utility_section(cfg, extras, paths: _Paths, links: _Links) -> str:
         flat = ovr.copy()
         flat.columns = [f"{metric} [{cls}]" for metric, cls in flat.columns]
         flat.index.name = "model"
+        flat = _collapse_replicates(flat)
         lines += [
             "",
             "SynthEval metrics that need two classes (AUROC difference, subgroup gaps) ran once "
@@ -526,6 +584,7 @@ def _utility_section(cfg, extras, paths: _Paths, links: _Links) -> str:
             "SynthEval metrics that need two classes ran on the target collapsed to "
             f"positive {bt.positive_classes} versus negative {bt.negative_classes}.",
         ]
+    lines += ["", "### All utility metrics", "", *_metric_plots(paths, links, "utility")]
     native = paths.evaluation_plots / "syntheval_plots"
     if native.is_dir():
         lines += [
@@ -578,7 +637,7 @@ def _privacy_section(cfg, combined, extras, paths: _Paths, links: _Links) -> str
             "not count. Read it as a lower bound; linkability and the distance checks are the "
             "copy-sensitive evidence (see docs/verification.md).",
             "",
-            _dataframe_to_markdown(table.reset_index()),
+            _dataframe_to_markdown(_collapse_replicates(table).reset_index()),
             "",
             "Every Anonymeter attack with its 95% interval, its attack, baseline and control "
             "success rates, and whether Anonymeter judged it reliable: "
@@ -597,8 +656,9 @@ def _privacy_section(cfg, combined, extras, paths: _Paths, links: _Links) -> str
             f"SynthEval and synthcity add {len(other)} more privacy metrics (membership "
             "inference, attribute disclosure, distances to closest record, identifiability, "
             f"k-anonymity); their raw values are in "
-            f"{links.maybe(paths.evaluation / 'combined_evaluation.csv')}.",
+            f"{links.maybe(paths.evaluation / 'combined_evaluation.csv')} and in the plot below.",
         ]
+    lines += ["", "### All privacy metrics", "", *_metric_plots(paths, links, "privacy")]
     return "\n".join(lines)
 
 
@@ -645,17 +705,20 @@ def _fairness_section(combined, extras, paths: _Paths, links: _Links) -> str:
         if (col[0], "fairness", col[1]) in combined.columns
     ]
     if available:
-        rows = [
-            {
-                "model": model,
-                **{
-                    label: combined.loc[model, (fw, "fairness", metric)]
-                    for (fw, metric), label, _ in available
-                },
-            }
-            for model in combined.index
+        gaps = pd.DataFrame(
+            {label: combined[(fw, "fairness", metric)] for (fw, metric), label, _ in available},
+            index=combined.index,
+        )
+        gaps.index.name = "model"
+        lines += [
+            "A protected column with more than two groups is compared one group against the "
+            "rest, for each group with at least 5% of the rows, and the gaps are averaged; a "
+            "numeric one (such as age) is cut into the bins set in `data.protected_bins`, "
+            "and left out when it has none.",
+            "",
+            _dataframe_to_markdown(_collapse_replicates(gaps).reset_index()),
+            "",
         ]
-        lines += [_dataframe_to_markdown(pd.DataFrame(rows)), ""]
         lines += [f"- **{label}**: {desc}" for _, label, desc in available]
     else:
         lines.append("Subgroup gap metrics were not computed this run.")
@@ -684,10 +747,13 @@ def _fairness_section(combined, extras, paths: _Paths, links: _Links) -> str:
             "whose drift is significant after Benjamini-Hochberg correction. The sunburst page "
             "shows which subgroups are over- or under-represented.",
             "",
-            _dataframe_to_markdown(pd.DataFrame(rows)),
+            _dataframe_to_markdown(
+                _collapse_replicates(pd.DataFrame(rows).set_index("model")).reset_index()
+            ),
         ]
     else:
         lines.append("Log disparity was not computed this run.")
+    lines += ["", "### All fairness metrics", "", *_metric_plots(paths, links, "fairness")]
     return "\n".join(lines)
 
 
@@ -733,7 +799,7 @@ def _readiness_lines(path: Path, links: _Links) -> list[str]:
     ]
 
 
-def _data_section(paths: _Paths, links: _Links) -> str:
+def _data_section(cfg, paths: _Paths, links: _Links) -> str:
     lines = ["## 6. Data and preparation", "", "### Patient-level split", ""]
     if paths.data is not None:
         split = paths.data / "split_report.csv"
@@ -754,7 +820,12 @@ def _data_section(paths: _Paths, links: _Links) -> str:
         f"{links.maybe(paths.imputation / 'imputation_validation_report.csv')}",
         "",
         "Drift of each column between the HPO-phase and final imputation: "
-        f"{links.maybe(paths.imputation / 'imputation_drift.csv')}",
+        + (
+            f"{links.maybe(paths.imputation / 'imputation_drift.csv')}"
+            if cfg.generation.hpo.enabled
+            else "_skipped: HPO is off, so only the final imputation ran (fitted on all "
+            "train rows)._"
+        ),
     ]
     lines += ["", "### Hyperparameter search", ""]
     lines.append(
@@ -775,7 +846,8 @@ def _data_section(paths: _Paths, links: _Links) -> str:
 _FILE_DESCRIPTIONS = {
     "combined_evaluation.csv": "Every metric for every model: raw values and per-group scores.",
     "ranking_summary.csv": "One row per model: mean scores, confidence intervals, ties.",
-    "tstr_holdout.csv": "Holdout train-on-synthetic, test-on-real scores, per class.",
+    "tstr_holdout.csv": "Holdout TSTR scores per class, and TSTS (train and test on synthetic).",
+    "metric_directions.csv": "Whether higher, lower or closer to 0 is better for each metric, and its ideal value.",
     "ovr_per_class.csv": "Two-class SynthEval metrics per class (one vs rest).",
     "privacy_attacks.csv": "Every Anonymeter attack with interval and success rates.",
     "checks.csv": "Output sanity checks: pass or warn per model, with value and limit.",
@@ -897,7 +969,7 @@ def build_evaluation_report(
         "",
         _fairness_section(combined, extras, paths, links),
         "",
-        _data_section(paths, links),
+        _data_section(cfg, paths, links),
         "",
         _file_index_section(paths, links, report_dir / "report.md"),
         "",

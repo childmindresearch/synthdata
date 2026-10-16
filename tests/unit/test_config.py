@@ -175,6 +175,19 @@ class TestValidate:
         with pytest.raises(ValueError, match="more than once"):
             _validate(cfg)
 
+    def test_protected_bins_need_a_protected_column_and_increasing_edges(self):
+        cfg = self._base_valid()
+        cfg.data.protected_columns = ["Age"]
+        cfg.data.protected_bins = {"Age": [0, 18, 65, 120]}
+        _validate(cfg)  # should not raise
+        cfg.data.protected_bins = {"Weight": [0, 50, 100]}
+        with pytest.raises(ValueError, match="not in data.protected_columns"):
+            _validate(cfg)
+        for edges in ([18], [0, 65, 18], [0, "18"]):
+            cfg.data.protected_bins = {"Age": edges}
+            with pytest.raises(ValueError, match="increasing numbers"):
+                _validate(cfg)
+
     def test_patient_id_column_cannot_be_the_target(self):
         cfg = self._base_valid()
         cfg.data.patient_id_column = cfg.data.target_column

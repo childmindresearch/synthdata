@@ -40,7 +40,7 @@ _RANK_COLUMNS = {"rank", "u_rank", "p_rank", "f_rank"}
 #: v7: q_mse preset compares categorical columns too; v8: Cramér's V square
 #: root and auroc scored by agreement, 1 - |diff|; v9: class-balanced
 #: classifier fits in cls_acc, auroc_diff and the fairness metrics).
-_CHECKPOINT_SCHEMA_VERSION = 9
+_CHECKPOINT_SCHEMA_VERSION = 10
 
 #: SynthEval tags every result row it returns with a ``dim`` of "u", "p" or "f"
 #: (see each metric's ``normalize_output``). That tag, not the preset key the
@@ -163,6 +163,114 @@ _METRICS_ON_PROTECTED_COLUMNS = frozenset(
     {"statistical_parity", "equal_opportunity", "equalized_odds"}
 )
 
+#: A protected group needs at least this share of the real rows to get its
+#: own one-vs-rest indicator (see :func:`binarize_protected`); smaller groups
+#: are pooled into "rest", where too few rows land in a fold to give a gap.
+PROTECTED_MIN_GROUP_SHARE = 0.05
+
+
+def _group_label(value) -> str:
+    """A column-name-safe label for a group value (letters, digits and _)."""
+    return re.sub(r"[^0-9A-Za-z]+", "_", str(value)).strip("_") or "blank"
+
+
+def binarize_protected(
+    real: pd.DataFrame,
+    frames: list,
+    protected_columns: list,
+    cat_cols: list,
+    protected_bins: dict | None = None,
+    min_group_share: float = PROTECTED_MIN_GROUP_SHARE,
+) -> tuple[pd.DataFrame, list, list, list, dict]:
+    """One-vs-rest 0/1 protected columns for SynthEval's fairness metrics.
+
+    SynthEval's statistical parity, equal opportunity and equalized odds only
+    read protected columns with exactly two values. A categorical protected
+    column with more groups is replaced by one indicator per group that holds
+    at least ``min_group_share`` of the ``real`` rows (the column's one-hot
+    encoding, so the metrics' classifier sees the same information); the
+    metrics then average the gap of each group against everyone else, as the
+    one-vs-rest target passes do for classes. A column with edges in
+    ``protected_bins`` is cut into those bins (upper edge included, as in log
+    disparity), kept as a feature, and gets one indicator per bin with enough
+    rows. A numeric column with more than two values and no bins has no
+    groups, so it is left out of these metrics with a warning. Groups come
+    from ``real`` and are applied to every frame in ``frames`` (synthetic,
+    holdout; None entries pass through).
+
+    Returns ``(real, frames, protected, cat_cols, groups)`` with ``groups``
+    mapping each new indicator to ``(column, group)``; unchanged inputs when
+    every protected column is already binary.
+    """
+    from synthdata.log_disparity.metric_log_disparity import generate_bin_labels
+
+    protected_bins = protected_bins or {}
+    groups: dict = {}
+    binned: dict = {}
+    drop: list = []
+    skipped: list = []
+
+    def _bin(frame, column):
+        edges = protected_bins[column]
+        return pd.cut(
+            pd.to_numeric(frame[column], errors="coerce"),
+            bins=edges,
+            labels=generate_bin_labels(list(edges)),
+            include_lowest=True,
+        )
+
+    for column in protected_columns:
+        if column in protected_bins:
+            shares = _bin(real, column).value_counts(normalize=True, sort=False)
+            kept = [g for g, share in shares.items() if share >= min_group_share]
+            for group in kept:
+                name = f"{column}_is_{_group_label(group)}"
+                groups[name] = (column, group)
+                binned[name] = column
+            if not kept:
+                skipped.append(column)
+            continue
+        values = real[column].dropna()
+        if values.nunique() <= 2:
+            continue
+        if column in cat_cols or not pd.api.types.is_numeric_dtype(real[column]):
+            shares = values.value_counts(normalize=True)
+            kept = [g for g, share in shares.items() if share >= min_group_share]
+            for group in kept:
+                groups[f"{column}_is_{_group_label(group)}"] = (column, group)
+            if kept:
+                drop.append(column)
+        else:
+            skipped.append(column)
+    if skipped:
+        logger.warning(
+            "[syntheval] fairness metrics leave out numeric protected column(s) %s: "
+            "they have no groups; set their bin edges in data.protected_bins",
+            skipped,
+        )
+
+    if not groups:
+        protected = [c for c in protected_columns if c not in skipped]
+        return real, frames, protected, cat_cols, groups
+
+    def _apply(frame):
+        if frame is None:
+            return None
+        cuts = {column: _bin(frame, column) for column in set(binned.values())}
+        extra = {}
+        for name, (column, group) in groups.items():
+            values = cuts[column] if name in binned else frame[column]
+            extra[name] = (values == group).astype(int)
+        return pd.concat([frame.drop(columns=drop), pd.DataFrame(extra, index=frame.index)], axis=1)
+
+    replaced = {column for column, _ in groups.values()}
+    protected = [c for c in protected_columns if c not in replaced and c not in skipped] + list(
+        groups
+    )
+    cat_cols = [c for c in cat_cols if c not in drop] + list(groups)
+    return _apply(real), [_apply(f) for f in frames], protected, cat_cols, groups
+
+
 #: SynthEval metrics that infer the sensitive columns. With no sensitive
 #: columns att_discl returns NaN instead of failing, so it is skipped.
 _METRICS_ON_SENSITIVE_COLUMNS = frozenset({"att_discl"})
@@ -179,6 +287,7 @@ def _evaluate_seeded(
     seed: int,
     model_name,
     empty_roles: frozenset = frozenset(),
+    protected_eval: tuple | None = None,
 ):
     """Run each preset metric on its own, from the same seeded random state.
 
@@ -192,6 +301,9 @@ def _evaluate_seeded(
     ``AnalysisConfig`` each metric reads (see _METRICS_ON_PROTECTED_COLUMNS).
     A metric that reads a role listed in ``empty_roles`` (no columns declared)
     is skipped with a log line rather than run or reported as failed.
+    ``protected_eval`` is ``(SynthEval, synthetic frame)`` for the metrics on
+    protected columns when those columns were binarized
+    (:func:`binarize_protected`); None runs them on ``se`` and ``synthetic_frame``.
     """
     parts, failed = [], []
     for method, params in preset.items():
@@ -210,19 +322,22 @@ def _evaluate_seeded(
         analysis_config = analysis_configs[
             "protected" if method in _METRICS_ON_PROTECTED_COLUMNS else "sensitive"
         ]
+        evaluator, frame = se, synthetic_frame
+        if protected_eval is not None and method in _METRICS_ON_PROTECTED_COLUMNS:
+            evaluator, frame = protected_eval
         np.random.seed(seed)
         random.seed(seed)
         if method in _METRICS_WITH_PROCESS_RANDOMNESS:
             with _in_process_joblib():
-                part = se.evaluate(
-                    synthetic_frame,
+                part = evaluator.evaluate(
+                    frame,
                     analysis_target=analysis_config,
                     _dataset_name=model_name,
                     **{method: params},
                 )
         else:
-            part = se.evaluate(
-                synthetic_frame,
+            part = evaluator.evaluate(
+                frame,
                 analysis_target=analysis_config,
                 _dataset_name=model_name,
                 **{method: params},
@@ -250,6 +365,7 @@ def _model_worker(
     target_column: str,
     sensitive_columns: list,
     protected_columns: list,
+    protected_bins: dict,
     preset_path: str,
     checkpoint_root: str,
     pass_name: str,
@@ -310,17 +426,40 @@ def _model_worker(
             target_column = renames.get(target_column, target_column)
             sensitive_columns = [renames.get(c, c) for c in sensitive_columns]
             protected_columns = [renames.get(c, c) for c in protected_columns]
+            protected_bins = {renames.get(c, c): e for c, e in protected_bins.items()}
 
+        preset = json.loads(Path(preset_path).read_text())
+        # The fairness metrics read binary protected columns only: give them
+        # one-vs-rest indicators per protected group, in frames of their own
+        # so no other metric sees the extra columns.
+        protected_real, protected_frames, fairness_columns, fairness_cats, groups = (
+            binarize_protected(
+                real_frame,
+                [synthetic_frame, holdout_frame],
+                protected_columns,
+                cat_cols,
+                protected_bins,
+            )
+            if protected_columns and _METRICS_ON_PROTECTED_COLUMNS.intersection(preset)
+            else (real_frame, [synthetic_frame, holdout_frame], protected_columns, cat_cols, {})
+        )
+        if groups:
+            logger.info(
+                "[syntheval] %s: fairness metrics compare each protected group with the rest: %s",
+                model_name,
+                {name: f"{column} = {group}" for name, (column, group) in groups.items()},
+            )
         analysis_configs = {
-            role: AnalysisConfig(
+            "sensitive": AnalysisConfig(
                 dataset=real_frame,
                 target_vars=target_column,
-                sensitive_vars=columns,
-            )
-            for role, columns in (
-                ("sensitive", sensitive_columns),
-                ("protected", protected_columns),
-            )
+                sensitive_vars=sensitive_columns,
+            ),
+            "protected": AnalysisConfig(
+                dataset=protected_real,
+                target_vars=target_column,
+                sensitive_vars=fairness_columns,
+            ),
         }
         plot_dir = None
         if plots_output_dir is not None:
@@ -339,7 +478,20 @@ def _model_worker(
             console="off",
             show_warnings=False,
         )
-        preset = json.loads(Path(preset_path).read_text())
+        protected_eval = None
+        if groups:
+            protected_eval = (
+                SynthEval(
+                    protected_real,
+                    holdout_dataframe=protected_frames[1],  # ty: ignore[invalid-argument-type]
+                    cat_cols=fairness_cats,
+                    verbose=False,
+                    enable_plots=False,
+                    console="off",
+                    show_warnings=False,
+                ),
+                protected_frames[0],
+            )
         result, failed_metrics = _evaluate_seeded(
             se,
             synthetic_frame,
@@ -351,10 +503,11 @@ def _model_worker(
                 role
                 for role, columns in (
                     ("sensitive", sensitive_columns),
-                    ("protected", protected_columns),
+                    ("protected", fairness_columns),
                 )
                 if not columns
             ),
+            protected_eval=protected_eval,
         )
         if result is None:
             raise RuntimeError("SynthEval returned no normalized metric results")
@@ -595,6 +748,7 @@ def _evaluation_context_fingerprint(
         "target_column": dataset.target_column,
         "sensitive_columns": dataset.sensitive_columns,
         "protected_columns": dataset.protected_columns,
+        "protected_bins": dataset.protected_bins,
         "categorical_columns": dataset.all_categorical_columns,
         "train": _frame_fingerprint(dataset.train_imputed_df),
         "holdout": _frame_fingerprint(dataset.test_imputed_df),
@@ -669,6 +823,7 @@ def _run_resumable_syntheval(
                     dataset.target_column,
                     dataset.sensitive_columns,
                     dataset.protected_columns,
+                    dataset.protected_bins,
                     str(preset_path.resolve()),
                     str(checkpoint_root),
                     pass_name,

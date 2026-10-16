@@ -576,3 +576,37 @@ def test_generation_worker_splits_into_untuned_fits_hpo_and_tuned_fits():
         ("HPO", _minutes(5).replace(microsecond=0), _minutes(10).replace(microsecond=0)),
         ("tuned fit", _minutes(10).replace(microsecond=0), _minutes(12).replace(microsecond=0)),
     ]
+
+
+def test_one_vs_rest_passes_show_as_one_step():
+    lines = [_runner(T0, "=== evaluate: -m scripts.run_evaluation")]
+    for i, cls in enumerate(("0", "1", "2")):
+        pool = f"syntheval ovr_{cls}"
+        lines += [
+            _logline(
+                _minutes(10 * i),
+                "synthdata.compute",
+                "INFO",
+                f"[{pool}] 1 models, 1 at a time with 4 CPU threads each",
+            ),
+            _logline(
+                _minutes(10 * i + 1),
+                "synthdata.compute",
+                "INFO",
+                f"[{pool}] started ctgan (pid {100 + i}; 1 of 1)",
+            ),
+            _logline(
+                _minutes(10 * i + 5),
+                "synthdata.compute",
+                "INFO",
+                f"[{pool}] ctgan finished after 4 min; 1 of 1 done",
+            ),
+        ]
+    parsed = dashboard.parse_log(lines)
+    assert list(parsed["pools"]) == [dashboard.OVR_STEP]
+    (task,) = parsed["tasks"]
+    assert (task["status"], task["start"], task["end"]) == (
+        "done",
+        _minutes(1).replace(microsecond=0),
+        _minutes(25).replace(microsecond=0),
+    )

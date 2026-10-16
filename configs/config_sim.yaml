@@ -48,6 +48,8 @@ data:
   quasi_identifier_columns: [age_reg, birth_year, gender, region, Ethnicity]
   sensitive_columns: [Income, Anxiety disorder]
   protected_columns: [gender, age_reg, Ethnicity]
+  # Groups for numeric protected columns (fairness metrics, log disparity).
+  protected_bins: {age_reg: [0, 18, 30, 45, 60, 200]}
 
   # Patient-level 60/20/20 split: train fits the imputer and HPO candidates,
   # tuning scores them, holdout is touched only by evaluation. Stratified
@@ -181,7 +183,6 @@ evaluation:
 
   log_disparity:
     protected_columns: [gender, age_reg, Ethnicity]
-    protected_bins: [null, [0, 18, 30, 45, 60, 200], null]
 
   # Metrics that need two target classes (AUROC difference, subgroup gaps) on a
   # 3+ class target: ovr_macro = once per class vs the rest, averaged with equal

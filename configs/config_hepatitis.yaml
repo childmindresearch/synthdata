@@ -32,6 +32,8 @@ data:
   quasi_identifier_columns: [AGE, SEX]
   sensitive_columns: [HISTOLOGY]
   protected_columns: [SEX, AGE]
+  # Groups for numeric protected columns (fairness metrics, log disparity).
+  protected_bins: {AGE: [7, 18, 30, 45, 60, 78]}
 
   # 60/20/20 split: train fits the imputer and HPO candidates, tuning scores
   # them, holdout is touched only by evaluation. Stratified on the target.
@@ -107,7 +109,6 @@ evaluation:
     protected_columns: [SEX, AGE]
     target_map: { 0: died, 1: survived }
     protected_map: [{ 0: male, 1: female }, null]
-    protected_bins: [null, [7, 18, 30, 45, 60, 78]]
 
   # Overall rank = weighted geometric mean of the utility, privacy and
   # fairness ranks.

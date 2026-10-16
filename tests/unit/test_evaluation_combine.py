@@ -12,6 +12,7 @@ from synthdata.evaluation.combine import (
     _synthcity_frames,
     _syntheval_frames,
     build_combined_table,
+    metric_directions,
 )
 
 pytestmark = pytest.mark.unit
@@ -438,3 +439,37 @@ class TestTstrColumns:
         assert combined.loc["good", ("custom", "utility", "rank")] == 1.0
         assert combined.loc["bad", ("custom", "utility", "rank")] == 0.0
         assert list(combined.index) == ["good", "bad"]
+
+
+def test_metric_directions_follow_the_ranking_orientation():
+    models = ["a", "b", "c", "d"]
+    raw = pd.DataFrame(
+        {
+            ("custom", "utility", "tstr_macro_f1"): [0.2, 0.4, 0.6, 0.8],
+            ("custom", "privacy", "distance_mia_auc"): [0.5, 0.6, 0.7, 0.9],
+            ("syntheval", "fairness", "sp_gap"): [-0.2, 0.1, 0.0, 0.3],
+            ("custom", "utility", "tsts_macro_f1"): [0.3, 0.5, 0.7, 0.9],
+        },
+        index=models,
+    )
+    oriented = pd.DataFrame(
+        {
+            ("custom", "utility", "tstr_macro_f1"): raw[("custom", "utility", "tstr_macro_f1")],
+            ("custom", "privacy", "distance_mia_auc"): -raw[
+                ("custom", "privacy", "distance_mia_auc")
+            ].clip(lower=0.5),
+            ("syntheval", "fairness", "sp_gap"): 1 - raw[("syntheval", "fairness", "sp_gap")].abs(),
+        },
+        index=models,
+    )
+    table = metric_directions(raw, oriented)
+    directions = table["direction"].droplevel([0, 1]).to_dict()
+    assert directions == {
+        "tstr_macro_f1": "higher",
+        "distance_mia_auc": "lower",
+        "sp_gap": "closer to 0",
+        "tsts_macro_f1": "unranked",
+    }
+    ideals = table["ideal"].droplevel([0, 1])
+    assert ideals["distance_mia_auc"] == 0.5 and ideals["sp_gap"] == 0
+    assert np.isnan(ideals["tstr_macro_f1"])

@@ -24,7 +24,7 @@ from synthdata.evaluation.privacy_attacks import (
     HOLDOUT_DISTANCE_NAME,
     run_privacy_attack_evaluation,
 )
-from synthdata.evaluation.tstr import target_classes, tstr_scores
+from synthdata.evaluation.tstr import TSTRScores, target_classes, tstr_scores
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -72,6 +72,10 @@ def run_log_disparity_evaluation(
         logger.warning("[custom] log_disparity requires protected columns; skipping")
         return {}
 
+    protected_bins = log_disparity_cfg.protected_bins or [
+        dataset.protected_bins.get(c) for c in protected_cols
+    ]
+
     # The imputed train split, which generators learn from and the train copy
     # repeats: against the raw split, a missing protected value is a subgroup
     # ("nan") that no imputed dataset can contain, so even a copy of train
@@ -88,7 +92,7 @@ def run_log_disparity_evaluation(
                 model_name=name,
                 target_map=log_disparity_cfg.target_map,
                 protected_map=log_disparity_cfg.protected_map,
-                protected_bins=log_disparity_cfg.protected_bins,
+                protected_bins=protected_bins,
             )
         except (KeyError, ValueError) as exc:
             logger.warning("[custom] log_disparity failed for %s: %s", name, exc)
@@ -128,6 +132,44 @@ def build_log_disparity_summary_table(reports: dict[str, dict]) -> pd.DataFrame:
 LOG_DISPARITY_MINIMIZE = dict(LOG_DISPARITY_METRICS)
 
 
+#: Share of each synthetic dataset held back to score its TSTS fit.
+TSTS_SCORE_FRACTION = 0.2
+
+
+def tstr_and_tsts_scores(
+    synthetic_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    target: str,
+    nominal_columns: list,
+    classes: list,
+    seeds: list,
+    ordinal: bool = False,
+) -> tuple[TSTRScores, TSTRScores | None]:
+    """TSTR (fit on all synthetic rows, score on the real test split) and TSTS.
+
+    TSTS (train on synthetic, test on synthetic) fits the same classifier on
+    80% of the synthetic rows and scores it on the other 20%, split stratified
+    by the target with the first seed (unstratified when a class has fewer
+    than two rows). It says how learnable the target is inside the synthetic
+    data; next to TSTR it shows whether that signal carries over to real rows.
+    None when the synthetic data has too few rows to split.
+    """
+    from sklearn.model_selection import train_test_split
+
+    tstr = tstr_scores(
+        synthetic_df, test_df, target, nominal_columns, classes, seeds, ordinal=ordinal
+    )
+    counts = synthetic_df[target].value_counts()
+    if len(synthetic_df) < 10:
+        return tstr, None
+    stratify = synthetic_df[target] if len(counts) > 1 and counts.min() >= 2 else None
+    fit_df, score_df = train_test_split(
+        synthetic_df, test_size=TSTS_SCORE_FRACTION, random_state=seeds[0], stratify=stratify
+    )
+    tsts = tstr_scores(fit_df, score_df, target, nominal_columns, classes, seeds, ordinal=ordinal)
+    return tstr, tsts
+
+
 def run_tstr_evaluation(
     synthetic_datasets: dict[str, pd.DataFrame],
     dataset: Dataset,
@@ -135,16 +177,16 @@ def run_tstr_evaluation(
     n_seeds: int,
     seed: int,
     compute_cfg=None,
-    n_samples: int | None = None,
 ) -> dict:
-    """Holdout TSTR: fit the fixed XGBoost on each dataset, score on the test split.
+    """Holdout TSTR and TSTS: the fixed XGBoost fitted on each dataset.
 
     The classifier is the one HPO tunes against (synthdata.evaluation.tstr),
     but scored here on the test rows, which no generator or search ever saw.
-    The same classifier fitted on the real training rows (TRTR) is the
-    ceiling; with ``n_samples`` below the train size it is fitted on a random
-    ``n_samples`` of them, so the ceiling has as many rows as each synthetic
-    dataset and the gap is not a sample-size effect. Returns ``{"scores": {model: TSTRScores}, "trtr": TSTRScores,
+    The real-data reference is the ``baseline_train_copy`` row: its TSTR is
+    the classifier fitted on real training rows (train on real, test on real),
+    on as many rows as each synthetic dataset. TSTS (see
+    :func:`tstr_and_tsts_scores`) is reported next to it, unranked.
+    Returns ``{"scores": {model: TSTRScores}, "tsts": {model: TSTRScores},
     "classes": [...]}``, or ``{}`` when TSTR is not selected, the target is
     not categorical, or there is no test split. A model whose fit fails is
     logged and left out (its row is NaN in the combined table).
@@ -165,23 +207,10 @@ def run_tstr_evaluation(
     classes = target_classes(train_df[target], ordinal)
     seeds = [seed + i for i in range(n_seeds)]
 
-    trtr_df = train_df
-    if n_samples is not None and n_samples < len(train_df):
-        trtr_df = train_df.sample(n=n_samples, random_state=seed)
-        logger.info("[custom] holdout TRTR fitted on %d of %d train rows", n_samples, len(train_df))
-    trtr = tstr_scores(
-        trtr_df, test_df, target, dataset.nominal_columns, classes, seeds, ordinal=ordinal
-    )
-    logger.info(
-        "[custom] holdout TRTR ceiling: macro-F1=%.4f balanced-accuracy=%.4f macro-AUPRC=%.4f",
-        trtr.macro_f1,
-        trtr.balanced_accuracy,
-        trtr.macro_auprc,
-    )
     # Models are scored in parallel processes per compute_cfg; a failed one
     # is logged there and left out.
     run = run_per_model(
-        functools.partial(tstr_scores, ordinal=ordinal),
+        functools.partial(tstr_and_tsts_scores, ordinal=ordinal),
         {
             name: (
                 syn_df[train_df.columns],
@@ -197,27 +226,38 @@ def run_tstr_evaluation(
         n_columns=train_df.shape[1],
         label="holdout TSTR",
     )
-    return {"scores": run.results, "trtr": trtr, "classes": [str(c) for c in classes]}
+    return {
+        "scores": {name: pair[0] for name, pair in run.results.items()},
+        "tsts": {name: pair[1] for name, pair in run.results.items() if pair[1] is not None},
+        "classes": [str(c) for c in classes],
+    }
 
 
 def build_tstr_table(tstr_result: dict) -> pd.DataFrame:
-    """Models x (macro scores + ``f1_<class>``) table of holdout TSTR, with a
-    ``trtr (real train)`` reference row last."""
+    """Models x (TSTR macro scores, ``f1_<class>``, TSTS macro scores) table."""
     if not tstr_result:
         return pd.DataFrame()
-    rows = dict(tstr_result["scores"])
-    rows["trtr (real train)"] = tstr_result["trtr"]
+    tsts = tstr_result.get("tsts") or {}
 
-    def _row(s):
-        return {
+    def _row(name, s):
+        row = {
             "tstr_macro_f1": s.macro_f1,
             "tstr_balanced_accuracy": s.balanced_accuracy,
             "tstr_macro_auprc": s.macro_auprc,
             "tstr_kappa": s.kappa,
             **{f"f1_{c}": v for c, v in s.per_class_f1.items()},
         }
+        t = tsts.get(name)
+        row.update(
+            {
+                "tsts_macro_f1": t.macro_f1 if t else float("nan"),
+                "tsts_balanced_accuracy": t.balanced_accuracy if t else float("nan"),
+                "tsts_macro_auprc": t.macro_auprc if t else float("nan"),
+            }
+        )
+        return row
 
-    table = pd.DataFrame({name: _row(s) for name, s in rows.items()}).T
+    table = pd.DataFrame({name: _row(name, s) for name, s in tstr_result["scores"].items()}).T
     table.index.name = "model"
     return table
 

@@ -118,6 +118,8 @@ class Dataset:
     #: Public, linkable columns and fairness-group columns (see DataConfig).
     quasi_identifier_columns: list = dataclasses.field(default_factory=list)
     protected_columns: list = dataclasses.field(default_factory=list)
+    #: Bin edges of numeric protected columns, ``{column: [edges]}``.
+    protected_bins: dict = dataclasses.field(default_factory=dict)
     #: Labels of the ``train_df`` rows held out as the tuning split (see
     #: ``DataConfig.tuning_fraction``). Empty when no tuning split was requested.
     tuning_index: pd.Index = dataclasses.field(default_factory=lambda: pd.Index([]))
@@ -1253,6 +1255,7 @@ def load_dataset(cfg: Config) -> Dataset:
         sensitive_columns=list(cfg.data.sensitive_columns),
         quasi_identifier_columns=list(cfg.data.quasi_identifier_columns),
         protected_columns=list(cfg.data.protected_columns or []),
+        protected_bins=dict(cfg.data.protected_bins or {}),
         data_dir=data_dir,
         full_df=df,
         train_df=train_df,

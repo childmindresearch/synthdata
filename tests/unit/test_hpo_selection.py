@@ -1,5 +1,7 @@
 """Unit tests for objective selection, noise estimates and search control in HPO."""
 
+import datetime
+
 import numpy as np
 import optuna
 import pandas as pd
@@ -7,6 +9,7 @@ import pytest
 
 from synthdata.config import HPOConfig, HPOConstraintsConfig, _validate_hpo
 from synthdata.evaluation.tstr import chance_scores, tstr_scores
+from synthdata.generation import hpo as hpo_module
 from synthdata.generation.hpo import (
     REFIT_SEED_ATTR,
     SCREENS,
@@ -209,10 +212,18 @@ def _stopped(study, callback) -> bool:
 
 
 def test_patience_stops_after_trials_without_a_gain_above_min_delta():
-    callback = _Patience("toy", patience=3, min_delta=None, min_trials=3)
+    callback = _Patience("toy", patience=3, min_delta=None, min_trials=1)
     # Gains of 0.005 are under the median SE (0.01), so they don't reset patience.
     assert _stopped(_toy_study([0.30, 0.305, 0.308, 0.309]), callback)
     assert not _stopped(_toy_study([0.30, 0.305, 0.40, 0.402]), callback)
+
+
+def test_patience_does_not_count_the_start_up_trials():
+    # Start-up trials without a gain set the bar but don't use up patience,
+    # so TPE gets its own trials before the study can stop.
+    flat = [0.30] * 10
+    assert not _stopped(_toy_study(flat + [0.30]), _Patience("toy", 3, 0.0, min_trials=10))
+    assert _stopped(_toy_study(flat + [0.30] * 3), _Patience("toy", 3, 0.0, min_trials=10))
 
 
 def test_patience_waits_for_start_up_trials_and_a_feasible_trial():
@@ -232,7 +243,43 @@ def test_patience_ends_the_study_early(tmp_path):
     study = optuna.load_study(
         study_name="hpo_flat", storage=f"sqlite:///{tmp_path / 'optuna_studies.db'}"
     )
-    assert len(study.trials) == 5
+    # Trial 0 sets the best; patience counts trials 2-5, after the 2 start-up trials.
+    assert len(study.trials) == 6
+
+
+def test_refits_stop_at_the_deadline(monkeypatch):
+    study = optuna.create_study(direction="maximize")
+    choice = optuna.distributions.CategoricalDistribution(["a", "b"])
+    start = datetime.datetime(2026, 1, 1)
+    for name, value in (("a", 0.9), ("b", 0.8)):
+        study.add_trial(
+            optuna.trial.FrozenTrial(
+                number=0,
+                trial_id=0,
+                state=optuna.trial.TrialState.COMPLETE,
+                value=value,
+                values=None,
+                datetime_start=start,
+                datetime_complete=start + datetime.timedelta(hours=1),
+                params={"name": name},
+                distributions={"name": choice},
+                user_attrs={"constraints": FEASIBLE},
+                system_attrs={},
+                intermediate_values={},
+            )
+        )
+    clock = [0.0]
+    monkeypatch.setattr(hpo_module.time, "time", lambda: clock[0])
+
+    def objective(trial):
+        clock[0] += 3600  # each refit takes as long as the trials did
+        return 0.5
+
+    cfg = _hpo(refit_top_k=2, refit_seeds=2)
+    # Three hours: trial a's two refits fit, trial b's two more don't.
+    best = _refit_top_k(study, objective, cfg, 0, "x", deadline=3 * 3600)
+    assert clock[0] == 2 * 3600 and best.params == {"name": "a"}
+    assert set(study.user_attrs["refit"]) == {"0"}
 
 
 def test_defaults_are_the_first_trial_and_failures_keep_their_reason(tmp_path):
@@ -326,6 +373,16 @@ def test_protected_screens_see_missing_and_skewed_groups():
     # Age forms quartile groups: everyone 18 leaves three of four groups empty.
     young = protected_scores(_clinic(1000, 3).assign(age=18), train, "y", groupers)
     assert young["protected_coverage"] == 0.25
+
+
+def test_protected_screens_use_the_user_bins():
+    train = _clinic(1000, 0)
+    groupers = protected_groups(train, ["age"], protected_bins={"age": [0, 40, 200]})
+    labels = groupers["age"](pd.DataFrame({"age": [18, 40, 41, 250, np.nan]}))
+    assert labels[0] == labels[1] and labels[3] == "outside" and labels[4] == "nan"
+    # Everyone 18 leaves one of the two user groups empty (four with quartiles).
+    young = protected_scores(_clinic(1000, 3).assign(age=18), train, "y", groupers)
+    assert young["protected_coverage"] == 0.5
 
 
 def test_protected_target_gap_sees_a_broken_group_label_relation():

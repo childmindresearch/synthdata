@@ -26,6 +26,7 @@ from synthdata.evaluation.syntheval_eval import (
     _save_syntheval_cache,
     _shutdown_nested_joblib_executor,
     average_ovr_results,
+    binarize_protected,
     build_binary_preset,
     build_binary_target_series,
     build_preset,
@@ -545,6 +546,7 @@ def test_column_names_lightgbm_rejects_still_get_an_mia_score(tmp_path):
         "y",
         ["ward: name"],
         [],
+        {},
         str(preset),
         str(tmp_path / "ckpt"),
         "main",
@@ -558,3 +560,96 @@ def test_column_names_lightgbm_rejects_still_get_an_mia_score(tmp_path):
     status = json.loads(status_path.read_text())
     assert status["state"] == "succeeded" and status["failed_metrics"] == []
     assert pd.read_parquet(result_path)["metric"].str.contains("mia|MIA").any()
+
+
+class TestBinarizeProtected:
+    @staticmethod
+    def _frames():
+        rng = np.random.default_rng(0)
+        n = 300
+        real = pd.DataFrame(
+            {
+                "ethnicity": rng.choice(["a", "b", "c", "tiny"], n, p=[0.5, 0.3, 0.18, 0.02]),
+                "sex": rng.choice(["f", "m"], n),
+                "birth_year": rng.integers(1940, 2000, n),
+                "x": rng.normal(size=n),
+                "target": rng.integers(0, 2, n),
+            }
+        )
+        return real, real.sample(frac=1, random_state=1).reset_index(drop=True)
+
+    def test_groups_become_one_vs_rest_indicators(self):
+        real, synthetic = self._frames()
+        cat_cols = ["ethnicity", "sex", "target"]
+        real_b, (syn_b, hold_b), protected, cats, groups = binarize_protected(
+            real,
+            [synthetic, None],
+            ["ethnicity", "sex", "birth_year"],
+            cat_cols,
+            {"birth_year": [1940, 1960, 1980, 2000]},
+        )
+        # One indicator per group with >= 5% of rows; the 2% group stays in "rest".
+        assert {"ethnicity_is_a", "ethnicity_is_b", "ethnicity_is_c"} <= set(protected)
+        assert "ethnicity_is_tiny" not in real_b.columns
+        assert "ethnicity" not in real_b.columns and "ethnicity" not in cats
+        # Binary columns are kept as they are; binned ones get one indicator per bin.
+        assert "sex" in protected
+        bins = ["birth_year_is_1940_1960", "birth_year_is_1961_1980", "birth_year_is_1981_2000"]
+        assert set(bins) <= set(protected)
+        assert "birth_year" in real_b.columns and "birth_year" not in protected
+        assert hold_b is None
+        assert list(syn_b.columns) == list(real_b.columns)
+        for name in groups:
+            assert set(real_b[name].unique()) <= {0, 1} and name in cats
+        assert (syn_b["ethnicity_is_a"] == (synthetic["ethnicity"] == "a")).all()
+        year = synthetic["birth_year"]
+        assert (syn_b["birth_year_is_1940_1960"] == (year <= 1960)).all()
+        assert (syn_b["birth_year_is_1961_1980"] == ((year > 1960) & (year <= 1980))).all()
+        assert (syn_b[bins].sum(axis=1) == 1).all()
+
+    def test_values_outside_the_bins_belong_to_no_group(self):
+        real, synthetic = self._frames()
+        _, (syn_b,), protected, _, _ = binarize_protected(
+            real, [synthetic], ["birth_year"], [], {"birth_year": [1960, 1980]}
+        )
+        assert protected == ["birth_year_is_1960_1980"]
+        outside = (synthetic["birth_year"] < 1960) | (synthetic["birth_year"] > 1980)
+        assert (syn_b.loc[outside, "birth_year_is_1960_1980"] == 0).all()
+
+    def test_numeric_column_without_bins_is_left_out(self, caplog):
+        real, synthetic = self._frames()
+        from synthdata.evaluation import syntheval_eval
+
+        syntheval_eval.logger.addHandler(caplog.handler)
+        try:
+            out = binarize_protected(real, [synthetic], ["sex", "birth_year"], ["sex"])
+        finally:
+            syntheval_eval.logger.removeHandler(caplog.handler)
+        assert out[0] is real and out[2] == ["sex"] and out[4] == {}
+        assert "data.protected_bins" in caplog.text
+
+    def test_binary_protected_columns_pass_through(self):
+        real, synthetic = self._frames()
+        out = binarize_protected(real, [synthetic], ["sex"], ["sex"])
+        assert out[0] is real and out[2] == ["sex"] and out[4] == {}
+
+    def test_statistical_parity_runs_on_a_three_group_column(self):
+        from syntheval import AnalysisConfig, SynthEval
+
+        real, synthetic = self._frames()
+        real, synthetic = real.drop(columns="sex"), synthetic.drop(columns="sex")
+        cat_cols = ["ethnicity", "target"]
+        preset = {"statistical_parity": {"positive_class": 1, "folds": 2}}
+
+        def _run(r, s, protected, cats):
+            se = SynthEval(r, cat_cols=cats, verbose=False, console="off", enable_plots=False)
+            config = AnalysisConfig(dataset=r, target_vars="target", sensitive_vars=protected)
+            return se.evaluate(s, analysis_target=config, _dataset_name="m", **preset)
+
+        before = _run(real, synthetic, ["ethnicity"], cat_cols)
+        assert before is None or before.empty  # "no sensitive variables with exactly 2 values"
+        real_b, (syn_b,), protected, cats, _ = binarize_protected(
+            real, [synthetic], ["ethnicity"], cat_cols
+        )
+        result = _run(real_b, syn_b, protected, cats)
+        assert result is not None and not result.empty

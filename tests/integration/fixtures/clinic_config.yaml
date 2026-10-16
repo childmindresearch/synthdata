@@ -23,6 +23,8 @@ data:
   quasi_identifier_columns: [AGE, SEX, SITE]
   sensitive_columns: [DIAGNOSIS]
   protected_columns: [SEX, AGE]
+  # Groups for numeric protected columns (fairness metrics, log disparity).
+  protected_bins: {AGE: [18, 40, 60, 80]}
   # The fixture carries repeat encounters per patient: split by patient, then
   # drop the identifier before modeling.
   patient_id_column: patient_id
@@ -125,7 +127,6 @@ evaluation:
     protected_columns: [SEX, AGE]
     target_map: { 0: negative, 1: positive }
     protected_map: [null, null]
-    protected_bins: [null, [18, 40, 60, 80]]
 
   # Metrics that need two target classes (AUROC difference, subgroup gaps) on a
   # 3+ class target: ovr_macro = once per class vs the rest, averaged with equal
