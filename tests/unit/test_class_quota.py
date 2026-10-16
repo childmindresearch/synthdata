@@ -55,6 +55,21 @@ def test_a_class_the_model_never_makes_stays_short():
     assert len(out) == 90 and out["x"].is_unique
 
 
+def test_one_round_keeps_short_classes_short_without_drawing_more():
+    calls = []
+
+    def sample(count, seed, labels):
+        calls.append(count)
+        return _skewed_sampler({"a": 0.8, "b": 0.2})(count, seed, labels)
+
+    first = sample(100, 0, None)
+    out, report = sample_to_quota(sample, "y", PRIOR, 100, seed=0, first_batch=first, max_rounds=1)
+
+    assert calls == [100]  # only the first batch, drawn before sample_to_quota
+    assert report.rounds == 1 and report.shortfall["c"] == 10
+    assert len(out) < 100
+
+
 def test_a_backend_that_ignores_the_seed_cannot_fill_quotas_with_repeats():
     fixed = pd.DataFrame({"x": range(100), "y": ["a"] * 95 + ["b"] * 5})
     out, report = sample_to_quota(lambda count, seed, labels: fixed, "y", PRIOR, 100, seed=0)

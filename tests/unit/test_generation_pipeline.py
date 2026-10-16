@@ -147,7 +147,7 @@ def test_synthcity_models_are_drawn_to_the_train_class_shares(make_config, make_
     ]
 
 
-def test_other_backends_are_rejection_sampled_without_repeating_rows(
+def test_tabpfn_keeps_its_first_batch_without_refitting_for_short_classes(
     make_config, make_dataset, mocker
 ):
     cfg = make_config()
@@ -173,11 +173,12 @@ def test_other_backends_are_rejection_sampled_without_repeating_rows(
 
     result = run_generation(cfg, dataset)["tabpfn_custom"]
 
+    # Each extra batch would be a whole TabPFN refit: the short class stays short.
     quotas = class_quotas(dataset.train_df[target].value_counts(normalize=True), 100)
-    assert result[target].value_counts().sort_index().tolist() == quotas.sort_index().tolist()
+    got = result[target].value_counts().reindex(quotas.index, fill_value=0)
+    assert (got <= quotas).all() and (got < quotas).any()
     assert not result.duplicated().any()
     record = pd.read_csv(Path(cfg.generation.output_dir) / "diagnostics" / "class_sampling.csv")
     assert set(record["method"]) == {"rejection"}
-    assert record["rounds"].iloc[0] > 1
-    # Each batch is asked for the count sample_to_quota chose.
-    assert counts[0] == 100 and len(counts) == record["rounds"].iloc[0]
+    assert (record["rounds"] == 1).all()
+    assert counts == [100]
