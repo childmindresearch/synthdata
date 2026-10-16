@@ -155,9 +155,16 @@ def _split_rows(dataset: Dataset) -> dict:
 
 
 def assess(dataset: Dataset, cfg: DataReadinessConfig) -> pd.DataFrame:
-    """Every finding of the readiness check on ``dataset``'s train split."""
+    """Every finding of the readiness check on ``dataset``'s train split.
+
+    Missingness indicators (``<column>__missing``) are left out: they are
+    derived from columns checked here (``heavy_missingness`` covers them), and
+    columns missing together give identical indicators that would read as
+    duplicates to drop.
+    """
     train = dataset.train_df
-    features = [c for c in dataset.feature_columns if c in train.columns]
+    indicators = set(getattr(dataset, "missing_indicator_columns", {}) or {})
+    features = [c for c in dataset.feature_columns if c in train.columns and c not in indicators]
     categorical = set(dataset.categorical_columns)
     nominal = set(dataset.nominal_columns)
     continuous = [

@@ -32,82 +32,128 @@ def plot_rank_tradeoff(
 ):
     """Build a two-dimensional rank trade-off scatter plot.
 
-    HPO-tuned variants are diamond markers; regular variants are circles.
-    All variants of the same base model share a color.
+    One labelled point per model: the mean over its seed replicates, with
+    95% interval bars on both axes when it has two or more. Single seeds are
+    small faint dots behind it, unlabelled. HPO-tuned variants are diamonds,
+    regular ones circles; variants of one base model share a color. Both
+    ranks are higher-is-better, so the top-right corner is best.
     """
     from matplotlib.lines import Line2D
 
-    models = list(combined.index)
-    base_models = sorted({_base_model(model) for model in models})
+    from synthdata.evaluation.combine import mean_and_interval
+
+    groups = pd.Series(
+        [split_replicate_name(name)[0] for name in combined.index], index=combined.index
+    )
+    base_models = sorted({_base_model(model) for model in groups.unique()})
     # tab20 has 20 colors; reuse them rather than fail when a run has more generators.
     colors = plt.get_cmap("tab20").colors  # ty: ignore[unresolved-attribute]
     palette = {base: colors[i % len(colors)] for i, base in enumerate(base_models)}
 
     fig, ax = plt.subplots(figsize=(11, 7))
-    for model in models:
-        is_hpo = _is_hpo(model)
-        base = _base_model(model)
-        x_value = combined.loc[model, x_key]
-        y_value = combined.loc[model, y_key]
+    any_interval = False
+    for model, names in groups.groupby(groups, sort=False).groups.items():
+        is_hpo = _is_hpo(str(model))
+        color = palette[_base_model(str(model))]
+        xs = pd.to_numeric(combined.loc[names, x_key], errors="coerce")
+        ys = pd.to_numeric(combined.loc[names, y_key], errors="coerce")
+        x_mean, x_low, x_high = mean_and_interval(xs, 0.95)
+        y_mean, y_low, y_high = mean_and_interval(ys, 0.95)
+        if len(names) > 1:
+            ax.scatter(xs, ys, s=18, color=color, alpha=0.35, linewidths=0, zorder=2)
+        if pd.notna(x_low):
+            any_interval = True
+            # Ranks live in [0, 1]; a t-interval from few seeds can overshoot.
+            x_low, x_high = max(x_low, 0.0), min(x_high, 1.0)
+            y_low, y_high = max(y_low, 0.0), min(y_high, 1.0)
+            ax.errorbar(
+                x_mean,
+                y_mean,
+                xerr=[[x_mean - x_low], [x_high - x_mean]],
+                yerr=[[y_mean - y_low], [y_high - y_mean]],
+                fmt="none",
+                ecolor=color,
+                elinewidth=1.2,
+                alpha=0.8,
+                zorder=3,
+            )
         ax.scatter(
-            x_value,
-            y_value,
+            x_mean,
+            y_mean,
             s=130,
             marker="D" if is_hpo else "o",
-            color=palette[base],
-            alpha=0.85,
-            edgecolors="black" if is_hpo else palette[base],
-            linewidths=1.2 if is_hpo else 0.0,
-            zorder=3,
+            color=color,
+            alpha=0.9,
+            edgecolors="black" if is_hpo else "white",
+            linewidths=1.2 if is_hpo else 0.8,
+            zorder=4,
         )
         ax.annotate(
             str(model),
-            (x_value, y_value),
-            xytext=(5, 5),
+            (x_mean, y_mean),
+            xytext=(7, 6),
             textcoords="offset points",
             fontsize=8,
+            zorder=5,
         )
 
-    ax.set_xlabel(x_label, fontsize=12)
-    ax.set_ylabel(y_label, fontsize=12)
+    ax.set_xlim(-0.03, 1.05)
+    ax.set_ylim(-0.03, 1.05)
+    ax.annotate(
+        "better",
+        xy=(0.97, 0.97),
+        xytext=(0.88, 0.88),
+        xycoords="axes fraction",
+        textcoords="axes fraction",
+        fontsize=9,
+        color="#2e8b57",
+        ha="center",
+        arrowprops={"arrowstyle": "->", "color": "#2e8b57"},
+    )
+    ax.set_xlabel(f"{x_label} (higher is better)", fontsize=12)
+    ax.set_ylabel(f"{y_label} (higher is better)", fontsize=12)
     ax.set_title(title, fontsize=14, fontweight="bold")
     ax.grid(True, alpha=0.3)
-    color_handles = [
+    handles = [
         Line2D(
             [0],
             [0],
             marker="o",
             linestyle="none",
-            markerfacecolor=palette[base],
-            markeredgecolor=palette[base],
+            color="grey",
             markersize=9,
-            label=base,
+            markeredgecolor="white",
+            label="Model (mean over seeds)",
+        ),
+    ]
+    if any(_is_hpo(str(m)) for m in groups.unique()):
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="D",
+                linestyle="none",
+                color="grey",
+                markersize=9,
+                markeredgecolor="black",
+                label="HPO-tuned model",
+            )
         )
-        for base in base_models
-    ]
-    variant_handles = [
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            linestyle="none",
-            color="grey",
-            markersize=9,
-            markeredgecolor="none",
-            label="Regular model",
-        ),
-        Line2D(
-            [0],
-            [0],
-            marker="D",
-            linestyle="none",
-            color="grey",
-            markersize=9,
-            markeredgecolor="black",
-            label="HPO-tuned model",
-        ),
-    ]
-    ax.legend(handles=color_handles + variant_handles, loc="best", fontsize=8, ncol=2)
+    if any_interval:
+        handles += [
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                linestyle="none",
+                color="grey",
+                alpha=0.35,
+                markersize=5,
+                label="One seed",
+            ),
+            Line2D([0], [0], color="grey", lw=1.2, label="95% interval over seeds"),
+        ]
+    ax.legend(handles=handles, loc="lower left", fontsize=8)
     fig.tight_layout()
     return fig
 
@@ -138,11 +184,33 @@ def plot_rank_tradeoff_3d(combined: pd.DataFrame):
     }
     fig = go.Figure()
     for model in models:
-        is_hpo = _is_hpo(model)
         ranks = [combined.loc[model, key] for key in rank_keys.values()]
         if pd.isna(ranks).any():
             raise ValueError(f"Cannot plot 3D rank trade-off; {model} has missing ranks: {ranks}")
-        base = _base_model(model)
+    # One labelled point per model at its mean over seeds; single seeds are
+    # small unlabelled points (hover shows their name).
+    groups = pd.Series([split_replicate_name(m)[0] for m in models], index=models)
+    replicated = groups.duplicated(keep=False)
+    for model in [m for m in models if replicated[m]]:
+        ranks = [combined.loc[model, key] for key in rank_keys.values()]
+        fig.add_trace(
+            go.Scatter3d(
+                x=[ranks[0]],
+                y=[ranks[1]],
+                z=[ranks[2]],
+                mode="markers",
+                showlegend=False,
+                marker={"size": 3, "color": palette[_base_model(model)], "opacity": 0.4},
+                hovertemplate=(
+                    f"{model}<br>Utility rank: %{{x:.3f}}<br>"
+                    "Privacy rank: %{y:.3f}<br>Fairness rank: %{z:.3f}<extra></extra>"
+                ),
+            )
+        )
+    for model, names in groups.groupby(groups, sort=False).groups.items():
+        is_hpo = _is_hpo(str(model))
+        ranks = [float(combined.loc[names, key].astype(float).mean()) for key in rank_keys.values()]
+        base = _base_model(str(model))
         fig.add_trace(
             go.Scatter3d(
                 x=[ranks[0]],
@@ -278,3 +346,121 @@ def save_log_disparity_plots(
                 )
             continue
         save_plotly_figure(fig, output_dir / name, ("html",))
+
+
+#: Short note shown with each direction in the metric overview titles.
+_DIRECTION_NOTE = {
+    "higher": "higher is better",
+    "lower": "lower is better",
+    "closer to 0": "closer to 0 is better",
+    "unranked": "reported, not ranked",
+    "unknown": "direction unknown",
+}
+
+
+def metric_overview_table(combined: pd.DataFrame, metric: tuple) -> pd.DataFrame:
+    """Mean and 95% interval over seed replicates of one raw metric, per model.
+
+    Rows are base models (``"ctgan__rep2"`` counts as ``"ctgan"``); columns
+    ``mean``, ``ci_low``, ``ci_high`` and ``n`` (NaN interval for one seed).
+    """
+    from synthdata.evaluation.combine import mean_and_interval
+
+    values = pd.to_numeric(combined[metric], errors="coerce")
+    models = pd.Series(
+        [split_replicate_name(name)[0] for name in combined.index], index=combined.index
+    )
+    rows = {}
+    for model, names in models.groupby(models, sort=False).groups.items():
+        mean, low, high = mean_and_interval(values[names], 0.95)
+        rows[model] = {
+            "mean": mean,
+            "ci_low": low,
+            "ci_high": high,
+            "n": values[names].notna().sum(),
+        }
+    return pd.DataFrame.from_dict(rows, orient="index")
+
+
+def plot_metric_overview(
+    combined: pd.DataFrame, directions: pd.DataFrame, metric_type: str, n_cols: int = 4
+):
+    """One small panel per raw metric of ``metric_type``: each model's mean over
+    seeds with its 95% interval, the better direction in the title, the ideal
+    value as a green line where one exists, and baselines in grey.
+    Returns None when the type has no metrics.
+    """
+    import math
+
+    from synthdata.evaluation.baselines import is_baseline
+
+    metrics = [
+        key
+        for key in combined.columns
+        if key[0] != "__all__"
+        and key[1] == metric_type
+        and key[2] != "rank"
+        and pd.to_numeric(combined[key], errors="coerce").notna().any()
+    ]
+    if not metrics:
+        return None
+    first = metric_overview_table(combined, metrics[0])
+    models = [m for m in first.index if not is_baseline(m)] + [
+        m for m in first.index if is_baseline(m)
+    ]
+    n_rows = math.ceil(len(metrics) / n_cols)
+    height = max(1.6, 0.22 * len(models) + 0.9)
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(4.2 * n_cols, height * n_rows + 0.8), squeeze=False, sharey=True
+    )
+    y = range(len(models))
+    for ax, key in zip(axes.flat, metrics, strict=False):
+        table = metric_overview_table(combined, key).reindex(models)
+        direction = (
+            directions["direction"].get(key, "unknown") if directions is not None else "unknown"
+        )
+        ideal = (
+            directions["ideal"].get(key, float("nan")) if directions is not None else float("nan")
+        )
+        for i, model in enumerate(models):
+            row = table.loc[model]
+            color = "#8a8a8a" if is_baseline(model) else "#2a6fb0"
+            if pd.notna(row["ci_low"]):
+                ax.plot([row["ci_low"], row["ci_high"]], [i, i], color=color, lw=1.6)
+            ax.plot(row["mean"], i, "o", color=color, ms=4.5)
+        if pd.notna(ideal):
+            ax.axvline(ideal, color="#2e8b57", lw=1.2, ls="--")
+        arrow = {"higher": " →", "lower": " ←"}.get(direction, "")
+        ax.set_title(f"{key[2]}\n({_DIRECTION_NOTE.get(direction, direction)}{arrow})", fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.grid(axis="x", alpha=0.3)
+    for ax in list(axes.flat)[len(metrics) :]:
+        ax.set_visible(False)
+    for ax in axes[:, 0]:
+        ax.set_yticks(list(y), models)
+        ax.invert_yaxis()
+    fig.suptitle(
+        f"{metric_type.capitalize()} metrics: mean over seeds (dot) with 95% interval (bar). "
+        "Grey rows are baselines: train copy = real data, marginals = no relationships. "
+        "Green dashed line: ideal value.",
+        fontsize=9,
+    )
+    fig.tight_layout()
+    return fig
+
+
+def save_metric_overview_plots(
+    cfg: Config, combined: pd.DataFrame, directions: pd.DataFrame | None, output_dir: str | Path
+) -> None:
+    """Save ``metrics_<type>.png`` (utility, privacy, fairness) under ``<output_dir>/evaluation``."""
+    output_dir = Path(output_dir) / "evaluation"
+    for metric_type in ("utility", "privacy", "fairness"):
+        fig = plot_metric_overview(combined, directions, metric_type)
+        if fig is None:
+            continue
+        try:
+            save_matplotlib_figure(
+                fig, output_dir / f"metrics_{metric_type}", cfg.plots.dpi, cfg.plots.formats
+            )
+        finally:
+            plt.close(fig)

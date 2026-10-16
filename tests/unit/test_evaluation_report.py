@@ -290,3 +290,48 @@ def test_data_section_summarizes_the_readiness_findings(make_config, make_datase
     )
     assert "| constant | warn | 2 | a, b |" in data
     assert "| skewed | info | 1 | c |" in data
+
+
+def test_imputation_reports_are_found_after_the_experiment_nests_output_dir(
+    make_config, make_dataset, tmp_path
+):
+    from synthdata.experiment import start_experiment
+
+    cfg = make_config()
+    readiness = imputation_output_dir(cfg) / "data_readiness.csv"
+    pd.DataFrame(
+        {
+            "check": ["constant"],
+            "column": ["a"],
+            "value": [1],
+            "threshold": [1],
+            "status": ["warn"],
+            "action": ["drop"],
+        }
+    ).to_csv(readiness, index=False)
+    (imputation_output_dir(cfg) / "imputation_validation_report.csv").write_text("column\n")
+    experiment = start_experiment(cfg)
+    # As scripts/run_evaluation.py does before evaluating.
+    cfg.generation.output_dir = str(experiment.generation_dir)
+    data = _section(
+        build_evaluation_report(cfg, make_dataset(), _combined_table(), {}, experiment=experiment),
+        "6. Data and preparation",
+    )
+    assert "| constant | warn | 1 | a |" in data
+    assert "imputation_validation_report.csv](" in data
+    assert "HPO is off" in data or "imputation_drift.csv" in data
+
+
+def test_replicate_rows_fold_into_a_mean_and_interval():
+    from synthdata.evaluation.report import _collapse_replicates
+
+    table = pd.DataFrame(
+        {"score": [0.5, 0.6, 0.7, 0.9], "link": ["a", "b", "c", "d"]},
+        index=pd.Index(["ctgan", "ctgan__rep1", "ctgan__rep2", "tvae"], name="model"),
+    )
+    folded = _collapse_replicates(table)
+    assert list(folded.index) == ["ctgan", "tvae"]
+    assert folded.loc["ctgan", "seeds"] == 3
+    assert folded.loc["ctgan", "score"].startswith("0.600 [")
+    assert folded.loc["ctgan", "link"] == "a"
+    assert folded.loc["tvae", "score"] == "0.9" or folded.loc["tvae", "score"].startswith("0.9")

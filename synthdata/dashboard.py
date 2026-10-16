@@ -94,6 +94,17 @@ _FIT_START = re.compile(r"^\[(?P<model>[^\]\s]+)\] generating synthetic data \(n
 _GENERATED = re.compile(r"^Generated/loaded \d+ synthetic datasets")
 #: Any line of an HPO study's own ("[hpo_ctgan] trial 3 ...", "[hpo_ctgan_probe] ...").
 _HPO_LINE = re.compile(r"^\[hpo_[^\]]+\] ")
+#: SynthEval's one-vs-rest passes (``syntheval ovr_<class>``, one per target
+#: class) are shown as one step; a model's bar spans all its passes.
+OVR_STEP = "syntheval one-vs-rest"
+_OVR_PASS = re.compile(r"\[syntheval ovr_[^\]:]+")
+
+
+def merge_ovr_passes(text: str) -> str:
+    """Rename every ``syntheval ovr_<class>`` step label to :data:`OVR_STEP`."""
+    return _OVR_PASS.sub(f"[{OVR_STEP}", text)
+
+
 #: Step label for fits in the runner's own process.
 MAIN_STEP = "generation (main process)"
 _HPO_START = re.compile(
@@ -204,7 +215,7 @@ def parse_log(lines: list[str]) -> dict:
                 entry.update(status=status, end=moment)
 
     for raw in lines:
-        line = raw.rstrip("\n")
+        line = merge_ovr_passes(raw.rstrip("\n"))
         if not line.strip():
             continue
         runner = _RUNNER.match(line)
@@ -319,11 +330,13 @@ def parse_log(lines: list[str]) -> dict:
             pools[m["label"]] = {"total": int(m["n"]), "workers": int(m["w"]), "cores": int(m["c"])}
         elif m := _TASK_START.match(msg):
             pools.setdefault(m["label"], {"total": int(m["n"])})
+            earlier = tasks.get((m["label"], m["model"]))
             tasks[(m["label"], m["model"])] = {
                 "step": m["label"],
                 "model": m["model"],
                 "status": "running",
-                "start": moment,
+                # A merged step (OVR_STEP) runs each model once per pass.
+                "start": earlier["start"] if earlier and earlier.get("start") else moment,
                 "end": None,
                 "pid": int(m["pid"]),
                 "order": int(m["i"]),
@@ -541,6 +554,7 @@ def read_resources(log_path: Path) -> dict:
     latest_time = task_rows[-1]["time_utc"] if task_rows else None
     by_task: dict[str, dict] = {}
     for row in task_rows:
+        row["task"] = merge_ovr_passes(f"[{row['task']}")[1:]
         entry = by_task.setdefault(
             row["task"], {"task": row["task"], "ram_peak": 0.0, "cpu_peak": 0.0, "vram_peak": 0.0}
         )

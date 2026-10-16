@@ -166,7 +166,6 @@ def run_evaluation(
         eval_cfg.tstr_seeds,
         cfg.seed,
         compute_cfg=cfg.compute,
-        n_samples=n_samples,
     )
     tstr_table = custom_eval.build_tstr_table(tstr_result)
     if not tstr_table.empty:
@@ -196,6 +195,9 @@ def run_evaluation(
     )
 
     combined.to_csv(output_dir / "combined_evaluation.csv")
+    directions = combined.attrs.get("metric_directions")
+    if directions is not None:
+        directions.to_csv(output_dir / combine.METRIC_DIRECTIONS_FILENAME)
     ranking_summary = combine.summarize_replicates(combined)
     ranking_summary.to_csv(output_dir / "ranking_summary.csv")
 

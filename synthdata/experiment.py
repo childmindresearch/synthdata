@@ -105,6 +105,10 @@ class Experiment:
     manifest_path: Path
     created_at: str
     git_commit: str | None
+    #: Version-scoped imputation reports (:func:`imputation_output_dir`),
+    #: resolved before the scripts nest ``generation.output_dir`` under the
+    #: experiment, which would otherwise move it.
+    imputation_dir: Path | None = None
 
     def record(self, stage: str, artifacts: dict[str, Any] | None = None, **extra: Any) -> None:
         """Append a stage entry to this experiment's manifest.json."""
@@ -174,6 +178,7 @@ def _build_experiment(experiment_id: str, cfg: Config) -> Experiment:
         manifest_path=manifest_path,
         created_at=datetime.now(UTC).isoformat(),
         git_commit=git_commit(),
+        imputation_dir=imputation_output_dir(cfg),
     )
 
     config_snapshot_path = experiment_root / "config_snapshot.json"

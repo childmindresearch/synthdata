@@ -429,9 +429,14 @@ def test_holdout_tstr_is_ranked_and_reported_per_class(pipeline_run):
     assert tstr.notna().all() and tstr.between(0, 1).all()
     assert ("custom", "utility", "rank") in combined.columns
     table = pd.read_csv(pipeline_run.evaluation_dir / "tstr_holdout.csv", index_col=0)
-    assert "trtr (real train)" in table.index
-    assert {"f1_0", "f1_1"} <= set(table.columns)
-    assert "trtr (real train)" in (pipeline_run.evaluation_dir / "report.md").read_text()
+    assert "trtr (real train)" not in table.index
+    assert {"f1_0", "f1_1", "tsts_macro_f1"} <= set(table.columns)
+    # TSTS is reported next to TSTR but not ranked.
+    assert ("custom", "utility", "tsts_macro_f1") in combined.columns
+    directions = pd.read_csv(pipeline_run.evaluation_dir / "metric_directions.csv", index_col=2)
+    assert directions.loc["tsts_macro_f1", "direction"] == "unranked"
+    assert directions.loc["tstr_macro_f1", "direction"] == "higher"
+    assert "tsts_macro_f1" in (pipeline_run.evaluation_dir / "report.md").read_text()
 
 
 def test_ranking_summary_has_one_row_per_model(pipeline_run):

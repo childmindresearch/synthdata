@@ -103,7 +103,9 @@ class DataConfig:
     #: Secret attributes privacy metrics try to infer (see above).
     sensitive_columns: list = dataclasses.field(default_factory=list)
     #: Fairness groups (see above); also the default for
-    #: ``evaluation.log_disparity.protected_columns``.
+    #: ``evaluation.log_disparity.protected_columns``. SynthEval's gap
+    #: metrics compare each group holding at least 5% of the rows with the
+    #: rest, and split a numeric column (e.g. birth year) at its median.
     protected_columns: list | None = None
     #: Columns to drop entirely before any modeling (e.g. free-text/ID columns).
     drop_columns: list = dataclasses.field(default_factory=list)
@@ -663,7 +665,7 @@ class GenerationConfig:
     #: keeps TSTR comparable with the real-data ceiling, and adds no rows that
     #: carry no new signal but more chances to leak a memorized record. An
     #: integer fixes the count instead (e.g. to cap a slow generator); the
-    #: holdout TRTR ceiling is then fitted on that many real train rows.
+    #: ``baseline_train_copy`` reference then holds that many real train rows.
     n_samples: int | None = None
     #: Times each model is fitted and sampled, with seeds seed, seed+1, ...
     #: Replicate r > 0 is saved as "<model>__rep<r>". With 2 or more, the

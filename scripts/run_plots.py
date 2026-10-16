@@ -112,9 +112,10 @@ def main() -> None:
             load_log_disparity_reports,
             verify_native_syntheval_artifacts,
         )
-        from synthdata.evaluation.combine import load_combined_table
+        from synthdata.evaluation.combine import load_combined_table, load_metric_directions
         from synthdata.plotting.evaluation_plots import (
             save_log_disparity_plots,
+            save_metric_overview_plots,
             save_rank_tradeoff_plots,
         )
 
@@ -127,6 +128,12 @@ def main() -> None:
         combined = load_combined_table(str(combined_path))
         log_disparity_reports = load_log_disparity_reports(cfg.evaluation.output_dir)
         save_rank_tradeoff_plots(cfg, combined, cfg.plots.output_dir)
+        save_metric_overview_plots(
+            cfg,
+            combined,
+            load_metric_directions(cfg.evaluation.output_dir),
+            cfg.plots.output_dir,
+        )
         save_log_disparity_plots(log_disparity_reports, cfg.plots.output_dir)
         verify_native_syntheval_artifacts(cfg.evaluation.output_dir)
 
