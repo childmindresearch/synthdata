@@ -546,6 +546,7 @@ def test_column_names_lightgbm_rejects_still_get_an_mia_score(tmp_path):
         "y",
         ["ward: name"],
         [],
+        {},
         str(preset),
         str(tmp_path / "ckpt"),
         "main",
@@ -581,22 +582,51 @@ class TestBinarizeProtected:
         real, synthetic = self._frames()
         cat_cols = ["ethnicity", "sex", "target"]
         real_b, (syn_b, hold_b), protected, cats, groups = binarize_protected(
-            real, [synthetic, None], ["ethnicity", "sex", "birth_year"], cat_cols
+            real,
+            [synthetic, None],
+            ["ethnicity", "sex", "birth_year"],
+            cat_cols,
+            {"birth_year": [1940, 1960, 1980, 2000]},
         )
         # One indicator per group with >= 5% of rows; the 2% group stays in "rest".
         assert {"ethnicity_is_a", "ethnicity_is_b", "ethnicity_is_c"} <= set(protected)
         assert "ethnicity_is_tiny" not in real_b.columns
         assert "ethnicity" not in real_b.columns and "ethnicity" not in cats
-        # Binary columns are kept as they are; numeric ones get a median split.
-        assert "sex" in protected and "birth_year_ge_median" in protected
+        # Binary columns are kept as they are; binned ones get one indicator per bin.
+        assert "sex" in protected
+        bins = ["birth_year_is_1940_1960", "birth_year_is_1961_1980", "birth_year_is_1981_2000"]
+        assert set(bins) <= set(protected)
         assert "birth_year" in real_b.columns and "birth_year" not in protected
         assert hold_b is None
         assert list(syn_b.columns) == list(real_b.columns)
         for name in groups:
             assert set(real_b[name].unique()) <= {0, 1} and name in cats
         assert (syn_b["ethnicity_is_a"] == (synthetic["ethnicity"] == "a")).all()
-        median = real["birth_year"].median()
-        assert (syn_b["birth_year_ge_median"] == (synthetic["birth_year"] >= median)).all()
+        year = synthetic["birth_year"]
+        assert (syn_b["birth_year_is_1940_1960"] == (year <= 1960)).all()
+        assert (syn_b["birth_year_is_1961_1980"] == ((year > 1960) & (year <= 1980))).all()
+        assert (syn_b[bins].sum(axis=1) == 1).all()
+
+    def test_values_outside_the_bins_belong_to_no_group(self):
+        real, synthetic = self._frames()
+        _, (syn_b,), protected, _, _ = binarize_protected(
+            real, [synthetic], ["birth_year"], [], {"birth_year": [1960, 1980]}
+        )
+        assert protected == ["birth_year_is_1960_1980"]
+        outside = (synthetic["birth_year"] < 1960) | (synthetic["birth_year"] > 1980)
+        assert (syn_b.loc[outside, "birth_year_is_1960_1980"] == 0).all()
+
+    def test_numeric_column_without_bins_is_left_out(self, caplog):
+        real, synthetic = self._frames()
+        from synthdata.evaluation import syntheval_eval
+
+        syntheval_eval.logger.addHandler(caplog.handler)
+        try:
+            out = binarize_protected(real, [synthetic], ["sex", "birth_year"], ["sex"])
+        finally:
+            syntheval_eval.logger.removeHandler(caplog.handler)
+        assert out[0] is real and out[2] == ["sex"] and out[4] == {}
+        assert "data.protected_bins" in caplog.text
 
     def test_binary_protected_columns_pass_through(self):
         real, synthetic = self._frames()

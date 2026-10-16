@@ -76,3 +76,4 @@ Break any of these and results are invalid even if every test runs:
 - Use the conventional-commit style seen in the log: `fix(evaluation): ...`, `feat(generation): ...`, `docs(manual): ...`, `test(integration): ...`.
 - Open PRs as drafts against `main`. Before pushing, run ruff and the unit tests; run the integration suite when a stage's behaviour changes.
 - Describe what a reader would see change, and link the verification.md row for metric or generator changes.
+- Every PR bumps `version` in `pyproject.toml` (and the `synthdata` entry in `uv.lock`) and adds an entry to [CHANGELOG.md](CHANGELOG.md): minor for new features, changed results or config edits users must make, patch for fixes that don't. The entry says what users see change, which config keys or output files moved, and whether a new experiment id or golden re-record is needed.

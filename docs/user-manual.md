@@ -132,7 +132,7 @@ The settings you will most often change, by section:
 | `data.variable_schema_path` | CSV that says which columns are categorical or continuous | see [section 12](#12-setting-up-your-own-dataset) |
 | `data.target_column` | The outcome column | `readmission_group` |
 | `data.patient_id_column` | Groups rows by patient so no patient is in two splits | `research_subject_id` |
-| `data.quasi_identifier_columns`, `sensitive_columns`, `protected_columns` | Column roles for privacy and fairness | see [section 5](#5-stage-1-load-and-split-the-data) |
+| `data.quasi_identifier_columns`, `sensitive_columns`, `protected_columns`, `protected_bins` | Column roles for privacy and fairness, and the groups of a numeric protected column | see [section 5](#5-stage-1-load-and-split-the-data) |
 | `data.stratify_columns`, `stratify_bins` | What the split keeps balanced | `[target, gender, age]` |
 | `imputation.method` | How missing values are filled | `missforest`, `simple` |
 | `generation.n_samples` | Synthetic rows per model | `null` (the real train size) |
@@ -246,10 +246,12 @@ The memory and GPU figures above are starting points; after a first run, set `--
 ```yaml
 generation:
   hpo:
-    stage_time_limit_hours: 66   # for --time=3-00:00:00, leaving about 6 h for imputation and evaluation
+    stage_time_limit_hours: 48   # for --time=3-00:00:00: 72 h minus imputation and evaluation
 ```
 
-Every model's search then stops starting new trials early enough to leave time for its tuned fit and replicates. That margin is taken from how long the model's untuned fits took, which uses the same training-length cap. A trial is also not started when the longest trial so far would run past it. The models that run out of time keep the best trial found so far, and the log says so (`stopping the search at the stage time limit`). The limit counts from the start of the generation stage and is off by default (`null`). It only cuts trials and makes nothing faster, so leave it off when there is no hard limit. Each finished trial is logged with its score, its duration, how many trials are done, the best so far and, with a limit set, the time left for the search:
+The limit covers the generation stage only, so subtract what imputation and evaluation need from the job's time. Evaluation grows with the number of synthetic sets (models x 2 with HPO, for the untuned and tuned versions, x `n_replicates`, plus the baselines) and with the number of columns: on the clinical dataset (about 620 columns, 6,400 train rows) it took about 25 min per set with 3 workers, mostly SynthEval, so 42 sets need about 16 h. Imputation took about 30 min there.
+
+Every model's search then stops starting new trials early enough to leave time for the refits of its best trials (`refit_top_k` x `refit_seeds`, each counted as long as its longest trial) and for its tuned fit and replicates. The fit margin is taken from how long the model's untuned fits took, which uses the same training-length cap. A trial is also not started when it and those refits would run past that point, and refits that would are skipped (the best of the refitted trials is taken). Give generation at least one worker per model when a limit is set (`compute.workers`, or enough CPUs and memory for `auto` to choose that many): a model waiting for a free worker starts only when another finishes, by which time the searches running before it have used the time, so it gets few or no trials. The models that run out of time keep the best trial found so far, and the log says so (`stopping the search at the stage time limit`). The limit counts from the start of the generation stage and is off by default (`null`). It only cuts trials and makes nothing faster, so leave it off when there is no hard limit. Each finished trial is logged with its score, its duration, how many trials are done, the best so far and, with a limit set, the time left for the search:
 
 ```
 [hpo_ddpm] trial 12 tstr_macro_f1=0.3121 after 24 min (13 of 40 done); best 0.3254 (trial 7); search stops in 5.2 h
@@ -284,6 +286,8 @@ Privacy and fairness metrics need to know what each column means. Three lists in
 | `protected_columns` | Groups whose fair treatment you want to check | Fairness metrics | sex, ethnicity, age band |
 
 A column can be both a quasi-identifier and protected, or sensitive and protected, but never both a quasi-identifier and sensitive. None of the lists may contain the target or the patient ID. If you set `sensitive_columns`, you must also set `protected_columns` (even to `[]`).
+
+A numeric protected column, such as age or birth year, has no groups of its own: give it bin edges in `protected_bins`, for example `protected_bins: {age: [0, 18, 30, 45, 60, 200]}`. Each bin includes its upper edge (the first bin also its lower edge), so these edges give the groups 0-18, 19-30, 31-45, 46-60 and 61-200; a value outside every bin belongs to no group. The fairness gap metrics and log disparity both use these bins. A numeric protected column without bins is left out of the gap metrics, with a warning in the log.
 
 Only Anonymeter reads the quasi-identifiers. synthcity and SynthEval have no quasi-identifier setting: their attribute attacks assume the attacker knows every other column and have no holdout control, so treat them as a worst-case screen and Anonymeter inference as the evidence for your declared threat model. The full table is in [verification.md, Column roles](verification.md#column-roles).
 
@@ -416,7 +420,7 @@ For each model, [Optuna](https://optuna.org/) tries a number of settings ("trial
 1. Fit the model on search-train with the trial's settings.
 2. Generate synthetic rows, class by class, to the search-train class shares (as described above).
 3. Train a fixed XGBoost classifier on the synthetic rows and test it on the real tuning rows (**TSTR**, train on synthetic, test on real). The classifier weights rows by inverse class frequency, so every class counts equally in training, here and in evaluation. Every trial logs macro AUPRC, macro AUROC, macro-F1 and Cohen's kappa, each with a bootstrap standard error (how much the score would move with a different sample of tuning rows), plus the same scores for the classifier trained on real rows (**TRTR**, the ceiling). It also logs the worst protected group's AUPRC and three fidelity scores (`fid_marginal`, `fid_association`, `fid_detection_auc`; lower is closer to the real data), which are never optimized.
-4. Check the screens in `hpo.constraints`. A trial that copies training rows (`copy_margin`), drops categories (`min_category_coverage`, the worst categorical column) or classes, produces out-of-range values (`max_out_of_range`), leaves a class short (`max_class_share_gap`), drops a protected group (`min_protected_coverage`, 1.0 = every gender, age-quartile and ethnicity group with at least 1% of the rows), shifts the protected group shares by more than the same number of real rows would (`max_protected_share_gap`), or sits closer to the training rows than to unseen rows (`max_dcr_closer_to_train`; 0.5 means no memorization) is marked infeasible and cannot be chosen as best.
+4. Check the screens in `hpo.constraints`. A trial that copies training rows (`copy_margin`), drops categories (`min_category_coverage`, the worst categorical column) or classes, produces out-of-range values (`max_out_of_range`), leaves a class short (`max_class_share_gap`), drops a protected group (`min_protected_coverage`, 1.0 = every gender, age and ethnicity group with at least 1% of the rows; a numeric column is grouped by its `data.protected_bins`, or by train quartiles without them), shifts the protected group shares by more than the same number of real rows would (`max_protected_share_gap`), or sits closer to the training rows than to unseen rows (`max_dcr_closer_to_train`; 0.5 means no memorization) is marked infeasible and cannot be chosen as best.
 
 **Which score is optimized** (`hpo.objective`). The default, `auto`, decides per model with a rule fixed in advance, so the choice can't be tuned to the results:
 
@@ -425,7 +429,7 @@ For each model, [Optuna](https://optuna.org/) tries a number of settings ("trial
 
 The choice and the table behind it are logged and stored in the study. Set `objective` to one score, such as `tstr_macro_auprc`, to fix it instead. You then get a warning if that score has no headroom.
 
-**How the search proceeds.** The first trial is the library's default settings (`enqueue_defaults`), followed by the best settings from an earlier run on similar data if you point `warm_start.storage` at its `optuna_studies.db`. After the start-up trials, Optuna's multivariate TPE sampler picks settings likely to score better. A study stops early when `patience` (10) trials in a row bring no gain larger than the score's bootstrap standard error (`min_delta: null`). The trial and time budgets stay as upper limits.
+**How the search proceeds.** The first trial is the library's default settings (`enqueue_defaults`), followed by the best settings from an earlier run on similar data if you point `warm_start.storage` at its `optuna_studies.db`. After the start-up trials, Optuna's multivariate TPE sampler picks settings likely to score better. A study stops early when `patience` (10) trials in a row after the start-up trials bring no gain larger than the score's bootstrap standard error (`min_delta: null`). The trial and time budgets stay as upper limits.
 
 **Choosing the winner.** The best of many noisy trials looks better than it is. So the `refit_top_k` (3) best feasible trials are refitted with `refit_seeds` (2) new seeds, and the one with the best mean wins. The final model is refitted with those settings on all of train. The best settings are saved in `hpo_best_params.json`, and every trial is stored in `optuna_studies.db`, so an interrupted search resumes where it stopped when you rerun with the same experiment id.
 
@@ -547,8 +551,8 @@ Singling-out risk reads low even for `baseline_train_copy`. Anonymeter compares 
 
 ### Fairness
 
-- **Subgroup gaps** (SynthEval, custom): how differently a classifier trained on the synthetic data treats protected groups. They compare two groups at a time, so a protected column with more groups is compared one group against the rest (each group with at least 5% of the train rows), and the gaps are averaged, as the one-vs-rest passes do for target classes. A numeric protected column, such as birth year, is split at its median.
-- **Log disparity** (Bhanot et al., 2021): how far each protected subgroup's outcome share drifts from the real data. Continuous protected columns need bins, set in `evaluation.log_disparity.protected_bins`; `target_map` and `protected_map` give readable labels.
+- **Subgroup gaps** (SynthEval, custom): how differently a classifier trained on the synthetic data treats protected groups. They compare two groups at a time, so a protected column with more groups is compared one group against the rest (each group with at least 5% of the train rows), and the gaps are averaged, as the one-vs-rest passes do for target classes. A numeric protected column, such as birth year, is compared bin by bin, using the bins in `data.protected_bins` (see [section 5](#5-stage-1-load-and-split-the-data)).
+- **Log disparity** (Bhanot et al., 2021): how far each protected subgroup's outcome share drifts from the real data. Continuous protected columns use the bins in `data.protected_bins` (`evaluation.log_disparity.protected_bins` overrides them for this metric only); `target_map` and `protected_map` give readable labels.
 
 ### Ranking
 

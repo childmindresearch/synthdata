@@ -252,6 +252,7 @@ def run_generation(
             match_prior=match_prior,
             workspace=output_dir / "synthcity_workspace",
             protected_columns=dataset.protected_columns,
+            protected_bins=dataset.protected_bins,
             ordinal_target=dataset.target_column in dataset.ordinal_columns,
         )
 

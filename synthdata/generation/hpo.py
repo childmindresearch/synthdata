@@ -167,21 +167,37 @@ def trial_seed(trial, seed: int) -> int:
 
 
 def protected_groups(
-    reference: pd.DataFrame, protected_columns: list, n_bins: int = 4
+    reference: pd.DataFrame,
+    protected_columns: list,
+    n_bins: int = 4,
+    protected_bins: dict | None = None,
 ) -> dict[str, Callable[[pd.DataFrame], pd.Series]]:
     """Per protected column, a function mapping rows to group labels.
 
-    Categorical columns (or numeric ones with at most 10 values in
-    ``reference``) group by value; other numeric columns by the reference
+    A column with edges in ``protected_bins`` (``data.protected_bins``)
+    groups by those bins, upper edge included as in the fairness metrics,
+    with values outside every bin in an "outside" group. Otherwise
+    categorical columns (or numeric ones with at most 10 values in
+    ``reference``) group by value, and other numeric columns by the reference
     quartiles (``n_bins`` quantile bins), so age-like columns form groups.
     """
+    protected_bins = protected_bins or {}
     groupers = {}
     for column in protected_columns:
         if column not in reference:
             continue
         values = reference[column]
         numeric = pd.api.types.is_numeric_dtype(values) and values.nunique() > 10
-        if numeric:
+        if column in protected_bins:
+
+            def grouper(df, column=column, edges=tuple(protected_bins[column])):
+                numbers = pd.to_numeric(df[column], errors="coerce")
+                bins = pd.cut(numbers, bins=list(edges), include_lowest=True).astype(str)
+                return pd.Series(
+                    np.where(numbers.isna(), "nan", np.where(bins == "nan", "outside", bins)),
+                    index=df.index,
+                )
+        elif numeric:
             edges = np.unique(np.nanquantile(values.astype(float), np.linspace(0, 1, n_bins + 1)))
             inner = edges[1:-1]
 
@@ -475,6 +491,7 @@ def build_hpo_eval_fn(
     workspace: str | Path | None = None,
     protected_columns: Sequence[str] = (),
     ordinal_target: bool = False,
+    protected_bins: dict | None = None,
 ) -> HPOEvalFn:
     """Build a ``synthetic_df -> TrialScore`` function scored on the tuning split.
 
@@ -487,7 +504,8 @@ def build_hpo_eval_fn(
     ceiling, logged on every trial; with :func:`chance_scores` they give each
     candidate objective's headroom, attached as ``eval_fn.headroom``
     (``{objective: {"trtr", "chance", "se", "z"}}``) for ``objective: auto``.
-    ``protected_columns`` get the protected-group screens and per-group TSTR.
+    ``protected_columns`` get the protected-group screens and per-group TSTR,
+    grouped by ``protected_bins`` where given (see :func:`protected_groups`).
     """
     tstr = hpo_cfg.objective.startswith("tstr_") or hpo_cfg.objective == "auto"
     if tstr and not target_is_categorical:
@@ -498,7 +516,9 @@ def build_hpo_eval_fn(
     prior = search_train_df[target_column].value_counts(normalize=True)
     classes = target_classes(pd.Series(prior.index), ordinal_target)
     seeds = [seed + i for i in range(hpo_cfg.tstr_seeds)]
-    groupers = protected_groups(search_train_df, list(protected_columns))
+    groupers = protected_groups(
+        search_train_df, list(protected_columns), protected_bins=protected_bins
+    )
     tuning_groups = {column: grouper(tuning_df) for column, grouper in groupers.items()}
 
     def _tstr(fit_df):
@@ -957,15 +977,19 @@ def _hours(seconds: float) -> str:
 class _TrialProgress:
     """Optuna callback: one log line per finished trial; stops at the search deadline.
 
-    A trial is not started when the longest trial so far would not finish
-    before ``search_deadline``.
+    A trial is not started when it and the ``refit_fits`` refits of the best
+    trials after the search would not finish before ``search_deadline``,
+    each counted at the longest trial so far.
     """
 
-    def __init__(self, study_name: str, objective: str, n_target: int, search_deadline):
+    def __init__(
+        self, study_name: str, objective: str, n_target: int, search_deadline, refit_fits: int = 0
+    ):
         self.study_name = study_name
         self.objective = objective
         self.n_target = n_target
         self.search_deadline = search_deadline
+        self.refit_fits = refit_fits
         self.longest = 0.0
 
     def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
@@ -996,12 +1020,15 @@ class _TrialProgress:
             best_text,
             left,
         )
-        if self.search_deadline is not None and time.time() + self.longest > self.search_deadline:
+        needed = self.longest * (1 + self.refit_fits)
+        if self.search_deadline is not None and time.time() + needed > self.search_deadline:
             logger.warning(
-                "[%s] stopping the search at the stage time limit: the longest trial "
-                "(%s) would not finish in time; %d of %d trials done",
+                "[%s] stopping the search at the stage time limit: another trial (longest so "
+                "far %s) and %d refit(s) of the best trials would not finish in time; "
+                "%d of %d trials done",
                 self.study_name,
                 _hours(self.longest),
+                self.refit_fits,
                 n_done,
                 self.n_target,
             )
@@ -1030,8 +1057,10 @@ class _Patience:
     """Optuna callback: stop once ``patience`` finished trials in a row failed
     to improve the best feasible value by more than ``min_delta``.
 
-    Pruned and failed trials count towards the run. Never stops before
-    ``min_trials`` trials. ``min_delta`` None: the median bootstrap standard
+    Pruned and failed trials count towards the run. The first ``min_trials``
+    trials (random start-up, defaults, warm start) set the best value to beat
+    but don't count towards the run: stopping right after the start-up
+    trials would leave TPE no trials of its own. ``min_delta`` None: the median bootstrap standard
     error of the objective over the feasible trials so far (0 without one).
     """
 
@@ -1055,20 +1084,21 @@ class _Patience:
         delta = self.threshold(done, objective)
         sign = 1.0 if study.direction == optuna.study.StudyDirection.MAXIMIZE else -1.0
         best, since = None, 0
-        for t in sorted(done, key=lambda t: t.number):
+        for position, t in enumerate(sorted(done, key=lambda t: t.number)):
             if _feasible(t) and (best is None or sign * (_value(t) - best) > delta):
                 best, since = _value(t), 0
-            else:
+            elif position >= self.min_trials:
                 since += 1
         # Without a feasible trial yet, keep searching for one.
         if best is not None and since >= self.patience:
+            top = _best_feasible(study)
             logger.info(
                 "[%s] stopping early: %d trials in a row without a gain above %.4f "
                 "(best %s; patience %d)",
                 self.study_name,
                 since,
                 delta,
-                "none feasible" if best is None else f"{best:.4f}",
+                "none feasible" if top is None else f"{top.value:.4f}",
                 self.patience,
             )
             study.stop()
@@ -1178,6 +1208,7 @@ def _refit_top_k(
     hpo_cfg: HPOConfig,
     seed: int,
     objective: str,
+    deadline: float | None = None,
 ) -> optuna.trial.FrozenTrial | None:
     """Refit the best feasible trials with new seeds; return the best by mean.
 
@@ -1185,7 +1216,9 @@ def _refit_top_k(
     ``refit_seeds`` new seeds (through a ``FixedTrial`` of its params) and
     scored the same way. Results are kept in the study's ``refit`` user
     attribute, so a resumed run reuses them. A refit that fails counts as a
-    failed candidate.
+    failed candidate. With a ``deadline`` (seconds since the epoch), no refit
+    starts that the longest trial's duration would carry past it; the choice
+    is then made among the trials refitted so far.
     """
     feasible = [t for t in study.trials if _feasible(t)]
     if not feasible:
@@ -1195,10 +1228,22 @@ def _refit_top_k(
     sign = 1.0 if study.direction == optuna.study.StudyDirection.MAXIMIZE else -1.0
     top = sorted(feasible, key=lambda t: sign * _value(t), reverse=True)[: hpo_cfg.refit_top_k]
     done = dict(study.user_attrs.get("refit", {}))
+    longest = max(
+        (t.duration.total_seconds() for t in study.trials if t.duration is not None), default=0.0
+    )
     for t in top:
         key = str(t.number)
         if key in done:
             continue
+        if deadline is not None and time.time() + longest * hpo_cfg.refit_seeds > deadline:
+            logger.warning(
+                "[%s] no time left to refit trial %d and the rest under the stage time limit; "
+                "choosing among the %d refitted",
+                study.study_name,
+                t.number,
+                len(done),
+            )
+            break
         values = [_value(t)]
         for j in range(hpo_cfg.refit_seeds):
             fixed = optuna.trial.FixedTrial(dict(t.params), number=t.number)
@@ -1284,8 +1329,9 @@ def run_study(
 
     With ``hpo.stage_time_limit_hours`` set, the search also stops starting
     trials ``reserve_seconds`` before the stage deadline (the time the
-    model's final fits need), and a trial is not started when the longest
-    one so far would run past that point.
+    model's final fits need), and a trial is not started when it and the
+    refits of the top trials, each as long as the longest trial so far, would
+    run past that point.
 
     When both checkpoint arguments are provided, synthcity HPO studies with no
     running trial retain only their best and latest generator caches. Studies
@@ -1307,6 +1353,11 @@ def run_study(
         return len([t for t in s.trials if t.state.is_finished()])
 
     n_remaining = max(n_trials - n_finished(study), 0)
+    refit_fits = (
+        hpo_cfg.refit_top_k * hpo_cfg.refit_seeds
+        if hpo_cfg.refit_seeds > 0 and hpo_cfg.refit_top_k > 1
+        else 0
+    )
     deadline = stage_deadline(hpo_cfg)
     search_deadline = None if deadline is None else deadline - reserve_seconds
     if search_deadline is not None and n_remaining > 0:
@@ -1378,7 +1429,11 @@ def run_study(
                 show_progress_bar=False,
                 callbacks=[
                     _TrialProgress(
-                        probe.study_name, hpo_cfg.objective_candidates[0], n_probe, search_deadline
+                        probe.study_name,
+                        hpo_cfg.objective_candidates[0],
+                        n_probe,
+                        search_deadline,
+                        refit_fits,
                     )
                 ],
             )
@@ -1417,7 +1472,7 @@ def run_study(
             n_trials,
             time_left(),
         )
-        callbacks = [_TrialProgress(study_name, objective, n_trials, search_deadline)]
+        callbacks = [_TrialProgress(study_name, objective, n_trials, search_deadline, refit_fits)]
         if hpo_cfg.patience is not None:
             callbacks.append(
                 _Patience(study_name, hpo_cfg.patience, hpo_cfg.min_delta, hpo_cfg.n_startup_trials)
@@ -1441,7 +1496,9 @@ def run_study(
         logger.warning("[%s] no time left to refit the top trials; taking the best", study_name)
         best_trial = _best_feasible(study)
     else:
-        best_trial = _refit_top_k(study, objective_fn, hpo_cfg, seed, objective)
+        best_trial = _refit_top_k(
+            study, objective_fn, hpo_cfg, seed, objective, deadline=search_deadline
+        )
     if best_trial is None:
         logger.warning(
             "[%s] no trial passed the HPO screens (%d completed); falling back to defaults",

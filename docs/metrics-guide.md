@@ -93,7 +93,7 @@ Privacy numbers are evidence from specific attacks, not guarantees. Compare ever
 
 ## Fairness: does the synthetic data treat groups like the real data does?
 
-Protected columns are set in the variable schema.
+Protected columns are set in `data.protected_columns`, and the groups of a numeric one (such as age) in `data.protected_bins`.
 
 | Metric | What it measures | Read it as |
 | --- | --- | --- |
@@ -103,4 +103,4 @@ Protected columns are set in the variable schema.
 | `log_disparity_mean_abs` | How far each protected subgroup x outcome share drifts from its real share, in log-odds, averaged (Bhanot et al. 2021). | 0 is ideal. |
 | `log_disparity_share_significant` | Share of subgroups whose drift is significant after Benjamini-Hochberg correction. | 0 is ideal. |
 
-The three gap metrics need a two-class target and a two-group protected column. For a target with 3 or more classes they run once per class against the rest. A protected column with more than two groups is compared one group against the rest (each group with at least 5% of the rows) and the gaps are averaged; a numeric protected column such as birth year is split at its median. The `sp_*`, `eo_*` and `eqo_*` columns hold the gap of each group.
+The three gap metrics need a two-class target and a two-group protected column. For a target with 3 or more classes they run once per class against the rest. A protected column with more than two groups is compared one group against the rest (each group with at least 5% of the rows) and the gaps are averaged; a numeric protected column such as birth year is cut into the bins you set in `data.protected_bins`, each bin then being a group (left out, with a warning, when it has no bins). The `sp_*`, `eo_*` and `eqo_*` columns hold the gap of each group.

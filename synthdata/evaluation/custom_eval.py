@@ -72,6 +72,10 @@ def run_log_disparity_evaluation(
         logger.warning("[custom] log_disparity requires protected columns; skipping")
         return {}
 
+    protected_bins = log_disparity_cfg.protected_bins or [
+        dataset.protected_bins.get(c) for c in protected_cols
+    ]
+
     # The imputed train split, which generators learn from and the train copy
     # repeats: against the raw split, a missing protected value is a subgroup
     # ("nan") that no imputed dataset can contain, so even a copy of train
@@ -88,7 +92,7 @@ def run_log_disparity_evaluation(
                 model_name=name,
                 target_map=log_disparity_cfg.target_map,
                 protected_map=log_disparity_cfg.protected_map,
-                protected_bins=log_disparity_cfg.protected_bins,
+                protected_bins=protected_bins,
             )
         except (KeyError, ValueError) as exc:
             logger.warning("[custom] log_disparity failed for %s: %s", name, exc)

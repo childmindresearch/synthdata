@@ -179,6 +179,7 @@ def binarize_protected(
     frames: list,
     protected_columns: list,
     cat_cols: list,
+    protected_bins: dict | None = None,
     min_group_share: float = PROTECTED_MIN_GROUP_SHARE,
 ) -> tuple[pd.DataFrame, list, list, list, dict]:
     """One-vs-rest 0/1 protected columns for SynthEval's fairness metrics.
@@ -189,19 +190,46 @@ def binarize_protected(
     at least ``min_group_share`` of the ``real`` rows (the column's one-hot
     encoding, so the metrics' classifier sees the same information); the
     metrics then average the gap of each group against everyone else, as the
-    one-vs-rest target passes do for classes. A numeric protected column is
-    kept and gets one indicator, at or above its median in ``real``.
-    Groups and the median come from ``real`` and are applied to every frame
-    in ``frames`` (synthetic, holdout; None entries pass through).
+    one-vs-rest target passes do for classes. A column with edges in
+    ``protected_bins`` is cut into those bins (upper edge included, as in log
+    disparity), kept as a feature, and gets one indicator per bin with enough
+    rows. A numeric column with more than two values and no bins has no
+    groups, so it is left out of these metrics with a warning. Groups come
+    from ``real`` and are applied to every frame in ``frames`` (synthetic,
+    holdout; None entries pass through).
 
     Returns ``(real, frames, protected, cat_cols, groups)`` with ``groups``
     mapping each new indicator to ``(column, group)``; unchanged inputs when
     every protected column is already binary.
     """
+    from synthdata.log_disparity.metric_log_disparity import generate_bin_labels
+
+    protected_bins = protected_bins or {}
     groups: dict = {}
-    at_or_above: set = set()
+    binned: dict = {}
     drop: list = []
+    skipped: list = []
+
+    def _bin(frame, column):
+        edges = protected_bins[column]
+        return pd.cut(
+            pd.to_numeric(frame[column], errors="coerce"),
+            bins=edges,
+            labels=generate_bin_labels(list(edges)),
+            include_lowest=True,
+        )
+
     for column in protected_columns:
+        if column in protected_bins:
+            shares = _bin(real, column).value_counts(normalize=True, sort=False)
+            kept = [g for g, share in shares.items() if share >= min_group_share]
+            for group in kept:
+                name = f"{column}_is_{_group_label(group)}"
+                groups[name] = (column, group)
+                binned[name] = column
+            if not kept:
+                skipped.append(column)
+            continue
         values = real[column].dropna()
         if values.nunique() <= 2:
             continue
@@ -213,26 +241,32 @@ def binarize_protected(
             if kept:
                 drop.append(column)
         else:
-            name = f"{column}_ge_median"
-            groups[name] = (column, float(values.median()))
-            at_or_above.add(name)
+            skipped.append(column)
+    if skipped:
+        logger.warning(
+            "[syntheval] fairness metrics leave out numeric protected column(s) %s: "
+            "they have no groups; set their bin edges in data.protected_bins",
+            skipped,
+        )
 
     if not groups:
-        return real, frames, protected_columns, cat_cols, groups
+        protected = [c for c in protected_columns if c not in skipped]
+        return real, frames, protected, cat_cols, groups
 
     def _apply(frame):
         if frame is None:
             return None
+        cuts = {column: _bin(frame, column) for column in set(binned.values())}
         extra = {}
         for name, (column, group) in groups.items():
-            if name in at_or_above:
-                extra[name] = (frame[column] >= group).astype(int)
-            else:
-                extra[name] = (frame[column] == group).astype(int)
+            values = cuts[column] if name in binned else frame[column]
+            extra[name] = (values == group).astype(int)
         return pd.concat([frame.drop(columns=drop), pd.DataFrame(extra, index=frame.index)], axis=1)
 
     replaced = {column for column, _ in groups.values()}
-    protected = [c for c in protected_columns if c not in replaced] + list(groups)
+    protected = [c for c in protected_columns if c not in replaced and c not in skipped] + list(
+        groups
+    )
     cat_cols = [c for c in cat_cols if c not in drop] + list(groups)
     return _apply(real), [_apply(f) for f in frames], protected, cat_cols, groups
 
@@ -331,6 +365,7 @@ def _model_worker(
     target_column: str,
     sensitive_columns: list,
     protected_columns: list,
+    protected_bins: dict,
     preset_path: str,
     checkpoint_root: str,
     pass_name: str,
@@ -391,6 +426,7 @@ def _model_worker(
             target_column = renames.get(target_column, target_column)
             sensitive_columns = [renames.get(c, c) for c in sensitive_columns]
             protected_columns = [renames.get(c, c) for c in protected_columns]
+            protected_bins = {renames.get(c, c): e for c, e in protected_bins.items()}
 
         preset = json.loads(Path(preset_path).read_text())
         # The fairness metrics read binary protected columns only: give them
@@ -398,7 +434,11 @@ def _model_worker(
         # so no other metric sees the extra columns.
         protected_real, protected_frames, fairness_columns, fairness_cats, groups = (
             binarize_protected(
-                real_frame, [synthetic_frame, holdout_frame], protected_columns, cat_cols
+                real_frame,
+                [synthetic_frame, holdout_frame],
+                protected_columns,
+                cat_cols,
+                protected_bins,
             )
             if protected_columns and _METRICS_ON_PROTECTED_COLUMNS.intersection(preset)
             else (real_frame, [synthetic_frame, holdout_frame], protected_columns, cat_cols, {})
@@ -463,7 +503,7 @@ def _model_worker(
                 role
                 for role, columns in (
                     ("sensitive", sensitive_columns),
-                    ("protected", protected_columns),
+                    ("protected", fairness_columns),
                 )
                 if not columns
             ),
@@ -708,6 +748,7 @@ def _evaluation_context_fingerprint(
         "target_column": dataset.target_column,
         "sensitive_columns": dataset.sensitive_columns,
         "protected_columns": dataset.protected_columns,
+        "protected_bins": dataset.protected_bins,
         "categorical_columns": dataset.all_categorical_columns,
         "train": _frame_fingerprint(dataset.train_imputed_df),
         "holdout": _frame_fingerprint(dataset.test_imputed_df),
@@ -782,6 +823,7 @@ def _run_resumable_syntheval(
                     dataset.target_column,
                     dataset.sensitive_columns,
                     dataset.protected_columns,
+                    dataset.protected_bins,
                     str(preset_path.resolve()),
                     str(checkpoint_root),
                     pass_name,

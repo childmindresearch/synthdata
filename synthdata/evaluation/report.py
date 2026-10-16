@@ -713,7 +713,8 @@ def _fairness_section(combined, extras, paths: _Paths, links: _Links) -> str:
         lines += [
             "A protected column with more than two groups is compared one group against the "
             "rest, for each group with at least 5% of the rows, and the gaps are averaged; a "
-            "numeric one (such as birth year) is split at its median.",
+            "numeric one (such as age) is cut into the bins set in `data.protected_bins`, "
+            "and left out when it has none.",
             "",
             _dataframe_to_markdown(_collapse_replicates(gaps).reset_index()),
             "",
