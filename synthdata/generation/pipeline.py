@@ -256,16 +256,18 @@ def run_generation(
             ordinal_target=dataset.target_column in dataset.ordinal_columns,
         )
 
-    def _cached_or_build(name, build_fn):
+    def _cached_or_build(name, build_fn, top_up=True):
         """Load or build every replicate of ``name``; ``build_fn(seed, count)`` makes one.
 
         Replicate ``r`` is saved as ``replicate_name(name, r)`` and generated
         with seed ``cfg.seed + r`` (replicate 0 keeps the plain name and the
         base seed), so the spread across replicates measures how much a
-        model's scores depend on its random seed.
+        model's scores depend on its random seed. ``top_up=False`` keeps a
+        class short instead of drawing more batches for it, for backends where
+        each batch is a whole new fit (TabPFN: about 10 h per fit on wide data).
         """
         for replicate in range(gen_cfg.n_replicates):
-            _build_one(replicate_name(name, replicate), seed + replicate, build_fn)
+            _build_one(replicate_name(name, replicate), seed + replicate, build_fn, top_up)
 
     remask = cfg.imputation.missing_indicators.remask_synthetic and bool(
         dataset.missing_indicator_columns
@@ -315,7 +317,7 @@ def run_generation(
                 report.to_csv(released.with_name(f"{name}_recorded_values.csv"), index=False)
             out.to_csv(released, index=False)
 
-    def _build_one(name, replicate_seed, build_fn):
+    def _build_one(name, replicate_seed, build_fn, top_up=True):
         path = output_dir / f"{name}.csv"
         if path.exists() and not gen_cfg.force_retrain:
             logger.info("[%s] using cached synthetic data at %s", name, path)
@@ -351,6 +353,7 @@ def run_generation(
                     n_samples,
                     replicate_seed,
                     first_batch=df,
+                    max_rounds=class_quota.MAX_ROUNDS if top_up else 1,
                 )
             df.attrs.pop("class_sampling", None)
             _record_class_sampling(name, report)
@@ -533,6 +536,7 @@ def run_generation(
                             seed=seed,
                         )
                     ),
+                    top_up=False,
                 )
             if "custom" in gen_cfg.tabpfn.variants:
                 _cached_or_build(
@@ -547,6 +551,7 @@ def run_generation(
                             variable_schema_fingerprint=dataset.variable_schema_fingerprint,
                         )
                     ),
+                    top_up=False,
                 )
 
     # ------------------------------------------------------------------

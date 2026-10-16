@@ -109,6 +109,7 @@ def sample_to_quota(
     seed: int,
     conditional: bool = False,
     first_batch: pd.DataFrame | None = None,
+    max_rounds: int = MAX_ROUNDS,
 ) -> tuple[pd.DataFrame, ClassSamplingReport]:
     """Draw rows from ``sample_fn`` until each class of ``prior`` has its quota.
 
@@ -116,7 +117,8 @@ def sample_to_quota(
     is used as batch 0 instead of calling ``sample_fn`` again. Rows of a later
     batch whose features equal a row already drawn are dropped, so a backend
     that ignores the seed cannot fill a quota with repeats. The result is
-    shuffled with ``seed``.
+    shuffled with ``seed``. At most ``max_rounds`` batches are drawn (1: no
+    top-up, for backends where one batch costs a whole refit).
     """
     quota = class_quotas(prior, n)
     quota = quota[quota > 0]
@@ -128,7 +130,7 @@ def sample_to_quota(
     total_drawn = 0
     observed = pd.Series(0, index=quota.index)
 
-    while rounds < MAX_ROUNDS:
+    while rounds < max_rounds:
         need = (quota - have).clip(lower=0)
         if not need.any():
             break

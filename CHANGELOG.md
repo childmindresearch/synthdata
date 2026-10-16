@@ -4,6 +4,12 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.8.1 (2026-10-16)
+
+### Fixed
+
+- TabPFN no longer refits to top up a class that fell short of its quota (`generation.match_class_prior`). Each top-up was a whole new fit, about 10 h on wide data. The class now stays short, recorded in `diagnostics/class_sampling.csv` and flagged by `checks.csv`, as for any other model after its last batch. Other models are unchanged.
+
 ## 0.8.0 (2026-10-16)
 
 Results are not comparable with 0.7.x: use a new experiment id.
