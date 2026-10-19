@@ -4,6 +4,20 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.8.2 (2026-10-19)
+
+Results are unchanged: no new experiment id or golden re-record is needed (no numerical library moved).
+
+### Removed
+
+- `scripts/document_pipeline/` (old PII and Markdown-parsing scripts, not part of the pipeline). Git history keeps it. This closes both CodeQL alerts.
+- The `ydata` extra and `notebooks/ydata-test.py`. `ydata-synthetic` 1.4.0 pins TensorFlow 2.15, Keras 2, an old `requests`, `pytest<8` and old Jupyter, and caused most of the Dependabot alerts. `uv sync --extra ydata` no longer works.
+
+### Fixed
+
+- Security updates in `uv.lock` for packages with known vulnerabilities, among them aiohttp, pillow, gitpython, cryptography, urllib3, tornado, jupyterlab, notebook, jupyter-server, starlette, protobuf and pytest (7 to 9). numpy, pandas, scipy, scikit-learn, xgboost, torch and the generators stay at their old versions.
+- `python-dotenv` is now a direct dependency: `synthdata/__init__.py` imports it, but it was only installed through other packages.
+
 ## 0.8.1 (2026-10-16)
 
 ### Fixed

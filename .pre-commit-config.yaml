@@ -11,12 +11,11 @@ repos:
     hooks:
       # Scoped to the synthdata pipeline (package/CLI entrypoints/tests) --
       # these two hooks *rewrite* files, so unlike the read-only checks below
-      # they must not touch apps/, notebooks/, scripts/document_pipeline/, or
-      # vendored submodules/.
+      # they must not touch apps/, notebooks/, or vendored submodules/.
       - id: trailing-whitespace
-        files: '^(synthdata/|scripts/(?!document_pipeline/)|tests/).*\.py$'
+        files: '^(synthdata/|scripts/|tests/).*\.py$'
       - id: end-of-file-fixer
-        files: '^(synthdata/|scripts/(?!document_pipeline/)|tests/).*\.py$'
+        files: '^(synthdata/|scripts/|tests/).*\.py$'
       - id: check-yaml
       - id: check-toml
       - id: check-merge-conflict

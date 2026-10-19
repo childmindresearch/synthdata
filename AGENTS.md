@@ -20,7 +20,7 @@ SynthData generates synthetic versions of a clinical table and evaluates them fo
 - `configs/`: `config_hepatitis.yaml` (quick, public), `config_sim.yaml` (simulated clinical data, ~680 columns), `config_loris.yaml` (~1090 columns).
 - `submodules/synthcity`, `submodules/syntheval`: our forks `alperkent-cmi/synthcity` and `alperkent-cmi/syntheval`, installed editable. A fix there is a commit on the fork's `main`, then a submodule bump here.
 - `tests/unit/`, `tests/integration/` (real CLIs on the committed fixture `tests/integration/fixtures/clinic.csv`; see its README).
-- `apps/`, `notebooks/`, `scripts/document_pipeline/`: legacy or exploratory, not part of the pipeline.
+- `apps/`, `notebooks/`: legacy or exploratory, not part of the pipeline.
 
 ## Commands
 

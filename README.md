@@ -107,17 +107,12 @@ The pipeline above is the supported path for new work. The following areas are o
 
 ### Notebooks
 
-- [`notebooks/ydata-test.py`](notebooks/ydata-test.py): ydata-synthetic experimentation; requires `uv sync --extra ydata`.
 - [`notebooks/ctgan_hpo_hepatitis.ipynb`](notebooks/ctgan_hpo_hepatitis.ipynb) and [`notebooks/test_hepatitis_data.ipynb`](notebooks/test_hepatitis_data.ipynb): earlier Hepatitis-focused synthesis, imputation, HPO, and evaluation work.
 - [`notebooks/tabpfn_demo.ipynb`](notebooks/tabpfn_demo.ipynb): TabPFN classification and synthesis exploration. Configure `TABPFN_TOKEN` (and, optionally, `HF_TOKEN`) in `.env` when the API is required.
 
 ### Imputation benchmark
 
 - `synthdata-imputation-benchmark` ([`synthdata/imputation/benchmark.py`](synthdata/imputation/benchmark.py)): an exploratory masked-cell benchmark for RefiDiff settings. It has not been validated since its first implementation and is not part of the pipeline; its options (`imputation.benchmark`) are documented in [`synthdata/config.py`](synthdata/config.py).
-
-### Scripts
-
-- [`scripts/document_pipeline/`](scripts/document_pipeline): early PII-anonymization and Markdown-parsing work unrelated to the synthetic-data pipeline.
 
 ## Repository layout
 
