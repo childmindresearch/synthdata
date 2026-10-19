@@ -182,3 +182,46 @@ def test_tabpfn_keeps_its_first_batch_without_refitting_for_short_classes(
     assert set(record["method"]) == {"rejection"}
     assert (record["rounds"] == 1).all()
     assert counts == [100]
+
+
+def _two_synthcity_models(make_config, make_dataset, mocker):
+    cfg = make_config()
+    cfg.generation.tabpfn.enabled = False
+    cfg.generation.tabpfgen.enabled = False
+    cfg.generation.hpo.enabled = False
+    cfg.generation.synthcity.names = ["ctgan", "pategan"]
+    cfg.generation.match_class_prior = False
+    dataset = make_dataset()
+    dataset.train_imputed_df = dataset.train_df
+    mocker.patch("synthdata.generation.pipeline.sc.make_loader")
+
+    def fit(name, *args, **kwargs):
+        if name == "pategan":
+            raise RuntimeError("CUDA out of memory. Tried to allocate 1.42 GiB")
+        return dataset.train_df
+
+    mocker.patch("synthdata.generation.pipeline.sc.fit_generate", side_effect=fit)
+    return cfg, dataset
+
+
+def test_a_failed_model_is_recorded_and_the_others_continue(make_config, make_dataset, mocker):
+    from synthdata.generation.pipeline import FAILURES_FILE, read_failures
+
+    cfg, dataset = _two_synthcity_models(make_config, make_dataset, mocker)
+    output_dir = Path(cfg.generation.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / FAILURES_FILE).write_text('{"old": "from an earlier run"}')
+
+    result = run_generation(cfg, dataset)
+
+    assert sorted(result) == ["ctgan"]
+    assert read_failures(output_dir) == {
+        "pategan": "RuntimeError: CUDA out of memory. Tried to allocate 1.42 GiB"
+    }
+
+
+def test_a_failed_model_stops_the_run_when_continuing_is_off(make_config, make_dataset, mocker):
+    cfg, dataset = _two_synthcity_models(make_config, make_dataset, mocker)
+    cfg.generation.continue_on_model_failure = False
+    with pytest.raises(RuntimeError, match="out of memory"):
+        run_generation(cfg, dataset)

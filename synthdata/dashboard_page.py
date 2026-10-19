@@ -232,11 +232,8 @@ def _segments(tasks: list[dict], t1: float) -> list[dict]:
 PHASE_LABEL = {"fit": "untuned fits", "HPO": "HPO search", "tuned fit": "tuned fits"}
 
 
-def _phases(tasks: list[dict], t1: float, pct, model: str) -> list[str]:
-    """Shading over a generation worker's bar: its HPO search and its tuned fits.
-
-    Consecutive fits of one kind (a model's replicates) merge into one span.
-    """
+def _phase_spans(tasks: list[dict], t1: float) -> list[list]:
+    """[kind, start, end, count] per run of phases; a model's replicates merge into one span."""
     spans: list[list] = []
     for t in tasks:
         for phase in t.get("phases") or []:
@@ -246,12 +243,20 @@ def _phases(tasks: list[dict], t1: float, pct, model: str) -> list[str]:
                 spans[-1][3] += 1
             else:
                 spans.append([phase["kind"], start, end, 1])
+    return spans
+
+
+def _phase_text(kind: str, start: float, end: float, n: int) -> str:
+    return PHASE_LABEL[kind] + (f" ({n})" if kind != "HPO" else "") + f" {_duration(end - start)}"
+
+
+def _phases(tasks: list[dict], t1: float, pct, model: str) -> list[str]:
+    """Shading over a generation worker's bar: its HPO search and its tuned fits."""
     out = []
-    for kind, start, end, n in spans:
+    for kind, start, end, n in _phase_spans(tasks, t1):
         if kind == "fit":
             continue  # the bar itself is untuned fitting
-        what = PHASE_LABEL[kind] + (f" ({n})" if kind != "HPO" else "")
-        tip = f"{model} · generation · {what} · {_duration(end - start)}"
+        tip = f"{model} · generation · {_phase_text(kind, start, end, n)}"
         cls = "hpo" if kind == "HPO" else "tuned"
         out.append(
             f'<div class="phase {cls}" style="left:{pct(start):.2f}%;'
@@ -297,8 +302,17 @@ def _timeline(d: dict) -> str:
         segs = []
         for s in _segments(mine, t1):
             n = len(s["tasks"])
-            what = f"{n} replicates" if n > 1 else s["tasks"][0]["model"]
-            tip = f"{model} · {s['step']} · {what} · {s['status']} · {_duration(s['end'] - s['start'])}"
+            # What the segment did: its phases (untuned fits, search, tuned
+            # fits) for a generation worker, else its replicates.
+            spans = _phase_spans(s["tasks"], t1)
+            if spans:
+                what = ", ".join(_phase_text(*span) for span in spans)
+            elif n > 1:
+                what = f"{n} replicates"
+            else:
+                what = "" if s["tasks"][0]["model"] == model else s["tasks"][0]["model"]
+            parts = [model, s["step"], what, s["status"], _duration(s["end"] - s["start"])]
+            tip = " · ".join(p for p in parts if p)
             n_failed = sum(t.get("metric_failures", 0) for t in s["tasks"])
             if n_failed:
                 tip += f" · {n_failed} metric failure{'s' * (n_failed != 1)}"
@@ -396,8 +410,8 @@ def _screen_text(screen: dict) -> str:
     return f"{screen['name']}: off by {screen['violation']:.3g}"
 
 
-def _trial_tip(c: list) -> str:
-    lines = [f"trial {c[0]}: {c[1]:.4g}"]
+def _trial_tip(c: list, objective: str | None = None) -> str:
+    lines = [f"trial {c[0]}: {objective + ' ' if objective else ''}{c[1]:.4g}"]
     failed = c[4] if len(c) > 4 else []
     if failed:
         lines += ["failed " + _screen_text(f) for f in failed]
@@ -408,7 +422,7 @@ def _trial_tip(c: list) -> str:
     return "\n".join(lines)
 
 
-def _sparkline(curve: list, maximize: bool) -> str:
+def _sparkline(curve: list, maximize: bool, objective: str | None = None) -> str:
     if len(curve) < 2:
         return '<span class="muted small">-</span>'
     w, h, pad = 220, 56, 4
@@ -428,7 +442,7 @@ def _sparkline(curve: list, maximize: bool) -> str:
     # Each dot's <title> is the browser's own hover tooltip: no script needed.
     dots = "".join(
         f'<circle cx="{px(c[0]):.1f}" cy="{py(c[1]):.1f}" r="2.6" class="{"dot" if c[3] else "dot off"}">'
-        f"<title>{_e(_trial_tip(c))}</title></circle>"
+        f"<title>{_e(_trial_tip(c, objective))}</title></circle>"
         for c in curve
     )
     best = [c for c in curve if c[2] is not None]
@@ -438,10 +452,16 @@ def _sparkline(curve: list, maximize: bool) -> str:
         path += f"M{x:.1f},{y:.1f}" if i == 0 else f"H{x:.1f}V{y:.1f}"
     if best:
         path += f"H{px(x1):.1f}"
-    label = f"best so far by trial ({'higher' if maximize else 'lower'} is better)"
+    better = "higher" if maximize else "lower"
+    label = f"{objective or 'objective'} by trial, best so far ({better} is better)"
+    # The objective and its range sit next to the plot, so the y axis reads without the table.
+    axis = (
+        f'<div class="spark-axis small"><b>{_e(objective or "objective")}</b> '
+        f'<span class="muted">{_num(lo)} to {_num(hi)}, {better} is better</span></div>'
+    )
     return (
-        f'<svg class="spark" width="{w}" height="{h}" viewBox="0 0 {w} {h}" role="img" aria-label="{label}">'
-        f'<title>{label}</title><path d="{path}" class="best"/>{dots}</svg>'
+        f'<svg class="spark" width="{w}" height="{h}" viewBox="0 0 {w} {h}" role="img" aria-label="{_e(label)}">'
+        f'<title>{_e(label)}</title><path d="{path}" class="best"/>{dots}</svg>{axis}'
     )
 
 
@@ -469,7 +489,8 @@ def _hpo(d: dict) -> str:
                 if fails
                 else '<span class="muted small">none failed</span>'
             )
-            objective = _e(s.get("objective") or "-")
+            stop = s.get("stop") if status == "stopped" else None
+            why = f'<div class="muted small">{_e(stop)}</div>' if stop else ""
             err = (
                 f'<details><summary class="small">last failure</summary><pre>{_e(s["last_error"])}</pre></details>'
                 if s["last_error"]
@@ -482,16 +503,16 @@ def _hpo(d: dict) -> str:
             )
             eta = _duration(s["eta_s"]) if s["eta_s"] is not None and status == "running" else "-"
             rows.append(
-                f'<tr><td class="model">{_e(s["model"])}</td><td class="small">{objective}</td>'
-                f"<td>{_badge(status)}</td>"
+                f'<tr><td class="model">{_e(s["model"])}</td>'
+                f"<td>{_badge(status)}{why}</td>"
                 f'<td><div class="tnum">{counts}</div>{prog}<div class="muted small">{detail}</div></td>'
                 f'<td class="small">{screens}</td>'
-                f'<td class="num">{best}</td><td>{_sparkline(s["curve"], s["maximize"])}</td>'
+                f'<td class="num">{best}</td><td>{_sparkline(s["curve"], s["maximize"], s.get("objective"))}</td>'
                 f'<td class="num">{_e(_duration(s["median_trial_s"]))}</td><td class="num">{_e(eta)}</td>'
                 f"<td>{err}</td></tr>"
             )
         body = (
-            '<div class="scroll"><table><thead><tr><th>Model</th><th>Objective</th><th>Status</th>'
+            '<div class="scroll"><table><thead><tr><th>Model</th><th>Status</th>'
             "<th>Trials</th><th>Failed screens (trials)</th>"
             '<th class="num">Best</th><th>Trials and best so far</th><th class="num">Median trial</th>'
             '<th class="num">Time left</th><th></th></tr></thead><tbody>'
@@ -819,7 +840,7 @@ tr.group th{background:var(--track);color:var(--ink);font-size:13px}td.indent{pa
 th,td{padding:6px 8px;border-bottom:1px solid var(--grid);text-align:left;vertical-align:middle}
 th{font-size:12px;font-weight:600;color:var(--muted)}tr.baseline td{color:var(--ink2)}td.model{white-space:nowrap}
 .prog{height:4px;background:var(--track);border-radius:2px;margin:3px 0;min-width:90px}.prog div{height:100%;background:var(--s1);border-radius:2px}
-.spark .dot{fill:var(--muted);opacity:.55}.spark .dot.off{fill:none;stroke:var(--muted);stroke-width:.8}.spark .best{fill:none;stroke:var(--s1);stroke-width:2}
+.spark .dot{fill:var(--muted);opacity:.55}.spark .dot.off{fill:none;stroke:var(--muted);stroke-width:.8;pointer-events:all}.spark-axis{margin-top:2px;white-space:nowrap}.spark .best{fill:none;stroke:var(--s1);stroke-width:2}
 details summary{cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin:6px 0 0}
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,520px),1fr));gap:16px}
 figure{margin:0;position:relative;min-width:0}figcaption{font-size:13px;font-weight:600;margin-bottom:4px;display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center}

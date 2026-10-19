@@ -693,6 +693,13 @@ class GenerationConfig:
     #: Retrain and overwrite models whose synthetic CSV already exists in this
     #: experiment (False reuses them, so a rerun only fills in what is missing).
     force_retrain: bool = False
+    #: When a model's search, fit or sampling fails (for example out of GPU
+    #: memory), log it, list it in ``generation_failures.json`` and go on with
+    #: the other models, so evaluation still runs on every model that
+    #: finished; the stage fails only if no synthetic dataset is left. False
+    #: stops the run at the first failed model instead. A rerun of the same
+    #: experiment redoes only the failed models (the others are cached).
+    continue_on_model_failure: bool = True
     #: synthcity generators (see SynthcityModelsConfig).
     synthcity: SynthcityModelsConfig = dataclasses.field(default_factory=SynthcityModelsConfig)
     #: TabPFN generators (see TabPFNConfig).
@@ -854,10 +861,12 @@ class ComputeConfig:
     #: RAM (GiB) one model's process needs; None estimates it from the column count.
     memory_per_worker_gib: float | None = None
     #: GPU sharing while models train in parallel (synthdata.gpu_slots): each
-    #: fit runs on the least busy GPU. "auto" sets no limit per GPU (sharing
+    #: fit runs on the least busy GPU that has the memory its model needs
+    #: (measured on the model's earlier fits; a share of the GPU before the
+    #: first). "auto" sets no limit on the number of fits per GPU (sharing
     #: raised total speed in measurements); a number caps the fits per GPU,
-    #: most remaining work first (e.g. to fit GPU memory); 0/None keeps each
-    #: model on one GPU, assigned round-robin.
+    #: most remaining work first; 0/None keeps each model on one GPU,
+    #: assigned round-robin, with no memory check.
     fits_per_gpu: str | int | None = "auto"
 
 

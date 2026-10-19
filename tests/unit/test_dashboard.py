@@ -610,3 +610,55 @@ def test_one_vs_rest_passes_show_as_one_step():
         _minutes(1).replace(microsecond=0),
         _minutes(25).replace(microsecond=0),
     )
+
+
+def test_a_stopped_search_gives_its_reason():
+    task = "generation: ctgan"
+    lines = [
+        _logline(
+            _minutes(1),
+            "synthdata.generation.hpo",
+            "INFO",
+            "[hpo_ctgan] stopping early: 10 trials in a row without a gain above 0.0050 "
+            "(best 0.4000; patience 10)",
+            task=task,
+        ),
+        _logline(
+            _minutes(2),
+            "synthdata.generation.hpo",
+            "INFO",
+            "[hpo_tvae] search ended at its time budget: 7 of 40 trials done",
+            task="generation: tvae",
+        ),
+    ]
+    budgets = dashboard.parse_log(lines)["hpo_budget"]
+    assert budgets["hpo_ctgan"]["stop"] == "no gain in 10 trials"
+    assert budgets["hpo_tvae"]["stop"] == "time budget"
+
+
+def test_generation_segment_names_its_phases_and_trial_dots_name_the_objective():
+    from synthdata import dashboard_page as page
+
+    def at(minutes):
+        return f"{T0 + timedelta(minutes=minutes):%Y-%m-%dT%H:%M:%SZ}"
+
+    tasks = [
+        {
+            "phases": [
+                {"kind": "fit", "start": at(0), "end": at(60)},
+                {"kind": "HPO", "start": at(60), "end": at(120)},
+                {"kind": "tuned fit", "start": at(120), "end": at(150)},
+                {"kind": "tuned fit", "start": at(150), "end": at(180)},
+            ]
+        }
+    ]
+    spans = page._phase_spans(tasks, (T0 + timedelta(hours=4)).timestamp())
+    assert [page._phase_text(*span) for span in spans] == [
+        "untuned fits (1) 1 h 00 min",
+        "HPO search 1 h 00 min",
+        "tuned fits (2) 1 h 00 min",
+    ]
+    curve = [[0, 0.3, None, False, []], [1, 0.4, 0.4, True, []]]
+    svg = page._sparkline(curve, True, "tstr_macro_f1")
+    assert "trial 0: tstr_macro_f1 0.3" in svg
+    assert "<b>tstr_macro_f1</b>" in svg and "higher is better" in svg

@@ -112,6 +112,23 @@ _HPO_START = re.compile(
     r"\d+ trial\(s\) remaining "
     r"\(\d+ already finished, target=(?P<target>\d+), timeout=(?P<timeout>\w+)s\)"
 )
+#: Log lines that end a search before its trial target, and the reason shown.
+_HPO_STOPS = (
+    (
+        re.compile(r"^\[(?P<study>[^\]]+)\] stopping early: (?P<n>\d+) trials in a row"),
+        "no gain in {n} trials",
+    ),
+    (
+        re.compile(r"^\[(?P<study>[^\]]+)\] stopping the search at the stage time limit"),
+        "stage time limit",
+    ),
+    (re.compile(r"^\[(?P<study>[^\]]+)\] no time left for the search"), "stage time limit"),
+    (re.compile(r"^\[(?P<study>[^\]]+)\] search ended at its time budget"), "time budget"),
+    (
+        re.compile(r"^\[(?P<study>[^\]]+)\] the start-up trials used the study's time budget"),
+        "time budget",
+    ),
+)
 
 STAGE_ORDER = ["impute", "generate", "evaluate", "plot"]
 
@@ -370,6 +387,13 @@ def parse_log(lines: list[str]) -> dict:
                 "session_start": moment,
                 "objective": m["objective"],
             }
+        elif _HPO_LINE.match(msg):
+            for pattern, reason in _HPO_STOPS:
+                if stop := pattern.match(msg):
+                    hpo_budget.setdefault(stop["study"], {})["stop"] = reason.format(
+                        **stop.groupdict()
+                    )
+                    break
         if level in ("ERROR", "CRITICAL", "WARNING"):
             failed_model = None
             if level != "WARNING" and (m := _TASK_FAIL.match(msg)):
@@ -701,6 +725,7 @@ def read_hpo(db_path: Path | None, budgets: dict, now: datetime) -> tuple[list[d
                 "running": counts["RUNNING"],
                 "target": target,
                 "timeout": budget.get("timeout"),
+                "stop": budget.get("stop"),
                 "best": best,
                 "curve": curve[-300:],
                 "median_trial_s": recent[len(recent) // 2] if recent else None,
@@ -958,7 +983,10 @@ def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
     generating = state == "running" and generate is not None and generate["status"] == "running"
     gen_status = {t["model"]: t["status"] for t in tasks if t["step"] == "generation"}
     for study in hpo:
-        study["status"] = hpo_status(study, generating, gen_status.get(study["model"]))
+        worker = gen_status.get(study["model"])
+        study["status"] = hpo_status(study, generating, worker)
+        if study["status"] == "stopped" and worker == "failed":
+            study["stop"] = "generation failed"
 
     resources = read_resources(log_path)
     machine = {}

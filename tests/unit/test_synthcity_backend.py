@@ -301,3 +301,65 @@ def test_arf_samples_stay_in_range_on_wide_data():
     features = df.columns.drop("y")
     assert (syn[features] >= df[features].min()).all().all()
     assert (syn[features] <= df[features].max()).all().all()
+
+
+def test_large_draws_are_chunked_with_their_own_seeds(monkeypatch):
+    import numpy as np
+    import pandas as pd
+
+    from synthdata.generation import synthcity_backend as sc
+
+    monkeypatch.setattr(sc, "CHUNK_ROWS", 4)
+    calls = []
+
+    def generate(count, seed, cond):
+        calls.append((count, seed, None if cond is None else list(cond)))
+        return pd.DataFrame({"x": np.arange(count)})
+
+    # Up to one chunk: a single call with the draw's own seed, as before.
+    assert len(sc.generate_in_chunks(generate, 3, 7)) == 3
+    assert calls == [(3, 7, None)]
+    calls.clear()
+    out = sc.generate_in_chunks(generate, 10, 7, cond=np.arange(10))
+    assert len(out) == 10 and list(out.index) == list(range(10))
+    assert [c[0] for c in calls] == [4, 4, 2]
+    assert calls[0][1] == 7 and len({c[1] for c in calls}) == 3
+    assert [c[2] for c in calls] == [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9]]
+
+
+def test_out_of_memory_chunk_is_retried_with_the_same_seed(monkeypatch):
+    import pandas as pd
+
+    from synthdata.generation import synthcity_backend as sc
+
+    monkeypatch.setattr(sc, "OOM_WAIT_SECONDS", 0)
+    seeds = []
+
+    def generate(count, seed, cond):
+        seeds.append(seed)
+        if len(seeds) == 1:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 1.42 GiB")
+        return pd.DataFrame({"x": range(count)})
+
+    assert len(sc.generate_in_chunks(generate, 3, 5)) == 3
+    assert seeds == [5, 5]
+
+
+def test_fit_out_of_memory_is_retried_on_the_gpu_only(mocker, monkeypatch):
+    from synthcity.plugins import Plugins
+
+    from synthdata import gpu_slots
+    from synthdata.generation import synthcity_backend as sc
+
+    monkeypatch.setattr(sc, "OOM_WAIT_SECONDS", 0)
+    noted = mocker.patch.object(gpu_slots, "note_oom")
+    get = mocker.patch.object(Plugins, "get")
+    get.return_value.fit.side_effect = [RuntimeError("CUDA out of memory"), None]
+    sc.fit_generate("ctgan", {}, mocker.Mock(), 5, device="cuda", discrete_columns=[])
+    assert get.call_count == 2 and noted.call_count == 1
+    # On the CPU (or for another error) the error is raised at once.
+    get.reset_mock()
+    get.return_value.fit.side_effect = RuntimeError("CUDA out of memory")
+    with pytest.raises(RuntimeError):
+        sc.fit_generate("ctgan", {}, mocker.Mock(), 5, discrete_columns=[])
+    assert get.call_count == 1
