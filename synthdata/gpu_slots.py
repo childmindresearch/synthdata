@@ -366,7 +366,9 @@ def _start_peak(device: str | None) -> None:
     except ImportError:
         return
     if device and str(device).startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats(torch.device(device))
+        # Measuring must never stop a fit, e.g. for a device index this machine lacks.
+        with contextlib.suppress(RuntimeError, ValueError):
+            torch.cuda.reset_peak_memory_stats(torch.device(device))
 
 
 def _peak_gib(device: str | None) -> float | None:
@@ -375,7 +377,10 @@ def _peak_gib(device: str | None) -> float | None:
     except ImportError:
         return None
     if device and str(device).startswith("cuda") and torch.cuda.is_available():
-        return torch.cuda.max_memory_reserved(torch.device(device)) / 2**30
+        try:
+            return torch.cuda.max_memory_reserved(torch.device(device)) / 2**30
+        except (RuntimeError, ValueError):
+            return None
     return None
 
 
