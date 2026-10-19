@@ -44,15 +44,6 @@ synthdata-run = "scripts.run_pipeline:main"
 synthdata-dashboard = "scripts.run_dashboard:main"
 
 [project.optional-dependencies]
-presidio = [
-    "presidio-analyzer[transformers,stanza,gliner]",
-    "presidio-anonymizer",
-    "streamlit",
-    "streamlit-tags",
-    "st-annotated-text",
-    "python-dotenv",
-    "flair",
-]
 tabpfn = [
     "tabpfgen",
     "tabpfn",
@@ -132,16 +123,15 @@ line-length = 100
 # Scope linting to the synthdata pipeline itself: the package, its CLI
 # entrypoints, and its tests. `include` only affects directory *discovery*
 # (e.g. plain `ruff check .`) -- it has no effect on files passed explicitly
-# on the command line (as pre-commit does), so apps/, notebooks/ and
-# submodules/ (vendored syntheval/synthcity)
-# must also be listed in `extend-exclude` below to stay out of scope in both
+# on the command line (as pre-commit does), so notebooks/ and
+# submodules/ (vendored syntheval/synthcity) must also be listed in `extend-exclude` below to stay out of scope in both
 # invocation styles.
 include = ["synthdata/**/*.py", "scripts/**/*.py", "tests/**/*.py"]
-extend-exclude = ["apps", "notebooks", "submodules"]
+extend-exclude = ["notebooks", "submodules"]
 # pre-commit passes explicit file paths on the command line, which ruff
 # otherwise always lints regardless of exclude/extend-exclude (force-exclude
-# defaults to false). Without this, `pre-commit run` would lint apps/,
-# and notebooks/ despite the excludes above.
+# defaults to false). Without this, `pre-commit run` would lint
+# notebooks/ despite the excludes above.
 force-exclude = true
 
 [tool.ruff.lint]

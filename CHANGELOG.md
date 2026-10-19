@@ -10,7 +10,9 @@ Results are unchanged: no new experiment id or golden re-record is needed (no nu
 
 ### Removed
 
-- `scripts/document_pipeline/` (old PII and Markdown-parsing scripts, not part of the pipeline). Git history keeps it. This closes both CodeQL alerts.
+- Legacy code that was not part of the pipeline, was no longer maintained and caused most of the security alerts. The tag `legacy-archive` marks the last commit that has it; restore a path with `git checkout legacy-archive -- <path>`.
+- `scripts/document_pipeline/` (old PII and Markdown-parsing scripts). This closes both CodeQL alerts.
+- `apps/presidio/` (the Presidio PII Streamlit app) and the `presidio` extra, which pulled in an old `transformers` and `sqlitedict`. `uv sync --extra presidio` no longer works.
 - The `ydata` extra and `notebooks/ydata-test.py`. `ydata-synthetic` 1.4.0 pins TensorFlow 2.15, Keras 2, an old `requests`, `pytest<8` and old Jupyter, and caused most of the Dependabot alerts. `uv sync --extra ydata` no longer works.
 
 ### Fixed

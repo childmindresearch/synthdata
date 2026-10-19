@@ -99,11 +99,9 @@ Tests are under [`tests/`](tests/). See `pyproject.toml` for available test mark
 
 ## Legacy and exploratory code
 
-The pipeline above is the supported path for new work. The following areas are older or exploratory tracks retained for reference and targeted experimentation:
+The pipeline above is the supported path for new work. The following areas are older or exploratory tracks retained for reference and targeted experimentation.
 
-### Apps
-
-- [`apps/presidio/presidio_streamlit.py`](apps/presidio/presidio_streamlit.py): an offline-focused Presidio Streamlit app for PHI/PII processing. Install its dependencies with `uv sync --extra presidio`; see the [Presidio app guide](apps/presidio/PRESIDIO_APP_GUIDE.md) for setup and security guidance.
+> **Deleted legacy code.** Version 0.8.2 removed the Presidio PII app (`apps/presidio/`, the `presidio` extra), the document-parsing scripts (`scripts/document_pipeline/`) and the ydata-synthetic notebook (`notebooks/ydata-test.py`, the `ydata` extra). None of them was part of the pipeline, they were no longer maintained, and their old pinned dependencies caused most of the repository's security alerts. They are still in git history: the tag `legacy-archive` points at the last commit that has them. To look at or reuse one, run `git checkout legacy-archive -- <path>` (or browse the tag on GitHub), and update its dependencies before running it.
 
 ### Notebooks
 
@@ -120,4 +118,4 @@ The pipeline above is the supported path for new work. The following areas are o
 - [`synthdata/`](synthdata/): pipeline implementation.
 - [`configs/`](configs/): example configurations (Hepatitis, simulated data, LORIS).
 - [`scripts/`](scripts/): installed CLI entry points.
-- [`apps/`](apps/) and [`notebooks/`](notebooks/): optional exploratory work.
+- [`notebooks/`](notebooks/): optional exploratory work.
