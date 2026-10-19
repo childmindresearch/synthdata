@@ -233,6 +233,7 @@ def main() -> None:
         cfg.seed,
         match_prior=match_prior,
         workspace=workspace,
+        xgb_params=cfg.evaluation.tstr_xgboost_params,
     )
     fairness_column = dataset.protected_columns[0] if dataset.protected_columns else None
     loader = sc.make_loader(

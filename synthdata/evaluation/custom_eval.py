@@ -144,6 +144,7 @@ def tstr_and_tsts_scores(
     classes: list,
     seeds: list,
     ordinal: bool = False,
+    xgb_params: dict | None = None,
 ) -> tuple[TSTRScores, TSTRScores | None]:
     """TSTR (fit on all synthetic rows, score on the real test split) and TSTS.
 
@@ -157,7 +158,14 @@ def tstr_and_tsts_scores(
     from sklearn.model_selection import train_test_split
 
     tstr = tstr_scores(
-        synthetic_df, test_df, target, nominal_columns, classes, seeds, ordinal=ordinal
+        synthetic_df,
+        test_df,
+        target,
+        nominal_columns,
+        classes,
+        seeds,
+        ordinal=ordinal,
+        xgb_params=xgb_params,
     )
     counts = synthetic_df[target].value_counts()
     if len(synthetic_df) < 10:
@@ -166,7 +174,16 @@ def tstr_and_tsts_scores(
     fit_df, score_df = train_test_split(
         synthetic_df, test_size=TSTS_SCORE_FRACTION, random_state=seeds[0], stratify=stratify
     )
-    tsts = tstr_scores(fit_df, score_df, target, nominal_columns, classes, seeds, ordinal=ordinal)
+    tsts = tstr_scores(
+        fit_df,
+        score_df,
+        target,
+        nominal_columns,
+        classes,
+        seeds,
+        ordinal=ordinal,
+        xgb_params=xgb_params,
+    )
     return tstr, tsts
 
 
@@ -177,6 +194,7 @@ def run_tstr_evaluation(
     n_seeds: int,
     seed: int,
     compute_cfg=None,
+    xgb_params: dict | None = None,
 ) -> dict:
     """Holdout TSTR and TSTS: the fixed XGBoost fitted on each dataset.
 
@@ -190,6 +208,8 @@ def run_tstr_evaluation(
     "classes": [...]}``, or ``{}`` when TSTR is not selected, the target is
     not categorical, or there is no test split. A model whose fit fails is
     logged and left out (its row is NaN in the combined table).
+    ``xgb_params`` overrides the classifier's defaults
+    (``evaluation.tstr_xgboost_params``).
     """
     if not _selected(selection_cfg, TSTR_NAME):
         return {}
@@ -210,7 +230,7 @@ def run_tstr_evaluation(
     # Models are scored in parallel processes per compute_cfg; a failed one
     # is logged there and left out.
     run = run_per_model(
-        functools.partial(tstr_and_tsts_scores, ordinal=ordinal),
+        functools.partial(tstr_and_tsts_scores, ordinal=ordinal, xgb_params=xgb_params),
         {
             name: (
                 syn_df[train_df.columns],

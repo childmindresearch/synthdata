@@ -189,6 +189,16 @@ evaluation:
   # weight (per-class values in ovr_per_class.csv); binary = once on the
   # binary_target collapse (see config_loris.yaml), which must then be enabled.
   class_averaging: ovr_macro
+  # XGBoost that predicts the target in holdout TSTR, the HPO objective and its
+  # real-data ceiling. These are a collaborator's tuned parameters for their own
+  # baseline model on this data; keys left out keep the defaults (80 trees,
+  # depth 4, learning rate 0.08, no subsampling). With subsample/colsample_bytree
+  # below 1 the fit depends on its seed: tstr_seeds (3) averages that out here,
+  # generation.hpo.tstr_seeds (1) does not. null = defaults. Changing it changes
+  # the HPO objective, so use a new experiment id.
+  tstr_xgboost_params:
+    { n_estimators: 300, max_depth: 5, learning_rate: 0.01, subsample: 0.8,
+      colsample_bytree: 0.6, min_child_weight: 1, gamma: 0.1 }
   # Custom privacy metrics (Anonymeter, holdout-referenced DCR/NNDR).
   # unit: row = every row is an individual (each synthetic row is released as its
   # own record); patient = attacks target one encounter per patient and the

@@ -4,6 +4,15 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.9.0 (2026-10-19)
+
+Results are unchanged with the default config. A config that sets the new key changes the HPO objective and holdout TSTR: use a new experiment id. No golden re-record is needed (the golden config does not set it).
+
+### Added
+
+- `evaluation.tstr_xgboost_params`: your own `XGBClassifier` parameters for the classifier that predicts the target in holdout TSTR/TSTS, the HPO objective and its real-data ceiling, for example the parameters of a baseline model tuned on the real data. Keys you leave out keep the defaults; `random_state`, `seed`, `objective` and `num_class` are refused, and class-balanced weights still apply. SynthEval's and synthcity's utility metrics, `fid_detection_auc` and the privacy attacks keep their own classifiers. `configs/config_sim.yaml` sets it to a collaborator's tuned baseline parameters as an example.
+- `manifest.json`: the evaluation entry (and the generation entry when HPO runs) records the classifier parameters used as `tstr_xgboost_params`.
+
 ## 0.8.2 (2026-10-19)
 
 Results are unchanged: no new experiment id or golden re-record is needed (no numerical library moved).

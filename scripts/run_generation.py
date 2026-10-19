@@ -18,6 +18,7 @@ from pathlib import Path
 
 from synthdata.config import load_config
 from synthdata.data import load_dataset, load_imputed_splits
+from synthdata.evaluation.tstr import tstr_xgb_params
 from synthdata.experiment import start_experiment
 from synthdata.generation import run_generation
 from synthdata.generation.pipeline import needs_imputed_data
@@ -105,6 +106,11 @@ def main() -> None:
             "models": sorted(synthetic_datasets),
         },
         n_models=len(synthetic_datasets),
+        **(
+            {"tstr_xgboost_params": tstr_xgb_params(cfg.evaluation.tstr_xgboost_params)}
+            if cfg.generation.hpo.enabled
+            else {}
+        ),
     )
 
     logger.info(

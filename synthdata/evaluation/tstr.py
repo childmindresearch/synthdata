@@ -5,7 +5,9 @@ training data rather than the classifier (ported from the core of
 ``feat/final-release-evaluation``'s ``tstr.py``, without its provenance layer).
 Scores are averaged over the given XGBoost seeds; with ``subsample`` and
 ``colsample_bytree`` at 1 the classifier is deterministic, so one seed is
-enough and the seeds add no noise estimate. Every fit weights its rows by
+enough and the seeds add no noise estimate. ``evaluation.tstr_xgboost_params``
+can replace any of these settings (for example with parameters tuned for the
+real data); with row or column subsampling the seeds then matter. Every fit weights its rows by
 inverse class frequency (scikit-learn's ``compute_sample_weight("balanced")``),
 so each class contributes equally to the loss and an imbalanced target is
 handled the same way in HPO, the TRTR ceiling and holdout evaluation. The score's sampling noise comes
@@ -32,6 +34,7 @@ from synthdata.utils import get_logger
 logger = get_logger(__name__)
 
 #: Fixed evaluator, as in the feat branch: small, shallow, deterministic.
+#: ``evaluation.tstr_xgboost_params`` overrides any of these keys.
 XGB_PARAMS = {
     "n_estimators": 80,
     "max_depth": 4,
@@ -40,6 +43,16 @@ XGB_PARAMS = {
     "colsample_bytree": 1.0,
     "tree_method": "hist",
 }
+
+#: Keys the pipeline sets itself, so ``evaluation.tstr_xgboost_params`` may
+#: not: the seeds come from ``tstr_seeds`` and the multi-class objective
+#: from the target's classes.
+RESERVED_XGB_KEYS = frozenset({"random_state", "seed", "objective", "num_class"})
+
+
+def tstr_xgb_params(overrides: dict | None = None) -> dict:
+    """The TSTR classifier's parameters: :data:`XGB_PARAMS` updated by ``overrides``."""
+    return {**XGB_PARAMS, **(overrides or {})}
 
 
 @dataclasses.dataclass
@@ -196,6 +209,7 @@ def tstr_scores(
     n_bootstrap: int = 0,
     groups: dict | None = None,
     ordinal: bool = False,
+    xgb_params: dict | None = None,
 ) -> TSTRScores:
     """Fit the fixed XGBoost on ``fit_df`` once per seed and score on ``score_df``.
 
@@ -209,6 +223,7 @@ def tstr_scores(
     low to high, so kappa uses quadratic weights.
     ``groups`` (``{column: labels aligned with score_df}``) adds the macro
     AUPRC within each group (``group_auprc``), from the first seed's fit.
+    ``xgb_params`` overrides keys of :data:`XGB_PARAMS` (see :func:`tstr_xgb_params`).
     """
     from sklearn.utils.class_weight import compute_sample_weight
     from xgboost import XGBClassifier
@@ -232,6 +247,7 @@ def tstr_scores(
     to_local = {c: i for i, c in enumerate(present)}
 
     sample_weight = compute_sample_weight("balanced", y_fit)
+    params = tstr_xgb_params(xgb_params)
 
     def predict_proba(seed):
         proba = np.zeros((len(x_score), len(classes)))
@@ -239,7 +255,7 @@ def tstr_scores(
             # A collapsed fit set can only ever predict its one class.
             proba[:, present[0]] = 1.0
         else:
-            model = XGBClassifier(**XGB_PARAMS, random_state=seed)
+            model = XGBClassifier(**params, random_state=seed)
             model.fit(x_fit, np.vectorize(to_local.get)(y_fit), sample_weight=sample_weight)
             proba[:, present] = model.predict_proba(x_score)
         return proba
