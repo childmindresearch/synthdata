@@ -109,7 +109,7 @@ def main() -> None:
         },
         n_models=len(synthetic_datasets),
         **(
-            {"tstr_xgboost_params": tstr_xgb_params(cfg.evaluation.tstr_xgboost_params)}
+            {"xgboost_params": tstr_xgb_params(cfg.evaluation.xgboost_params)}
             if cfg.generation.hpo.enabled
             else {}
         ),

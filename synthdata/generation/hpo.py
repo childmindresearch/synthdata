@@ -508,7 +508,7 @@ def build_hpo_eval_fn(
     ``protected_columns`` get the protected-group screens and per-group TSTR,
     grouped by ``protected_bins`` where given (see :func:`protected_groups`).
     ``xgb_params`` overrides the TSTR classifier's defaults
-    (``evaluation.tstr_xgboost_params``), so HPO selects against the same
+    (``evaluation.xgboost_params``), so HPO selects against the same
     classifier that evaluation scores with. The real-vs-synthetic detection
     classifier logged next to it keeps the defaults.
     """

@@ -942,7 +942,7 @@ class EvaluationConfig:
     #: utility metrics, the real-vs-synthetic detection score or the privacy
     #: attacks. Changing it changes the HPO objective: use a new experiment
     #: id. null = defaults.
-    tstr_xgboost_params: dict | None = None
+    xgboost_params: dict | None = None
     #: Anonymeter attacks and holdout-referenced DCR/NNDR (custom privacy).
     privacy_attacks: PrivacyAttacksConfig = dataclasses.field(default_factory=PrivacyAttacksConfig)
 
@@ -1283,14 +1283,12 @@ def _validate_hpo(hpo: HPOConfig) -> None:
             )
 
 
-def _validate_tstr_xgboost_params(params) -> None:
-    """``evaluation.tstr_xgboost_params``: null or XGBClassifier arguments the pipeline leaves free."""
+def _validate_xgboost_params(params) -> None:
+    """``evaluation.xgboost_params``: null or XGBClassifier arguments the pipeline leaves free."""
     if params is None:
         return
     if not isinstance(params, dict):
-        raise ValueError(
-            f"evaluation.tstr_xgboost_params must be a mapping or null, got {params!r}"
-        )
+        raise ValueError(f"evaluation.xgboost_params must be a mapping or null, got {params!r}")
     from xgboost import XGBClassifier
 
     from synthdata.evaluation.tstr import RESERVED_XGB_KEYS
@@ -1298,13 +1296,13 @@ def _validate_tstr_xgboost_params(params) -> None:
     reserved = sorted(set(params) & RESERVED_XGB_KEYS)
     if reserved:
         raise ValueError(
-            f"evaluation.tstr_xgboost_params cannot set {reserved}: the pipeline sets them "
+            f"evaluation.xgboost_params cannot set {reserved}: the pipeline sets them "
             "(seeds from tstr_seeds, objective from the target's classes)"
         )
     unknown = sorted(set(params) - set(XGBClassifier().get_params()))
     if unknown:
         raise ValueError(
-            f"evaluation.tstr_xgboost_params has keys XGBClassifier does not accept: {unknown}"
+            f"evaluation.xgboost_params has keys XGBClassifier does not accept: {unknown}"
         )
 
 
@@ -1551,7 +1549,7 @@ def _validate(cfg: Config) -> None:
         )
     if cfg.evaluation.tstr_seeds < 1:
         raise ValueError(f"evaluation.tstr_seeds must be >= 1, got {cfg.evaluation.tstr_seeds}")
-    _validate_tstr_xgboost_params(cfg.evaluation.tstr_xgboost_params)
+    _validate_xgboost_params(cfg.evaluation.xgboost_params)
     attacks = cfg.evaluation.privacy_attacks
     if attacks.unit not in PRIVACY_UNITS:
         raise ValueError(

@@ -129,7 +129,7 @@ def main() -> None:
             **({"report": extras["report_path"]} if "report_path" in extras else {}),
         },
         n_models=len(synthetic_datasets),
-        tstr_xgboost_params=tstr_xgb_params(cfg.evaluation.tstr_xgboost_params),
+        xgboost_params=tstr_xgb_params(cfg.evaluation.xgboost_params),
     )
 
     logger.info("Done. Combined table saved under %s", cfg.evaluation.output_dir)

@@ -313,7 +313,7 @@ def run_generation(
             protected_columns=dataset.protected_columns,
             protected_bins=dataset.protected_bins,
             ordinal_target=dataset.target_column in dataset.ordinal_columns,
-            xgb_params=cfg.evaluation.tstr_xgboost_params,
+            xgb_params=cfg.evaluation.xgboost_params,
         )
 
     def _cached_or_build(name, build_fn, top_up=True):

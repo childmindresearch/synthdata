@@ -209,7 +209,7 @@ def run_tstr_evaluation(
     not categorical, or there is no test split. A model whose fit fails is
     logged and left out (its row is NaN in the combined table).
     ``xgb_params`` overrides the classifier's defaults
-    (``evaluation.tstr_xgboost_params``).
+    (``evaluation.xgboost_params``).
     """
     if not _selected(selection_cfg, TSTR_NAME):
         return {}

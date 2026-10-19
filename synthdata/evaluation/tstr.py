@@ -5,7 +5,7 @@ training data rather than the classifier (ported from the core of
 ``feat/final-release-evaluation``'s ``tstr.py``, without its provenance layer).
 Scores are averaged over the given XGBoost seeds; with ``subsample`` and
 ``colsample_bytree`` at 1 the classifier is deterministic, so one seed is
-enough and the seeds add no noise estimate. ``evaluation.tstr_xgboost_params``
+enough and the seeds add no noise estimate. ``evaluation.xgboost_params``
 can replace any of these settings (for example with parameters tuned for the
 real data); with row or column subsampling the seeds then matter. Every fit weights its rows by
 inverse class frequency (scikit-learn's ``compute_sample_weight("balanced")``),
@@ -34,7 +34,7 @@ from synthdata.utils import get_logger
 logger = get_logger(__name__)
 
 #: Fixed evaluator, as in the feat branch: small, shallow, deterministic.
-#: ``evaluation.tstr_xgboost_params`` overrides any of these keys.
+#: ``evaluation.xgboost_params`` overrides any of these keys.
 XGB_PARAMS = {
     "n_estimators": 80,
     "max_depth": 4,
@@ -44,7 +44,7 @@ XGB_PARAMS = {
     "tree_method": "hist",
 }
 
-#: Keys the pipeline sets itself, so ``evaluation.tstr_xgboost_params`` may
+#: Keys the pipeline sets itself, so ``evaluation.xgboost_params`` may
 #: not: the seeds come from ``tstr_seeds`` and the multi-class objective
 #: from the target's classes.
 RESERVED_XGB_KEYS = frozenset({"random_state", "seed", "objective", "num_class"})

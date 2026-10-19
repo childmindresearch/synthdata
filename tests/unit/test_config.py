@@ -203,18 +203,18 @@ class TestValidate:
         cfg.generation.hpo.enabled = False
         _validate(cfg)  # no tuning split needed without HPO
 
-    def test_tstr_xgboost_params_are_validated(self):
+    def test_xgboost_params_are_validated(self):
         cfg = self._base_valid()
-        assert cfg.evaluation.tstr_xgboost_params is None
-        cfg.evaluation.tstr_xgboost_params = {"max_depth": 5, "gamma": 0.1}
+        assert cfg.evaluation.xgboost_params is None
+        cfg.evaluation.xgboost_params = {"max_depth": 5, "gamma": 0.1}
         _validate(cfg)
-        cfg.evaluation.tstr_xgboost_params = {"random_state": 1}
+        cfg.evaluation.xgboost_params = {"random_state": 1}
         with pytest.raises(ValueError, match="cannot set"):
             _validate(cfg)
-        cfg.evaluation.tstr_xgboost_params = {"max_dept": 5}
+        cfg.evaluation.xgboost_params = {"max_dept": 5}
         with pytest.raises(ValueError, match="does not accept"):
             _validate(cfg)
-        cfg.evaluation.tstr_xgboost_params = [5]
+        cfg.evaluation.xgboost_params = [5]
         with pytest.raises(ValueError, match="mapping"):
             _validate(cfg)
 
