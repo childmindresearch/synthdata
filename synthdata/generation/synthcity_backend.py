@@ -1,9 +1,11 @@
 """synthcity plugin fit/generate/hyperparameter-search glue."""
 
 import inspect
+import time
 from collections.abc import Callable
 from pathlib import Path
 
+import numpy as np
 import optuna
 import pandas as pd
 import torch
@@ -58,6 +60,14 @@ HPO_PARAM_RANGES: dict[str, dict[str, tuple[int, int, int]]] = {
 #: family); its default of 10000 epochs with early stopping is far too long
 #: for a search.
 EPOCH_RANGE_DEFAULTS: dict[str, tuple[int, int, int]] = {"adsgan": (100, 1000, 100)}
+
+#: Most rows drawn in one ``generate`` call (see :func:`generate_in_chunks`).
+CHUNK_ROWS = 10_000
+
+#: Retries of a fit, or of a chunk of a draw, that ran out of GPU memory,
+#: and the seconds to wait before each (for other fits to finish).
+OOM_RETRIES = 3
+OOM_WAIT_SECONDS = 60.0
 
 
 def untuned_params(name: str, hpo_cfg) -> dict:
@@ -322,20 +332,39 @@ def fit_generate(
     uses_gpu = device is not None and plugin_accepts(name, "device")
     if "device" in plugin_kwargs:  # an HPO trial passes its device in params
         device, uses_gpu = str(plugin_kwargs["device"]), True
-    with gpu_slots.gpu_slot(
-        name, kind, _epochs(name, plugin_kwargs), device if uses_gpu else None
-    ) as slot_device:
-        if uses_gpu and slot_device is not None:
-            plugin_kwargs["device"] = torch.device(slot_device)
-        with declared_discrete_columns(discrete_columns):
-            return _fit_generate(
-                Plugins().get(name, **plugin_kwargs),
-                train_loader,
-                n_samples,
-                random_state,
-                class_prior,
-                conditional=bool(plugin_kwargs.get("is_classification")),
+    for attempt in range(OOM_RETRIES + 1):
+        try:
+            with gpu_slots.gpu_slot(
+                name, kind, _epochs(name, plugin_kwargs), device if uses_gpu else None
+            ) as slot_device:
+                if uses_gpu and slot_device is not None:
+                    plugin_kwargs["device"] = torch.device(slot_device)
+                with declared_discrete_columns(discrete_columns):
+                    return _fit_generate(
+                        Plugins().get(name, **plugin_kwargs),
+                        train_loader,
+                        n_samples,
+                        random_state,
+                        class_prior,
+                        conditional=bool(plugin_kwargs.get("is_classification")),
+                    )
+        except Exception as exc:
+            if not (uses_gpu and gpu_slots.is_oom(exc)) or attempt == OOM_RETRIES:
+                raise
+            # Same seeds, so a retry computes what the first attempt would
+            # have; the raised estimate makes the slot wait for the memory.
+            logger.warning(
+                "[%s] %s fit ran out of GPU memory (%s); retrying (%d/%d) once the GPU has room",
+                name,
+                kind,
+                str(exc).splitlines()[0][:200],
+                attempt + 1,
+                OOM_RETRIES,
             )
+            gpu_slots.free_cached_memory()
+            gpu_slots.note_oom(name)
+            time.sleep(OOM_WAIT_SECONDS)
+    raise AssertionError("unreachable")
 
 
 def _epochs(name: str, plugin_kwargs: dict) -> float:
@@ -348,21 +377,64 @@ def _epochs(name: str, plugin_kwargs: dict) -> float:
     return 0.0 if default is inspect.Parameter.empty else float(default)
 
 
+def _chunk_seed(seed: int, chunk: int) -> int:
+    """Seed of chunk ``chunk`` of a draw seeded ``seed``; chunk 0 keeps ``seed``."""
+    if chunk == 0:
+        return seed
+    return int(np.random.SeedSequence([seed, chunk]).generate_state(1)[0])
+
+
+def generate_in_chunks(generate, count: int, seed: int, cond=None) -> pd.DataFrame:
+    """Draw ``count`` rows as ``generate(count, seed, cond)`` calls of at most :data:`CHUNK_ROWS`.
+
+    A class-quota top-up can ask for up to 10 times the train size at once,
+    and synthcity decodes a whole draw on the GPU in one go: on the
+    9,000-row simulated data a PATE-GAN top-up ran out of GPU memory there
+    after a 10-hour fit. A draw no larger than one chunk is a single call
+    with ``seed``, as before; chunk ``k`` of a larger one uses its own seed
+    (:func:`_chunk_seed`), so chunks never repeat each other. A chunk that
+    runs out of GPU memory is retried with the same seed once the cache is
+    freed, so the rows do not depend on memory pressure.
+    """
+    parts = []
+    for chunk, start in enumerate(range(0, count, CHUNK_ROWS)):
+        size = min(CHUNK_ROWS, count - start)
+        part_cond = None if cond is None else cond[start : start + size]
+        for attempt in range(OOM_RETRIES + 1):
+            try:
+                parts.append(generate(size, _chunk_seed(seed, chunk), part_cond))
+                break
+            except Exception as exc:
+                if not gpu_slots.is_oom(exc) or attempt == OOM_RETRIES:
+                    raise
+                logger.warning("sampling ran out of GPU memory; retrying the chunk")
+                gpu_slots.free_cached_memory()
+                time.sleep(OOM_WAIT_SECONDS)
+    if len(parts) == 1:
+        return parts[0]
+    return pd.concat(parts, ignore_index=True)
+
+
 def _fit_generate(model, train_loader, n_samples, random_state, class_prior, conditional):
     model.fit(train_loader)
+
+    def draw(count, seed, cond):
+        kwargs = {} if cond is None else {"cond": cond}
+        return model.generate(count=count, random_state=seed, **kwargs).dataframe()
+
     if class_prior is None:
-        return model.generate(count=n_samples, random_state=random_state).dataframe()
+        return generate_in_chunks(draw, n_samples, random_state)
 
     target = train_loader.target_column
     encoder = (model._data_encoders or {}).get(target)
 
     def sample(count, seed, labels):
-        kwargs = {}
+        cond = None
         if labels is not None:
             # The plugin conditions on its label-encoded target (Plugin.fit
             # encodes it); generate() decodes the output again.
-            kwargs["cond"] = encoder.transform(labels) if encoder is not None else labels
-        return model.generate(count=count, random_state=seed, **kwargs).dataframe()
+            cond = encoder.transform(labels) if encoder is not None else labels
+        return generate_in_chunks(draw, count, seed, cond)
 
     df, report = class_quota.sample_to_quota(
         sample,

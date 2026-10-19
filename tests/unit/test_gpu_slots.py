@@ -218,3 +218,92 @@ def test_lost_waiting_entry_is_put_back():
     assert table["waiting"]["me"]["since"] == 1.0
     table["gpus"]["0"] = []
     assert gpu_slots._try_take(table, "me", 5, entry) == "0"
+
+
+def _memory_table(capacity=40.0, peaks=None):
+    return {
+        "slots": gpu_slots.UNLIMITED,
+        "gpus": {"0": []},
+        "waiting": {},
+        "capacity": {"0": capacity},
+        "peaks": dict(peaks or {}),
+    }
+
+
+def test_need_is_measured_peak_with_margin_else_a_prior_share():
+    table = _memory_table(peaks={"ctgan": 10.0})
+    assert gpu_slots.need_gib(table, "ctgan", "0") == pytest.approx(
+        10.0 * gpu_slots.PEAK_MARGIN + gpu_slots.CONTEXT_GIB
+    )
+    assert gpu_slots.need_gib(table, "tvae", "0") == pytest.approx(
+        gpu_slots._DEFAULT_VRAM_SHARE * 40.0
+    )
+    assert gpu_slots.need_gib({"gpus": {"0": []}}, "tvae") == 0.0  # no memory info
+
+
+def test_fit_waits_while_the_gpu_lacks_memory():
+    table = _memory_table(peaks={"ctgan": 20.0})
+    pid = os.getpid()
+    table["waiting"]["a"] = {**_waiter(pid, 1, 1.0), "model": "ctgan"}
+    table["waiting"]["b"] = {**_waiter(pid, 1, 2.0), "model": "ctgan"}
+    assert gpu_slots._try_take(table, "a", 1) == "0"  # an empty GPU always admits
+    assert table["gpus"]["0"][0]["need"] == pytest.approx(24.6)
+    assert gpu_slots._try_take(table, "b", 1) is None  # 24.6 + 24.6 > 0.9 * 40
+    assert table["waiting"]["b"]["short_of_memory"]
+    table["gpus"]["0"] = []
+    assert gpu_slots._try_take(table, "b", 1) == "0"
+
+
+def test_small_fits_share_and_go_to_the_gpu_with_most_memory_free():
+    table = _memory_table(peaks={"ddpm": 1.0, "ctgan": 20.0})
+    table["gpus"]["1"] = []
+    table["capacity"]["1"] = 40.0
+    pid = os.getpid()
+    table["waiting"]["big"] = {**_waiter(pid, 1, 1.0), "model": "ctgan"}
+    assert gpu_slots._try_take(table, "big", 1) == "0"
+    table["waiting"]["small"] = {**_waiter(pid, 1, 2.0), "model": "ddpm"}
+    assert gpu_slots._try_take(table, "small", 1) == "1"
+    table["waiting"]["small2"] = {**_waiter(pid, 1, 3.0), "model": "ddpm"}
+    # One fit on each GPU: the one holding less memory is taken.
+    assert gpu_slots._try_take(table, "small2", 1) == "1"
+
+
+def test_long_starved_fit_blocks_newer_ones():
+    table = _memory_table(peaks={"ddpm": 1.0, "ctgan": 20.0})
+    pid = os.getpid()
+    table["gpus"]["0"] = [{**_waiter(pid, 1, 0.0), "model": "ctgan", "need": 24.6}]
+    table["waiting"]["big"] = {**_waiter(pid, 1, 1.0), "model": "ctgan"}
+    assert gpu_slots._try_take(table, "big", 1, now=2.0) is None
+    table["waiting"]["small"] = {**_waiter(pid, 1, 3.0), "model": "ddpm"}
+    assert gpu_slots._try_take(table, "small", 1, now=4.0) == "0"  # not starved yet
+    table["gpus"]["0"].pop(0)  # the large fit ends; the small one still runs
+    table["waiting"]["small2"] = {**_waiter(pid, 1, 5.0), "model": "ddpm"}
+    late = 1.0 + gpu_slots.STARVATION_SECONDS + 1
+    assert gpu_slots._try_take(table, "small2", 1, now=late) is None
+    assert gpu_slots._try_take(table, "big", 1, now=late) == "0"
+
+
+def test_out_of_memory_raises_the_estimate_and_peaks_only_grow():
+    table = _memory_table(peaks={"tvae": 10.0})
+    gpu_slots._set_peak(table, "tvae", 8.0)
+    assert table["peaks"]["tvae"] == 10.0
+    gpu_slots._set_peak(table, "tvae", 0.0, grow=True)
+    expected = (10.0 * gpu_slots.PEAK_MARGIN + gpu_slots.CONTEXT_GIB) * gpu_slots.OOM_GROWTH
+    assert table["peaks"]["tvae"] == pytest.approx(expected)
+
+
+def test_is_oom():
+    assert gpu_slots.is_oom(RuntimeError("CUDA out of memory. Tried to allocate 1.42 GiB"))
+    assert not gpu_slots.is_oom(RuntimeError("shape mismatch"))
+    assert not gpu_slots.is_oom(ValueError("out of memory"))
+
+
+def test_measured_peak_goes_to_the_table_and_fits_csv(slots, monkeypatch):
+    folder = slots(n_gpus=1, fits_per_gpu=gpu_slots.UNLIMITED)
+    monkeypatch.setattr(gpu_slots, "_start_peak", lambda device: None)
+    monkeypatch.setattr(gpu_slots, "_peak_gib", lambda device: 3.5)
+    with gpu_slots.gpu_slot("ctgan", "trial", 5, "cuda"):
+        pass
+    assert _table(folder)["peaks"] == {"ctgan": 3.5}
+    with open(_records() / "fits.csv") as f:
+        assert next(csv.DictReader(f))["peak_vram_gib"] == "3.5"
