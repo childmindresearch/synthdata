@@ -492,6 +492,7 @@ def build_hpo_eval_fn(
     protected_columns: Sequence[str] = (),
     ordinal_target: bool = False,
     protected_bins: dict | None = None,
+    xgb_params: dict | None = None,
 ) -> HPOEvalFn:
     """Build a ``synthetic_df -> TrialScore`` function scored on the tuning split.
 
@@ -506,6 +507,10 @@ def build_hpo_eval_fn(
     (``{objective: {"trtr", "chance", "se", "z"}}``) for ``objective: auto``.
     ``protected_columns`` get the protected-group screens and per-group TSTR,
     grouped by ``protected_bins`` where given (see :func:`protected_groups`).
+    ``xgb_params`` overrides the TSTR classifier's defaults
+    (``evaluation.xgboost_params``), so HPO selects against the same
+    classifier that evaluation scores with. The real-vs-synthetic detection
+    classifier logged next to it keeps the defaults.
     """
     tstr = hpo_cfg.objective.startswith("tstr_") or hpo_cfg.objective == "auto"
     if tstr and not target_is_categorical:
@@ -532,6 +537,7 @@ def build_hpo_eval_fn(
             n_bootstrap=hpo_cfg.n_bootstrap,
             groups=tuning_groups,
             ordinal=ordinal_target,
+            xgb_params=xgb_params,
         )
 
     def _worst_group(scores):

@@ -166,6 +166,7 @@ def run_evaluation(
         eval_cfg.tstr_seeds,
         cfg.seed,
         compute_cfg=cfg.compute,
+        xgb_params=eval_cfg.xgboost_params,
     )
     tstr_table = custom_eval.build_tstr_table(tstr_result)
     if not tstr_table.empty:

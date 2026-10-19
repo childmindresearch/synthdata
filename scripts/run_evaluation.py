@@ -19,6 +19,7 @@ from synthdata.config import load_config
 from synthdata.data import load_dataset, load_imputed_splits, read_like
 from synthdata.evaluation import run_evaluation
 from synthdata.evaluation.combine import simple_rank_summary
+from synthdata.evaluation.tstr import tstr_xgb_params
 from synthdata.experiment import load_experiment
 from synthdata.utils import get_logger, set_global_seed
 
@@ -128,6 +129,7 @@ def main() -> None:
             **({"report": extras["report_path"]} if "report_path" in extras else {}),
         },
         n_models=len(synthetic_datasets),
+        xgboost_params=tstr_xgb_params(cfg.evaluation.xgboost_params),
     )
 
     logger.info("Done. Combined table saved under %s", cfg.evaluation.output_dir)

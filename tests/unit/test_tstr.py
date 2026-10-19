@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from synthdata.evaluation.tstr import tstr_scores
+from synthdata.evaluation.tstr import XGB_PARAMS, tstr_scores, tstr_xgb_params
 
 pytestmark = pytest.mark.unit
 
@@ -19,6 +19,36 @@ def _frame(n, seed):
             "y": np.where(x > 1.0, "rare", "common"),
         }
     )
+
+
+def test_user_xgb_params_override_only_their_keys_and_reach_the_fit(monkeypatch):
+    params = tstr_xgb_params({"max_depth": 5, "subsample": 0.8})
+    assert params == {**XGB_PARAMS, "max_depth": 5, "subsample": 0.8}
+    assert tstr_xgb_params(None) == XGB_PARAMS
+
+    import xgboost
+
+    seen = []
+    real = xgboost.XGBClassifier
+
+    class Spy(real):
+        def __init__(self, **kwargs):
+            seen.append(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(xgboost, "XGBClassifier", Spy)
+    fit, score = _frame(400, 0), _frame(300, 1)
+    tuned = tstr_scores(
+        fit, score, "y", ["site"], ["common", "rare"], [0, 1], xgb_params={"subsample": 0.5}
+    )
+    assert [k["subsample"] for k in seen] == [0.5, 0.5]
+    assert [k["random_state"] for k in seen] == [0, 1]
+    assert tuned.macro_f1 > 0.9
+    # Row subsampling makes the fit depend on its seed; seeded, it still repeats.
+    again = tstr_scores(
+        fit, score, "y", ["site"], ["common", "rare"], [0, 1], xgb_params={"subsample": 0.5}
+    )
+    assert tuned == again
 
 
 def test_tstr_learns_a_real_signal_and_is_deterministic():

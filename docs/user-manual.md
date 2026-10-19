@@ -542,6 +542,17 @@ Both libraries run from our pinned forks, which fix the bugs listed in [verifica
 
 The same XGBoost classifier used in HPO, with the same class-balanced row weights, is trained on each synthetic dataset and tested on the holdout. `tstr_holdout.csv` reports macro-F1, balanced accuracy, macro AUPRC, Cohen's kappa (agreement beyond chance: 0 = chance, 1 = perfect; quadratic-weighted for an ordinal target, so a near miss costs less than a far one) and per-class F1. The `baseline_train_copy` rows are the ceiling: the same classifier trained on real train rows and tested on the holdout (train on real, test on real). The `tsts_*` columns fit and score the classifier inside each synthetic dataset (80/20 split, **TSTS**). They are reported, not ranked: TSTS far above TSTR means the synthetic data holds a signal that real rows do not share; TSTS near chance means the generator lost the target.
 
+The classifier's settings are fixed so that a TSTR score measures the data, not the classifier: 80 trees, depth 4, learning rate 0.08, no row or column subsampling. To use your own, for example the parameters you tuned for a baseline model on the real data, set `evaluation.xgboost_params` to `XGBClassifier` arguments; keys you leave out keep the defaults:
+
+```yaml
+evaluation:
+  xgboost_params:
+    { n_estimators: 300, max_depth: 5, learning_rate: 0.01, subsample: 0.8,
+      colsample_bytree: 0.6, min_child_weight: 1, gamma: 0.1 }
+```
+
+The same parameters are used by the HPO objective and its real-data ceiling, so the search tunes generators against the classifier that evaluation scores them with; change them only with a new experiment id. The pipeline still sets the seeds, the multi-class objective and the class-balanced row weights (`random_state`, `seed`, `objective` and `num_class` are refused). With `subsample` or `colsample_bytree` below 1 each seed gives a different fit, so `evaluation.tstr_seeds` (3) averages over them; `generation.hpo.tstr_seeds` is 1 by default and can be raised at the cost of a longer trial. Parameters tuned on one dataset fit that dataset: on another, keep the defaults or tune again. SynthEval's and synthcity's own utility metrics, the `fid_detection_auc` score and the privacy attacks keep their own classifiers. The parameters used are recorded in `manifest.json` (`xgboost_params`).
+
 Every classifier a metric trains to predict the target uses the same balanced class weights: SynthEval's `cls_acc`, `auroc_diff` and fairness metrics, and synthcity's performance metrics, on the real and the synthetic side alike. Privacy attacks keep their own classifiers unweighted, since they model an attacker.
 
 For a target with 3 or more classes, metrics that need two classes (AUROC difference, subgroup gaps) run once per class against the rest and are averaged with equal weight (`evaluation.class_averaging: ovr_macro`, per-class values in `ovr_per_class.csv`). Alternatively, set `class_averaging: binary` and define which classes count as positive in `evaluation.binary_target` (see `config_loris.yaml`).

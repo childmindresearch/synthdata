@@ -18,6 +18,7 @@ from pathlib import Path
 
 from synthdata.config import load_config
 from synthdata.data import load_dataset, load_imputed_splits
+from synthdata.evaluation.tstr import tstr_xgb_params
 from synthdata.experiment import start_experiment
 from synthdata.generation import run_generation
 from synthdata.generation.pipeline import FAILURES_FILE, needs_imputed_data, read_failures
@@ -107,6 +108,11 @@ def main() -> None:
             "failed_models": sorted(failures),
         },
         n_models=len(synthetic_datasets),
+        **(
+            {"xgboost_params": tstr_xgb_params(cfg.evaluation.xgboost_params)}
+            if cfg.generation.hpo.enabled
+            else {}
+        ),
     )
     if not synthetic_datasets:
         raise SystemExit(

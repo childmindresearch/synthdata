@@ -927,6 +927,22 @@ class EvaluationConfig:
     #: synthetic dataset, score on the test split; see
     #: synthdata.evaluation.tstr). Needs a categorical target.
     tstr_seeds: int = 3
+    #: Parameters for the XGBoost classifier that predicts the target in
+    #: holdout TSTR/TSTS, the HPO objective and its TRTR ceiling, for example
+    #: parameters tuned on the real data for your own baseline model. Keys
+    #: are ``xgboost.XGBClassifier`` arguments and replace the matching
+    #: defaults (n_estimators 80, max_depth 4, learning_rate 0.08, subsample
+    #: 1, colsample_bytree 1, tree_method hist; see
+    #: synthdata.evaluation.tstr.XGB_PARAMS); keys left out keep them.
+    #: ``random_state``, ``seed``, ``objective`` and ``num_class`` are set by
+    #: the pipeline and refused here. Class-balanced sample weights still
+    #: apply. With ``subsample`` or ``colsample_bytree`` below 1 the fit
+    #: depends on its seed, so ``tstr_seeds`` (and ``generation.hpo.tstr_seeds``)
+    #: above 1 average that out. Not used by SynthEval's or synthcity's own
+    #: utility metrics, the real-vs-synthetic detection score or the privacy
+    #: attacks. Changing it changes the HPO objective: use a new experiment
+    #: id. null = defaults.
+    xgboost_params: dict | None = None
     #: Anonymeter attacks and holdout-referenced DCR/NNDR (custom privacy).
     privacy_attacks: PrivacyAttacksConfig = dataclasses.field(default_factory=PrivacyAttacksConfig)
 
@@ -1267,6 +1283,29 @@ def _validate_hpo(hpo: HPOConfig) -> None:
             )
 
 
+def _validate_xgboost_params(params) -> None:
+    """``evaluation.xgboost_params``: null or XGBClassifier arguments the pipeline leaves free."""
+    if params is None:
+        return
+    if not isinstance(params, dict):
+        raise ValueError(f"evaluation.xgboost_params must be a mapping or null, got {params!r}")
+    from xgboost import XGBClassifier
+
+    from synthdata.evaluation.tstr import RESERVED_XGB_KEYS
+
+    reserved = sorted(set(params) & RESERVED_XGB_KEYS)
+    if reserved:
+        raise ValueError(
+            f"evaluation.xgboost_params cannot set {reserved}: the pipeline sets them "
+            "(seeds from tstr_seeds, objective from the target's classes)"
+        )
+    unknown = sorted(set(params) - set(XGBClassifier().get_params()))
+    if unknown:
+        raise ValueError(
+            f"evaluation.xgboost_params has keys XGBClassifier does not accept: {unknown}"
+        )
+
+
 def _validate_column_roles(data: DataConfig) -> None:
     if data.sensitive_columns and data.protected_columns is None:
         raise ValueError(
@@ -1510,6 +1549,7 @@ def _validate(cfg: Config) -> None:
         )
     if cfg.evaluation.tstr_seeds < 1:
         raise ValueError(f"evaluation.tstr_seeds must be >= 1, got {cfg.evaluation.tstr_seeds}")
+    _validate_xgboost_params(cfg.evaluation.xgboost_params)
     attacks = cfg.evaluation.privacy_attacks
     if attacks.unit not in PRIVACY_UNITS:
         raise ValueError(
