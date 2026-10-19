@@ -99,15 +99,12 @@ Tests are under [`tests/`](tests/). See `pyproject.toml` for available test mark
 
 ## Legacy and exploratory code
 
-The pipeline above is the supported path for new work. The following areas are older or exploratory tracks retained for reference and targeted experimentation:
+The pipeline above is the supported path for new work. The following areas are older or exploratory tracks retained for reference and targeted experimentation.
 
-### Apps
-
-- [`apps/presidio/presidio_streamlit.py`](apps/presidio/presidio_streamlit.py): an offline-focused Presidio Streamlit app for PHI/PII processing. Install its dependencies with `uv sync --extra presidio`; see the [Presidio app guide](apps/presidio/PRESIDIO_APP_GUIDE.md) for setup and security guidance.
+> **Deleted legacy code.** Version 0.8.2 removed the Presidio PII app (`apps/presidio/`, the `presidio` extra), the document-parsing scripts (`scripts/document_pipeline/`) and the ydata-synthetic notebook (`notebooks/ydata-test.py`, the `ydata` extra). None of them was part of the pipeline, they were no longer maintained, and their old pinned dependencies caused most of the repository's security alerts. They are still in git history: the tag `legacy-archive` points at the last commit that has them. To look at or reuse one, run `git checkout legacy-archive -- <path>` (or browse the tag on GitHub), and update its dependencies before running it.
 
 ### Notebooks
 
-- [`notebooks/ydata-test.py`](notebooks/ydata-test.py): ydata-synthetic experimentation; requires `uv sync --extra ydata`.
 - [`notebooks/ctgan_hpo_hepatitis.ipynb`](notebooks/ctgan_hpo_hepatitis.ipynb) and [`notebooks/test_hepatitis_data.ipynb`](notebooks/test_hepatitis_data.ipynb): earlier Hepatitis-focused synthesis, imputation, HPO, and evaluation work.
 - [`notebooks/tabpfn_demo.ipynb`](notebooks/tabpfn_demo.ipynb): TabPFN classification and synthesis exploration. Configure `TABPFN_TOKEN` (and, optionally, `HF_TOKEN`) in `.env` when the API is required.
 
@@ -115,14 +112,10 @@ The pipeline above is the supported path for new work. The following areas are o
 
 - `synthdata-imputation-benchmark` ([`synthdata/imputation/benchmark.py`](synthdata/imputation/benchmark.py)): an exploratory masked-cell benchmark for RefiDiff settings. It has not been validated since its first implementation and is not part of the pipeline; its options (`imputation.benchmark`) are documented in [`synthdata/config.py`](synthdata/config.py).
 
-### Scripts
-
-- [`scripts/document_pipeline/`](scripts/document_pipeline): early PII-anonymization and Markdown-parsing work unrelated to the synthetic-data pipeline.
-
 ## Repository layout
 
 - [`docs/`](docs/): the [user manual](docs/user-manual.md) and the [verification of generators and metrics](docs/verification.md).
 - [`synthdata/`](synthdata/): pipeline implementation.
 - [`configs/`](configs/): example configurations (Hepatitis, simulated data, LORIS).
 - [`scripts/`](scripts/): installed CLI entry points.
-- [`apps/`](apps/) and [`notebooks/`](notebooks/): optional exploratory work.
+- [`notebooks/`](notebooks/): optional exploratory work.
