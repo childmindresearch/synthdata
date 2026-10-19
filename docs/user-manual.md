@@ -194,8 +194,8 @@ While it runs, `synthdata-run` rewrites `<UTC time>_dashboard.html` next to the 
 
 - whether the run is running, finished, failed or stopped (the runner process is gone without logging an end), with elapsed time and a note when the log has been quiet for 20 minutes;
 - each stage's status, duration and peak resource use;
-- a timeline with one bar per model: each parallel step (generation, SynthEval, synthcity, TSTR, privacy attacks) is a colored segment on it, replicates folded together, with clock-time ticks, the pipeline stages above and the error of a failed model. A generation bar is shaded by phase: plain for the untuned fits, light for the HPO search, dark for the tuned fits (hover for each phase's length). A model whose step finished but lost some metrics has an amber outline and lists the failed-metric count per step. A fit in the runner's own process (TabPFN, which logs nothing until its fit ends) gets a row of its own under *generation (main process)*;
-- each HPO study's objective, its status (*running* only while its own generation worker is; *stopped* when it ended short of its budget; *none passed, defaults used* when no trial passed the screens), its trials against its budget, how many trials failed each sanity screen, best score so far (trials that fail a screen don't count), a plot of every trial's score and the best so far (hover a dot to see which screens that trial failed, with its value and the limit), median trial time and an estimate of the time left;
+- a timeline with one bar per model: each parallel step (generation, SynthEval, synthcity, TSTR, privacy attacks) is a colored segment on it, replicates folded together, with clock-time ticks, the pipeline stages above and the error of a failed model. A generation bar is shaded by phase: plain for the untuned fits, light for the HPO search, dark for the tuned fits (hover the bar for every phase and its length, or a shaded part for that phase). A model whose step finished but lost some metrics has an amber outline and lists the failed-metric count per step. A fit in the runner's own process (TabPFN, which logs nothing until its fit ends) gets a row of its own under *generation (main process)*;
+- each HPO study's status (*running* only while its own generation worker is; *stopped* when it ended short of its trial count, with the reason under it: *no gain in N trials* for patience, *time budget*, *stage time limit* or *generation failed*; *none passed, defaults used* when no trial passed the screens), its trials against its budget, how many trials failed each sanity screen, best score so far (trials that fail a screen don't count), a plot of every trial's score and the best so far, with the objective it scores and its range written under it (hover a dot, filled or hollow, to see the trial's score and which screens it failed, with the value and the limit), median trial time and an estimate of the time left;
 - RAM, CPU, GPU utilization and GPU memory over time, and use by model, grouped by step or by model;
 - errors and warnings from the log, repeated ones folded together, each with its traceback; a metric that synthcity or SynthEval caught and left out of its results counts as an error, and so does a model whose worker failed; the same failure on several models folds into one entry that lists them;
 - once evaluation is done, the ranking with each model's 95% interval drawn as a bar, whether it is statistically tied with the best, how many output checks passed and a link to `report.md`;
@@ -411,7 +411,13 @@ uv run python scripts/gpu_concurrency.py --csv <train_imputed.csv> --model ddpm 
     --background ctgan --background-epochs 40
 ```
 
-None of this changes what a fit computes (same seeds and settings), only when and on which GPU it runs. Every fit is listed in `<generation dir>/gpu_slots/fits.csv` (model, kind, GPU, epochs, when it started, seconds it waited and seconds it trained), and a fit that waited more than a minute for a place is logged. The table of who holds which GPU lives in a temporary folder on local disk (under `TMPDIR`), not in the output folder, because file locks are unreliable on network drives.
+#### GPU memory
+
+In both modes a fit also waits until its GPU has the memory for it. The pipeline does not try to predict a model's memory from the config: it depends on the data, the network and batch sizes, and on what PyTorch keeps cached, so a formula would be either loose or wrong. It measures instead. Each fit's peak is recorded, and a fit's need is the largest peak measured for its model so far, plus 20% and 0.6 GiB. Until a model has a measured fit, it is assumed to need a quarter of the GPU (a tenth for DDPM). A fit starts only if the needs of the fits on the GPU, its own included, stay within 90% of the GPU's memory, or if the GPU is empty. A fit that has been kept out for memory for more than 10 minutes goes before newer fits, so a large model is not starved by small ones.
+
+After each fit the process gives its cached GPU memory back, so a model scoring a trial on the CPU holds none. Before, a model's memory only grew over its search (TVAE and RTVAE held 20 GiB each between trials on the 9,000-row simulated data). Sampling draws at most 10,000 rows per call: a class top-up can ask for ten times the train size, which ran out of memory in one call. A fit or a chunk of rows that still runs out of memory is retried up to 3 times with the same seeds, after a minute's wait and with the model's estimate raised by half, so the rows do not depend on how busy the GPU was.
+
+None of this changes what a fit computes (same seeds and settings), only when and on which GPU it runs. Every fit is listed in `<generation dir>/gpu_slots/fits.csv` (model, kind, GPU, epochs, when it started, seconds it waited and seconds it trained, and its peak GPU memory in GiB as `peak_vram_gib`), and a fit that waited more than a minute for a place is logged. The table of who holds which GPU lives in a temporary folder on local disk (under `TMPDIR`), not in the output folder, because file locks are unreliable on network drives.
 
 ### How the hyperparameter search works
 
@@ -479,8 +485,13 @@ Under `generation.output_dir/data_v_<version>/exp_v_<id>/`:
 - `<model>.csv`: synthetic data, imputed (what evaluation scores).
 - `released/<model>.csv`: synthetic data with missing values put back (what you would share).
 - `hpo_best_params.json`, `optuna_studies.db`: search results.
+- `generation_failures.json`: the models whose generation failed in this run, with the error. It is only there when something failed.
 
 A rerun of the same experiment skips models whose CSV already exists. Set `generation.force_retrain: true` to retrain them.
+
+### When a model fails
+
+If one model's search, fit or sampling fails (for example out of GPU memory), the others carry on. The failure is logged as an error and listed in `generation_failures.json`, and evaluation then runs on every model that finished; `report.md` names the failed models under **Read with care**. A failed search only drops the tuned model (`<model>_hpo`); the untuned one is kept. The generate stage itself fails only if no synthetic dataset is left. A long unattended run therefore no longer stops at the first failure. To fill in the gaps, rerun the same experiment (`--experiment-id <id> --stages generate evaluate`): finished models are read from their CSVs and only the failed ones are generated again. Set `generation.continue_on_model_failure: false` to stop the run at the first failed model instead.
 
 ## 8. Stage 4: evaluation
 

@@ -23,6 +23,19 @@ model, then the speed measured on its own finished fits. Nothing waits for a
 measurement. Slots never change what a fit computes (same seeds and
 settings), only when and on which GPU it runs.
 
+GPU memory is shared the same way, from measurements rather than a formula:
+a fit is admitted to a GPU only if the memory its holders need plus its own
+stays within :data:`MEMORY_FRACTION` of the GPU (or the GPU is empty). A
+fit's need is the largest peak measured on that model's earlier fits (in any
+process) plus a margin, and a share of the GPU (:data:`PRIOR_VRAM_SHARE`)
+until the first fit of the model finishes; an out-of-memory error raises the
+model's estimate. A model's memory depends on its data, network size and
+batch size together, and on what the caching allocator keeps, so a formula
+from the config would be either loose or wrong; one measured fit is exact for
+that data. After each fit the process hands its cached memory back to the
+driver, so a worker doing CPU work between fits (scoring a trial) holds no
+GPU memory.
+
 The parent keeps the slot table in a temporary folder on local disk (under
 ``TMPDIR``) and sets :data:`SLOTS_ENV_VAR` to it for its worker processes,
 which all run on the same machine; the table is guarded by a file lock, and
@@ -75,6 +88,27 @@ _DEFAULT_PRIOR = 15.0
 #: never wait for a slot.
 GPU_MODELS = frozenset(PRIOR_SECONDS_PER_EPOCH)
 
+#: Share of a GPU's memory a model is assumed to need until one of its fits
+#: has been measured. From the 9,000-row simulated clinical run, where
+#: single fits peaked at 10-16 GiB (ddpm: 1 GiB) on a 48 GiB GPU.
+PRIOR_VRAM_SHARE = {"ddpm": 0.1}
+_DEFAULT_VRAM_SHARE = 0.25
+
+#: Share of a GPU's memory the fits on it may need together.
+MEMORY_FRACTION = 0.9
+
+#: A measured peak is raised by this factor, plus :data:`CONTEXT_GIB` for the
+#: CUDA context, to give a fit's need.
+PEAK_MARGIN = 1.2
+CONTEXT_GIB = 0.6
+
+#: Factor applied to a model's estimate after an out-of-memory error.
+OOM_GROWTH = 1.5
+
+#: A fit kept out by memory this long blocks newer fits from jumping ahead
+#: of it, so a large fit is not starved by a stream of small ones.
+STARVATION_SECONDS = 600.0
+
 #: Seconds between checks while waiting for a slot.
 POLL_SECONDS = 2.0
 
@@ -93,15 +127,24 @@ def resolve_fits_per_gpu(value) -> int | None:
     return int(value) if value else None
 
 
-def setup(records: Path, n_gpus: int, fits_per_gpu: int) -> None:
+def setup(
+    records: Path, n_gpus: int, fits_per_gpu: int, capacity_gib: list[float] | None = None
+) -> None:
     """Create the slot table for ``n_gpus`` GPUs and point worker processes at it.
 
     The table goes in a new local temporary folder; ``records`` is where
-    ``fits.csv`` is written.
+    ``fits.csv`` is written. ``capacity_gib`` (memory of each GPU) turns on
+    memory-aware admission; without it only ``fits_per_gpu`` limits a GPU.
     """
     records.mkdir(parents=True, exist_ok=True)
     folder = Path(tempfile.mkdtemp(prefix="synthdata_gpu_slots_"))
-    table = {"slots": fits_per_gpu, "gpus": {str(i): [] for i in range(n_gpus)}, "waiting": {}}
+    table = {
+        "slots": fits_per_gpu,
+        "gpus": {str(i): [] for i in range(n_gpus)},
+        "waiting": {},
+        "capacity": {str(i): float(c) for i, c in enumerate(capacity_gib or [])},
+        "peaks": {},
+    }
     with FileLock(str(folder / "table.lock")):
         _write_table(folder / "table.json", table)
     os.environ[SLOTS_ENV_VAR] = str(folder)
@@ -197,22 +240,66 @@ def _update(folder: Path, change):
         return result
 
 
-def _try_take(table: dict, key: str, priority: float, entry: dict | None = None) -> str | None:
-    """Take a slot on the least busy GPU if one is free and no one ahead is waiting.
+def need_gib(table: dict, model: str, gpu: str | None = None) -> float:
+    """Memory (GiB) a fit of ``model`` is expected to need: measured peak, else a prior share."""
+    peak = table.get("peaks", {}).get(model)
+    if peak is not None:
+        return peak * PEAK_MARGIN + CONTEXT_GIB
+    capacity = table.get("capacity", {})
+    size = capacity.get(gpu) if gpu is not None else max(capacity.values(), default=0.0)
+    return PRIOR_VRAM_SHARE.get(model, _DEFAULT_VRAM_SHARE) * (size or 0.0)
+
+
+def _used_gib(table: dict, gpu: str) -> float:
+    return sum(h.get("need", 0.0) for h in table["gpus"][gpu])
+
+
+def _room(table: dict, gpu: str, need: float) -> bool:
+    """Whether a fit needing ``need`` GiB fits next to the fits on ``gpu``."""
+    capacity = table.get("capacity", {}).get(gpu)
+    if not capacity or not table["gpus"][gpu]:
+        return True
+    return _used_gib(table, gpu) + need <= MEMORY_FRACTION * capacity
+
+
+def _try_take(
+    table: dict,
+    key: str,
+    priority: float,
+    entry: dict | None = None,
+    now: float | None = None,
+) -> str | None:
+    """Take a slot on the least busy GPU if one is free, has the memory, and no one ahead waits.
 
     ``entry`` is the waiting entry to put back if it went missing from the
     table, so a lost entry costs a place in the queue rather than the fit.
     """
     if entry is not None:
         table["waiting"].setdefault(key, dict(entry))
-    table["waiting"][key]["priority"] = priority
-    if table["slots"] == UNLIMITED:
-        gpu = min(table["gpus"], key=lambda g: (len(table["gpus"][g]), int(g)))
-        table["gpus"][gpu].append(dict(table["waiting"].pop(key)))
-        return gpu
-    free = [gpu for gpu, holders in table["gpus"].items() if len(holders) < table["slots"]]
+    me = table["waiting"][key]
+    me["priority"] = priority
+    now = time.time() if now is None else now
+    # A fit kept out by memory for long has first claim on the memory that frees up.
+    if any(
+        other_key != key
+        and other.get("short_of_memory")
+        and other["since"] < me["since"]
+        and now - other["since"] > STARVATION_SECONDS
+        for other_key, other in table["waiting"].items()
+    ):
+        return None
+    with_slot = [
+        gpu
+        for gpu, holders in table["gpus"].items()
+        if table["slots"] == UNLIMITED or len(holders) < table["slots"]
+    ]
+    free = [gpu for gpu in with_slot if _room(table, gpu, need_gib(table, me["model"], gpu))]
+    me["short_of_memory"] = bool(with_slot) and not free
     if not free:
         return None
+    if table["slots"] == UNLIMITED:
+        gpu = min(free, key=lambda g: (len(table["gpus"][g]), _used_gib(table, g), int(g)))
+        return _hold(table, key, gpu)
     me = (-priority, table["waiting"][key]["since"])
     ahead = [
         other
@@ -222,10 +309,79 @@ def _try_take(table: dict, key: str, priority: float, entry: dict | None = None)
     # Everyone ahead of us gets a slot first; there must be one left for us.
     if len(ahead) >= sum(table["slots"] - len(table["gpus"][gpu]) for gpu in free):
         return None
-    gpu = min(free, key=lambda g: (len(table["gpus"][g]), int(g)))
+    gpu = min(free, key=lambda g: (len(table["gpus"][g]), _used_gib(table, g), int(g)))
+    return _hold(table, key, gpu)
+
+
+def _hold(table: dict, key: str, gpu: str) -> str:
     holder = dict(table["waiting"].pop(key))
+    holder.pop("short_of_memory", None)
+    holder["need"] = need_gib(table, holder["model"], gpu)
     table["gpus"][gpu].append(holder)
     return gpu
+
+
+def _set_peak(table: dict, model: str, peak_gib: float, grow: bool = False) -> None:
+    """Keep the largest peak measured for ``model``; ``grow`` raises it after an OOM."""
+    peaks = table.setdefault("peaks", {})
+    old = peaks.get(model)
+    if grow:
+        base = max(old or 0.0, peak_gib, need_gib(table, model))
+        peaks[model] = base * OOM_GROWTH
+    elif peak_gib > 0:
+        peaks[model] = max(old or 0.0, peak_gib)
+
+
+def note_oom(model: str) -> None:
+    """Raise ``model``'s memory estimate after an out-of-memory error (no-op without a table)."""
+    folder = os.environ.get(SLOTS_ENV_VAR)
+    if folder:
+        _update(Path(folder), lambda table: _set_peak(table, model, 0.0, grow=True))
+
+
+def is_oom(exc: BaseException) -> bool:
+    """Whether ``exc`` is a CUDA out-of-memory error."""
+    name = type(exc).__name__
+    return name == "OutOfMemoryError" or (
+        isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+    )
+
+
+def free_cached_memory() -> None:
+    """Hand this process's cached GPU memory back to the driver."""
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+    except ImportError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _start_peak(device: str | None) -> None:
+    try:
+        import torch
+    except ImportError:
+        return
+    if device and str(device).startswith("cuda") and torch.cuda.is_available():
+        # Measuring must never stop a fit, e.g. for a device index this machine lacks.
+        with contextlib.suppress(RuntimeError, ValueError):
+            torch.cuda.reset_peak_memory_stats(torch.device(device))
+
+
+def _peak_gib(device: str | None) -> float | None:
+    try:
+        import torch
+    except ImportError:
+        return None
+    if device and str(device).startswith("cuda") and torch.cuda.is_available():
+        try:
+            return torch.cuda.max_memory_reserved(torch.device(device)) / 2**30
+        except (RuntimeError, ValueError):
+            return None
+    return None
 
 
 @contextlib.contextmanager
@@ -241,7 +397,11 @@ def gpu_slot(model: str, kind: str, epochs: float, device: str | None):
     on_gpu = model in GPU_MODELS and device is not None and str(device).startswith("cuda")
     if not folder or not on_gpu:
         started = time.monotonic()
-        yield device
+        try:
+            yield device
+        finally:
+            if on_gpu:
+                free_cached_memory()
         work.done(epochs, time.monotonic() - started)
         return
 
@@ -268,10 +428,14 @@ def gpu_slot(model: str, kind: str, epochs: float, device: str | None):
     if waited > 60:
         logger.info("[%s] %s got cuda:%s after waiting %.0f min", model, kind, gpu, waited / 60)
     started = time.monotonic()
+    device = f"cuda:{gpu}"
+    _start_peak(device)
     try:
-        yield f"cuda:{gpu}"
+        yield device
     finally:
         held = time.monotonic() - started
+        peak = _peak_gib(device)
+        free_cached_memory()
 
         def release(table):
             table["gpus"][gpu] = [
@@ -279,13 +443,15 @@ def gpu_slot(model: str, kind: str, epochs: float, device: str | None):
                 for h in table["gpus"][gpu]
                 if not (h["pid"] == os.getpid() and h["since"] == asked)
             ]
+            if peak:
+                _set_peak(table, model, peak)
 
         _update(folder, release)
         work.done(epochs, held)
-        _record(model, kind, gpu, epochs, waited, held, asked)
+        _record(model, kind, gpu, epochs, waited, held, asked, peak)
 
 
-def _record(model, kind, gpu, epochs, waited, held, asked) -> None:
+def _record(model, kind, gpu, epochs, waited, held, asked, peak=None) -> None:
     records = os.environ.get(RECORDS_ENV_VAR)
     if not records:
         return
@@ -299,11 +465,14 @@ def _record(model, kind, gpu, epochs, waited, held, asked) -> None:
         "asked_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(asked)),
         "waited_s": round(waited),
         "held_s": round(held),
+        "peak_vram_gib": "" if peak is None else round(peak, 2),
     }
     with FileLock(str(folder / "fits.lock")):
         new = not path.exists()
+        # A file from an older version keeps its columns (no peak column).
+        fields = list(row) if new else path.open(encoding="utf-8").readline().strip().split(",")
         with open(path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(row))
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
             if new:
                 writer.writeheader()
             writer.writerow(row)

@@ -363,6 +363,16 @@ def _glance_section(cfg, dataset, combined, extras, model_names, experiment) -> 
             ]
 
     cautions = []
+    from synthdata.generation.pipeline import FAILURES_FILE, read_failures
+
+    failed = read_failures(cfg.generation.output_dir)
+    if failed:
+        cautions.append(
+            f"Generation failed for {', '.join(f'`{m}`' for m in sorted(failed))}, so "
+            f"{'it is' if len(failed) == 1 else 'they are'} missing from every table "
+            f"(errors in `{FAILURES_FILE}`). A rerun of the same experiment redoes only "
+            f"{'it' if len(failed) == 1 else 'them'}."
+        )
     if not _has_replicates(extras.get("ranking_summary")):
         cautions.append(
             "Single seed: scores carry no uncertainty estimate, so small gaps may be noise. "
@@ -856,6 +866,7 @@ _FILE_DESCRIPTIONS = {
     "imputation_validation_report.csv": "Per-column check that imputed values are plausible.",
     "data_readiness.csv": "Columns likely to be hard to model, with a suggested change (advisory).",
     "hpo_best_params.json": "Best hyperparameters found per model.",
+    "generation_failures.json": "Models whose generation failed in this run, with the error.",
     "optuna_studies.db": "Optuna studies (open with optuna-dashboard).",
     "manifest.json": "What each stage of this experiment ran and produced.",
     "config_snapshot.json": "The full configuration this experiment ran with.",
@@ -895,7 +906,7 @@ def _file_index_section(paths: _Paths, links: _Links, report_path: Path) -> str:
         released,
         "Synthetic data to share: missing values put back where the real data has them.",
     )
-    for name in ("hpo_best_params.json", "optuna_studies.db"):
+    for name in ("hpo_best_params.json", "optuna_studies.db", "generation_failures.json"):
         add(paths.generation / name)
     add(
         paths.generation / "diagnostics" / "class_sampling.csv",

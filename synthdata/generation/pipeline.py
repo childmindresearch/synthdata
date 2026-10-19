@@ -7,6 +7,7 @@ cached to CSV under ``generation.output_dir`` (skip regeneration unless
 JSON file (see :class:`synthdata.generation.hpo.BestParamsCache`).
 """
 
+import contextlib
 import copy
 import time
 from collections.abc import Callable
@@ -43,6 +44,30 @@ from synthdata.utils import (
 
 logger = get_logger(__name__)
 
+#: Models whose generation failed in the latest run, by name, with the error
+#: (in ``generation.output_dir``; not a CSV, so evaluation never reads it).
+FAILURES_FILE = "generation_failures.json"
+
+
+def read_failures(output_dir) -> dict[str, str]:
+    """Models that failed in the latest generation run of ``output_dir`` (empty if none)."""
+    path = Path(output_dir) / FAILURES_FILE
+    return load_json(path) if path.exists() else {}
+
+
+def _record_failure(output_dir, name: str, error: str) -> None:
+    """Add ``name`` to the failures file; parallel model processes share it."""
+    path = Path(output_dir) / FAILURES_FILE
+    with FileLock(f"{path}.lock"):
+        failures = load_json(path) if path.exists() else {}
+        failures[name] = error
+        save_json(path, failures)
+
+
+def _error_text(exc: BaseException) -> str:
+    first = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
+    return f"{type(exc).__name__}: {first[:300]}"
+
 
 def needs_imputed_data(gen_cfg) -> bool:
     """Whether any configured model actually requires the imputed train split.
@@ -71,7 +96,9 @@ def _synthcity_worker(cfg: Config, dataset: Dataset, name: str, device: str):
     sub.generation.tabpfn.enabled = False
     sub.generation.tabpfgen.enabled = False
     generated = []
-    datasets = run_generation(sub, dataset, plot_callback=lambda n, df, extra: generated.append(n))
+    datasets = run_generation(
+        sub, dataset, plot_callback=lambda n, df, extra: generated.append(n), _worker=True
+    )
     return datasets, generated
 
 
@@ -92,17 +119,23 @@ def _run_synthcity_workers(cfg: Config, dataset: Dataset, device: str) -> dict:
         # Create the Optuna tables once, so parallel studies never race to.
         hpo_mod.create_storage(gen_cfg.hpo, ensure_dir(gen_cfg.output_dir))
     n_gpus = 0
+    capacity = []
     if device == "cuda":
         import torch
 
         n_gpus = torch.cuda.device_count()
+        capacity = [torch.cuda.get_device_properties(i).total_memory / 2**30 for i in range(n_gpus)]
     fits_per_gpu = gpu_slots.resolve_fits_per_gpu(cfg.compute.fits_per_gpu)
     if n_gpus and fits_per_gpu is not None:
-        # Each fit goes to the least busy GPU (synthdata.gpu_slots).
-        gpu_slots.setup(ensure_dir(gen_cfg.output_dir) / "gpu_slots", n_gpus, fits_per_gpu)
+        # Each fit goes to the least busy GPU with the memory for it (synthdata.gpu_slots).
+        gpu_slots.setup(
+            ensure_dir(gen_cfg.output_dir) / "gpu_slots", n_gpus, fits_per_gpu, capacity
+        )
         logger.info(
-            "[generation] GPU fits: %d GPU(s), each fit on the least busy one; %s",
+            "[generation] GPU fits: %d GPU(s) (%s GiB), each fit on the least busy one with "
+            "the memory its model needs; %s",
             n_gpus,
+            ", ".join(f"{c:.0f}" for c in capacity),
             "no limit per GPU"
             if fits_per_gpu == gpu_slots.UNLIMITED
             else f"at most {fits_per_gpu} per GPU, longest remaining work first",
@@ -122,10 +155,14 @@ def _run_synthcity_workers(cfg: Config, dataset: Dataset, device: str) -> dict:
         gpu_slots.teardown()
     if run.failures:
         # Finished models are cached, so a rerun only redoes the failed ones.
-        raise RuntimeError(
-            f"synthcity generation failed for {sorted(run.failures)}: "
-            + "; ".join(f"{n}: {e}" for n, e in run.failures.items())
+        message = f"synthcity generation failed for {sorted(run.failures)}: " + "; ".join(
+            f"{n}: {e}" for n, e in run.failures.items()
         )
+        if not gen_cfg.continue_on_model_failure:
+            raise RuntimeError(message)
+        logger.error("[generation] %s; continuing with the other models", message)
+        for name, error in run.failures.items():
+            _record_failure(gen_cfg.output_dir, name, str(error)[:300])
     return run.results
 
 
@@ -164,6 +201,8 @@ def run_generation(
     dataset: Dataset,
     plot_callback: Callable | None = None,
     experiment=None,
+    *,
+    _worker: bool = False,
 ) -> dict[str, pd.DataFrame]:
     """Generate (or load cached) synthetic datasets for every configured model.
 
@@ -174,6 +213,12 @@ def run_generation(
     failed plot callback is recorded to its manifest (``stage="generation_plot_failed"``)
     in addition to the console warning, so the skip is visible from the
     output directory alone.
+
+    With ``generation.continue_on_model_failure`` (the default), a model
+    whose search, fit or sampling raises is logged, listed in
+    :data:`FAILURES_FILE` and skipped, and the other models carry on; the
+    error is raised only when the option is off. ``_worker`` marks a call
+    from one model's process (the parent clears the failures file).
     """
     if dataset.train_imputed_df is None and needs_imputed_data(cfg.generation):
         raise RuntimeError(
@@ -188,6 +233,20 @@ def run_generation(
     gen_cfg = cfg.generation
     hpo_mod.mark_stage_start()
     output_dir = ensure_dir(gen_cfg.output_dir)
+    if not _worker:
+        (output_dir / FAILURES_FILE).unlink(missing_ok=True)
+
+    @contextlib.contextmanager
+    def _skip_on_failure(name):
+        """Log and record a failure of ``name`` and carry on (unless the option is off)."""
+        try:
+            yield
+        except Exception as exc:
+            if not gen_cfg.continue_on_model_failure:
+                raise
+            logger.exception("[%s] generation failed; continuing with the other models", name)
+            _record_failure(output_dir, name, _error_text(exc))
+
     # Final models draw as many rows as train has, HPO candidates as many as
     # search-train has (unless generation.n_samples fixes the count).
     n_samples = gen_cfg.rows_for(len(dataset.train_df))
@@ -268,7 +327,8 @@ def run_generation(
         each batch is a whole new fit (TabPFN: about 10 h per fit on wide data).
         """
         for replicate in range(gen_cfg.n_replicates):
-            _build_one(replicate_name(name, replicate), seed + replicate, build_fn, top_up)
+            with _skip_on_failure(replicate_name(name, replicate)):
+                _build_one(replicate_name(name, replicate), seed + replicate, build_fn, top_up)
 
     remask = cfg.imputation.missing_indicators.remask_synthetic and bool(
         dataset.missing_indicator_columns
@@ -447,62 +507,64 @@ def run_generation(
             untuned_seconds = _untuned_fit_seconds(
                 output_dir, name, time.monotonic() - untuned_started
             )
-            if gen_cfg.hpo.enabled and hpo_mod.model_budget(gen_cfg.hpo, name)[0] > 0:
-                if not best_params.has("synthcity", name):
-                    assert hpo_eval_fn is not None  # synthcity models read imputed data
-                    objective = sc.build_synthcity_objective(
-                        name,
-                        search_loader,
-                        gen_cfg.hpo,
-                        seed,
-                        hpo_eval_fn,
-                        hpo_n_samples,
-                        workspace=output_dir / "synthcity_workspace",
-                        device=device,
-                        classification=dataset.target_is_categorical,
-                        class_prior=search_prior,
-                        discrete_columns=dataset.all_categorical_columns,
+            # A failed search skips the tuned model only; the untuned one is kept.
+            with _skip_on_failure(f"{name}_hpo"):
+                if gen_cfg.hpo.enabled and hpo_mod.model_budget(gen_cfg.hpo, name)[0] > 0:
+                    if not best_params.has("synthcity", name):
+                        assert hpo_eval_fn is not None  # synthcity models read imputed data
+                        objective = sc.build_synthcity_objective(
+                            name,
+                            search_loader,
+                            gen_cfg.hpo,
+                            seed,
+                            hpo_eval_fn,
+                            hpo_n_samples,
+                            workspace=output_dir / "synthcity_workspace",
+                            device=device,
+                            classification=dataset.target_is_categorical,
+                            class_prior=search_prior,
+                            discrete_columns=dataset.all_categorical_columns,
+                        )
+                        params = hpo_mod.run_study(
+                            f"hpo_{name}",
+                            objective,
+                            gen_cfg.hpo,
+                            output_dir,
+                            seed,
+                            checkpoint_workspace=output_dir / "synthcity_workspace",
+                            checkpoint_plugin=name,
+                            reserve_seconds=untuned_seconds,
+                            default_params=sc.default_trial_params(name, gen_cfg.hpo),
+                            headroom=hpo_eval_fn.headroom,
+                        )
+                        best_params.set("synthcity", name, params)
+                    # No feasible trial ({}): fit the untuned model's params, so the
+                    # fallback keeps the capped training length instead of the
+                    # library default (RTVAE diverged at 1000 epochs on LORIS).
+                    params = dict(best_params.get("synthcity", name)) or sc.untuned_params(
+                        name, gen_cfg.hpo
                     )
-                    params = hpo_mod.run_study(
-                        f"hpo_{name}",
-                        objective,
-                        gen_cfg.hpo,
-                        output_dir,
-                        seed,
-                        checkpoint_workspace=output_dir / "synthcity_workspace",
-                        checkpoint_plugin=name,
-                        reserve_seconds=untuned_seconds,
-                        default_params=sc.default_trial_params(name, gen_cfg.hpo),
-                        headroom=hpo_eval_fn.headroom,
+
+                    override = gen_cfg.hpo.final_n_iter_override
+                    if override and sc.plugin_accepts(name, "n_iter"):
+                        params["n_iter"] = override
+
+                    _cached_or_build(
+                        f"{name}_hpo",
+                        lambda seed, count, name=name, params=params: sc.fit_generate(
+                            name,
+                            params,
+                            train_loader,
+                            count,
+                            seed,
+                            workspace=output_dir / "synthcity_workspace",
+                            device=device,
+                            classification=dataset.target_is_categorical,
+                            class_prior=class_prior,
+                            discrete_columns=dataset.all_categorical_columns,
+                            kind="tuned",
+                        ),
                     )
-                    best_params.set("synthcity", name, params)
-                # No feasible trial ({}): fit the untuned model's params, so the
-                # fallback keeps the capped training length instead of the
-                # library default (RTVAE diverged at 1000 epochs on LORIS).
-                params = dict(best_params.get("synthcity", name)) or sc.untuned_params(
-                    name, gen_cfg.hpo
-                )
-
-                override = gen_cfg.hpo.final_n_iter_override
-                if override and sc.plugin_accepts(name, "n_iter"):
-                    params["n_iter"] = override
-
-                _cached_or_build(
-                    f"{name}_hpo",
-                    lambda seed, count, name=name, params=params: sc.fit_generate(
-                        name,
-                        params,
-                        train_loader,
-                        count,
-                        seed,
-                        workspace=output_dir / "synthcity_workspace",
-                        device=device,
-                        classification=dataset.target_is_categorical,
-                        class_prior=class_prior,
-                        discrete_columns=dataset.all_categorical_columns,
-                        kind="tuned",
-                    ),
-                )
 
     # ------------------------------------------------------------------
     # TabPFN models (no HPO; can fit on the original pre-imputation train
@@ -675,4 +737,13 @@ def run_generation(
         len(synthetic_datasets),
         sorted(synthetic_datasets),
     )
+    failures = read_failures(output_dir) if not _worker else {}
+    if failures:
+        logger.error(
+            "[generation] %d model(s) failed and are left out of evaluation: %s (listed in %s; "
+            "a rerun of the same experiment redoes only these)",
+            len(failures),
+            ", ".join(sorted(failures)),
+            output_dir / FAILURES_FILE,
+        )
     return synthetic_datasets

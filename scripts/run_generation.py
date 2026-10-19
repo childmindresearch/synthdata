@@ -21,7 +21,7 @@ from synthdata.data import load_dataset, load_imputed_splits
 from synthdata.evaluation.tstr import tstr_xgb_params
 from synthdata.experiment import start_experiment
 from synthdata.generation import run_generation
-from synthdata.generation.pipeline import needs_imputed_data
+from synthdata.generation.pipeline import FAILURES_FILE, needs_imputed_data, read_failures
 from synthdata.utils import get_logger, set_global_seed
 
 logger = get_logger("run_generation")
@@ -99,11 +99,13 @@ def main() -> None:
             save_generation_plots(cfg, dataset, unplotted, cfg.plots.output_dir)
         save_hpo_plots(cfg, cfg.plots.output_dir)
 
+    failures = read_failures(cfg.generation.output_dir)
     experiment.record(
         "generation",
         artifacts={
             "synthetic_data_dir": str(experiment.generation_dir),
             "models": sorted(synthetic_datasets),
+            "failed_models": sorted(failures),
         },
         n_models=len(synthetic_datasets),
         **(
@@ -112,6 +114,10 @@ def main() -> None:
             else {}
         ),
     )
+    if not synthetic_datasets:
+        raise SystemExit(
+            f"No synthetic dataset was generated; see {FAILURES_FILE} and the log for the errors."
+        )
 
     logger.info(
         "Generated/loaded %d synthetic datasets under %s",

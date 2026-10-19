@@ -4,7 +4,7 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
-## 0.9.0 (2026-10-19)
+## 0.10.0 (2026-10-19)
 
 Results are unchanged with the default config. A config that sets the new key changes the HPO objective and holdout TSTR: use a new experiment id. No golden re-record is needed (the golden config does not set it).
 
@@ -12,6 +12,23 @@ Results are unchanged with the default config. A config that sets the new key ch
 
 - `evaluation.tstr_xgboost_params`: your own `XGBClassifier` parameters for the classifier that predicts the target in holdout TSTR/TSTS, the HPO objective and its real-data ceiling, for example the parameters of a baseline model tuned on the real data. Keys you leave out keep the defaults; `random_state`, `seed`, `objective` and `num_class` are refused, and class-balanced weights still apply. SynthEval's and synthcity's utility metrics, `fid_detection_auc` and the privacy attacks keep their own classifiers. `configs/config_sim.yaml` sets it to a collaborator's tuned baseline parameters as an example.
 - `manifest.json`: the evaluation entry (and the generation entry when HPO runs) records the classifier parameters used as `tstr_xgboost_params`.
+
+## 0.9.0 (2026-10-19)
+
+Results stay comparable and the golden run is unchanged: no new experiment id is needed, and a failed run can be resumed with its own experiment id. The one change to generated rows: a class top-up that asks for more than 10,000 rows at once is now drawn in chunks with their own seeds, so a model that needed one draws different (equally valid) rows than before.
+
+### Added
+
+- `generation.continue_on_model_failure` (default `true`): when one model's search, fit or sampling fails, the others carry on and evaluation runs on every model that finished. Before, one failed model (a PATE-GAN out-of-memory error after 36 h on the simulated data) stopped the run before evaluation. Failed models are listed in the new `<generation dir>/generation_failures.json` and under **Read with care** in `report.md`; the generate stage fails only if no synthetic dataset is left. Set it to `false` for the old behaviour.
+- GPU memory is shared by measurement: a fit starts on a GPU only when the memory its model needs (its largest measured peak plus a margin, or a quarter of the GPU before its first fit) fits next to the fits already there. This applies with `compute.fits_per_gpu: auto` and with a number. `gpu_slots/fits.csv` gains a `peak_vram_gib` column (new files only).
+- Dashboard: each HPO study that stopped short says why (*no gain in N trials*, *time budget*, *stage time limit*, *generation failed*); the objective and its range sit under each trial plot and in each trial's tooltip (the separate Objective column is gone); hovering a generation bar lists its phases (untuned fits, HPO search, tuned fits) with their lengths instead of repeating the model name.
+- HPO logs `search ended at its time budget` when a study's timeout ends it.
+
+### Fixed
+
+- A model's process now hands its cached GPU memory back after every fit. Before, PyTorch kept each worker's highest use for the rest of its search (TVAE and RTVAE held 20 GiB each between trials), which left too little for the other models.
+- Sampling draws at most 10,000 rows per call, and a fit or chunk that runs out of GPU memory is retried up to 3 times with the same seeds after the GPU frees up.
+- Dashboard: hovering a hollow dot (a trial that failed a screen) now shows its tooltip; only the dot's outline reacted before, so models where no trial passed showed nothing.
 
 ## 0.8.2 (2026-10-19)
 

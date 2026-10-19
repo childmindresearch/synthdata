@@ -1492,6 +1492,14 @@ def run_study(
             show_progress_bar=False,
             callbacks=callbacks,
         )
+        if time_left() == 0 and n_finished(study) < n_trials:
+            # Read by the dashboard as the reason the search stopped.
+            logger.info(
+                "[%s] search ended at its time budget: %d of %d trials done",
+                study_name,
+                n_finished(study),
+                n_trials,
+            )
 
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     if not completed:
