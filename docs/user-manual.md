@@ -487,7 +487,7 @@ Under `generation.output_dir/data_v_<version>/exp_v_<id>/`:
 - `hpo_best_params.json`, `optuna_studies.db`: search results.
 - `generation_failures.json`: the models whose generation failed in this run, with the error. It is only there when something failed.
 
-A rerun of the same experiment skips models whose CSV already exists. Set `generation.force_retrain: true` to retrain them.
+A rerun of the same experiment skips models whose CSV already exists. A cached CSV with no rows, no target column or that cannot be read (an interrupted write) is refitted, with a warning. Set `generation.force_retrain: true` to retrain them all. Evaluation skips an empty CSV with an error naming it rather than letting every metric fail on it.
 
 ### When a model fails
 
@@ -584,7 +584,7 @@ Singling-out risk reads low even for `baseline_train_copy`. Anonymeter compares 
 
 A few reported metrics are left out of the ranking because they cannot tell a copy of the training data from a fresh draw (synthcity's k-anonymization, k-map, distinct l-diversity, delta-presence, alpha-precision coverage, data_leakage linear and mlp, DomiasMIA accuracy, and the augmentation scores) or only qualify another score (the feat_rank_distance p-value). They still appear in `combined_evaluation.csv`; [verification.md](verification.md) says why.
 
-With replicates, each score is the mean over seeds with a 95% confidence interval, and a model is "tied with best" when a one-sided Welch t-test cannot place its overall score below the best model's. A tuned model marked **(untuned)** (dashboard: *untuned*) had no HPO trial pass the screens, so it was fitted with the untuned settings and repeats its untuned model: read the two rows as one model, and check the `hpo` log lines for why every trial failed.
+With replicates, each score is the mean over seeds with a 95% confidence interval, and a model is "tied with best" when a one-sided Welch t-test cannot place its overall score below the best model's. A tuned model marked **(untuned)** (dashboard: *untuned*) had no HPO trial pass the screens, so it got the untuned settings and the same seeds: its CSVs are copies of the untuned model's, saved without a refit (unless `hpo.final_n_iter_override` changes its training length, which needs a new fit): read the two rows as one model, and check the `hpo` log lines for why every trial failed.
 
 ### Running on large data
 

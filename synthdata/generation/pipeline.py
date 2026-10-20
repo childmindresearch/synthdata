@@ -378,14 +378,80 @@ def run_generation(
                 report.to_csv(released.with_name(f"{name}_recorded_values.csv"), index=False)
             out.to_csv(released, index=False)
 
+    def _reuse_untuned(name):
+        """Save the untuned sets of ``name`` as ``<name>_hpo``; False if one is missing.
+
+        When no HPO trial passes the screens, the tuned model gets the untuned
+        settings and the same seeds, so refitting it only repeats the untuned
+        fits (about 2 h for ddpm on the clinical data). The report still marks
+        the row as an untuned fallback (``hpo.untuned_fallbacks``).
+        """
+        names = [replicate_name(name, r) for r in range(gen_cfg.n_replicates)]
+        if any(n not in synthetic_datasets for n in names):
+            return False
+        logger.info("[%s_hpo] no trial passed the screens: reusing the untuned sets", name)
+        copied = []
+        for replicate, untuned in enumerate(names):
+            tuned = replicate_name(f"{name}_hpo", replicate)
+            path = output_dir / f"{tuned}.csv"
+            # A set cached by an earlier run (perhaps a refit) stays as it is.
+            cached = (
+                None if gen_cfg.force_retrain or not path.exists() else _read_cached(tuned, path)
+            )
+            if cached is not None:
+                synthetic_datasets[tuned] = cached
+                continue
+            df = synthetic_datasets[untuned]
+            df.to_csv(path, index=False)
+            _write_released(tuned, df, overwrite=True, replicate_seed=seed + replicate)
+            synthetic_datasets[tuned] = df
+            _plot(tuned, df, None)
+            copied.append(untuned)
+        if copied and class_sampling_path.exists():
+            with FileLock(f"{class_sampling_path}.lock"):
+                rows = pd.read_csv(class_sampling_path)
+                copies = rows[rows["model"].isin(copied)].copy()
+                copies["model"] = copies["model"].map(
+                    lambda n: replicate_name(f"{name}_hpo", split_replicate_name(n)[1])
+                )
+                rows = rows[~rows["model"].isin(copies["model"])]
+                pd.concat([rows, copies], ignore_index=True).to_csv(
+                    class_sampling_path, index=False
+                )
+        return True
+
+    def _read_cached(name, path):
+        """The cached set at ``path``, or None (with a warning) when it must be refitted.
+
+        A header-only or unreadable CSV (an interrupted write, or one from before
+        the CSV dtype fixes) would otherwise be evaluated as an empty dataset,
+        and every metric fails on it one by one.
+        """
+        try:
+            df = read_like(path, dataset.full_df)
+        except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError) as exc:
+            logger.warning("[%s] cached %s is unreadable (%s); refitting", name, path, exc)
+            return None
+        if df.empty or dataset.target_column not in df:
+            logger.warning(
+                "[%s] cached %s has %d rows%s; refitting",
+                name,
+                path,
+                len(df),
+                "" if dataset.target_column in df else f" and no {dataset.target_column!r} column",
+            )
+            return None
+        return df
+
     def _build_one(name, replicate_seed, build_fn, top_up=True):
         path = output_dir / f"{name}.csv"
         if path.exists() and not gen_cfg.force_retrain:
-            logger.info("[%s] using cached synthetic data at %s", name, path)
-            df = read_like(path, dataset.full_df)
-            synthetic_datasets[name] = df
-            _write_released(name, df, overwrite=False, replicate_seed=replicate_seed)
-            return df
+            df = _read_cached(name, path)
+            if df is not None:
+                logger.info("[%s] using cached synthetic data at %s", name, path)
+                synthetic_datasets[name] = df
+                _write_released(name, df, overwrite=False, replicate_seed=replicate_seed)
+                return df
 
         logger.info(
             "[%s] generating synthetic data (n_samples=%d, seed=%d)",
@@ -548,6 +614,9 @@ def run_generation(
                     override = gen_cfg.hpo.final_n_iter_override
                     if override and sc.plugin_accepts(name, "n_iter"):
                         params["n_iter"] = override
+
+                    if params == sc.untuned_params(name, gen_cfg.hpo) and _reuse_untuned(name):
+                        continue
 
                     _cached_or_build(
                         f"{name}_hpo",
