@@ -189,6 +189,39 @@ class TestBuildEvaluationReport:
         assert "`model_a`: Anonymeter linkability succeeded" in glance
         assert "`model_b`: Anonymeter" not in glance
 
+    def test_fairness_lists_privacy_by_protected_group(self, make_config, make_dataset):
+        cfg = make_config()
+        combined = _combined_table()
+        combined[("custom", "privacy", "distance_mia_auc")] = [0.6, 0.5]
+        combined[("custom", "fairness", "subgroup_distance_mia_auc_gap")] = [0.2, 0.02]
+        combined[("custom", "fairness", "subgroup_distance_mia_auc_max")] = [0.7, 0.51]
+        subgroups = pd.DataFrame(
+            {
+                "model": ["model_a", "model_a", "model_b", "model_b"],
+                "column": ["sex"] * 4,
+                "group": ["F", "M"] * 2,
+                "n_train_patients": [40, 35] * 2,
+                "n_test_patients": [12, 11] * 2,
+                "distance_mia_auc": [0.7, 0.5, 0.51, 0.49],
+                "auc_se": [0.08, 0.09, 0.09, 0.1],
+            }
+        )
+        extras = {"selected_datasets": {}, "privacy_result": {"subgroups": subgroups}}
+        text = build_evaluation_report(cfg, make_dataset(), combined, extras)
+        fairness = _section(text, "5. Fairness")
+        part = fairness.split("### Privacy by protected group")[1]
+        assert "subgroup_distance_mia_auc_gap" in part and "not ranked" in part
+        assert "sex = F" in part and "sex = M" in part
+        assert "sex = F 40/12" in part
+        assert "Privacy by protected group" in _section(text, "4. Privacy evidence")
+
+    def test_privacy_by_group_says_when_it_was_not_run(self, make_config, make_dataset):
+        text = build_evaluation_report(
+            make_config(), make_dataset(), _combined_table(), {"selected_datasets": {}}
+        )
+        part = _section(text, "5. Fairness").split("### Privacy by protected group")[1]
+        assert "Not computed this run" in part
+
     def test_reads_tables_back_and_embeds_plots_from_disk(self, make_config, make_dataset):
         cfg = make_config()
         eval_dir = Path(cfg.evaluation.output_dir)
