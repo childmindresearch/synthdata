@@ -126,10 +126,12 @@ generation:
       { enforce: false, copy_margin: 0.02, min_category_coverage: 0.8, max_out_of_range: 0.01,
         max_class_share_gap: 0.02, min_protected_coverage: 1.0,
         max_protected_share_gap: 0.1, max_dcr_closer_to_train: 0.6 }
-    # Stop a study after 10 trials in a row without a gain above the
-    # objective's bootstrap SE (min_delta null); timeouts stay as caps.
+    # Stop a study after 10 trials in a row without a gain above min_delta;
+    # timeouts stay as caps. 0.01 macro AUPRC is about 1.5 bootstrap SEs: on
+    # the sim run, refitting with new seeds moved a trial's score about as much
+    # as its bootstrap SE, so one-SE gains (min_delta null) were mostly noise.
     patience: 10
-    min_delta: null
+    min_delta: 0.01
     # Library defaults first, then multivariate TPE after 10 random trials;
     # the best 3 feasible trials are refitted with 2 new seeds and the best
     # mean wins. warm_start: an earlier run's optuna_studies.db (e.g. the sim
@@ -160,15 +162,18 @@ generation:
     n_trials_per_model:
       { ctgan: 40, tvae: 40, adsgan: 40, rtvae: 40, pategan: 40, ddpm: 40, arf: 25 }
     timeout_seconds_per_model:
-      { ctgan: 155000, tvae: 85000, adsgan: 95500, rtvae: 99000, pategan: 19500,
+      { ctgan: 155000, tvae: 160000, adsgan: 95500, rtvae: 188000, pategan: 19500,
         ddpm: 103000, arf: 42000 }
     # Training length is searched, [low, high, step]. The libraries' ranges
     # (100-1000 epochs; PATE-GAN 1-500) would take 3+ hours per trial here.
     # The top also caps the untuned default model, which would otherwise
     # train for the library default (CTGAN 2000, ADS-GAN 10000 epochs).
+    # TVAE and RTVAE go to 300 (2026-10-20): on the sim run their macro AUPRC
+    # rose with epochs and their best trials sat at the old 150 cap; their
+    # timeouts above were raised by the same factor (mean epochs x1.9).
     epoch_ranges:
-      { ctgan: [25, 150, 25], tvae: [25, 150, 25], adsgan: [25, 150, 25],
-        rtvae: [25, 150, 25], pategan: [2, 10, 2], ddpm: [100, 1000, 100] }
+      { ctgan: [25, 150, 25], tvae: [25, 300, 25], adsgan: [25, 150, 25],
+        rtvae: [25, 300, 25], pategan: [2, 10, 2], ddpm: [100, 1000, 100] }
     # Median pruning on synthcity's GAN detection metric: off, it sat at 1.000
     # for every GAN trial on the sim run and never checked the shortest ones.
     pruner: null
