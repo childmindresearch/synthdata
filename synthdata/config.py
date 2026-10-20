@@ -479,6 +479,34 @@ class TabPFGenConfig:
 
 
 @dataclasses.dataclass
+class TabularARGNConfig:
+    """MOSTLY AI's TabularARGN (``mostlyai-engine``), run in its own environment.
+
+    mostlyai-engine's torch and psutil pins clash with this repo's, so it is
+    installed separately (``uv sync --project envs/tabularargn``) and run as a
+    subprocess; see ``synthdata/generation/tabularargn_backend.py``. It fits on
+    the imputed train split, like the synthcity models. No HPO: the library
+    stops training early on its own validation split.
+    """
+
+    #: Off by default: needs the separate environment above.
+    enabled: bool = False
+    #: The environment's folder (relative paths are from the repo root).
+    env_dir: str = "envs/tabularargn"
+    #: Arguments for ``TabularARGN()`` (e.g. ``model: MOSTLY_AI/Large``,
+    #: ``max_epochs``, ``max_training_time`` in minutes, ``value_protection``).
+    #: Empty keeps the library defaults.
+    params: dict = dataclasses.field(default_factory=dict)
+    #: Arguments for ``TabularARGN.sample()``. Value protection (on by default)
+    #: hides categories too rare to release; ``sample`` draws a common category
+    #: in their place instead of the library's ``_RARE_`` token, which is not a
+    #: real value of the column.
+    sample_params: dict = dataclasses.field(
+        default_factory=lambda: {"rare_category_replacement_method": "sample"}
+    )
+
+
+@dataclasses.dataclass
 class HPOConstraintsConfig:
     """Lenient sanity screens for HPO trials, passed to Optuna as constraints.
 
@@ -714,6 +742,8 @@ class GenerationConfig:
     tabpfn: TabPFNConfig = dataclasses.field(default_factory=TabPFNConfig)
     #: TabPFGen generators (see TabPFGenConfig).
     tabpfgen: TabPFGenConfig = dataclasses.field(default_factory=TabPFGenConfig)
+    #: TabularARGN generator (see TabularARGNConfig).
+    tabularargn: TabularARGNConfig = dataclasses.field(default_factory=TabularARGNConfig)
     #: Hyperparameter search (see HPOConfig).
     hpo: HPOConfig = dataclasses.field(default_factory=HPOConfig)
     #: Draw every synthetic dataset (and every HPO candidate) to the real train
@@ -1113,6 +1143,7 @@ _NESTED_DATACLASSES = {
     (GenerationConfig, "synthcity"): SynthcityModelsConfig,
     (GenerationConfig, "tabpfn"): TabPFNConfig,
     (GenerationConfig, "tabpfgen"): TabPFGenConfig,
+    (GenerationConfig, "tabularargn"): TabularARGNConfig,
     (GenerationConfig, "hpo"): HPOConfig,
     (HPOConfig, "constraints"): HPOConstraintsConfig,
     (EvaluationConfig, "synthcity"): FrameworkSelectionConfig,

@@ -384,8 +384,17 @@ output/<name>/imputation/data_v_<version>/
 | TabPFN `standard` | Foundation model | Generates features, then assigns labels from TabPFN's predicted class probabilities |
 | TabPFN `custom` | Foundation model | Generates features and target jointly |
 | TabPFGen | Energy-based sampling | Off by default: its output is near-copies of training rows (see [verification](verification.md)) |
+| `tabularargn` | Autoregressive network (MOSTLY AI's TabularARGN) | Off by default. Runs in its own environment; no HPO (see below) |
 
 Synthcity models are chosen with `generation.synthcity.names`. TabPFN runs when `generation.tabpfn.enabled` is true; `variants` picks `standard` and/or `custom`, and `data_variants` picks whether it learns from the `raw` data (TabPFN handles missing values itself) or the `imputed` data. Imputed-data outputs get an `_imputed` suffix, for example `tabpfn_custom_imputed`. `model_version` picks the TabPFN weights (default `v3.5`, which did slightly better than `v3` on Hepatitis and runs faster). Each version works only after you accept its non-commercial license on ux.priorlabs.ai with the account behind your `TABPFN_TOKEN`.
+
+TabularARGN ([MOSTLY AI 2025](https://arxiv.org/abs/2501.12012)) comes from MOSTLY AI's `mostlyai-engine` package. That package pins its own PyTorch version and an old `psutil`, which clash with this project's, so it is installed into a separate environment and the pipeline runs it as a subprocess:
+
+```bash
+uv sync --project envs/tabularargn     # once; downloads its own PyTorch
+```
+
+Then set `generation.tabularargn.enabled: true`. It learns from the imputed data, like the synthcity models, and is fitted once per replicate (output `tabularargn.csv`). It has no hyperparameter search: the library stops training early on its own validation split. `generation.tabularargn.params` passes arguments to `TabularARGN()` (for example `model: MOSTLY_AI/Large`, `max_epochs`, or `max_training_time` in minutes), and `sample_params` passes arguments to its `sample()`. For a categorical target, the class quotas are given to the model as fixed target values, so each class gets exactly its share. Its value protection (on by default) hides categories too rare to release; the default `rare_category_replacement_method: sample` replaces them with a common category instead of a `_RARE_` token. `env_dir` points to the environment if you keep it elsewhere.
 
 ### Rows, class balance and replicates
 

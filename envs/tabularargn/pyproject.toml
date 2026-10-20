@@ -1,0 +1,31 @@
+# Separate environment for MOSTLY AI's TabularARGN (mostlyai-engine).
+#
+# mostlyai-engine pins one torch minor per release (2.7.x: torch 2.13) and
+# psutil<6, while synthcity needs psutil>=6.1 (via tsai) and this repo keeps
+# torch 2.7.1+cu128 on Linux. They cannot share one environment without
+# overriding the library's own pins, so the pipeline runs TabularARGN here,
+# in a subprocess (synthdata/generation/tabularargn_backend.py). Install with
+#   uv sync --project envs/tabularargn
+[project]
+name = "synthdata-tabularargn"
+version = "0.1.0"
+requires-python = "==3.11.*"
+dependencies = [
+    "mostlyai-engine==2.7.3",
+    "pandas",
+    "pyarrow",
+]
+
+[tool.uv]
+package = false
+
+# PyPI's torch is CPU-only on Windows; take the CUDA 13.0 build there.
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

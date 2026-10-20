@@ -4,6 +4,14 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.15.0 (2026-10-20)
+
+A new optional generator; nothing changes unless you turn it on, so existing results and golden runs stay comparable.
+
+### Added
+
+- TabularARGN (MOSTLY AI's autoregressive generator, `mostlyai-engine==2.7.3`) as `generation.tabularargn` (`enabled`, `env_dir`, `params`, `sample_params`; off by default). Its package pins torch 2.13 and `psutil<6`, which clash with this project's, so it lives in its own environment (`uv sync --project envs/tabularargn`) and runs as a subprocess. It fits on the imputed train split, writes `tabularargn.csv` (plus replicates), has no HPO, and fills class quotas by fixing the target as seed data. See the user manual (Generators) and `docs/verification.md`.
+
 ## 0.13.0 (2026-10-20)
 
 The simulated and LORIS configs change HPO selection: use a new experiment id for them (old Optuna studies are stale). The hepatitis config, and so the golden run, is unchanged; no re-record is needed.
