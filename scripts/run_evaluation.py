@@ -15,6 +15,8 @@ Requires generated synthetic data (run `synthdata-generate` first).
 import argparse
 from pathlib import Path
 
+import pandas as pd
+
 from synthdata.config import load_config
 from synthdata.data import load_dataset, load_imputed_splits, read_like
 from synthdata.evaluation import run_evaluation
@@ -30,7 +32,17 @@ def _load_synthetic_datasets(cfg, reference) -> dict:
     output_dir = Path(cfg.generation.output_dir)
     datasets = {}
     for path in sorted(output_dir.glob("*.csv")):
-        datasets[path.stem] = read_like(path, reference)
+        try:
+            df = read_like(path, reference)
+        except pd.errors.EmptyDataError:
+            df = pd.DataFrame()
+        if df.empty:
+            # Scoring it would only fail every metric in turn.
+            logger.error(
+                "skipping %s: it has no rows; rerun the generate stage to refit it", path.name
+            )
+            continue
+        datasets[path.stem] = df
     return datasets
 
 

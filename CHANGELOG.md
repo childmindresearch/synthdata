@@ -13,6 +13,16 @@ Existing metrics and ranks are unchanged; two new reported (unranked) columns ap
 - Subgroup privacy gap (fairness of privacy): the holdout distance membership attack (`distance_mia_auc`) is now also run inside each protected group, using the same groups as SynthEval's fairness metrics (each category or `data.protected_bins` bin with at least 5% of the train rows). `combined_evaluation.csv` gains `subgroup_distance_mia_auc_gap` (largest AUC difference between groups of one protected column; 0 = equally exposed) and `subgroup_distance_mia_auc_max` (the most exposed group's AUC) under custom fairness. Both are reported, not ranked: a copy of train leaks equally in every group, so the gap cannot tell it from a fresh draw. It runs whenever `holdout_distance` is selected and protected columns are declared; there is no new config key.
 - `privacy_subgroups.csv` in the evaluation folder: each model x protected group with its train and test patient counts, AUC and standard error (Hanley & McNeil). Groups with fewer than 10 patients on either side get no AUC.
 
+## 0.10.1 (2026-10-20)
+
+Results stay comparable: no new experiment id is needed, and a run can be resumed with its own experiment id. No golden re-record is needed (the fixture is far below the size where geomloss switched to KeOps, so its Wasserstein value is unchanged).
+
+### Fixed
+
+- `stats.wasserstein_dist` (synthcity fork) runs on geomloss's plain-torch backend instead of switching to KeOps above 5000 x 5000 points, so it works where KeOps cannot compile. When it does fail, it no longer leaves autograd off for the worker, which used to make `alpha_precision`, `identifiability_score`, `detection_mlp` and `data_leakage_mlp` fail too. Configs that dropped `wasserstein_dist` from `evaluation.synthcity.metrics` as a workaround can put it back.
+- Generation refits a cached synthetic CSV that has no rows, no target column or cannot be read, with a warning, instead of passing it to evaluation. Evaluation skips an empty CSV with an error naming it rather than failing every metric on it.
+- When no HPO trial passes the screens, `<model>_hpo` is saved as a copy of the untuned sets instead of being refitted with the same settings and seeds (about 2 h per replicate for ddpm on the clinical data). With `hpo.final_n_iter_override` set, the training length differs, so it is still refitted.
+
 ## 0.10.0 (2026-10-19)
 
 Results are unchanged with the default config. A config that sets the new key changes the HPO objective and holdout TSTR: use a new experiment id. No golden re-record is needed (the golden config does not set it).

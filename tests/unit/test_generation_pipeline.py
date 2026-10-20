@@ -225,3 +225,63 @@ def test_a_failed_model_stops_the_run_when_continuing_is_off(make_config, make_d
     cfg.generation.continue_on_model_failure = False
     with pytest.raises(RuntimeError, match="out of memory"):
         run_generation(cfg, dataset)
+
+
+def _one_synthcity_model(make_config, make_dataset, mocker):
+    cfg = make_config()
+    cfg.generation.tabpfn.enabled = False
+    cfg.generation.tabpfgen.enabled = False
+    cfg.generation.hpo.enabled = False
+    cfg.generation.synthcity.names = ["ctgan"]
+    cfg.generation.match_class_prior = False
+    dataset = make_dataset()
+    dataset.train_imputed_df = dataset.train_df
+    mocker.patch("synthdata.generation.pipeline.sc.make_loader")
+    fit = mocker.patch(
+        "synthdata.generation.pipeline.sc.fit_generate",
+        side_effect=lambda *args, **kwargs: dataset.train_df.assign(seed=args[4]),
+    )
+    return cfg, dataset, fit
+
+
+def test_a_header_only_cached_set_is_refitted(make_config, make_dataset, mocker):
+    cfg, dataset, fit = _one_synthcity_model(make_config, make_dataset, mocker)
+    output_dir = Path(cfg.generation.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dataset.train_df.head(0).to_csv(output_dir / "ctgan.csv", index=False)
+
+    result = run_generation(cfg, dataset)
+
+    assert fit.call_count == 1
+    assert len(result["ctgan"]) == len(dataset.train_df)
+    assert len(pd.read_csv(output_dir / "ctgan.csv")) == len(dataset.train_df)
+
+
+def test_a_valid_cached_set_is_reused(make_config, make_dataset, mocker):
+    cfg, dataset, fit = _one_synthcity_model(make_config, make_dataset, mocker)
+    output_dir = Path(cfg.generation.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dataset.train_df.to_csv(output_dir / "ctgan.csv", index=False)
+
+    run_generation(cfg, dataset)
+
+    fit.assert_not_called()
+
+
+def test_hpo_without_a_feasible_trial_reuses_the_untuned_sets(make_config, make_dataset, mocker):
+    cfg, dataset, fit = _one_synthcity_model(make_config, make_dataset, mocker)
+    cfg.generation.hpo.enabled = True
+    cfg.generation.hpo.final_n_iter_override = None
+    cfg.generation.n_replicates = 2
+    dataset.tuning_index = dataset.train_df.index[:5]
+    dataset.full_imputed_df = dataset.full_df
+    mocker.patch("synthdata.generation.pipeline.hpo_mod.build_hpo_eval_fn")
+    mocker.patch("synthdata.generation.pipeline.sc.build_synthcity_objective")
+    mocker.patch("synthdata.generation.pipeline.hpo_mod.run_study", return_value={})
+
+    result = run_generation(cfg, dataset)
+
+    assert [call.args[4] for call in fit.call_args_list] == [cfg.seed, cfg.seed + 1]
+    for untuned, tuned in [("ctgan", "ctgan_hpo"), ("ctgan__rep1", "ctgan_hpo__rep1")]:
+        pd.testing.assert_frame_equal(result[tuned], result[untuned])
+        assert (Path(cfg.generation.output_dir) / f"{tuned}.csv").exists()
