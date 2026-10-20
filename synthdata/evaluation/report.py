@@ -22,7 +22,12 @@ from synthdata.evaluation.combine import (
     simple_rank_summary,
     summarize_replicates,
 )
-from synthdata.evaluation.privacy_attacks import ANONYMETER_METRICS, HOLDOUT_DISTANCE_METRICS
+from synthdata.evaluation.privacy_attacks import (
+    ANONYMETER_METRICS,
+    HOLDOUT_DISTANCE_METRICS,
+    SUBGROUP_MIN_PATIENTS,
+    SUBGROUP_PRIVACY_METRICS,
+)
 from synthdata.experiment import dataset_version_scope
 from synthdata.utils import get_logger, split_replicate_name
 
@@ -162,6 +167,7 @@ def _load_extras(evaluation_dir: Path, combined: pd.DataFrame, extras: dict) -> 
         "tstr_table": ("tstr_holdout.csv", {"index_col": 0}),
         "ovr_per_class": ("ovr_per_class.csv", {"index_col": 0, "header": [0, 1]}),
         "privacy_attacks": ("privacy_attacks.csv", {}),
+        "privacy_subgroups": ("privacy_subgroups.csv", {}),
         "checks": ("checks.csv", {}),
     }
     for key, (name, kwargs) in readers.items():
@@ -171,10 +177,11 @@ def _load_extras(evaluation_dir: Path, combined: pd.DataFrame, extras: dict) -> 
                 extras[key] = pd.read_csv(path, **kwargs)  # ty: ignore[no-matching-overload]
             except (ValueError, pd.errors.ParserError) as exc:
                 logger.warning("[report] could not read %s: %s", path, exc)
-    if extras.get("privacy_attacks") is None:
-        attacks = (extras.get("privacy_result") or {}).get("attacks")
-        if attacks is not None:
-            extras["privacy_attacks"] = attacks
+    for key, result_key in (("privacy_attacks", "attacks"), ("privacy_subgroups", "subgroups")):
+        if extras.get(key) is None:
+            table = (extras.get("privacy_result") or {}).get(result_key)
+            if table is not None and not table.empty:
+                extras[key] = table
     return extras
 
 
@@ -653,15 +660,11 @@ def _privacy_section(cfg, combined, extras, paths: _Paths, links: _Links) -> str
             "success rates, and whether Anonymeter judged it reliable: "
             f"{links.maybe(paths.evaluation / 'privacy_attacks.csv')}.",
         ]
-        if (paths.evaluation / "privacy_subgroups.csv").exists():
+        if extras.get("privacy_subgroups") is not None:
             lines += [
                 "",
-                "Privacy per protected group (reported under fairness, not ranked): "
-                "`subgroup_distance_mia_auc_gap` is the largest spread of `distance_mia_auc` "
-                "between the groups of one protected column (0 = every group equally exposed) "
-                "and `subgroup_distance_mia_auc_max` the most exposed group's AUC. Small groups "
-                "give noisy AUCs; compare a gap with the groups' `auc_se` in "
-                f"{links.maybe(paths.evaluation / 'privacy_subgroups.csv')}.",
+                "How these risks differ between protected groups is under "
+                "[Privacy by protected group](#privacy-by-protected-group) in the fairness section.",
             ]
     else:
         lines.append("Anonymeter and holdout-distance checks were not run this run.")
@@ -707,14 +710,72 @@ _FAIRNESS_GAP_METRICS = [
 ]
 
 
+def _subgroup_privacy_lines(combined, extras, paths: _Paths, links: _Links) -> list:
+    """The fairness-of-privacy subsection: the distance membership attack per group."""
+    lines = ["### Privacy by protected group", ""]
+    columns = [
+        ("custom", "fairness", m)
+        for m in SUBGROUP_PRIVACY_METRICS
+        if ("custom", "fairness", m) in combined.columns
+    ]
+    groups = extras.get("privacy_subgroups")
+    if not columns or groups is None or groups.empty:
+        return [
+            *lines,
+            "Not computed this run: it needs the `holdout_distance` check and at least one "
+            "protected column.",
+        ]
+    summary = combined[columns].copy()
+    summary.columns = [c[2] for c in columns]
+    summary.index.name = "model"
+    groups = groups.assign(group_label=groups["column"] + " = " + groups["group"].astype(str))
+    auc = groups.pivot_table(
+        index="model", columns="group_label", values="distance_mia_auc", sort=False
+    )
+    auc.columns.name = None
+    counts = groups.drop_duplicates("group_label").set_index("group_label")
+    sizes = ", ".join(
+        f"{label} {int(row.n_train_patients)}/{int(row.n_test_patients)}"
+        for label, row in counts.iterrows()
+    )
+    lines += [
+        "Does the synthetic data leak more about some protected groups than others? The "
+        "distance membership attack from the privacy section (`distance_mia_auc`: can an "
+        "attacker tell a training patient from an unseen one by how close the synthetic data "
+        "comes to them?) is run separately inside each protected group, using the same groups "
+        "as the gap metrics above. Each group's AUC is 0.5 when it leaks nothing.",
+        "",
+        "- `subgroup_distance_mia_auc_gap`: the largest AUC difference between two groups of "
+        "the same protected column (0 = every group equally exposed). A large gap with a low "
+        "overall `distance_mia_auc` means one group carries most of the risk.",
+        "- `subgroup_distance_mia_auc_max`: the most exposed group's AUC (0.5 = no leak).",
+        "- Both are reported, not ranked: a copy of train leaks in every group alike, so its "
+        "gap is near 0 just like an independent draw's; compare with `baseline_train_copy` "
+        "and `baseline_marginals`.",
+        "",
+        _dataframe_to_markdown(_collapse_replicates(summary).reset_index()),
+        "",
+        "AUC per group (lower is safer, 0.5 = no leak):",
+        "",
+        _dataframe_to_markdown(_collapse_replicates(auc).reset_index()),
+        "",
+        f"Patients per group (train/test): {sizes}. Groups with fewer than "
+        f"{SUBGROUP_MIN_PATIENTS} patients on either side get no AUC. Small groups give noisy "
+        "AUCs: read a gap smaller than about two standard errors (`auc_se` in "
+        f"{links.maybe(paths.evaluation / 'privacy_subgroups.csv')}) as noise.",
+    ]
+    return lines
+
+
 def _fairness_section(combined, extras, paths: _Paths, links: _Links) -> str:
     lines = [
         "## 5. Fairness",
         "",
-        "Two views: subgroup **gap metrics** (how differently a classifier trained on the "
-        "data treats protected subgroups) and **log disparity** (Bhanot et al. 2021: how far "
-        "each protected subgroup x outcome is over- or under-represented). Lower is better "
-        "for every number below.",
+        "Three views: subgroup **gap metrics** (how differently a classifier trained on the "
+        "data treats protected subgroups), **log disparity** (Bhanot et al. 2021: how far "
+        "each protected subgroup x outcome is over- or under-represented) and **privacy by "
+        "protected group** (whether some groups' patients are easier to identify as training "
+        "members). Lower is better for every number below.",
         "",
         "### Subgroup gap metrics (0 = perfectly fair)",
         "",
@@ -773,6 +834,7 @@ def _fairness_section(combined, extras, paths: _Paths, links: _Links) -> str:
         ]
     else:
         lines.append("Log disparity was not computed this run.")
+    lines += ["", *_subgroup_privacy_lines(combined, extras, paths, links)]
     lines += ["", "### All fairness metrics", "", *_metric_plots(paths, links, "fairness")]
     return "\n".join(lines)
 

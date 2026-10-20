@@ -11,6 +11,7 @@ Existing metrics and ranks are unchanged; two new reported (unranked) columns ap
 ### Added
 
 - Subgroup privacy gap (fairness of privacy): the holdout distance membership attack (`distance_mia_auc`) is now also run inside each protected group, using the same groups as SynthEval's fairness metrics (each category or `data.protected_bins` bin with at least 5% of the train rows). `combined_evaluation.csv` gains `subgroup_distance_mia_auc_gap` (largest AUC difference between groups of one protected column; 0 = equally exposed) and `subgroup_distance_mia_auc_max` (the most exposed group's AUC) under custom fairness. Both are reported, not ranked: a copy of train leaks equally in every group, so the gap cannot tell it from a fresh draw. It runs whenever `holdout_distance` is selected and protected columns are declared; there is no new config key.
+- `report.md`: a new **Privacy by protected group** subsection under Fairness explains the two columns and shows each group's AUC per model and its patient counts; the privacy section links to it.
 - `privacy_subgroups.csv` in the evaluation folder: each model x protected group with its train and test patient counts, AUC and standard error (Hanley & McNeil). Groups with fewer than 10 patients on either side get no AUC.
 
 ## 0.10.1 (2026-10-20)
