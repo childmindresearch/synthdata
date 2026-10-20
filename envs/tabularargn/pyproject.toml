@@ -14,6 +14,9 @@ dependencies = [
     "mostlyai-engine==2.7.3",
     "pandas",
     "pyarrow",
+    # Listed directly so the Windows source below applies (uv sources only
+    # cover direct dependencies); mostlyai-engine still sets the version.
+    "torch",
 ]
 
 [tool.uv]
