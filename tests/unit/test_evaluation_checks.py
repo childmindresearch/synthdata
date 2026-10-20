@@ -74,6 +74,23 @@ def test_copied_invented_and_out_of_range_rows_warn(dataset):
         assert _status(table, check, "bad") == "warn", check
 
 
+def test_hpo_screens_are_reported_on_final_datasets(dataset):
+    from synthdata.config import HPOConstraintsConfig
+
+    dataset.protected_columns = ["sex"]
+    good = dataset.test_imputed_df.copy()
+    bad = dataset.train_imputed_df.copy()  # copies: nearer to train than to holdout
+    bad["sex"] = 0  # one protected group only
+    screens = HPOConstraintsConfig(enforce=False)
+    table = run_output_checks(dataset, {"good": good, "bad": bad}, pd.DataFrame(), True, screens)
+    for check in ("screen_protected_coverage", "screen_protected_share_gap"):
+        assert _status(table, check, "good") == "pass", check
+        assert _status(table, check, "bad") == "warn", check
+    assert _status(table, "screen_dcr_closer_to_train", "bad") == "warn"
+    assert _status(table, "screen_category_coverage", "good") == "pass"
+    assert "screen_copies" not in set(table["check"])  # exact_copies_of_train_rows covers it
+
+
 def test_missing_column_is_reported_and_stops_the_other_data_checks(dataset):
     synthetic = dataset.test_imputed_df.drop(columns="age")
     table = run_output_checks(dataset, {"m": synthetic}, pd.DataFrame(), True)

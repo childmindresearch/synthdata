@@ -9,7 +9,9 @@ SDV does it (``sample_from_conditions``):
   target) is given the quota labels and generates those rows directly.
 * Any other model is rejection-sampled: draw a batch, keep each class's rows up
   to its quota, and draw more batches for the classes still short, at most
-  ``MAX_ROUNDS`` batches in all.
+  ``MAX_ROUNDS`` batches in all. Top-ups stop early when the generator makes
+  the short classes so rarely that the batches left could not fill a tenth of
+  what is missing (``MIN_EXPECTED_FILL``).
 
 A class still short after the last batch is left short, and the shortfall is
 recorded. Rows are never repeated to fill a quota, so the output can have fewer
@@ -39,6 +41,14 @@ MAX_BATCH_FACTOR = 10
 #: scarcest short class, so one top-up batch usually suffices. Backends that
 #: refit per batch (TabPFN, TabPFGen) pay mostly per batch, not per row.
 TOP_UP_MARGIN = 1.5
+#: A short class expected to reach less than this share of its remaining
+#: need in all the batches left (at its observed rate, each batch at the size
+#: cap) no longer sizes the top-up batches, and once every short class is
+#: like that, top-ups stop: the generator makes those classes too rarely for
+#: rejection sampling, and the batches would only cost time and memory
+#: (PATE-GAN on the simulated data: 9 batches of 10x the train size for a
+#: class it hardly made).
+MIN_EXPECTED_FILL = 0.1
 #: Batch ``r`` is drawn with seed ``seed + ROUND_SEED_STRIDE * r``, far from the
 #: replicate seeds ``seed + replicate``.
 ROUND_SEED_STRIDE = 10_000
@@ -147,7 +157,21 @@ def sample_to_quota(
                 # rate (one pseudo-row for a class not seen yet), with a
                 # margin, capped.
                 rate = (observed[need > 0] + 1) / (total_drawn + 1)
-                expected = (need[need > 0] / rate).max()
+                reachable = rate * MAX_BATCH_FACTOR * n * (max_rounds - rounds)
+                fillable = reachable / need[need > 0] >= MIN_EXPECTED_FILL
+                if not fillable.any():
+                    logger.warning(
+                        "class quotas: stopping after %d batch(es); the short classes are "
+                        "drawn at rates %s, so the batches left would fill under %d%% of "
+                        "what is missing",
+                        rounds,
+                        {c: round(float(r), 5) for c, r in rate.items()},
+                        int(100 * MIN_EXPECTED_FILL),
+                    )
+                    break
+                # Size the batch for the classes it can fill; a class too rare
+                # to fill still keeps whatever rows the batch brings.
+                expected = (need[need > 0] / rate)[fillable].max()
                 count = min(math.ceil(TOP_UP_MARGIN * expected), MAX_BATCH_FACTOR * n)
             batch = sample_fn(count, round_seed, None)
         rounds += 1

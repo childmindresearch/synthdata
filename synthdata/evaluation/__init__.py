@@ -205,7 +205,12 @@ def run_evaluation(
     checks_table = None
     if eval_cfg.run_checks:
         checks_table = checks.run_output_checks(
-            dataset, selected_datasets, combined, cfg.generation.match_class_prior
+            dataset,
+            selected_datasets,
+            combined,
+            cfg.generation.match_class_prior,
+            screens=cfg.generation.hpo.constraints,
+            seed=cfg.seed,
         )
         checks_table.to_csv(output_dir / "checks.csv", index=False)
 

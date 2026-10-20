@@ -477,6 +477,123 @@ def class_share_gap(labels: pd.Series, prior: pd.Series) -> float:
     )
 
 
+def build_screen_fn(
+    reference_df: pd.DataFrame,
+    calibration_df: pd.DataFrame,
+    target_column: str,
+    categorical_columns: list,
+    target_is_categorical: bool,
+    constraints: HPOConstraintsConfig,
+    seed: int,
+    match_prior: bool = True,
+    protected_columns: Sequence[str] = (),
+    protected_bins: dict | None = None,
+) -> Callable[[pd.DataFrame], tuple[dict, dict, dict]]:
+    """Build ``synthetic_df -> (violations, details, attrs)`` for the sanity screens.
+
+    ``reference_df`` is what the generator was fitted on and ``calibration_df``
+    fresh real rows it never saw: search-train and tuning for an HPO trial,
+    train and holdout for a final dataset (``evaluation/checks.py``), so the
+    final data is held to the same screens as the trials. ``violations`` maps
+    every name in :data:`SCREENS` to its violation size (<= 0 passes, -1 when
+    the screen is off), ``details`` holds each measured screen's value and
+    limit (:func:`screen_detail`), and ``attrs`` the protected-group and
+    memorization scores logged next to them.
+    """
+    prior = reference_df[target_column].value_counts(normalize=True)
+    groupers = protected_groups(
+        reference_df, list(protected_columns), protected_bins=protected_bins
+    )
+
+    dcr_reference = None
+    if constraints.max_dcr_closer_to_train is not None:
+        from synthdata.evaluation.privacy_attacks import _encoder, _nearest
+
+        columns = list(reference_df.columns)
+        nominal = [
+            c
+            for c in columns
+            if c in categorical_columns
+            or (c == target_column and target_is_categorical)
+            or not pd.api.types.is_numeric_dtype(reference_df[c])
+        ]
+        encode = _encoder(reference_df, nominal)
+        sample = reference_df.sample(
+            n=min(len(calibration_df), len(reference_df)), random_state=seed
+        )
+        dcr_reference = (columns, encode, encode(sample), encode(calibration_df[columns]), _nearest)
+
+    def _dcr_closer_to_train(synthetic_df):
+        assert dcr_reference is not None
+        columns, encode, x_ref, x_hold, nearest = dcr_reference
+        x_syn = encode(synthetic_df.reindex(columns=columns))
+        d_ref = nearest(x_ref, x_syn, 1)[:, 0]
+        d_hold = nearest(x_hold, x_syn, 1)[:, 0]
+        return float(np.mean(d_ref < d_hold) + 0.5 * np.mean(d_ref == d_hold))
+
+    real_gaps = {}
+
+    def _real_share_gap(n_rows: int) -> float:
+        """Protected share gap of ``n_rows`` calibration rows (resampled if needed)."""
+        if n_rows not in real_gaps:
+            sample = calibration_df.sample(
+                n=n_rows, replace=n_rows > len(calibration_df), random_state=seed
+            )
+            real_gaps[n_rows] = protected_scores(sample, reference_df, target_column, groupers)[
+                "protected_share_gap"
+            ]
+        return real_gaps[n_rows]
+
+    def screen_fn(synthetic_df: pd.DataFrame) -> tuple[dict, dict, dict]:
+        details: dict = {}
+        violations = screen_violations(
+            synthetic_df,
+            reference_df,
+            calibration_df,
+            target_column,
+            categorical_columns,
+            constraints,
+            details,
+        )
+        if not target_is_categorical:
+            violations["missing_classes"] = -1.0
+            details.pop("missing_classes", None)
+        elif match_prior and constraints.max_class_share_gap is not None:
+            gap = class_share_gap(synthetic_df[target_column], prior)
+            violations["class_share_gap"] = gap - constraints.max_class_share_gap
+            details["class_share_gap"] = screen_detail(gap, constraints.max_class_share_gap, "max")
+        attrs: dict = {}
+        if groupers:
+            protected = protected_scores(synthetic_df, reference_df, target_column, groupers)
+            attrs["protected_target_gap"] = protected["protected_target_gap"]
+            attrs["protected_share_gap"] = protected["protected_share_gap"]
+            if constraints.min_protected_coverage is not None:
+                violations["protected_coverage"] = (
+                    constraints.min_protected_coverage - protected["protected_coverage"]
+                )
+                details["protected_coverage"] = screen_detail(
+                    protected["protected_coverage"], constraints.min_protected_coverage, "min"
+                )
+            if constraints.max_protected_share_gap is not None:
+                # Calibrated like the copy screen: fresh real rows of the same
+                # size also miss the train shares by sampling noise.
+                limit = _real_share_gap(len(synthetic_df)) + constraints.max_protected_share_gap
+                violations["protected_share_gap"] = protected["protected_share_gap"] - limit
+                details["protected_share_gap"] = screen_detail(
+                    protected["protected_share_gap"], limit, "max"
+                )
+        if dcr_reference is not None:
+            closer = _dcr_closer_to_train(synthetic_df)
+            attrs["dcr_closer_to_train"] = closer
+            violations["dcr_closer_to_train"] = closer - constraints.max_dcr_closer_to_train
+            details["dcr_closer_to_train"] = screen_detail(
+                closer, constraints.max_dcr_closer_to_train, "max"
+            )
+        return violations, details, attrs
+
+    return screen_fn
+
+
 def build_hpo_eval_fn(
     search_train_df: pd.DataFrame,
     tuning_df: pd.DataFrame,
@@ -597,93 +714,29 @@ def build_hpo_eval_fn(
         )
     )
 
-    dcr_reference = None
-    if hpo_cfg.constraints.max_dcr_closer_to_train is not None:
-        from synthdata.evaluation.privacy_attacks import _encoder, _nearest
-
-        columns = list(search_train_df.columns)
-        nominal = [
-            c
-            for c in columns
-            if c in categorical_columns
-            or (c == target_column and target_is_categorical)
-            or not pd.api.types.is_numeric_dtype(search_train_df[c])
-        ]
-        encode = _encoder(search_train_df, nominal)
-        sample = search_train_df.sample(
-            n=min(len(tuning_df), len(search_train_df)), random_state=seed
-        )
-        dcr_reference = (columns, encode, encode(sample), encode(tuning_df[columns]), _nearest)
-
-    def _dcr_closer_to_train(synthetic_df):
-        assert dcr_reference is not None
-        columns, encode, x_ref, x_hold, nearest = dcr_reference
-        x_syn = encode(synthetic_df.reindex(columns=columns))
-        d_ref = nearest(x_ref, x_syn, 1)[:, 0]
-        d_hold = nearest(x_hold, x_syn, 1)[:, 0]
-        return float(np.mean(d_ref < d_hold) + 0.5 * np.mean(d_ref == d_hold))
-
-    real_gaps = {}
-
-    def _real_share_gap(n_rows: int) -> float:
-        """Protected share gap of ``n_rows`` real tuning rows (resampled if needed)."""
-        if n_rows not in real_gaps:
-            sample = tuning_df.sample(n=n_rows, replace=n_rows > len(tuning_df), random_state=seed)
-            real_gaps[n_rows] = protected_scores(sample, search_train_df, target_column, groupers)[
-                "protected_share_gap"
-            ]
-        return real_gaps[n_rows]
-
-    constraints = hpo_cfg.constraints
+    screen_fn = build_screen_fn(
+        search_train_df,
+        tuning_df,
+        target_column,
+        categorical_columns,
+        target_is_categorical,
+        hpo_cfg.constraints,
+        seed,
+        match_prior=match_prior,
+        protected_columns=protected_columns,
+        protected_bins=protected_bins,
+    )
     objective_name = (
         hpo_cfg.objective_candidates[0] if hpo_cfg.objective == "auto" else hpo_cfg.objective
     )
 
     def eval_fn(synthetic_df: pd.DataFrame) -> TrialScore:
-        details: dict = {}
-        violations = screen_violations(
-            synthetic_df,
-            search_train_df,
-            tuning_df,
-            target_column,
-            categorical_columns,
-            constraints,
-            details,
-        )
-        if not target_is_categorical:
-            violations["missing_classes"] = -1.0
-            details.pop("missing_classes", None)
-        elif match_prior and constraints.max_class_share_gap is not None:
-            gap = class_share_gap(synthetic_df[target_column], prior)
-            violations["class_share_gap"] = gap - constraints.max_class_share_gap
-            details["class_share_gap"] = screen_detail(gap, constraints.max_class_share_gap, "max")
-        attrs = {"screens": violations, "screen_details": details}
-        if groupers:
-            protected = protected_scores(synthetic_df, search_train_df, target_column, groupers)
-            attrs["protected_target_gap"] = protected["protected_target_gap"]
-            attrs["protected_share_gap"] = protected["protected_share_gap"]
-            if constraints.min_protected_coverage is not None:
-                violations["protected_coverage"] = (
-                    constraints.min_protected_coverage - protected["protected_coverage"]
-                )
-                details["protected_coverage"] = screen_detail(
-                    protected["protected_coverage"], constraints.min_protected_coverage, "min"
-                )
-            if constraints.max_protected_share_gap is not None:
-                # Calibrated like the copy screen: fresh real rows of the same
-                # size also miss the train shares by sampling noise.
-                limit = _real_share_gap(len(synthetic_df)) + constraints.max_protected_share_gap
-                violations["protected_share_gap"] = protected["protected_share_gap"] - limit
-                details["protected_share_gap"] = screen_detail(
-                    protected["protected_share_gap"], limit, "max"
-                )
-        if dcr_reference is not None:
-            closer = _dcr_closer_to_train(synthetic_df)
-            attrs["dcr_closer_to_train"] = closer
-            violations["dcr_closer_to_train"] = closer - constraints.max_dcr_closer_to_train
-            details["dcr_closer_to_train"] = screen_detail(
-                closer, constraints.max_dcr_closer_to_train, "max"
-            )
+        violations, details, attrs = screen_fn(synthetic_df)
+        attrs = {
+            "screens": violations,
+            "screen_details": details,
+            "screens_enforced": hpo_cfg.constraints.enforce,
+        } | attrs
         if hpo_cfg.log_fidelity:
             attrs |= fidelity_scores(
                 synthetic_df, tuning_df, categorical_columns, nominal_columns, seed
@@ -716,7 +769,14 @@ def build_hpo_eval_fn(
             value = composite_fn(synthetic_df)
         if not np.isfinite(value):
             raise ValueError(f"HPO objective {objective_name} is not finite: {value}")
-        return TrialScore(value, [violations[name] for name in SCREENS], attrs)
+        # Not enforced: the screens stay in ``attrs`` (logged), but Optuna sees
+        # every trial as feasible.
+        constraints = (
+            [violations[name] for name in SCREENS]
+            if hpo_cfg.constraints.enforce
+            else [-1.0] * len(SCREENS)
+        )
+        return TrialScore(value, constraints, attrs)
 
     # The real-data ceiling and chance level per objective, read by the
     # generation stage for its log (see HPOEvalFn).
@@ -735,6 +795,10 @@ def score_candidate(
     failed = [name for name, v in zip(SCREENS, score.constraints, strict=True) if v > 0]
     if failed:
         logger.info("trial %d is infeasible: failed screens %s", trial.number, failed)
+    elif not score.attrs.get("screens_enforced", True):
+        logged = [n for n, v in score.attrs.get("screens", {}).items() if v > 0]
+        if logged:
+            logger.info("trial %d fails screens %s (logged, not enforced)", trial.number, logged)
     objective = trial.user_attrs.get(STUDY_OBJECTIVE_ATTR)
     if objective is None and hasattr(trial, "study"):
         objective = trial.study.user_attrs.get(STUDY_OBJECTIVE_ATTR)
