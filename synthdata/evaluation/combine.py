@@ -22,7 +22,11 @@ from synthdata.evaluation.catalog import (
     is_redundant_synthcity_submetric,
 )
 from synthdata.evaluation.custom_eval import build_log_disparity_summary_table
-from synthdata.evaluation.privacy_attacks import ANONYMETER_METRICS, HOLDOUT_DISTANCE_METRICS
+from synthdata.evaluation.privacy_attacks import (
+    ANONYMETER_METRICS,
+    HOLDOUT_DISTANCE_METRICS,
+    SUBGROUP_PRIVACY_METRICS,
+)
 from synthdata.evaluation.syntheval_eval import (
     extract_metric_types,
     extract_oriented_values,
@@ -194,14 +198,18 @@ def _privacy_attack_frames(
     below 0.5, ratio above 1) earn no extra credit: being further from the
     training rows than unseen real rows are is not more private, only less
     useful. So the oriented share/AUC are clipped at 0.5 and the ratios at 1.
+
+    The subgroup privacy gap is added to the raw table only, as custom
+    fairness columns: reported, not ranked (see SUBGROUP_PRIVACY_METRICS).
     """
     scores = (privacy_result or {}).get("scores") or {}
     if not scores:
         empty = pd.DataFrame(index=model_names)
         return empty, empty
     metrics = [*ANONYMETER_METRICS, *HOLDOUT_DISTANCE_METRICS]
-    raw = pd.DataFrame.from_dict(scores, orient="index").reindex(index=model_names)
-    raw = raw[[m for m in metrics if m in raw.columns]].astype(float)
+    table = pd.DataFrame.from_dict(scores, orient="index").reindex(index=model_names)
+    raw = table[[m for m in metrics if m in table.columns]].astype(float)
+    fairness = table[[m for m in SUBGROUP_PRIVACY_METRICS if m in table.columns]].astype(float)
     oriented = pd.DataFrame(index=raw.index)
     for metric in raw.columns:
         if metric in ANONYMETER_METRICS:
@@ -212,7 +220,12 @@ def _privacy_attack_frames(
             oriented[metric] = raw[metric].clip(upper=1.0)
     for frame in (raw, oriented):
         frame.columns = pd.MultiIndex.from_tuples([("custom", "privacy", c) for c in frame.columns])
-    return raw, oriented
+    if not len(fairness.columns):
+        return raw, oriented
+    fairness.columns = pd.MultiIndex.from_tuples(
+        [("custom", "fairness", c) for c in fairness.columns]
+    )
+    return pd.concat([raw, fairness], axis=1), oriented
 
 
 def _minmax_scale(col: pd.Series) -> pd.Series:
@@ -267,6 +280,8 @@ _KNOWN_IDEALS = {
     "distance_mia_auc": 0.5,
     "dcr_holdout_ratio": 1.0,
     "nndr_holdout_ratio": 1.0,
+    "subgroup_distance_mia_auc_gap": 0.0,
+    "subgroup_distance_mia_auc_max": 0.5,
     **{name: 0.0 for name in LOG_DISPARITY_METRICS},
 }
 

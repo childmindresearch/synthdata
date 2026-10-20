@@ -4,7 +4,7 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
-## 0.11.0 (2026-10-20)
+## 0.13.0 (2026-10-20)
 
 The simulated and LORIS configs change HPO selection: use a new experiment id for them (old Optuna studies are stale). The hepatitis config, and so the golden run, is unchanged; no re-record is needed.
 
@@ -17,6 +17,35 @@ The simulated and LORIS configs change HPO selection: use a new experiment id fo
 
 - `configs/config_sim.yaml` and `configs/config_loris.yaml`: `hpo.constraints.enforce: false`, and `hpo.objective: tstr_macro_auprc` for every model instead of `auto` (which chose three different objectives on the sim run). The sim config also sets `hpo.tstr_seeds: 3`, since its `evaluation.xgboost_params` make one TSTR fit seed-dependent. Why AUPRC rather than macro-F1, with evidence from the sim run's study database: `docs/verification.md`, HPO objective section. The sim config also sets `hpo.min_delta: 0.01` (about 1.5 bootstrap SEs, since seed noise matched the bootstrap SE on the sim run) and raises the TVAE and RTVAE epoch ranges to 25-300 (their untuned models now train 300 epochs) with timeouts raised to match.
 - Class quotas: a short class the generator makes too rarely for the remaining batches to fill a tenth of it no longer sizes the top-up batches, and top-ups stop once every short class is like that (logged with each class's rate). Before, such a class drove batches of up to 10x the train size for nothing (PATE-GAN on the simulated data).
+## 0.12.0 (2026-10-20)
+
+Existing metrics and ranks are unchanged; two new reported (unranked) columns appear, so the golden runs gain those columns (Linux CPU golden updated; the Linux CUDA golden needs a re-record). No new experiment id is needed; old evaluations simply lack the new columns.
+
+### Added
+
+- Subgroup privacy gap (fairness of privacy): the holdout distance membership attack (`distance_mia_auc`) is now also run inside each protected group, using the same groups as SynthEval's fairness metrics (each category or `data.protected_bins` bin with at least 5% of the train rows). `combined_evaluation.csv` gains `subgroup_distance_mia_auc_gap` (largest AUC difference between groups of one protected column; 0 = equally exposed) and `subgroup_distance_mia_auc_max` (the most exposed group's AUC) under custom fairness. Both are reported, not ranked: a copy of train leaks equally in every group, so the gap cannot tell it from a fresh draw. It runs whenever `holdout_distance` is selected and protected columns are declared; there is no new config key.
+- `report.md`: a new **Privacy by protected group** subsection under Fairness explains the two columns and shows each group's AUC per model and its patient counts; the privacy section links to it.
+- `privacy_subgroups.csv` in the evaluation folder: each model x protected group with its train and test patient counts, AUC and standard error (Hanley & McNeil). Groups with fewer than 10 patients on either side get no AUC.
+
+## 0.11.0 (2026-10-20)
+
+ddpm results change: use a new experiment id for runs that include ddpm. No golden re-record is needed (the golden run has no ddpm).
+
+### Fixed
+
+- ddpm no longer collapses. Its sampler (the TabDDPM reference code, which synthcity ports) never clipped the predicted clean numeric values, so small denoiser errors grew at every reverse step until numeric values were in the thousands on a scale where real ones lie within about ±5. The inverse transform hid this by piling those values on each column's minimum or maximum, and the categorical part, fed them, produced a few categories only (the simulated run's ddpm trials covered 23% of a column's common categories and missed protected-group shares by 0.81). The fork now clips the predicted values to each column's training range at every sampling step. On a test table the fix took the per-column category share error from 0.28-0.47 to 0.04 (sampling noise 0.02). Details in `docs/verification.md`, ddpm row.
+- ddpm's learning rate now decays per optimizer step, as in the TabDDPM reference, instead of per epoch.
+- The synthcity fork also carries its `wasserstein_dist` fix (runs without KeOps).
+
+## 0.10.1 (2026-10-20)
+
+Results stay comparable: no new experiment id is needed, and a run can be resumed with its own experiment id. No golden re-record is needed (the fixture is far below the size where geomloss switched to KeOps, so its Wasserstein value is unchanged).
+
+### Fixed
+
+- `stats.wasserstein_dist` (synthcity fork) runs on geomloss's plain-torch backend instead of switching to KeOps above 5000 x 5000 points, so it works where KeOps cannot compile. When it does fail, it no longer leaves autograd off for the worker, which used to make `alpha_precision`, `identifiability_score`, `detection_mlp` and `data_leakage_mlp` fail too. Configs that dropped `wasserstein_dist` from `evaluation.synthcity.metrics` as a workaround can put it back.
+- Generation refits a cached synthetic CSV that has no rows, no target column or cannot be read, with a warning, instead of passing it to evaluation. Evaluation skips an empty CSV with an error naming it rather than failing every metric on it.
+- When no HPO trial passes the screens, `<model>_hpo` is saved as a copy of the untuned sets instead of being refitted with the same settings and seeds (about 2 h per replicate for ddpm on the clinical data). With `hpo.final_n_iter_override` set, the training length differs, so it is still refitted.
 
 ## 0.10.0 (2026-10-19)
 

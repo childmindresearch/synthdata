@@ -46,7 +46,7 @@ A plain-language guide to every number in `report.md` and `combined_evaluation.c
 | `sanity.close_values_probability`, `distant_values_probability` | Share of synthetic rows very close to / very far from any real row. | Close: higher; distant: lower |
 | `stats.jensenshannon_dist`, `inv_kl_divergence`, `chi_squared_test`, `ks_test` | Column-by-column distribution similarity (Jensen-Shannon distance, inverse KL divergence, chi-squared and KS p-values). | Distance: lower; inverse KL and p-values: higher |
 | `stats.max_mean_discrepancy` | Kernel distance between the whole real and synthetic distributions. | Lower |
-| `stats.wasserstein_dist` | Earth mover's distance between the datasets. Off on machines where KeOps cannot compile. | Lower |
+| `stats.wasserstein_dist` | Sinkhorn divergence (about half the squared earth mover's distance) on min-max scaled columns. Runs in plain PyTorch, without KeOps. | Lower |
 | `stats.prdc.precision`, `recall`, `density`, `coverage` | Precision: synthetic rows look like real ones. Recall and coverage: the synthetic data covers all kinds of real rows. Density: like precision, counting how many real neighbours each synthetic row has. | Higher |
 | `stats.alpha_precision.*` | Alpha-precision (realistic rows), beta-recall (diversity) and authenticity (rows not copied from train). | Higher |
 | `performance.linear_model`, `mlp`, `xgb` | Train-on-synthetic, test-on-real scores of three model types. | Higher |
@@ -102,5 +102,9 @@ Protected columns are set in `data.protected_columns`, and the groups of a numer
 | `equalized_odds` | Mean of the differences in true-positive and false-positive rates. | 0 is ideal. |
 | `log_disparity_mean_abs` | How far each protected subgroup x outcome share drifts from its real share, in log-odds, averaged (Bhanot et al. 2021). | 0 is ideal. |
 | `log_disparity_share_significant` | Share of subgroups whose drift is significant after Benjamini-Hochberg correction. | 0 is ideal. |
+| `subgroup_distance_mia_auc_gap` | Fairness of privacy: `distance_mia_auc` computed inside each protected group, then the largest difference between two groups of the same protected column. | 0 is ideal (every group equally exposed). Not ranked. |
+| `subgroup_distance_mia_auc_max` | The most exposed protected group's `distance_mia_auc`. | 0.5 is ideal. Not ranked. |
 
 The three gap metrics need a two-class target and a two-group protected column. For a target with 3 or more classes they run once per class against the rest. A protected column with more than two groups is compared one group against the rest (each group with at least 5% of the rows) and the gaps are averaged; a numeric protected column such as birth year is cut into the bins you set in `data.protected_bins`, each bin then being a group (left out, with a warning, when it has no bins). The `sp_*`, `eo_*` and `eqo_*` columns hold the gap of each group.
+
+The two subgroup privacy metrics use the same groups (two-valued columns contribute both values). They are reported but not ranked: a copy of train leaks in every group alike, so its gap is near 0, just like an independent draw's, and the worst group mostly repeats the overall `distance_mia_auc`, which is already ranked under privacy. Read them next to `distance_mia_auc`: a model with a low overall AUC but a large gap leaks mainly for one group. `privacy_subgroups.csv` has each group's AUC with its standard error and patient counts; small groups give noisy AUCs, and groups under 10 patients on either side are left out.

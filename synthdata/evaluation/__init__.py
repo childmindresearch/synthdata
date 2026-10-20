@@ -183,6 +183,9 @@ def run_evaluation(
     privacy_attacks_table = (privacy_result or {}).get("attacks")
     if privacy_attacks_table is not None and not privacy_attacks_table.empty:
         privacy_attacks_table.to_csv(output_dir / "privacy_attacks.csv", index=False)
+    privacy_subgroups_table = (privacy_result or {}).get("subgroups")
+    if privacy_subgroups_table is not None and not privacy_subgroups_table.empty:
+        privacy_subgroups_table.to_csv(output_dir / "privacy_subgroups.csv", index=False)
 
     combined = combine.build_combined_table(
         synthcity_results,

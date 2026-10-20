@@ -54,6 +54,19 @@ HOLDOUT_DISTANCE_METRICS = {
     "nndr_holdout_ratio": False,
 }
 
+#: Subgroup privacy gap (fairness of privacy): the distance membership attack
+#: run within each protected group. Reported under fairness, unranked: a copy
+#: of train leaks in every group alike, so its gap is near 0, the same as an
+#: independent draw's; the worst group mostly repeats ``distance_mia_auc``.
+SUBGROUP_PRIVACY_METRICS = (
+    "subgroup_distance_mia_auc_gap",
+    "subgroup_distance_mia_auc_max",
+)
+
+#: A protected group needs at least this many training and as many test
+#: patients for its own membership AUC; smaller groups give too noisy an AUC.
+SUBGROUP_MIN_PATIENTS = 10
+
 #: Quantile of the DCR and NNDR distributions the ratios compare: privacy
 #: risk sits in the closest rows, not the typical ones.
 DISTANCE_QUANTILE = 0.05
@@ -177,6 +190,120 @@ def holdout_distance_scores(
         "dcr_holdout_ratio": _ratio(syn_train[:, 0], hold_train[:, 0]),
         "nndr_holdout_ratio": _ratio(_nndr(syn_train), _nndr(hold_train)),
     }
+
+
+def _hanley_mcneil_se(auc: float, n_pos: int, n_neg: int) -> float:
+    """Standard error of an AUC (Hanley & McNeil, 1982)."""
+    q1, q2 = auc / (2 - auc), 2 * auc**2 / (1 + auc)
+    var = (auc * (1 - auc) + (n_pos - 1) * (q1 - auc**2) + (n_neg - 1) * (q2 - auc**2)) / (
+        n_pos * n_neg
+    )
+    return float(np.sqrt(max(var, 0.0)))
+
+
+def protected_group_masks(
+    train: pd.DataFrame,
+    holdout: pd.DataFrame,
+    protected_columns: list,
+    nominal: list,
+    protected_bins: dict | None = None,
+) -> dict:
+    """``{(column, group): (train_mask, holdout_mask)}`` for every protected group.
+
+    The groups are the ones SynthEval's fairness metrics compare
+    (:func:`synthdata.evaluation.syntheval_eval.binarize_protected`): each
+    category or ``protected_bins`` bin holding at least 5% of the training
+    rows, including the values of a two-valued column. A numeric column with more
+    values and no bins has no groups and is left out.
+    """
+    from synthdata.evaluation.syntheval_eval import (
+        PROTECTED_MIN_GROUP_SHARE,
+        binarize_protected,
+    )
+
+    protected_columns = [c for c in protected_columns if c in train.columns]
+    if not protected_columns:
+        return {}
+    _, (train_bin, hold_bin), protected, _, groups = binarize_protected(
+        train, [train, holdout], protected_columns, list(nominal), protected_bins
+    )
+    masks = {}
+    for name, (column, group) in groups.items():
+        masks[(column, str(group))] = (
+            train_bin[name].to_numpy() == 1,
+            hold_bin[name].to_numpy() == 1,
+        )
+    for column in protected:
+        if column in groups:
+            continue
+        shares = train[column].value_counts(normalize=True)
+        for value in shares.index[shares >= PROTECTED_MIN_GROUP_SHARE]:
+            masks[(column, str(value))] = (
+                (train[column] == value).to_numpy(),
+                (holdout[column] == value).to_numpy(),
+            )
+    return masks
+
+
+def subgroup_privacy_scores(
+    train: pd.DataFrame,
+    holdout: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    nominal: list,
+    train_patients: pd.Series,
+    holdout_patients: pd.Series,
+    group_masks: dict,
+) -> tuple[dict, list]:
+    """The distance membership attack within each protected group.
+
+    For each group, the AUC of telling its training patients from its test
+    patients by the distance from each patient's closest encounter in the
+    group to the synthetic data (``distance_mia_auc`` restricted to the
+    group; all training patients of the group, since an AUC does not depend
+    on the class sizes). A group with fewer than
+    :data:`SUBGROUP_MIN_PATIENTS` patients on either side gets no AUC.
+
+    Returns ``(scores, rows)``: ``subgroup_distance_mia_auc_gap`` is the
+    largest spread (max - min group AUC) within one protected column, and
+    ``subgroup_distance_mia_auc_max`` the worst group's AUC, both NaN when no
+    column has two scored groups; ``rows`` holds one dict per group with its
+    patient counts, AUC and Hanley-McNeil standard error.
+    """
+    columns = list(train.columns)
+    encode = _encoder(train, [c for c in nominal if c in columns])
+    x_syn = encode(synthetic[columns])
+    member_d = _nearest(x_syn, encode(train), 1)[:, 0]
+    nonmember_d = _nearest(x_syn, encode(holdout), 1)[:, 0]
+    train_ids, holdout_ids = train_patients.to_numpy(), holdout_patients.to_numpy()
+
+    rows, aucs_by_column = [], {}
+    for (column, group), (in_train, in_hold) in group_masks.items():
+        member = pd.Series(member_d[in_train]).groupby(train_ids[in_train]).min()
+        nonmember = pd.Series(nonmember_d[in_hold]).groupby(holdout_ids[in_hold]).min()
+        auc = se = np.nan
+        if min(len(member), len(nonmember)) >= SUBGROUP_MIN_PATIENTS:
+            labels = np.r_[np.ones(len(member)), np.zeros(len(nonmember))]
+            score = -np.r_[member.to_numpy(), nonmember.to_numpy()]
+            auc = float(roc_auc_score(labels, score))
+            se = _hanley_mcneil_se(auc, len(member), len(nonmember))
+            aucs_by_column.setdefault(column, []).append(auc)
+        rows.append(
+            {
+                "column": column,
+                "group": group,
+                "n_train_patients": len(member),
+                "n_test_patients": len(nonmember),
+                "distance_mia_auc": auc,
+                "auc_se": se,
+            }
+        )
+    spreads = [max(a) - min(a) for a in aucs_by_column.values() if len(a) >= 2]
+    worst = [max(a) for a in aucs_by_column.values() if len(a) >= 2]
+    scores = {
+        "subgroup_distance_mia_auc_gap": float(max(spreads)) if spreads else np.nan,
+        "subgroup_distance_mia_auc_max": float(max(worst)) if worst else np.nan,
+    }
+    return scores, rows
 
 
 # ---------------------------------------------------------------------------
@@ -357,9 +484,11 @@ def run_privacy_attack_evaluation(
 ) -> dict:
     """Score every synthetic dataset with the selected privacy evaluators.
 
-    Returns ``{"scores": {model: {metric: value}}, "attacks": DataFrame}``
-    (``attacks`` holds every Anonymeter attack with its interval and its
-    attack and baseline success rates), or ``{}`` when neither evaluator is
+    Returns ``{"scores": {model: {metric: value}}, "attacks": DataFrame,
+    "subgroups": DataFrame}`` (``attacks`` holds every Anonymeter attack with
+    its interval and its attack and baseline success rates; ``subgroups``
+    the distance membership AUC per protected group, see
+    :func:`subgroup_privacy_scores`), or ``{}`` when neither evaluator is
     selected or there is no test split to act as unseen data. A model whose
     scoring fails is logged and left out (NaN in the combined table).
     """
@@ -392,6 +521,17 @@ def run_privacy_attack_evaluation(
 
     else:
         ori = control = None
+    group_masks = (
+        protected_group_masks(
+            train,
+            holdout,
+            list(dataset.protected_columns or []),
+            categorical,
+            dataset.protected_bins,
+        )
+        if run_distances
+        else {}
+    )
 
     # Models are scored in parallel processes per compute_cfg; a failed one
     # is logged there and left out.
@@ -413,6 +553,7 @@ def run_privacy_attack_evaluation(
                 attacks_cfg.anonymeter,
                 run_anonymeter,
                 run_distances,
+                group_masks,
                 seed,
             )
             for name, syn_df in synthetic_datasets.items()
@@ -421,9 +562,15 @@ def run_privacy_attack_evaluation(
         n_columns=train.shape[1],
         label="privacy attacks",
     )
-    scores = {name: row for name, (row, _) in run.results.items()}
-    attack_rows = [r for _, (_, rows) in run.results.items() for r in rows]
-    return {"scores": scores, "attacks": pd.DataFrame(attack_rows), "unit": unit}
+    scores = {name: row for name, (row, _, _) in run.results.items()}
+    attack_rows = [r for _, (_, rows, _) in run.results.items() for r in rows]
+    subgroup_rows = [r for _, (_, _, rows) in run.results.items() for r in rows]
+    return {
+        "scores": scores,
+        "attacks": pd.DataFrame(attack_rows),
+        "subgroups": pd.DataFrame(subgroup_rows),
+        "unit": unit,
+    }
 
 
 def _score_one(
@@ -441,16 +588,24 @@ def _score_one(
     anonymeter_cfg,
     run_anonymeter,
     run_distances,
+    group_masks,
     seed,
-) -> tuple[dict, list]:
-    """Privacy scores and Anonymeter attack rows for one synthetic dataset."""
-    row, attack_rows = {}, []
+) -> tuple[dict, list, list]:
+    """Privacy scores, Anonymeter attack rows and per-group membership rows
+    for one synthetic dataset."""
+    row, attack_rows, subgroup_rows = {}, [], []
     if run_distances:
         row.update(
             holdout_distance_scores(
                 train, holdout, syn_df, categorical, train_patients, holdout_patients, seed
             )
         )
+        if group_masks:
+            subgroup_scores, rows = subgroup_privacy_scores(
+                train, holdout, syn_df, categorical, train_patients, holdout_patients, group_masks
+            )
+            row.update(subgroup_scores)
+            subgroup_rows = [{"model": name, **r} for r in rows]
     if run_anonymeter:
         risks = anonymeter_risks(
             ori,
@@ -464,4 +619,4 @@ def _score_one(
         )
         row.update(summarize_anonymeter(risks))
         attack_rows = [{"model": name, **dataclasses.asdict(r)} for r in risks]
-    return row, attack_rows
+    return row, attack_rows, subgroup_rows
