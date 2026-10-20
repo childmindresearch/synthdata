@@ -51,8 +51,21 @@ def test_a_class_the_model_never_makes_stays_short():
     out, report = sample_to_quota(_skewed_sampler({"a": 0.8, "b": 0.2}), "y", PRIOR, 100, seed=0)
 
     assert report.shortfall == {"a": 0, "b": 0, "c": 10}
-    assert report.rounds == MAX_ROUNDS
+    # Each empty batch lowers the expected rate of c until the batches left
+    # could not fill a tenth of it.
+    assert 1 < report.rounds < MAX_ROUNDS
     assert len(out) == 90 and out["x"].is_unique
+
+
+def test_top_ups_stop_at_once_for_a_class_too_rare_to_fill():
+    calls = []
+    sample = _skewed_sampler({"a": 0.8, "b": 0.2}, calls)
+    _, report = sample_to_quota(sample, "y", PRIOR, 20_000, seed=0)
+
+    # Unseen in 20,000 rows: at most ~90 of the 2,000 missing rows expected,
+    # so a top-up (if any) is sized for b's few missing rows only.
+    assert all(count <= 1_000 for count in calls[1:]) and report.rounds < MAX_ROUNDS
+    assert report.shortfall["c"] == 2_000
 
 
 def test_one_round_keeps_short_classes_short_without_drawing_more():

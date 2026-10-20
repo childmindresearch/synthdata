@@ -418,6 +418,7 @@ def test_fidelity_scores_separate_real_like_from_broken_rows():
         ({"warm_start": {"path": "x"}}, "warm_start"),
         ({"search_params": {"tvae": "lr"}}, "search_params"),
         ({"objective": "auto", "n_bootstrap": 0}, "n_bootstrap"),
+        ({"constraints": HPOConstraintsConfig(enforce="no")}, "enforce"),
     ],
 )
 def test_new_hpo_options_are_validated(overrides, message):
@@ -429,4 +430,5 @@ def test_new_defaults():
     cfg = HPOConfig()
     assert cfg.objective == "auto" and cfg.pruner is None and cfg.tstr_seeds == 1
     assert HPOConstraintsConfig().min_category_coverage == 0.8
+    assert HPOConstraintsConfig().enforce is True
     _validate_hpo(cfg)

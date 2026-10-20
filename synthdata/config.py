@@ -485,7 +485,15 @@ class HPOConstraintsConfig:
     A trial that fails a screen keeps its objective value but is marked
     infeasible, so it can't be chosen as best and the sampler learns to avoid
     its region (constrained TPE). ``null`` turns a screen off.
+    With ``enforce: false`` every screen is still measured and logged on each
+    trial (and in the evaluation's ``checks.csv``), but no trial is marked
+    infeasible for failing one.
     """
+
+    #: Hold trials to the screens below. False: measure and log them only, so
+    #: the best objective value wins whatever its screens say, and a search
+    #: never falls back to the untuned defaults for want of a passing trial.
+    enforce: bool = True
 
     #: Copies: the share of synthetic rows that exactly match a search-train
     #: row may exceed the same share for the real tuning rows by at most this.
@@ -1275,8 +1283,15 @@ def _validate_hpo(hpo: HPOConfig) -> None:
                 f"generation.hpo.epoch_ranges.{model} must be [low, high, step] with "
                 f"0 < low <= high, got {bounds!r}"
             )
+    if not isinstance(hpo.constraints.enforce, bool):
+        raise ValueError(
+            f"generation.hpo.constraints.enforce must be true or false, got "
+            f"{hpo.constraints.enforce!r}"
+        )
     for field in dataclasses.fields(HPOConstraintsConfig):
         value = getattr(hpo.constraints, field.name)
+        if field.name == "enforce":
+            continue
         if value is not None and not 0 <= value <= 1:
             raise ValueError(
                 f"generation.hpo.constraints.{field.name} must be between 0 and 1 or null, got {value!r}"

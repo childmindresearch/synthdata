@@ -192,6 +192,26 @@ def test_class_share_gap_screen_fails_a_candidate_left_short_of_a_class():
     assert unmatched(short).constraints[gap] == -1.0
 
 
+def test_screens_not_enforced_are_logged_but_leave_the_trial_feasible():
+    train, tuning = _real(seed=0), _real(seed=1)
+    short = train.drop(train.index[train.target == 2][::2])
+    gap = SCREENS.index("class_share_gap")
+    cfg = HPOConfig(tstr_seeds=1, constraints=HPOConstraintsConfig(enforce=False))
+
+    score = build_hpo_eval_fn(train, tuning, "target", ["color"], ["color"], True, [], cfg, 0)(
+        short
+    )
+    assert all(v <= 0 for v in score.constraints)
+    assert score.attrs["screens"]["class_share_gap"] > 0
+    assert score.attrs["screen_details"]["class_share_gap"]["value"] > 0.02
+    assert score.attrs["screens_enforced"] is False
+    enforced = build_hpo_eval_fn(
+        train, tuning, "target", ["color"], ["color"], True, [], HPOConfig(tstr_seeds=1), 0
+    )(short)
+    assert enforced.constraints[gap] > 0
+    assert enforced.value == score.value
+
+
 def test_trials_stored_before_a_screen_was_added_stay_comparable():
     trial = optuna.trial.create_trial(
         value=0.5, user_attrs={"constraints": [-1.0, -1.0, -1.0, -1.0]}

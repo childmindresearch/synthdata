@@ -4,6 +4,19 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.13.0 (2026-10-20)
+
+The simulated and LORIS configs change HPO selection: use a new experiment id for them (old Optuna studies are stale). The hepatitis config, and so the golden run, is unchanged; no re-record is needed.
+
+### Added
+
+- `generation.hpo.constraints.enforce` (default `true`). With `false`, every HPO screen is still measured, stored on each trial (`screens`, `screen_details`, and the new `screens_enforced`) and logged (`trial N fails screens [...] (logged, not enforced)`), but no trial is marked infeasible, so the best score wins and no search falls back to the default settings. The dashboard shows failed screens in the trial tooltip and counts only enforced failures as infeasible.
+- `checks.csv` gains `screen_missing_classes`, `screen_category_coverage`, `screen_protected_coverage`, `screen_protected_share_gap` and `screen_dcr_closer_to_train` rows: the HPO screens measured on every final dataset, with train as the fitted data and the holdout as the unseen rows, whether or not the search enforced them.
+
+### Changed
+
+- `configs/config_sim.yaml` and `configs/config_loris.yaml`: `hpo.constraints.enforce: false`, and `hpo.objective: tstr_macro_auprc` for every model instead of `auto` (which chose three different objectives on the sim run). The sim config also sets `hpo.tstr_seeds: 3`, since its `evaluation.xgboost_params` make one TSTR fit seed-dependent. Why AUPRC rather than macro-F1, with evidence from the sim run's study database: `docs/verification.md`, HPO objective section. The sim config also sets `hpo.min_delta: 0.01` (about 1.5 bootstrap SEs, since seed noise matched the bootstrap SE on the sim run) and raises the TVAE and RTVAE epoch ranges to 25-300 (their untuned models now train 300 epochs) with timeouts raised to match.
+- Class quotas: a short class the generator makes too rarely for the remaining batches to fill a tenth of it no longer sizes the top-up batches, and top-ups stop once every short class is like that (logged with each class's rate). Before, such a class drove batches of up to 10x the train size for nothing (PATE-GAN on the simulated data).
 ## 0.12.0 (2026-10-20)
 
 Existing metrics and ranks are unchanged; two new reported (unranked) columns appear, so the golden runs gain those columns (Linux CPU golden updated; the Linux CUDA golden needs a re-record). No new experiment id is needed; old evaluations simply lack the new columns.

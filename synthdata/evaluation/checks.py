@@ -7,6 +7,11 @@ and metric wiring that no longer separates the two fixed baselines (see
 :mod:`synthdata.evaluation.baselines`). A baseline in the wrong place means a
 metric is broken, not that a generator is good or bad.
 
+The HPO sanity screens (``generation.hpo.constraints``) not already covered
+above are measured again on every final dataset, as ``screen_<name>`` rows,
+with train as the reference and the holdout as the fresh real rows they are
+calibrated on. They are reported whether or not the search enforced them.
+
 Each check is a row of ``checks.csv`` with ``status`` "pass" or "warn". The
 report lists the warnings under "Read with care", and ``synthdata-evaluate
 --strict-checks`` exits with an error when there is any.
@@ -145,6 +150,37 @@ def _dataset_checks(name, synthetic, train, holdout, dataset, match_class_prior)
     return rows
 
 
+#: HPO screens reported as ``screen_<name>`` rows; the copy, range and class
+#: share screens already have checks of their own above.
+SCREEN_CHECKS = (
+    "missing_classes",
+    "category_coverage",
+    "protected_coverage",
+    "protected_share_gap",
+    "dcr_closer_to_train",
+)
+
+
+def _screen_rows(name, synthetic, screen_fn) -> list:
+    violations, details, _ = screen_fn(synthetic)
+    rows = []
+    for screen in SCREEN_CHECKS:
+        detail = details.get(screen)
+        if detail is None:
+            continue
+        rows.append(
+            _row(
+                f"screen_{screen}",
+                name,
+                violations[screen] <= 0,
+                detail["value"],
+                detail["limit"],
+                f"HPO screen, {detail['bound']} limit; train vs holdout",
+            )
+        )
+    return rows
+
+
 def _mean_by_model(series: pd.Series) -> pd.Series:
     return series.groupby([split_replicate_name(m)[0] for m in series.index]).mean()
 
@@ -212,15 +248,42 @@ def run_output_checks(
     synthetic_datasets: dict[str, pd.DataFrame],
     combined: pd.DataFrame,
     match_class_prior: bool,
+    screens=None,
+    seed: int = 0,
 ) -> pd.DataFrame:
-    """Run every check; return one row per (check, model)."""
+    """Run every check; return one row per (check, model).
+
+    ``screens`` (an ``HPOConstraintsConfig``) adds the HPO screens' rows.
+    """
     train, holdout = dataset.train_imputed_df, dataset.test_imputed_df
     rows = []
+    screen_fn = None
+    if screens is not None:
+        from synthdata.generation.hpo import build_screen_fn
+
+        try:
+            screen_fn = build_screen_fn(
+                train,
+                holdout,
+                dataset.target_column,
+                list(getattr(dataset, "categorical_columns", dataset.all_categorical_columns)),
+                dataset.target_is_categorical,
+                screens,
+                seed,
+                match_prior=match_class_prior,
+                protected_columns=list(getattr(dataset, "protected_columns", [])),
+                protected_bins=dict(getattr(dataset, "protected_bins", {}) or {}),
+            )
+        except Exception as exc:  # noqa: BLE001 -- a check must never stop the evaluation
+            logger.warning("[checks] could not set up the HPO screens: %s", exc)
+            rows.append(_row("screens_ran", "", False, np.nan, np.nan, str(exc)))
     for name, synthetic in sorted(synthetic_datasets.items()):
         if is_baseline(name):
             continue
         try:
             rows += _dataset_checks(name, synthetic, train, holdout, dataset, match_class_prior)
+            if screen_fn is not None:
+                rows += _screen_rows(name, synthetic, screen_fn)
         except Exception as exc:  # noqa: BLE001 -- a check must never stop the evaluation
             logger.warning("[checks] %s: could not run the data checks: %s", name, exc)
             rows.append(_row("data_checks_ran", name, False, np.nan, np.nan, str(exc)))

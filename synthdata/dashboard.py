@@ -695,7 +695,10 @@ def read_hpo(db_path: Path | None, budgets: dict, now: datetime) -> tuple[list[d
             )
             for screen in failed:
                 screen_fails[screen["name"]] = screen_fails.get(screen["name"], 0) + 1
-            if failed:
+            # The stored constraints decide feasibility; with
+            # hpo.constraints.enforce off a trial can fail a screen (logged,
+            # shown in its tooltip) and still be feasible.
+            if failed and trial_id not in constraints:
                 feasible = False
             if feasible and (best is None or (value > best if maximize else value < best)):
                 best = value

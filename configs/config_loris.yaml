@@ -100,21 +100,23 @@ generation:
   hpo:
     enabled: true
     # Objective scored on the tuning split by a fixed XGBoost trained on the
-    # synthetic rows (train on synthetic, test on real). auto picks one of
-    # objective_candidates per model by a fixed rule: candidates whose
-    # real-data headroom over chance is under 2 bootstrap SEs are dropped,
-    # then the one that varies most beyond its noise across the random
-    # start-up trials wins. On the sim run macro-F1 had no headroom (real
-    # 0.305 vs always-majority 0.303), see docs/verification.md.
-    objective: auto
+    # synthetic rows (train on synthetic, test on real). Macro AUPRC for every
+    # model, so HPO gains compare across models; it is threshold-free and one
+    # of the ranked holdout TSTR scores. (auto picks per model by a fixed rule
+    # instead; on the sim run it chose three different objectives.) All
+    # candidates are logged on every trial (scripts/hpo_analysis.py compare).
+    objective: tstr_macro_auprc
     objective_candidates: [tstr_macro_auprc, tstr_macro_auroc, tstr_macro_f1]
-    # Screens a trial must pass to be chosen as best. Category coverage is the
-    # minimum over all categorical columns; the protected columns are held to
-    # full coverage and their group shares to within 0.05 of the real ones.
-    # dcr: share of synthetic rows nearer to a train row than a tuning row
-    # (0.5 = no memorization).
+    # Screens measured on every trial (and on the final data, checks.csv).
+    # enforce: false logs them without holding trials to them (2026-10-20:
+    # protected_share_gap rejected every pategan and ddpm trial on the sim
+    # run). Category coverage is the minimum over all categorical columns; the
+    # protected columns are held to full coverage and their group shares to
+    # within 0.1 of the real ones (beyond sampling noise). dcr: share of
+    # synthetic rows nearer to a train row than a tuning row (0.5 = no
+    # memorization).
     constraints:
-      { copy_margin: 0.02, min_category_coverage: 0.8, max_out_of_range: 0.01,
+      { enforce: false, copy_margin: 0.02, min_category_coverage: 0.8, max_out_of_range: 0.01,
         max_class_share_gap: 0.02, min_protected_coverage: 1.0,
         max_protected_share_gap: 0.1, max_dcr_closer_to_train: 0.6 }
     # Stop a study after 10 trials in a row without a gain above the
