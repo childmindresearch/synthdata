@@ -4,7 +4,7 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
-## 0.11.0 (2026-10-20)
+## 0.12.0 (2026-10-20)
 
 Existing metrics and ranks are unchanged; two new reported (unranked) columns appear, so the golden runs gain those columns (Linux CPU golden updated; the Linux CUDA golden needs a re-record). No new experiment id is needed; old evaluations simply lack the new columns.
 
@@ -13,6 +13,16 @@ Existing metrics and ranks are unchanged; two new reported (unranked) columns ap
 - Subgroup privacy gap (fairness of privacy): the holdout distance membership attack (`distance_mia_auc`) is now also run inside each protected group, using the same groups as SynthEval's fairness metrics (each category or `data.protected_bins` bin with at least 5% of the train rows). `combined_evaluation.csv` gains `subgroup_distance_mia_auc_gap` (largest AUC difference between groups of one protected column; 0 = equally exposed) and `subgroup_distance_mia_auc_max` (the most exposed group's AUC) under custom fairness. Both are reported, not ranked: a copy of train leaks equally in every group, so the gap cannot tell it from a fresh draw. It runs whenever `holdout_distance` is selected and protected columns are declared; there is no new config key.
 - `report.md`: a new **Privacy by protected group** subsection under Fairness explains the two columns and shows each group's AUC per model and its patient counts; the privacy section links to it.
 - `privacy_subgroups.csv` in the evaluation folder: each model x protected group with its train and test patient counts, AUC and standard error (Hanley & McNeil). Groups with fewer than 10 patients on either side get no AUC.
+
+## 0.11.0 (2026-10-20)
+
+ddpm results change: use a new experiment id for runs that include ddpm. No golden re-record is needed (the golden run has no ddpm).
+
+### Fixed
+
+- ddpm no longer collapses. Its sampler (the TabDDPM reference code, which synthcity ports) never clipped the predicted clean numeric values, so small denoiser errors grew at every reverse step until numeric values were in the thousands on a scale where real ones lie within about ±5. The inverse transform hid this by piling those values on each column's minimum or maximum, and the categorical part, fed them, produced a few categories only (the simulated run's ddpm trials covered 23% of a column's common categories and missed protected-group shares by 0.81). The fork now clips the predicted values to each column's training range at every sampling step. On a test table the fix took the per-column category share error from 0.28-0.47 to 0.04 (sampling noise 0.02). Details in `docs/verification.md`, ddpm row.
+- ddpm's learning rate now decays per optimizer step, as in the TabDDPM reference, instead of per epoch.
+- The synthcity fork also carries its `wasserstein_dist` fix (runs without KeOps).
 
 ## 0.10.1 (2026-10-20)
 
