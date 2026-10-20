@@ -4,6 +4,16 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.11.0 (2026-10-20)
+
+ddpm results change: use a new experiment id for runs that include ddpm. No golden re-record is needed (the golden run has no ddpm).
+
+### Fixed
+
+- ddpm no longer collapses. Its sampler (the TabDDPM reference code, which synthcity ports) never clipped the predicted clean numeric values, so small denoiser errors grew at every reverse step until numeric values were in the thousands on a scale where real ones lie within about ±5. The inverse transform hid this by piling those values on each column's minimum or maximum, and the categorical part, fed them, produced a few categories only (the simulated run's ddpm trials covered 23% of a column's common categories and missed protected-group shares by 0.81). The fork now clips the predicted values to each column's training range at every sampling step. On a test table the fix took the per-column category share error from 0.28-0.47 to 0.04 (sampling noise 0.02). Details in `docs/verification.md`, ddpm row.
+- ddpm's learning rate now decays per optimizer step, as in the TabDDPM reference, instead of per epoch.
+- The synthcity fork also carries its `wasserstein_dist` fix (runs without KeOps).
+
 ## 0.10.1 (2026-10-20)
 
 Results stay comparable: no new experiment id is needed, and a run can be resumed with its own experiment id. No golden re-record is needed (the fixture is far below the size where geomloss switched to KeOps, so its Wasserstein value is unchanged).
