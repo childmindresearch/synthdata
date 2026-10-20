@@ -15,7 +15,7 @@ The simulated and LORIS configs change HPO selection: use a new experiment id fo
 
 ### Changed
 
-- `configs/config_sim.yaml` and `configs/config_loris.yaml`: `hpo.constraints.enforce: false`, and `hpo.objective: tstr_macro_auprc` for every model instead of `auto` (which chose three different objectives on the sim run). The sim config also sets `hpo.tstr_seeds: 3`, since its `evaluation.xgboost_params` make one TSTR fit seed-dependent.
+- `configs/config_sim.yaml` and `configs/config_loris.yaml`: `hpo.constraints.enforce: false`, and `hpo.objective: tstr_macro_auprc` for every model instead of `auto` (which chose three different objectives on the sim run). The sim config also sets `hpo.tstr_seeds: 3`, since its `evaluation.xgboost_params` make one TSTR fit seed-dependent. Why AUPRC rather than macro-F1, with evidence from the sim run's study database: `docs/verification.md`, HPO objective section.
 - Class quotas: a short class the generator makes too rarely for the remaining batches to fill a tenth of it no longer sizes the top-up batches, and top-ups stop once every short class is like that (logged with each class's rate). Before, such a class drove batches of up to 10x the train size for nothing (PATE-GAN on the simulated data).
 
 ## 0.10.0 (2026-10-19)

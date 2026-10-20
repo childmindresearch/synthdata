@@ -100,6 +100,19 @@ IDs such as SC-05 or SE-12 refer to the evaluation audit of 2026-10-07, KA-01 to
 | failure reasons | Optuna user attributes | Verified | A failed trial stores `fail_reason` (exception type and message). |
 | `search_params` | fANOVA importance (Hutter et al., ICML 2014), Optuna `FanovaImportanceEvaluator` | Verified | Per model, the listed hyperparameters are searched and the rest held at the library default. Empty by default: on the sim run's studies, importance was stable only for TVAE (encoder width and epochs, about 75%) and RTVAE (epochs, decoder activation, learning rate); for the other models macro AUPRC moved across trials by about its noise (SD 0.003-0.006), so the importances were mostly fitted noise. `scripts/hpo_analysis.py importance` repeats the check, with bootstrap resamples, on a new run. |
 
+### Why macro AUPRC rather than macro-F1 (2026-10-20)
+
+The simulated and LORIS configs fix `hpo.objective: tstr_macro_auprc` for every model. Evidence is the study database of the sim run 1.4_full (9,000-row sample; 7 models, 189 completed trials):
+
+- **One objective for all models.** `objective: auto` chose macro-F1 for CTGAN and ARF, AUROC for TVAE and RTVAE and AUPRC for the rest. The holdout ranking stays fair, but the HPO gains of different models measured different things and could not be compared.
+- **F1 depends on a decision rule; AUPRC does not.** Macro-F1 scores the argmax prediction, so it changes only when a row's predicted class flips, and a candidate whose classifier predicts nearly one class gets a very low F1 whatever its probabilities say. In this run such degenerate candidates (F1 0.04 to 0.13 for PATE-GAN and ADS-GAN trials whose AUPRC was 0.333 to 0.343, about chance) produced most of F1's spread across trials for the GAN models. AUPRC ranks the predicted probabilities, so it rewards a candidate that keeps the relation between features and target even when the argmax is off. It is also prevalence-aware: chance is the class prevalence, unlike AUROC, whose chance is 0.5 for every class.
+- **Seed noise is larger for F1.** Refitting the top trials with new seeds moved CTGAN's macro-F1 by an SD of 0.0145, against a bootstrap SE of 0.0107 (ARF 0.0092 against 0.0094). Trials were selected on the bootstrap SE alone, so a one-SE F1 gain is mostly seed noise: CTGAN's best single F1 (0.361) refitted to a mean of 0.338. For AUPRC the seed SD was about equal to the bootstrap SE (ADS-GAN 0.0068 against 0.0058).
+- **Where the generators keep the label relation, the two agree.** TVAE and RTVAE are the only models whose trials vary well beyond noise (reliability 0.77 and 0.79 on AUPRC), and there F1 and AUPRC rank trials alike (Spearman 0.88 and 0.74). Across all trials the agreement is 0.45, so the choice matters mainly for models near chance, where F1 rewards a lucky threshold.
+- **Headroom.** The real-data ceiling on the tuning rows is AUPRC 0.400 against chance 0.333 (6.7 bootstrap SEs), and macro-F1 0.399 (7.3 SEs). Both have room, so headroom does not decide between them.
+- **Evaluation.** Macro AUPRC is one of the three ranked holdout TSTR scores, with macro-F1 and balanced accuracy. Every trial still logs macro-F1, AUROC, kappa and balanced accuracy, so `scripts/hpo_analysis.py compare` shows which trial F1 would have chosen.
+
+The trade-off: macro-F1 is the score most readers know, and it is the one a deployed classifier with a fixed decision rule would face. A model tuned on AUPRC can score lower on F1 than one tuned on F1; the holdout report shows both.
+
 ### HPO budgets
 
 Training length is a searched hyperparameter (synthcity's own `n_iter` range, or `hpo.epoch_ranges`), not a hard cap, so the tuned model is refitted with the epochs it was scored with. Pruned and failed trials count towards a model's trial budget.
