@@ -1,0 +1,39 @@
+# Separate environment for CDTD (Mueller, Gruber & Fok, "Continuous Diffusion
+# for Mixed-Type Tabular Data", ICLR 2025).
+#
+# The code is the authors' cdtd_simple wrapper, pinned as the git submodule
+# submodules/cdtd_simple (it is not a pip package). It needs Python 3.13 and
+# torch>=2.9.1, while this repo runs Python 3.11 and torch 2.7.1 on Linux, so the
+# pipeline runs it here, in a subprocess (synthdata/generation/cdtd_backend.py).
+# Install with
+#   uv sync --project envs/cdtd
+# Dependencies are those of cdtd_simple's pyproject.toml (minus its notebook's
+# plotting libraries), plus pyarrow for the data exchange.
+[project]
+name = "synthdata-cdtd"
+version = "0.1.0"
+requires-python = ">=3.13.11,<3.14"
+dependencies = [
+    "einops>=0.8.1",
+    "numpy>=2.4.0",
+    "pandas>=2.3.3",
+    "pyarrow",
+    "scikit-learn>=1.8.0",
+    "torch>=2.9.1",
+    "torch-ema>=0.3",
+    "tqdm>=4.67.1",
+]
+
+[tool.uv]
+package = false
+
+# PyPI's torch is CPU-only on Windows; take the CUDA 13.0 build there.
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

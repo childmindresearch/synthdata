@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from synthdata.generation.tabularargn_backend import REPO_ROOT
+from synthdata.generation.sidecar import REPO_ROOT
 
 from .conftest import new_run, run_full_pipeline
 
