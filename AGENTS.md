@@ -63,7 +63,7 @@ Break any of these and results are invalid even if every test runs:
 
 ## Pitfalls
 
-- TabPFN unsupervised generation costs roughly columns squared; about 10 h per fit on the simulated data (~680 columns) and infeasible on LORIS (~1090). Turn `generation.tabpfn.enabled` off for wide data.
+- TabPFN unsupervised generation costs roughly columns squared; hours per fit on the simulated data (~680 columns; 6.5 h with upstream's 3 permutations, we now use 1) and very long on LORIS (~1090). Turn `generation.tabpfn.enabled` off for wide data.
 - DomiasMIA_prior fails on wide data (singular KDE) and is opt-in only.
 - On wide, small datasets (LORIS) HPO trials can all fail screens because generators are undertrained in short budgets; check `hpo` logs before trusting `_hpo` models.
 - `torch` results differ by OS and device, so compare numbers only within one platform.
