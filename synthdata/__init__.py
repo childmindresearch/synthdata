@@ -106,8 +106,8 @@ os.environ.setdefault(
 # Windows-only startup noise from optional GPU backends this package never uses:
 # - KeOps (pulled in via geomloss by synthcity's WassersteinDistance) does not
 #   support Windows, so it always warns about a missing g++/CUDA/OpenMP and falls
-#   back. geomloss only uses KeOps for N*M > 5000^2 samples anyway and runs its
-#   plain-torch backend otherwise. Set KEOPS_VERBOSE=1 to see the checks again.
+#   back. Our synthcity fork runs WassersteinDistance on geomloss's plain-torch
+#   backend, so KeOps is never used. Set KEOPS_VERBOSE=1 to see the checks again.
 # - Torch logs "triton not found" when importing its FLOP counter; triton has
 #   no official Windows wheels, and this package doesn't count FLOPs.
 if platform.system() == "Windows":

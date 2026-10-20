@@ -46,7 +46,7 @@ A plain-language guide to every number in `report.md` and `combined_evaluation.c
 | `sanity.close_values_probability`, `distant_values_probability` | Share of synthetic rows very close to / very far from any real row. | Close: higher; distant: lower |
 | `stats.jensenshannon_dist`, `inv_kl_divergence`, `chi_squared_test`, `ks_test` | Column-by-column distribution similarity (Jensen-Shannon distance, inverse KL divergence, chi-squared and KS p-values). | Distance: lower; inverse KL and p-values: higher |
 | `stats.max_mean_discrepancy` | Kernel distance between the whole real and synthetic distributions. | Lower |
-| `stats.wasserstein_dist` | Earth mover's distance between the datasets. Off on machines where KeOps cannot compile. | Lower |
+| `stats.wasserstein_dist` | Sinkhorn divergence (about half the squared earth mover's distance) on min-max scaled columns. Runs in plain PyTorch, without KeOps. | Lower |
 | `stats.prdc.precision`, `recall`, `density`, `coverage` | Precision: synthetic rows look like real ones. Recall and coverage: the synthetic data covers all kinds of real rows. Density: like precision, counting how many real neighbours each synthetic row has. | Higher |
 | `stats.alpha_precision.*` | Alpha-precision (realistic rows), beta-recall (diversity) and authenticity (rows not copied from train). | Higher |
 | `performance.linear_model`, `mlp`, `xgb` | Train-on-synthetic, test-on-real scores of three model types. | Higher |
