@@ -653,6 +653,16 @@ def _privacy_section(cfg, combined, extras, paths: _Paths, links: _Links) -> str
             "success rates, and whether Anonymeter judged it reliable: "
             f"{links.maybe(paths.evaluation / 'privacy_attacks.csv')}.",
         ]
+        if (paths.evaluation / "privacy_subgroups.csv").exists():
+            lines += [
+                "",
+                "Privacy per protected group (reported under fairness, not ranked): "
+                "`subgroup_distance_mia_auc_gap` is the largest spread of `distance_mia_auc` "
+                "between the groups of one protected column (0 = every group equally exposed) "
+                "and `subgroup_distance_mia_auc_max` the most exposed group's AUC. Small groups "
+                "give noisy AUCs; compare a gap with the groups' `auc_se` in "
+                f"{links.maybe(paths.evaluation / 'privacy_subgroups.csv')}.",
+            ]
     else:
         lines.append("Anonymeter and holdout-distance checks were not run this run.")
     other = [
@@ -860,6 +870,7 @@ _FILE_DESCRIPTIONS = {
     "metric_directions.csv": "Whether higher, lower or closer to 0 is better for each metric, and its ideal value.",
     "ovr_per_class.csv": "Two-class SynthEval metrics per class (one vs rest).",
     "privacy_attacks.csv": "Every Anonymeter attack with interval and success rates.",
+    "privacy_subgroups.csv": "Distance membership AUC per protected group, with patient counts and standard error.",
     "checks.csv": "Output sanity checks: pass or warn per model, with value and limit.",
     "split_report.csv": "Rows, patients and class balance of each split.",
     "imputation_drift.csv": "Per-column drift between the HPO-phase and final imputation.",

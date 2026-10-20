@@ -4,6 +4,15 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.11.0 (2026-10-20)
+
+Existing metrics and ranks are unchanged; two new reported (unranked) columns appear, so the golden runs gain those columns (Linux CPU golden updated; the Linux CUDA golden needs a re-record). No new experiment id is needed; old evaluations simply lack the new columns.
+
+### Added
+
+- Subgroup privacy gap (fairness of privacy): the holdout distance membership attack (`distance_mia_auc`) is now also run inside each protected group, using the same groups as SynthEval's fairness metrics (each category or `data.protected_bins` bin with at least 5% of the train rows). `combined_evaluation.csv` gains `subgroup_distance_mia_auc_gap` (largest AUC difference between groups of one protected column; 0 = equally exposed) and `subgroup_distance_mia_auc_max` (the most exposed group's AUC) under custom fairness. Both are reported, not ranked: a copy of train leaks equally in every group, so the gap cannot tell it from a fresh draw. It runs whenever `holdout_distance` is selected and protected columns are declared; there is no new config key.
+- `privacy_subgroups.csv` in the evaluation folder: each model x protected group with its train and test patient counts, AUC and standard error (Hanley & McNeil). Groups with fewer than 10 patients on either side get no AUC.
+
 ## 0.10.0 (2026-10-19)
 
 Results are unchanged with the default config. A config that sets the new key changes the HPO objective and holdout TSTR: use a new experiment id. No golden re-record is needed (the golden config does not set it).
