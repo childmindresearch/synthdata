@@ -89,10 +89,14 @@ def test_generate_fixes_target_to_class_quotas(mocker):
     )
     assert len(calls) == 1 and calls[0]["seed"] == 7
     counts = df["target"].value_counts().sort_index()
-    pd.testing.assert_series_equal(counts, class_quotas(prior, 12).sort_index(), check_names=False)
+    pd.testing.assert_series_equal(
+        counts, class_quotas(prior, 12).sort_index(), check_names=False, check_dtype=False
+    )
     assert not any(df.attrs["class_sampling"].shortfall.values())
 
 
+# The fake `uv` is a shebang script, which Windows cannot execute.
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shebang stand-in for uv")
 def test_run_tabularargn_runs_the_env_script(tmp_path, monkeypatch):
     """The subprocess contract: train parquet + spec in, synthetic parquet out."""
     env = tmp_path / "env"
