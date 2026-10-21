@@ -479,6 +479,65 @@ class TabPFGenConfig:
 
 
 @dataclasses.dataclass
+class TabularARGNConfig:
+    """MOSTLY AI's TabularARGN (``mostlyai-engine``), run in its own environment.
+
+    mostlyai-engine's torch and psutil pins clash with this repo's, so it is
+    installed separately (``uv sync --project envs/tabularargn``) and run as a
+    subprocess; see ``synthdata/generation/tabularargn_backend.py``. It fits on
+    the imputed train split, like the synthcity models. No HPO: the library
+    stops training early on its own validation split.
+    """
+
+    #: Off by default: needs the separate environment above.
+    enabled: bool = False
+    #: The environment's folder (relative paths are from the repo root).
+    env_dir: str = "envs/tabularargn"
+    #: Arguments for ``TabularARGN()`` (e.g. ``model: MOSTLY_AI/Large``,
+    #: ``max_epochs``, ``max_training_time`` in minutes, ``value_protection``).
+    #: Empty keeps the library defaults.
+    params: dict = dataclasses.field(default_factory=dict)
+    #: Arguments for ``TabularARGN.sample()``. Value protection (on by default)
+    #: hides categories too rare to release; ``sample`` draws a common category
+    #: in their place instead of the library's ``_RARE_`` token, which is not a
+    #: real value of the column.
+    sample_params: dict = dataclasses.field(
+        default_factory=lambda: {"rare_category_replacement_method": "sample"}
+    )
+
+
+@dataclasses.dataclass
+class CDTDConfig:
+    """CDTD (Mueller, Gruber & Fok, ICLR 2025), run in its own environment.
+
+    The authors' ``cdtd_simple`` code is the submodule ``submodules/cdtd_simple``;
+    it needs Python 3.13 and a newer torch, so it is installed separately
+    (``uv sync --project envs/cdtd``) and run as a subprocess; see
+    ``synthdata/generation/cdtd_backend.py``. It fits on the imputed train
+    split, like the synthcity models. No HPO.
+    """
+
+    #: Off by default: needs the separate environment above.
+    enabled: bool = False
+    #: The environment's folder (relative paths are from the repo root).
+    env_dir: str = "envs/cdtd"
+    #: The cdtd_simple checkout.
+    source_dir: str = "submodules/cdtd_simple"
+    #: Arguments for ``CDTD()`` (e.g. ``mlp_n_units``, ``cat_emb_dim``). Empty
+    #: keeps the authors' defaults.
+    params: dict = dataclasses.field(default_factory=dict)
+    #: Arguments for ``CDTD.fit()``: ``num_steps_train`` (default 30000),
+    #: ``num_steps_warmup`` (1000), ``batch_size`` (4096, capped at the train
+    #: rows), ``lr`` (1e-3).
+    fit_params: dict = dataclasses.field(default_factory=dict)
+    #: Arguments for ``CDTD.sample()``: ``num_steps`` (default 200), ``batch_size``.
+    sample_params: dict = dataclasses.field(default_factory=dict)
+    #: CDTD cannot condition on the label, so for class quotas one fit draws
+    #: this many times the rows needed and the quotas are filled from them.
+    pool_factor: float = 3.0
+
+
+@dataclasses.dataclass
 class HPOConstraintsConfig:
     """Lenient sanity screens for HPO trials, passed to Optuna as constraints.
 
@@ -714,6 +773,10 @@ class GenerationConfig:
     tabpfn: TabPFNConfig = dataclasses.field(default_factory=TabPFNConfig)
     #: TabPFGen generators (see TabPFGenConfig).
     tabpfgen: TabPFGenConfig = dataclasses.field(default_factory=TabPFGenConfig)
+    #: TabularARGN generator (see TabularARGNConfig).
+    tabularargn: TabularARGNConfig = dataclasses.field(default_factory=TabularARGNConfig)
+    #: CDTD generator (see CDTDConfig).
+    cdtd: CDTDConfig = dataclasses.field(default_factory=CDTDConfig)
     #: Hyperparameter search (see HPOConfig).
     hpo: HPOConfig = dataclasses.field(default_factory=HPOConfig)
     #: Draw every synthetic dataset (and every HPO candidate) to the real train
@@ -1113,6 +1176,8 @@ _NESTED_DATACLASSES = {
     (GenerationConfig, "synthcity"): SynthcityModelsConfig,
     (GenerationConfig, "tabpfn"): TabPFNConfig,
     (GenerationConfig, "tabpfgen"): TabPFGenConfig,
+    (GenerationConfig, "tabularargn"): TabularARGNConfig,
+    (GenerationConfig, "cdtd"): CDTDConfig,
     (GenerationConfig, "hpo"): HPOConfig,
     (HPOConfig, "constraints"): HPOConstraintsConfig,
     (EvaluationConfig, "synthcity"): FrameworkSelectionConfig,
