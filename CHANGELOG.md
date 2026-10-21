@@ -4,6 +4,15 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.16.1 (2026-10-21)
+
+No result or config changes; old results stay comparable and no golden re-record is needed.
+
+### Fixed
+
+- Security update in `uv.lock`: certifi 2026.2.25 to 2026.10.19 (GHSA-6q48-6c7w-9gw2).
+- Still open, because a fix needs a pinned package to move: torch 2.7.1 and monai 1.5.2 (torch pin), pyarrow 21 (anonymeter needs pyarrow below 22, fix is 23.0.1), transformers 4.57 (be-great and mamba-ssm need 4.x, fixes are in 5.x) and datasets 2.14 (be-great pin, fix is 5.0.1). The `envs/cdtd` and `envs/tabularargn` lock files have no known vulnerabilities.
+
 ## 0.14.0 (2026-10-20)
 
 TabPFN results change: use a new experiment id for runs with `generation.tabpfn.enabled`. No golden re-record is needed (the golden run has no TabPFN models). No config key changes.
