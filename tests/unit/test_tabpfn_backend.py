@@ -138,3 +138,76 @@ def test_set_model_version_selects_the_weights_new_models_load():
             tabpfn_backend.set_model_version("v9")
     finally:
         settings.tabpfn.model_version = before
+
+
+class _FakeExperiment:
+    def __init__(self):
+        self.run_kwargs: dict = {}
+
+    def run(self, **kwargs):
+        import torch
+
+        self.run_kwargs = kwargs
+        self.synthetic_X = torch.as_tensor(kwargs["X"][: kwargs["n_samples"]])
+        self.data = pd.DataFrame({"a": [0]})
+
+
+def test_custom_generation_uses_one_permutation_and_the_replicate_seed(monkeypatch):
+    """Upstream's 3 permutations are identical fits; the seed reaches TabPFN."""
+    experiment = _FakeExperiment()
+    seeds = []
+
+    def make_experiment(seed):
+        seeds.append(seed)
+        return experiment, object()
+
+    monkeypatch.setattr(tabpfn_backend, "_make_experiment", make_experiment)
+    train = pd.DataFrame({"feature": [1.0, 2.0, 3.0], "target": [0, 1, 0]})
+
+    synthetic, _ = tabpfn_backend.generate_tabpfn_custom(train, [], "target", 2, seed=43)
+
+    assert seeds == [43]
+    assert experiment.run_kwargs["n_permutations"] == tabpfn_backend.N_PERMUTATIONS == 1
+    assert len(synthetic) == 2
+
+
+def test_make_experiment_seeds_both_tabpfn_estimators(monkeypatch):
+    """TabPFN defaults to random_state=0, which would make replicates share fits."""
+
+    class Estimator:
+        def __init__(self, random_state=0):
+            self.random_state = random_state
+
+    class Unsupervised:
+        def __init__(self, tabpfn_clf, tabpfn_reg):
+            self.tabpfn_clf, self.tabpfn_reg = tabpfn_clf, tabpfn_reg
+
+    tabpfn = types.ModuleType("tabpfn")
+    tabpfn.TabPFNClassifier = tabpfn.TabPFNRegressor = Estimator
+    extensions = types.ModuleType("tabpfn_extensions")
+    extensions.__path__ = []
+    unsupervised = types.ModuleType("tabpfn_extensions.unsupervised")
+    unsupervised.__path__ = []
+    unsupervised.TabPFNUnsupervisedModel = Unsupervised
+    experiments = types.ModuleType("tabpfn_extensions.unsupervised.experiments")
+    experiments.GenerateSyntheticDataExperiment = lambda task_type: _FakeExperiment()
+    extensions.unsupervised = unsupervised
+    unsupervised.experiments = experiments
+    for name, module in {
+        "tabpfn": tabpfn,
+        "tabpfn_extensions": extensions,
+        "tabpfn_extensions.unsupervised": unsupervised,
+        "tabpfn_extensions.unsupervised.experiments": experiments,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    for patch in (
+        "_patch_explicit_categorical_feature_inference",
+        "_patch_use_classifier_nan_bug",
+        "_patch_regression_prediction_device",
+    ):
+        monkeypatch.setattr(tabpfn_backend, patch, lambda: None)
+
+    _, model = tabpfn_backend._make_experiment(seed=44)
+
+    assert model.tabpfn_clf.random_state == 44
+    assert model.tabpfn_reg.random_state == 44

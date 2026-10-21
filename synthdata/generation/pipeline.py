@@ -324,7 +324,7 @@ def run_generation(
         base seed), so the spread across replicates measures how much a
         model's scores depend on its random seed. ``top_up=False`` keeps a
         class short instead of drawing more batches for it, for backends where
-        each batch is a whole new fit (TabPFN: about 10 h per fit on wide data).
+        each batch is a whole new fit (TabPFN: hours per fit on wide data).
         """
         for replicate in range(gen_cfg.n_replicates):
             with _skip_on_failure(replicate_name(name, replicate)):
@@ -681,6 +681,7 @@ def run_generation(
                             count,
                             target_is_categorical=dataset.target_is_categorical,
                             variable_schema_fingerprint=dataset.variable_schema_fingerprint,
+                            seed=seed,
                         )
                     ),
                     top_up=False,

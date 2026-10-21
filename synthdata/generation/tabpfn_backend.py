@@ -188,7 +188,16 @@ def set_model_version(version: str) -> None:
     logger.info("[tabpfn] using model weights %s", version)
 
 
-def _make_experiment():
+#: Feature permutations ``generate_synthetic_data`` averages per column. The
+#: upstream default of 3 runs the same fit three times at tabpfn-extensions
+#: 6ed13f6: the permuted conditioning order is lost when ``density_`` selects the
+#: columns with a boolean mask, and every fit uses the same ``random_state``.
+#: On Hepatitis (5 seeds), 3 seeded permutations, with or without the order
+#: reaching TabPFN, scored like 1 at 2.5x the time (docs/verification.md).
+N_PERMUTATIONS = 1
+
+
+def _make_experiment(seed: int):
     from tabpfn import TabPFNClassifier, TabPFNRegressor
     from tabpfn_extensions import unsupervised
     from tabpfn_extensions.unsupervised import experiments
@@ -198,7 +207,10 @@ def _make_experiment():
     _patch_regression_prediction_device()
 
     model_unsupervised = unsupervised.TabPFNUnsupervisedModel(
-        tabpfn_clf=TabPFNClassifier(), tabpfn_reg=TabPFNRegressor()
+        # TabPFN pins random_state=0 by default, which would give every
+        # replicate the same fitted conditionals; seed them per replicate.
+        tabpfn_clf=TabPFNClassifier(random_state=seed),
+        tabpfn_reg=TabPFNRegressor(random_state=seed),
     )
     experiment = experiments.GenerateSyntheticDataExperiment(task_type="unsupervised")
     # Disable the internal auto-plot: should_plot=False is not respected by this
@@ -252,7 +264,7 @@ def generate_tabpfn_standard(
         attribute_names.index(c) for c in categorical_columns if c in attribute_names
     ]
 
-    experiment, model_unsupervised = _make_experiment()
+    experiment, model_unsupervised = _make_experiment(seed)
     logger.info(
         "[tabpfn] standard: %d rows x %d columns (%d categorical) -> %d synthetic rows",
         *x.shape,
@@ -276,6 +288,7 @@ def generate_tabpfn_standard(
         indices=list(range(len(attribute_names))),
         categorical_features=categorical_indices,
         n_samples=n_samples,
+        n_permutations=N_PERMUTATIONS,
         should_plot=False,
     )
     experiment.data = experiment.data.reset_index(drop=True)
@@ -288,7 +301,7 @@ def generate_tabpfn_standard(
     synthetic_encoded = pd.DataFrame(synthetic_values, columns=attribute_names)
 
     # Schema categorical columns, not TabPFN's own guess from cardinality.
-    clf = TabPFNClassifier(categorical_features_indices=categorical_indices)
+    clf = TabPFNClassifier(categorical_features_indices=categorical_indices, random_state=seed)
     clf.fit(x, y)
     proba = clf.predict_proba(synthetic_encoded.to_numpy(dtype=float))
     target_values = sample_labels(proba, clf.classes_, seed)
@@ -306,6 +319,7 @@ def generate_tabpfn_custom(
     n_samples: int,
     target_is_categorical: bool = True,
     variable_schema_fingerprint: str | None = None,
+    seed: int = 0,
 ) -> tuple[pd.DataFrame, object]:
     """Features + target modeled jointly (target treated as just another column).
 
@@ -328,7 +342,7 @@ def generate_tabpfn_custom(
         attribute_names.index(c) for c in modeled_categorical_columns if c in attribute_names
     ]
 
-    experiment, model_unsupervised = _make_experiment()
+    experiment, model_unsupervised = _make_experiment(seed)
     logger.info(
         "[tabpfn] custom: %d rows x %d columns (%d categorical) -> %d synthetic rows",
         *train_array.shape,
@@ -352,6 +366,7 @@ def generate_tabpfn_custom(
         indices=list(range(len(attribute_names))),
         categorical_features=categorical_indices,
         n_samples=n_samples,
+        n_permutations=N_PERMUTATIONS,
         should_plot=False,
     )
     experiment.data = experiment.data.reset_index(drop=True)
