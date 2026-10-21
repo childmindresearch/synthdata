@@ -6,3 +6,6 @@
 	path = submodules/synthcity
 	url = https://github.com/alperkent-cmi/synthcity.git
 	branch = main
+[submodule "submodules/cdtd_simple"]
+	path = submodules/cdtd_simple
+	url = https://github.com/muellermarkus/cdtd_simple.git

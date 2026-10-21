@@ -13,6 +13,26 @@ No result or config changes; old results stay comparable and no golden re-record
 - Security update in `uv.lock`: certifi 2026.2.25 to 2026.10.19 (GHSA-6q48-6c7w-9gw2).
 - Still open, because a fix needs a pinned package to move: torch 2.7.1 and monai 1.5.2 (torch pin), pyarrow 21 (anonymeter needs pyarrow below 22, fix is 23.0.1), transformers 4.57 (be-great and mamba-ssm need 4.x, fixes are in 5.x) and datasets 2.14 (be-great pin, fix is 5.0.1). The `envs/cdtd` and `envs/tabularargn` lock files have no known vulnerabilities.
 
+## 0.16.0 (2026-10-20)
+
+A new optional generator; nothing changes unless you turn it on, so existing results and golden runs stay comparable.
+
+### Added
+
+- CDTD (continuous diffusion for mixed-type tabular data, ICLR 2025) as `generation.cdtd` (`enabled`, `env_dir`, `source_dir`, `params`, `fit_params`, `sample_params`, `pool_factor`; off by default). The authors' `cdtd_simple` code is the new submodule `submodules/cdtd_simple` (run `git submodule update --init`); it needs Python 3.13 and a newer torch, so it has its own environment (`uv sync --project envs/cdtd`) and runs as a subprocess. Writes `cdtd.csv` (plus replicates). A reference test checks that our runner reproduces the authors' notebook row for row; deviations are in `docs/verification.md`.
+
+### Changed
+
+- The subprocess plumbing TabularARGN used is now shared (`synthdata/generation/sidecar.py`), and progress bars from these subprocesses are logged at most once a minute.
+
+## 0.15.0 (2026-10-20)
+
+A new optional generator; nothing changes unless you turn it on, so existing results and golden runs stay comparable.
+
+### Added
+
+- TabularARGN (MOSTLY AI's autoregressive generator, `mostlyai-engine==2.7.3`) as `generation.tabularargn` (`enabled`, `env_dir`, `params`, `sample_params`; off by default). Its package pins torch 2.13 and `psutil<6`, which clash with this project's, so it lives in its own environment (`uv sync --project envs/tabularargn`) and runs as a subprocess. It fits on the imputed train split, writes `tabularargn.csv` (plus replicates), has no HPO, and fills class quotas by fixing the target as seed data. See the user manual (Generators) and `docs/verification.md`.
+
 ## 0.14.0 (2026-10-20)
 
 TabPFN results change: use a new experiment id for runs with `generation.tabpfn.enabled`. No golden re-record is needed (the golden run has no TabPFN models). No config key changes.

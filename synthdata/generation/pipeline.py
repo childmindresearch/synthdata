@@ -1,4 +1,4 @@
-"""Orchestrates synthetic data generation across synthcity, TabPFN, and TabPFGen.
+"""Orchestrates synthetic data generation across synthcity, TabPFN, TabPFGen, TabularARGN and CDTD.
 
 For each enabled model family, generates a default synthetic dataset and,
 if ``generation.hpo.enabled``, an Optuna-tuned ``*_hpo`` variant. Everything is
@@ -79,6 +79,8 @@ def needs_imputed_data(gen_cfg) -> bool:
     return (
         (gen_cfg.synthcity.enabled and bool(gen_cfg.synthcity.names))
         or gen_cfg.tabpfgen.enabled
+        or gen_cfg.tabularargn.enabled
+        or gen_cfg.cdtd.enabled
         or (gen_cfg.tabpfn.enabled and "imputed" in gen_cfg.tabpfn.data_variants)
     )
 
@@ -95,6 +97,8 @@ def _synthcity_worker(cfg: Config, dataset: Dataset, name: str, device: str):
     sub.generation.synthcity.names = [name]
     sub.generation.tabpfn.enabled = False
     sub.generation.tabpfgen.enabled = False
+    sub.generation.tabularargn.enabled = False
+    sub.generation.cdtd.enabled = False
     generated = []
     datasets = run_generation(
         sub, dataset, plot_callback=lambda n, df, extra: generated.append(n), _worker=True
@@ -801,6 +805,57 @@ def run_generation(
                         sgld_params=params,
                     ),
                 )
+
+    # ------------------------------------------------------------------
+    # TabularARGN (imputed train split; its own environment, no HPO)
+    # ------------------------------------------------------------------
+    if gen_cfg.tabularargn.enabled:
+        from synthdata.generation import tabularargn_backend as argn
+
+        train_imputed = dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df")
+        _cached_or_build(
+            "tabularargn",
+            lambda seed, count: argn.generate_tabularargn(
+                train_imputed,
+                dataset.all_categorical_columns,
+                dataset.target_column,
+                dataset.target_is_categorical,
+                count,
+                seed,
+                device,
+                gen_cfg.tabularargn.env_dir,
+                params=gen_cfg.tabularargn.params,
+                sample_params=gen_cfg.tabularargn.sample_params,
+                class_prior=class_prior,
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # CDTD (imputed train split; its own environment, no HPO)
+    # ------------------------------------------------------------------
+    if gen_cfg.cdtd.enabled:
+        from synthdata.generation import cdtd_backend
+
+        cdtd_cfg = gen_cfg.cdtd
+        train_imputed = dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df")
+        _cached_or_build(
+            "cdtd",
+            lambda seed, count: cdtd_backend.generate_cdtd(
+                train_imputed,
+                dataset.all_categorical_columns,
+                dataset.target_column,
+                dataset.target_is_categorical,
+                count,
+                seed,
+                cdtd_cfg.env_dir,
+                cdtd_cfg.source_dir,
+                params=cdtd_cfg.params,
+                fit_params=cdtd_cfg.fit_params,
+                sample_params=cdtd_cfg.sample_params,
+                class_prior=class_prior,
+                pool_factor=cdtd_cfg.pool_factor,
+            ),
+        )
 
     logger.info(
         "Generated/loaded %d synthetic datasets: %s",
