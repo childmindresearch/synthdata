@@ -24,6 +24,15 @@ A new optional generator; nothing changes unless you turn it on, so existing res
 
 - TabularARGN (MOSTLY AI's autoregressive generator, `mostlyai-engine==2.7.3`) as `generation.tabularargn` (`enabled`, `env_dir`, `params`, `sample_params`; off by default). Its package pins torch 2.13 and `psutil<6`, which clash with this project's, so it lives in its own environment (`uv sync --project envs/tabularargn`) and runs as a subprocess. It fits on the imputed train split, writes `tabularargn.csv` (plus replicates), has no HPO, and fills class quotas by fixing the target as seed data. See the user manual (Generators) and `docs/verification.md`.
 
+## 0.14.0 (2026-10-20)
+
+TabPFN results change: use a new experiment id for runs with `generation.tabpfn.enabled`. No golden re-record is needed (the golden run has no TabPFN models). No config key changes.
+
+### Changed
+
+- TabPFN generation averages 1 permutation per column instead of tabpfn-extensions' default 3. Upstream's 3 permutations are 3 identical fits (the permuted column order is dropped and the seed is fixed), so this changes no results in distribution and cuts TabPFN generation time to about a third. A Hepatitis comparison, including 3 seeded permutations with the order fixed, found no metric difference beyond chance: `docs/verification.md`, row "tabpfn permutations".
+- TabPFN's classifier and regressor, and the standard variant's label classifier, are seeded with each replicate's seed instead of TabPFN's fixed `random_state=0`, so replicates no longer share their fitted models and the replicate spread covers the model's own randomness.
+
 ## 0.13.0 (2026-10-20)
 
 The simulated and LORIS configs change HPO selection: use a new experiment id for them (old Optuna studies are stale). The hepatitis config, and so the golden run, is unchanged; no re-record is needed.
