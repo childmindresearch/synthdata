@@ -363,7 +363,8 @@ Whether a value is missing often carries information (a test that was not ordere
 | `columns`, `n_columns` | The columns of the pattern |
 | `missing_share` | Rows missing any of them |
 | `whole_share` | Of those, rows missing all of them |
-| `rule_auc`, `rule` | How well a depth-2 decision tree on the other columns (target excluded) predicts the missingness (cross-validated ROC AUC), and the tree's splits |
+| `rule_auc`, `rule` | How well a depth-2 decision tree on the other columns predicts the missingness (cross-validated ROC AUC), and the tree's splits. The target and any column blank in more than 10% of the pattern's missing rows are left out, so another form missing in the same rows cannot pass for a rule |
+| `indicator_only` | The column is missing so often that only its flag is kept; such columns are never put in a block |
 | `label` | `skip_logic_candidate` (`rule_auc` at least 0.95: a rule such as "no substance use" may decide it), `form_not_given_candidate` (a block missing as a whole in at least 80% of its missing rows, no clear rule), or `item_missing` (ordinary missing answers) |
 
 The labels are guesses to check against the codebook: the data cannot show why a value is missing. Blocks labelled skip logic or form not given are candidates for treating as "not assessed" rather than imputing.

@@ -110,6 +110,8 @@ def describe_patterns(
     rule_auc: float = 0.95,
     whole_block_share: float = 0.8,
     exclude_from_rules: list | None = None,
+    exclude_from_blocks: list | None = None,
+    min_observed_share: float = 0.9,
     seed: int = 0,
 ) -> pd.DataFrame:
     """One row per block and per other column missing in ``min_missing_fraction`` of rows.
@@ -117,9 +119,14 @@ def describe_patterns(
     Columns: ``pattern``, ``kind`` (block or column), ``columns``,
     ``n_columns``, ``missing_share`` (rows missing any of its columns),
     ``whole_share`` (of those, rows missing all of them), ``rule_auc`` and
-    ``rule`` (see :func:`missingness_rule`; the pattern's own columns and
-    ``exclude_from_rules``, e.g. the target, are not predictors), and
-    ``label``:
+    ``rule`` (see :func:`missingness_rule`), ``indicator_only`` (the column
+    is in ``exclude_from_blocks``, so it stays out of blocks; the pipeline
+    keeps only its flag), and ``label``. The rule's predictors leave out the
+    pattern's own columns, ``exclude_from_rules`` (e.g. the target) and every
+    column observed in fewer than ``min_observed_share`` of the pattern's
+    missing rows: a gate question is answered when its items are skipped,
+    whereas another form missing in the same rows would only restate that the
+    rows are missing together. Labels:
 
     * ``skip_logic_candidate``: the tree predicts the missingness with AUC at
       least ``rule_auc``, so a rule on other columns may decide it.
@@ -129,7 +136,8 @@ def describe_patterns(
     """
     shares = frame[columns].isna().mean()
     candidates = [c for c in columns if shares[c] >= min_missing_fraction]
-    blocks = find_blocks(frame[candidates].isna(), min_jaccard)
+    no_blocks = set(exclude_from_blocks or [])
+    blocks = find_blocks(frame[[c for c in candidates if c not in no_blocks]].isna(), min_jaccard)
     in_block = {c for block in blocks for c in block}
     patterns = [("block", b) for b in blocks]
     patterns += [("column", [c]) for c in candidates if c not in in_block]
@@ -140,6 +148,8 @@ def describe_patterns(
         any_missing, all_missing = masks.any(axis=1), masks.all(axis=1)
         whole = float(all_missing.sum() / any_missing.sum()) if any_missing.any() else 0.0
         predictors = frame.drop(columns=[c for c in [*members, *excluded] if c in frame])
+        observed = predictors.loc[any_missing].notna().mean()
+        predictors = predictors.loc[:, observed >= min_observed_share]
         auc, rule = missingness_rule(predictors, any_missing, seed)
         if auc >= rule_auc:
             label = SKIP_LOGIC
@@ -157,6 +167,7 @@ def describe_patterns(
                 "whole_share": whole,
                 "rule_auc": auc,
                 "rule": rule,
+                "indicator_only": kind == "column" and members[0] in no_blocks,
                 "label": label,
             }
         )
@@ -171,6 +182,7 @@ def describe_patterns(
             "whole_share",
             "rule_auc",
             "rule",
+            "indicator_only",
             "label",
         ],
     )
@@ -204,6 +216,8 @@ def save_blocks_report(cfg, dataset, output_dir: str | Path | None = None) -> pd
         min_missing_fraction=indicators.min_missing_fraction,
         min_jaccard=indicators.block_min_jaccard,
         exclude_from_rules=[dataset.target_column],
+        # These keep only their flag in the pipeline and cannot be in a block.
+        exclude_from_blocks=list(dataset.indicator_only_values.columns),
         seed=cfg.seed,
     )
     path = Path(output_dir or imputation_output_dir(cfg)) / BLOCKS_FILENAME

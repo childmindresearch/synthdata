@@ -43,7 +43,8 @@ def main() -> None:
     blocks = table[table["kind"] == "block"]
     if len(blocks):
         print(
-            "\nTo give these blocks one missing flag each, add under imputation.missing_indicators:"
+            "\nTo give these blocks one missing flag each, add under "
+            "imputation.missing_indicators (indicator-only columns are never in a block):"
         )
         print("  blocks:")
         for row in blocks.itertuples():

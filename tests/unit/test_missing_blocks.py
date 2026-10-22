@@ -132,3 +132,18 @@ def test_blocks_config_is_validated(make_config):
     cfg.imputation.missing_indicators.blocks = {"one": ["a"]}
     with pytest.raises(ValueError, match="at least two"):
         _validate(cfg)
+
+
+def test_indicator_only_columns_stay_out_of_blocks_and_other_forms_are_not_rules():
+    frame = _clinic()
+    # A second form missing in exactly the same rows as form_x/y/z.
+    frame["form2_a"] = frame["form_x"].where(frame["form_x"].notna(), np.nan) * 0 + 1
+    frame.loc[frame["form_x"].isna() & frame["form_z"].isna(), "form2_a"] = np.nan
+    features = [*FEATURES, "form2_a"]
+    table = describe_patterns(
+        frame, features, exclude_from_rules=["target"], exclude_from_blocks=["form_z"]
+    ).set_index("columns")
+    assert "form_x; form_y; form2_a" in table.index
+    assert bool(table.loc["form_z", "indicator_only"])
+    # The other co-missing columns are not usable predictors, so no "rule" is found.
+    assert table.loc["form_x; form_y; form2_a", "label"] == FORM_NOT_GIVEN
