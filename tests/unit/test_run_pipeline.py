@@ -149,3 +149,25 @@ def test_a_second_run_on_the_same_output_root_stops_at_once(tmp_path, monkeypatc
         held.release()
     # Once the first run ends, the lock is free again.
     assert run_pipeline.run_stages(_args("--stages", "impute"), log, echo=False) == 0
+
+
+def test_a_config_with_no_generator_stops_before_any_stage(tmp_path, monkeypatch):
+    config = tmp_path / "cfg.yaml"
+    config.write_text(
+        "data: {source: uci, uci_id: 46}\n"
+        "generation:\n"
+        "  synthcity: {enabled: false}\n"
+        "  tabpfn: {enabled: false}\n"
+        "  tabpfgen: {enabled: false}\n"
+    )
+    monkeypatch.chdir(tmp_path)  # the logs folder lands under the default output root
+    monkeypatch.setattr(
+        run_pipeline, "run_stages", lambda *a, **k: pytest.fail("no stage should start")
+    )
+    with pytest.raises(SystemExit, match="No generator is enabled"):
+        run_pipeline.main(["--config", str(config)])
+    # Stages without generation still run on such a config.
+    monkeypatch.setattr(run_pipeline, "run_stages", lambda *a, **k: 0)
+    with pytest.raises(SystemExit) as exit_info:
+        run_pipeline.main(["--config", str(config), "--stages", "impute"])
+    assert exit_info.value.code == 0

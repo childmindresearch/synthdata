@@ -45,7 +45,7 @@ from typing import Any
 
 from filelock import BaseFileLock, FileLock, Timeout
 
-from synthdata.config import load_config
+from synthdata.config import NO_GENERATOR_MESSAGE, load_config
 from synthdata.dashboard import DashboardWriter, dashboard_path
 from synthdata.resources import ResourceMonitor
 
@@ -325,6 +325,9 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(run_stages(args, Path(args.log_file), echo=False))
 
     cfg = load_config(args.config)  # fail fast on a bad config, before detaching
+    if "generate" in args.stages and not cfg.generation.enabled_generators():
+        # Stop before imputation runs, not after it with an empty experiment.
+        sys.exit("synthdata-run: " + NO_GENERATOR_MESSAGE.format(path=args.config))
     logs = log_dir(cfg)
     logs.mkdir(parents=True, exist_ok=True)
     try:  # fail fast, before detaching, if another run holds this output root

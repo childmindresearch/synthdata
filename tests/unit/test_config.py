@@ -670,3 +670,14 @@ def test_stage_time_limit_must_be_positive_hours(limit):
     with pytest.raises(ValueError, match="stage_time_limit_hours"):
         _validate_hpo(HPOConfig(stage_time_limit_hours=limit))
     _validate_hpo(HPOConfig(stage_time_limit_hours=46.5))
+
+
+def test_enabled_generators_lists_the_families_that_will_run():
+    gen = GenerationConfig()
+    assert "synthcity" in gen.enabled_generators()
+    gen.synthcity.names = []  # enabled but with nothing to train
+    gen.tabpfn.enabled = gen.tabpfgen.enabled = False
+    gen.tabularargn.enabled = gen.cdtd.enabled = False
+    assert gen.enabled_generators() == []
+    gen.cdtd.enabled = True
+    assert gen.enabled_generators() == ["cdtd"]
