@@ -4,6 +4,14 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.16.2 (2026-10-22)
+
+No result or config changes; old results stay comparable and no golden re-record is needed.
+
+### Fixed
+
+- A config that turns on no generator now stops at once with an error that names the keys to turn on. `synthdata-run` checks before any stage starts (so imputation is not run for nothing) whenever the `generate` stage is selected, and `synthdata-generate` checks before loading data. Before, such a run did all of imputation first and only stopped after logging `Generated/loaded 0 synthetic datasets: []` (on versions before 0.9.0 it went on to evaluation and failed on an empty experiment folder). Runs with only the `impute` or `evaluate` stage are unaffected.
+
 ## 0.16.1 (2026-10-21)
 
 No result or config changes; old results stay comparable and no golden re-record is needed.
