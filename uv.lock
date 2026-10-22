@@ -2367,6 +2367,22 @@ wheels = [
 ]
 
 [[package]]
+name = "miceforest"
+version = "6.0.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "lightgbm" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "pyarrow" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cd/78/3ee5d988c0c08932defd3dfcbb17bd1cc818a4e723c9839b566d1f6191b3/miceforest-6.0.5.tar.gz", hash = "sha256:df96a5b4cfcb87554ae54c5be1bce538f8580b4b20203dc51e1806516efe71e1", size = 45429, upload-time = "2025-10-27T00:37:35.11Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/db/a1/f2a4425415ce92a3b088a6e7d86c881c441f84231f023c680b0eb34d330c/miceforest-6.0.5-py3-none-any.whl", hash = "sha256:a9b2432ac2430dd7621538e4ef04dbc49ad1eaa181eb36a59ee34f279da7c57e", size = 38780, upload-time = "2025-10-27T00:37:34.159Z" },
+]
+
+[[package]]
 name = "mistune"
 version = "3.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -4605,15 +4621,17 @@ provides-extras = ["testing", "goggle", "all"]
 
 [[package]]
 name = "synthdata"
-version = "0.16.1"
+version = "0.17.0"
 source = { editable = "." }
 dependencies = [
     { name = "altair" },
     { name = "anonymeter" },
     { name = "filelock" },
     { name = "jupyter" },
+    { name = "lightgbm" },
     { name = "marimo" },
     { name = "matplotlib" },
+    { name = "miceforest" },
     { name = "numpy" },
     { name = "openpyxl" },
     { name = "optuna" },
@@ -4667,9 +4685,11 @@ requires-dist = [
     { name = "causal-conv1d", marker = "extra == 'refidiff'", specifier = "==1.6.2.post1" },
     { name = "filelock" },
     { name = "jupyter" },
+    { name = "lightgbm", specifier = ">=4.1.0,<4.7" },
     { name = "mamba-ssm", marker = "extra == 'refidiff'", specifier = "==2.3.1" },
     { name = "marimo" },
     { name = "matplotlib" },
+    { name = "miceforest", specifier = ">=6.0.5" },
     { name = "numpy" },
     { name = "openpyxl" },
     { name = "optuna" },
