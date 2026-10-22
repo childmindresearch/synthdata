@@ -897,7 +897,8 @@ def resolve_blocks(
     indicator_only: list,
 ) -> dict:
     """Configured blocks, or blocks found on the ``fit_index`` rows for ``"auto"``."""
-    if blocks == "auto":
+    # The config allows only "auto" as a string.
+    if isinstance(blocks, str):
         from synthdata.missing_blocks import block_names, find_blocks
 
         shares = df.loc[fit_index, columns].isna().mean()
