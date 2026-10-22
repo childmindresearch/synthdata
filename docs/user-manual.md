@@ -134,7 +134,7 @@ The settings you will most often change, by section:
 | `data.patient_id_column` | Groups rows by patient so no patient is in two splits | `research_subject_id` |
 | `data.quasi_identifier_columns`, `sensitive_columns`, `protected_columns`, `protected_bins` | Column roles for privacy and fairness, and the groups of a numeric protected column | see [section 5](#5-stage-1-load-and-split-the-data) |
 | `data.stratify_columns`, `stratify_bins` | What the split keeps balanced | `[target, gender, age]` |
-| `imputation.method` | How missing values are filled | `missforest`, `simple` |
+| `imputation.method` | How missing values are filled | `miceforest`, `missforest`, `simple` |
 | `generation.n_samples` | Synthetic rows per model | `null` (the real train size) |
 | `generation.n_replicates` | Times each model is retrained with a new seed | `1`, or `3` for confidence intervals |
 | `generation.synthcity.names` | Which synthcity generators run | `[ctgan, tvae, arf]` |
@@ -320,12 +320,17 @@ Most generators cannot handle missing values, so `synthdata-impute` fills them. 
 
 | `imputation.method` | What it is | When to use |
 | --- | --- | --- |
-| `missforest` (default) | Iterative random-forest imputation (scikit-learn `IterativeImputer`), as in Stekhoven and Bühlmann | Most datasets |
+| `miceforest` (default) | MICE with LightGBM forests and predictive mean matching (the `miceforest` library): each gap gets a real observed value from a row whose prediction is close | Most datasets |
+| `missforest` | Iterative random-forest imputation (scikit-learn `IterativeImputer`), as in Stekhoven and Bühlmann | Comparison with older runs |
 | `simple` | Median for continuous columns, most frequent value for categorical ones | Quick tests, CI |
 | `tabimpute` | TabPFN-based imputation | Experimental |
 | `refidiff` | Predictive plus diffusion hybrid; needs `uv sync --extra refidiff` | Experimental |
 
-`imputation.missforest` sets the number of trees and rounds; the defaults are smaller than the paper's so a 20,000 by 400 table imputes in minutes.
+Why `miceforest` is the default: MissForest fills each gap with the forests' average prediction. Averages shrink toward the middle, so continuous columns get a narrow spike, ordinal columns lose their extremes, and a categorical column whose other columns say little about it gets its most common class in every gap. Generators then learn those artifacts. `miceforest` predicts in the same way but copies the value from one of the `mean_match_candidates` observed rows with the closest prediction, so filled values are real values and keep the observed spread and category shares. Each filled cell is less likely to be exactly right, which is the price of a realistic distribution. No imputer can recover values that are missing for a reason the other columns don't show.
+
+`imputation.miceforest` sets the number of rounds (`iterations`, default 5), the donors per gap (`mean_match_candidates`, default 5) and LightGBM threads (`num_threads`, 0 = all cores). `imputation.missforest` sets the number of trees and rounds; the defaults are smaller than the paper's so a 20,000 by 400 table imputes in minutes.
+
+The `imputation/observed_vs_imputed` figure compares each column's observed values with its filled ones. Expect filled values to differ when the missing rows really differ from the rest (for example, a diagnosis missing for patients who were never assessed).
 
 ### No leakage from held-out rows
 
@@ -620,7 +625,7 @@ Evaluation scores several synthetic datasets at once, each in its own process, u
 
 1. **At a glance.** Dataset, experiment, seed, the recommended model and its overall score, how it compares with the two baselines, the [output checks](#output-checks) count, and a "Read with care" list of warnings (for example, a single seed, a failed output check, a metric that failed for a model and is scored as its worst value, or an Anonymeter attack whose 95% interval is above 0).
 2. **Ranking.** One row per model with overall, utility, privacy and fairness scores (with intervals and "tied with best" when there are replicates), followed by how the scores were built and the trade-off plots.
-3. **Utility.** How far each model's columns are from the real ones (a table with each model's median and mean difference and its three worst columns; total variation distance for categorical columns, Kolmogorov-Smirnov statistic for continuous ones), a figure per model of its 12 columns that differ most, a link to its every-column figure and to `column_differences.csv` (every column and model), the holdout TSTR and TSTS table (the `baseline_train_copy` rows are the real-data ceiling), and a plot of every utility metric.
+3. **Utility.** How far each model's columns are from the real ones (a table with each model's median and mean difference and its three worst columns; total variation distance for categorical columns, Kolmogorov-Smirnov statistic for continuous ones), a figure per model of its 12 columns that differ most, a link to its every-column figure and to `column_differences.csv` (every column and model). These compare the real values that were recorded with the synthetic values as released (blanked where the synthetic missing indicator says missing), so imputed values are on neither side; each panel title gives both sides' share of blanks. `plots/generation/<model>_filled` shows the filled data the metrics score. Then come the holdout TSTR and TSTS table (the `baseline_train_copy` rows are the real-data ceiling), and a plot of every utility metric.
 4. **Privacy evidence.** The attack and distance results next to the baselines, with how to read each column, and a plot of every privacy metric.
 5. **Fairness.** Subgroup gap metrics, log disparity (with links to sunburst pages that show which subgroups are over- or under-represented), privacy by protected group (the gap and worst-group columns, each group's membership AUC and its patient counts), and a plot of every fairness metric.
 

@@ -523,8 +523,11 @@ def _distribution_summary(directory: Path, links: _Links) -> list[str]:
     lines = [
         "How far each column's synthetic distribution is from the real train split: total "
         "variation distance for categorical columns, Kolmogorov-Smirnov statistic for "
-        "continuous ones (0 identical, 1 disjoint). Each model's figure shows its "
-        "columns that differ most; the full figure has every column. Every column and "
+        "continuous ones (0 identical, 1 disjoint). Both sides leave out blank cells: real "
+        "values that were missing and synthetic values blanked by their missing indicator "
+        "(as in `released/`), so imputed values are not compared. Each model's figure "
+        "shows its columns that differ most; the full figure has every column, and "
+        "`<model>_filled` compares the filled data the metrics score. Every column and "
         f"model: {links.file(table_path)}.",
         "",
     ]

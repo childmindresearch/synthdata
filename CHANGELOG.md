@@ -4,6 +4,19 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.17.0 (2026-10-22)
+
+Imputed values change, so results are not comparable with earlier runs: use a new experiment id and re-record the golden runs.
+
+### Changed
+
+- New default imputer `imputation.method: miceforest`: MICE with LightGBM forests and predictive mean matching (the `miceforest` library, new dependency; LightGBM capped below 4.7). Each gap gets a real observed value from a row with a close prediction, so filled columns keep their spread and category shares instead of MissForest's narrow spikes and single-class fills. Settings in `imputation.miceforest` (`iterations`, `mean_match_candidates`, `num_threads`). `missforest` is still available. The example configs now use `miceforest`. Run `uv sync` to install it.
+- Real-vs-synthetic figures (`plots/generation/<model>.png`, `<model>_top_columns.png`) and `column_differences.csv` now compare the real train values that were recorded with the synthetic values as released (blanked where the synthetic missing indicator is 1), so imputed values appear on neither side. Panel titles show each side's share of blanks. The old filled-vs-filled view, which is what the metrics score, is `<model>_filled.png` (written when there are missing indicators).
+
+### Fixed
+
+- Categorical axes in the plots sort labels that read as numbers by value (1, 2, ..., 10), even when they are stored as text; before, they sorted as text (1, 10, 11, 2). Schema `ordinal_order` still wins.
+
 ## 0.16.1 (2026-10-21)
 
 No result or config changes; old results stay comparable and no golden re-record is needed.

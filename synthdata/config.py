@@ -254,7 +254,25 @@ class RefiDiffConfig:
     categorical_decode_policy: str = "clip"
 
 
-IMPUTATION_METHODS = ("missforest", "simple", "tabimpute", "refidiff")
+IMPUTATION_METHODS = ("miceforest", "missforest", "simple", "tabimpute", "refidiff")
+
+
+@dataclasses.dataclass
+class MiceForestConfig:
+    """Settings for ``imputation.method: miceforest`` (MICE with LightGBM and mean matching).
+
+    The defaults are miceforest's own (48-tree LightGBM random forests per
+    column) plus 5 rounds, the usual MICE choice (van Buuren 2018, section 6.5).
+    """
+
+    #: Imputation rounds over all incomplete columns.
+    iterations: int = 5
+    #: Each filled value is copied from one of this many observed rows whose
+    #: predictions are closest (predictive mean matching). 0 turns matching
+    #: off and keeps the raw prediction, which shrinks toward the mean.
+    mean_match_candidates: int = 5
+    #: LightGBM threads; 0 uses every core.
+    num_threads: int = 0
 
 
 @dataclasses.dataclass
@@ -366,13 +384,16 @@ class ImputationConfig:
     #: Run imputation. When False, generators that cannot handle missing
     #: values will fail; keep it on unless the data has no missing values.
     enabled: bool = True
-    #: "missforest" (default; iterative random-forest imputation), "simple"
+    #: "miceforest" (default; MICE with LightGBM forests and predictive mean
+    #: matching, so filled values follow the observed distribution),
+    #: "missforest" (iterative random-forest imputation; fills conditional
+    #: means, which shrink toward the middle and the mode), "simple"
     #: (median for continuous columns, most frequent value for categorical
     #: ones; fast, used by CI), "tabimpute" (TabPFN-based) or "refidiff"
     #: (predictive+diffusion hybrid -- see synthdata/imputation/refidiff_backend.py).
     #: Every method is fitted twice: on train minus tuning for HPO, then on
     #: all of train for the final models and the holdout.
-    method: str = "missforest"
+    method: str = "miceforest"
     #: "auto" | "cpu" | "cuda" | "mps"
     device: str = "auto"
     #: Optional per-column rounding precision (decimal places) applied post-imputation.
@@ -396,6 +417,8 @@ class ImputationConfig:
     #: Warn when a column's imputed values differ between the two fits by more
     #: than this (see ``imputation_drift.csv``).
     drift_warn_threshold: float = 0.1
+    #: Only used when method == "miceforest".
+    miceforest: MiceForestConfig = dataclasses.field(default_factory=MiceForestConfig)
     #: Only used when method == "missforest".
     missforest: MissForestConfig = dataclasses.field(default_factory=MissForestConfig)
     #: ``<column>__missing`` indicator features (see MissingIndicatorConfig).
@@ -1169,6 +1192,7 @@ _NESTED_DATACLASSES = {
     (Config, "compute"): ComputeConfig,
     (Config, "experiment"): ExperimentConfig,
     (ImputationConfig, "refidiff"): RefiDiffConfig,
+    (ImputationConfig, "miceforest"): MiceForestConfig,
     (ImputationConfig, "missforest"): MissForestConfig,
     (ImputationConfig, "missing_indicators"): MissingIndicatorConfig,
     (ImputationConfig, "benchmark"): RefiDiffBenchmarkConfig,
@@ -1461,6 +1485,12 @@ def _validate(cfg: Config) -> None:
         raise ValueError(
             "imputation.missing_indicators.indicator_only_fraction must be between "
             "min_missing_fraction and 1"
+        )
+    miceforest = cfg.imputation.miceforest
+    if miceforest.iterations < 1 or miceforest.mean_match_candidates < 0:
+        raise ValueError(
+            "imputation.miceforest.iterations must be at least 1 and "
+            "mean_match_candidates at least 0"
         )
     missforest = cfg.imputation.missforest
     if missforest.n_estimators < 1 or missforest.max_iter < 1:

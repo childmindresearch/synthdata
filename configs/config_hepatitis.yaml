@@ -43,7 +43,7 @@ data:
 
 imputation:
   # Fitted on train minus tuning for HPO, then refitted on all of train.
-  method: missforest # missforest | simple (median/mode) | tabimpute | refidiff
+  method: miceforest # miceforest | missforest | simple (median/mode) | tabimpute | refidiff
   round_to_int_default: true # Round imputed values unless round_rules says otherwise.
   round_rules: { BILIRUBIN: 2, ALBUMIN: 1 }
 
