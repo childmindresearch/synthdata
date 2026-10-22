@@ -793,6 +793,26 @@ class GenerationConfig:
         """Synthetic rows to draw for a model fitted on ``n_real_rows`` real rows."""
         return n_real_rows if self.n_samples is None else self.n_samples
 
+    def enabled_generators(self) -> list[str]:
+        """The generator families this config turns on (empty: nothing to generate)."""
+        families = {
+            "synthcity": self.synthcity.enabled and bool(self.synthcity.names),
+            "tabpfn": self.tabpfn.enabled and bool(self.tabpfn.data_variants),
+            "tabpfgen": self.tabpfgen.enabled,
+            "tabularargn": self.tabularargn.enabled,
+            "cdtd": self.cdtd.enabled,
+        }
+        return [name for name, on in families.items() if on]
+
+
+#: Shown when no generator is enabled, so the run stops before any work.
+NO_GENERATOR_MESSAGE = (
+    "No generator is enabled in {path}, so generation would produce 0 synthetic datasets "
+    "and evaluation would have nothing to score. Turn at least one on: "
+    "generation.synthcity.enabled (with generation.synthcity.names), generation.tabpfn.enabled, "
+    "generation.tabpfgen.enabled, generation.tabularargn.enabled or generation.cdtd.enabled."
+)
+
 
 # ---------------------------------------------------------------------------
 # Evaluation

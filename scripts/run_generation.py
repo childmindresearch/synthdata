@@ -16,7 +16,7 @@ Requires imputed data (run `synthdata-impute` first).
 import argparse
 from pathlib import Path
 
-from synthdata.config import load_config
+from synthdata.config import NO_GENERATOR_MESSAGE, load_config
 from synthdata.data import load_dataset, load_imputed_splits
 from synthdata.evaluation.tstr import tstr_xgb_params
 from synthdata.experiment import start_experiment
@@ -54,6 +54,8 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if not cfg.generation.enabled_generators():
+        raise SystemExit(NO_GENERATOR_MESSAGE.format(path=cfg.config_path))
     if args.tag:
         cfg.experiment.tag = args.tag
     if args.experiment_id:
