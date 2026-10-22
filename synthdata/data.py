@@ -136,6 +136,9 @@ class Dataset:
     #: ``{indicator column: source column}`` for the ``<column>__missing``
     #: features added at load time (see ``imputation.missing_indicators``).
     missing_indicator_columns: dict = dataclasses.field(default_factory=dict)
+    #: ``{block indicator column: [source columns]}`` for the
+    #: ``<block>__missing`` features (see ``missing_indicators.blocks``).
+    missing_block_columns: dict = dataclasses.field(default_factory=dict)
     #: Raw values (``full_df`` index) of columns so often missing that only
     #: their indicator is imputed and generated; empty frame when none.
     indicator_only_values: pd.DataFrame = dataclasses.field(default_factory=pd.DataFrame)
@@ -826,7 +829,11 @@ MISSING_INDICATOR_SUFFIX = "__missing"
 
 
 def add_missing_indicators(
-    df: pd.DataFrame, columns: list, fit_index: pd.Index, min_missing_fraction: float
+    df: pd.DataFrame,
+    columns: list,
+    fit_index: pd.Index,
+    min_missing_fraction: float,
+    covered: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """Append a 0/1 ``<column>__missing`` feature for frequently missing columns.
 
@@ -835,9 +842,14 @@ def add_missing_indicators(
     (scikit-learn's ``MissingIndicator`` gives the same matrix), so it is
     fully observed and identical whichever imputer runs later. Missing
     indicators are standard in clinical prediction models (Sperrin et al.,
-    *Stat Med* 2020). Returns the widened frame and ``{indicator: column}``.
+    *Stat Med* 2020). ``covered`` (True where a block flag already marks the
+    cell, see :func:`add_block_indicators`) leaves those cells out of both the
+    share and the flag. Returns the widened frame and ``{indicator: column}``.
     """
-    fractions = df.loc[fit_index, columns].isna().mean()
+    missing = df[columns].isna()
+    if covered is not None:
+        missing = missing & ~covered.reindex(columns=columns, fill_value=False)
+    fractions = missing.loc[fit_index].mean()
     chosen = [c for c in columns if fractions[c] >= min_missing_fraction]
     indicators = {f"{c}{MISSING_INDICATOR_SUFFIX}": c for c in chosen}
     clash = [c for c in indicators if c in df.columns]
@@ -846,23 +858,93 @@ def add_missing_indicators(
     if not indicators:
         return df, {}
     flags = pd.DataFrame(
-        {name: df[column].isna().astype(int) for name, column in indicators.items()},
+        {name: missing[column].astype(int) for name, column in indicators.items()},
         index=df.index,
     )
     return pd.concat([df, flags], axis=1), indicators
 
 
-def remask_synthetic(synthetic: pd.DataFrame, indicators: dict) -> pd.DataFrame:
+def add_block_indicators(df: pd.DataFrame, blocks: dict) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
+    """Append one 0/1 ``<block>__missing`` feature per block of columns.
+
+    The flag is 1 where every column of the block is missing (the form was not
+    filled in). Returns the widened frame, ``{indicator: [columns]}`` and a
+    boolean frame of the cells the flags cover, for
+    :func:`add_missing_indicators`.
+    """
+    indicators = {f"{name}{MISSING_INDICATOR_SUFFIX}": list(cols) for name, cols in blocks.items()}
+    covered = pd.DataFrame(False, index=df.index, columns=df.columns)
+    if not indicators:
+        return df, {}, covered
+    clash = [c for c in indicators if c in df.columns]
+    if clash:
+        raise ValueError(f"Block indicator column names already exist in the data: {clash}")
+    flags = {}
+    for name, cols in indicators.items():
+        whole = df[cols].isna().all(axis=1)
+        flags[name] = whole.astype(int)
+        covered.loc[whole, cols] = True
+    return pd.concat([df, pd.DataFrame(flags, index=df.index)], axis=1), indicators, covered
+
+
+def resolve_blocks(
+    blocks: dict | str,
+    df: pd.DataFrame,
+    columns: list,
+    fit_index: pd.Index,
+    min_missing_fraction: float,
+    min_jaccard: float,
+    indicator_only: list,
+) -> dict:
+    """Configured blocks, or blocks found on the ``fit_index`` rows for ``"auto"``."""
+    if blocks == "auto":
+        from synthdata.missing_blocks import block_names, find_blocks
+
+        shares = df.loc[fit_index, columns].isna().mean()
+        candidates = [
+            c for c in columns if shares[c] >= min_missing_fraction and c not in indicator_only
+        ]
+        return block_names(find_blocks(df.loc[fit_index, candidates].isna(), min_jaccard))
+    unknown = sorted({c for cols in blocks.values() for c in cols} - set(columns))
+    if unknown:
+        raise KeyError(f"imputation.missing_indicators.blocks names unknown features: {unknown}")
+    dropped = sorted({c for cols in blocks.values() for c in cols} & set(indicator_only))
+    if dropped:
+        raise ValueError(
+            f"Columns {dropped} are in a missing block but would keep only their indicator "
+            "(indicator_only_fraction); list them in keep_values_columns or leave them out "
+            "of the block."
+        )
+    seen: dict = {}
+    for name, cols in blocks.items():
+        for c in cols:
+            if c in seen:
+                raise ValueError(f"Column {c!r} is in two missing blocks: {seen[c]}, {name}")
+            seen[c] = name
+    return dict(blocks)
+
+
+def remask_synthetic(
+    synthetic: pd.DataFrame, indicators: dict, blocks: dict | None = None
+) -> pd.DataFrame:
     """Blank synthetic values whose synthetic indicator is 1, then drop the indicators.
 
-    This gives the released data the missingness pattern the generator
-    learned instead of a fully filled table.
+    ``indicators`` maps a column flag to its column and ``blocks`` a block
+    flag to its columns. This gives the released data the missingness pattern
+    the generator learned instead of a fully filled table.
     """
     out = synthetic.copy()
-    for name, column in indicators.items():
-        if name in out.columns and column in out.columns:
-            out[column] = out[column].where(pd.to_numeric(out[name], errors="coerce").round() != 1)
-    return out.drop(columns=[c for c in indicators if c in out.columns])
+    targets = {name: [column] for name, column in indicators.items()}
+    for name, columns in (blocks or {}).items():
+        targets[name] = list(columns)
+    for name, columns in targets.items():
+        if name not in out.columns:
+            continue
+        flagged = pd.to_numeric(out[name], errors="coerce").round() == 1
+        for column in columns:
+            if column in out.columns:
+                out[column] = out[column].where(~flagged)
+    return out.drop(columns=[c for c in targets if c in out.columns])
 
 
 def stratification_key(
@@ -1178,22 +1260,12 @@ def load_dataset(cfg: Config) -> Dataset:
         df, patient_ids, fractions, seed=cfg.seed, strata=strata
     )
     missing_indicator_columns = {}
+    missing_block_columns = {}
     indicator_only_values = pd.DataFrame(index=df.index)
     indicator_cfg = cfg.imputation.missing_indicators
     if cfg.imputation.enabled and indicator_cfg.enabled:
         # Chosen on the rows the first imputer fits on, so both fits and the
         # holdout share one column set that no held-out row influenced.
-        df, missing_indicator_columns = add_missing_indicators(
-            df, feature_columns, train_only, indicator_cfg.min_missing_fraction
-        )
-        feature_columns = feature_columns + list(missing_indicator_columns)
-        nominal_columns = nominal_columns + list(missing_indicator_columns)
-        variable_schema = {
-            **variable_schema,
-            **{
-                c: {"kind": "categorical", "ordinal_order": None} for c in missing_indicator_columns
-            },
-        }
         protected_from_dropping = {
             *indicator_cfg.keep_values_columns,
             *stratify_columns,
@@ -1201,17 +1273,40 @@ def load_dataset(cfg: Config) -> Dataset:
             *cfg.data.sensitive_columns,
             *(cfg.data.protected_columns or []),
         }
-        fractions_missing = (
-            df.loc[train_only, list(missing_indicator_columns.values())].isna().mean()
-        )
+        fractions_missing = df.loc[train_only, feature_columns].isna().mean()
         threshold = indicator_cfg.indicator_only_fraction
         indicator_only = [
             column
-            for column in missing_indicator_columns.values()
+            for column in feature_columns
             if threshold is not None
-            and fractions_missing[column] >= threshold
+            and fractions_missing[column] >= max(threshold, indicator_cfg.min_missing_fraction)
             and column not in protected_from_dropping
         ]
+        blocks = resolve_blocks(
+            indicator_cfg.blocks,
+            df,
+            feature_columns,
+            train_only,
+            indicator_cfg.min_missing_fraction,
+            indicator_cfg.block_min_jaccard,
+            indicator_only,
+        )
+        df, missing_block_columns, covered = add_block_indicators(df, blocks)
+        if missing_block_columns:
+            logger.info(
+                "One missing flag per block of columns missing together: %s",
+                {k: len(v) for k, v in missing_block_columns.items()},
+            )
+        df, missing_indicator_columns = add_missing_indicators(
+            df, feature_columns, train_only, indicator_cfg.min_missing_fraction, covered
+        )
+        new_flags = list(missing_indicator_columns) + list(missing_block_columns)
+        feature_columns = feature_columns + new_flags
+        nominal_columns = nominal_columns + new_flags
+        variable_schema = {
+            **variable_schema,
+            **{c: {"kind": "categorical", "ordinal_order": None} for c in new_flags},
+        }
         if indicator_only:
             # Generators model only whether these were recorded; values are
             # filled in afterwards for "recorded" synthetic rows (see
@@ -1269,6 +1364,7 @@ def load_dataset(cfg: Config) -> Dataset:
         patient_ids=patient_ids,
         tuning_index=tuning_index,
         missing_indicator_columns=missing_indicator_columns,
+        missing_block_columns=missing_block_columns,
         indicator_only_values=indicator_only_values,
     )
 

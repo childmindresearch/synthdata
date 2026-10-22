@@ -158,7 +158,11 @@ def create_artificial_mask(
 
 def resolve_score_columns(dataset: Dataset, configured_columns: list | None) -> list:
     """Validate the score panel while retaining all features as imputer context."""
-    excluded = set(dataset.role_columns) | set(dataset.missing_indicator_columns)
+    excluded = (
+        set(dataset.role_columns)
+        | set(dataset.missing_indicator_columns)
+        | set(dataset.missing_block_columns)
+    )
     allowed = [column for column in dataset.feature_columns if column not in excluded]
     if configured_columns is None:
         return allowed

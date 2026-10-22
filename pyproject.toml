@@ -40,6 +40,7 @@ dependencies = [
 
 [project.scripts]
 synthdata-impute = "scripts.run_imputation:main"
+synthdata-missing-blocks = "scripts.detect_missing_blocks:main"
  synthdata-imputation-benchmark = "scripts.run_imputation_benchmark:main"
 synthdata-generate = "scripts.run_generation:main"
 synthdata-evaluate = "scripts.run_evaluation:main"

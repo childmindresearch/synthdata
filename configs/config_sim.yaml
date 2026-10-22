@@ -71,6 +71,9 @@ imputation:
     # 80%+ missing: generate only the indicator, fill 'recorded' rows by CART on release.
     # null = impute and generate every column as usual.
     indicator_only_fraction: 0.8
+    # One flag per block of columns missing together: {name: [cols]}, "auto", or {} (off).
+    # See missing_blocks.csv (synthdata-missing-blocks) before choosing.
+    blocks: {}
 
 generation:
   output_dir: output/sim/synthetic_data

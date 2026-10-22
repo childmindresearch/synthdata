@@ -352,6 +352,21 @@ Whether a value is missing often carries information (a test that was not ordere
 - Columns missing in at least `min_missing_fraction` (default 5%) of search-train rows get an extra binary column `<column>__missing`. Generators learn these like any other column.
 - After generation, synthetic values whose indicator is 1 are blanked again. The result is written to `released/<model>.csv`, the copy you would share. The CSV next to it, without `released/`, is the imputed version that evaluation scores.
 - Columns missing in at least `indicator_only_fraction` (default 80%) of rows keep only their indicator. Their values are neither imputed nor generated; in the released copy, synthetic rows marked as recorded get values sampled from a CART model fitted on the observed train values (the synthpop method). Set it to `null` to impute and generate every column. List columns you always want generated in `keep_values_columns`.
+- Columns that go missing together (a form that was not given, items skipped by design) can share one flag. `blocks` names them, either as `{name: [column, ...]}` or as `"auto"` (columns whose missing rows overlap by at least `block_min_jaccard`, default 0.9, named `block_1`, `block_2`, ...). The flag `<name>__missing` is 1 where every column of the block is missing, and the released copy blanks the whole block there. A block column still gets its own flag for its other gaps if those reach `min_missing_fraction`. Indicator-only columns cannot be in a block. The default `{}` keeps one flag per column.
+
+#### Finding blocks: `missing_blocks.csv`
+
+`synthdata-impute` also writes `missing_blocks.csv` next to `data_readiness.csv` (advisory; nothing changes automatically). To get it without imputing, run `uv run synthdata-missing-blocks --config configs/config_sim.yaml`, which prints the table and a `blocks:` snippet to paste into the config. It uses the search-train rows. One row per block and per other column missing in at least `min_missing_fraction` of rows:
+
+| Column | Meaning |
+| --- | --- |
+| `columns`, `n_columns` | The columns of the pattern |
+| `missing_share` | Rows missing any of them |
+| `whole_share` | Of those, rows missing all of them |
+| `rule_auc`, `rule` | How well a depth-2 decision tree on the other columns (target excluded) predicts the missingness (cross-validated ROC AUC), and the tree's splits |
+| `label` | `skip_logic_candidate` (`rule_auc` at least 0.95: a rule such as "no substance use" may decide it), `form_not_given_candidate` (a block missing as a whole in at least 80% of its missing rows, no clear rule), or `item_missing` (ordinary missing answers) |
+
+The labels are guesses to check against the codebook: the data cannot show why a value is missing. Blocks labelled skip logic or form not given are candidates for treating as "not assessed" rather than imputing.
 
 ### Caching
 

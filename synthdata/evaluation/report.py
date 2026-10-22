@@ -941,6 +941,7 @@ _FILE_DESCRIPTIONS = {
     "imputation_drift.csv": "Per-column drift between the HPO-phase and final imputation.",
     "imputation_validation_report.csv": "Per-column check that imputed values are plausible.",
     "data_readiness.csv": "Columns likely to be hard to model, with a suggested change (advisory).",
+    "missing_blocks.csv": "Columns missing together and each missingness pattern's candidate label (advisory).",
     "hpo_best_params.json": "Best hyperparameters found per model.",
     "generation_failures.json": "Models whose generation failed in this run, with the error.",
     "optuna_studies.db": "Optuna studies (open with optuna-dashboard).",
@@ -992,7 +993,12 @@ def _file_index_section(paths: _Paths, links: _Links, report_path: Path) -> str:
     if paths.manifest is not None:
         add(paths.manifest)
         add(paths.manifest.parent / "config_snapshot.json")
-    for name in ("data_readiness.csv", "imputation_validation_report.csv", "imputation_drift.csv"):
+    for name in (
+        "data_readiness.csv",
+        "missing_blocks.csv",
+        "imputation_validation_report.csv",
+        "imputation_drift.csv",
+    ):
         add(paths.imputation / name)
     if paths.data is not None:
         for name in ("split_report.csv", "full.csv", "train.csv", "test.csv"):

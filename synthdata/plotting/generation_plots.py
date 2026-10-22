@@ -162,13 +162,19 @@ def released_views(
     labels restored, and the columns to compare (features without their
     indicators, plus the target).
     """
-    indicators = dataset.missing_indicator_columns
-    if indicators and cfg.imputation.missing_indicators.remask_synthetic:
-        synth_df = remask_synthetic(synth_df, indicators)
-    columns = [c for c in dataset.feature_columns if c not in indicators]
+    indicators, blocks = dataset.missing_indicator_columns, dataset.missing_block_columns
+    if (indicators or blocks) and cfg.imputation.missing_indicators.remask_synthetic:
+        synth_df = remask_synthetic(synth_df, indicators, blocks)
+    flags = set(indicators) | set(blocks)
+    columns = [c for c in dataset.feature_columns if c not in flags]
     columns.append(dataset.target_column)
     real_df = dataset.decode_ordinal_frame(dataset.train_df)
     return real_df, dataset.decode_ordinal_frame(synth_df), columns
+
+
+def flags_exist(dataset: Dataset) -> bool:
+    """Whether the dataset has any missing flags (column or block)."""
+    return bool(dataset.missing_indicator_columns or dataset.missing_block_columns)
 
 
 def save_model_comparison(
@@ -202,7 +208,7 @@ def save_model_comparison(
         ("", real_df, released_df, columns, missing),
         ("_top_columns", real_df, released_df, top, missing),
     ]
-    if dataset.missing_indicator_columns and dataset.train_imputed_df is not None:
+    if flags_exist(dataset) and dataset.train_imputed_df is not None:
         figures.append(
             (
                 "_filled",

@@ -320,6 +320,19 @@ class MissingIndicatorConfig:
     #: Columns to keep imputing and generating whatever their missingness.
     #: The target, stratification and role columns are always kept.
     keep_values_columns: list = dataclasses.field(default_factory=list)
+    #: Columns that go missing together (a form not given, skip logic) and
+    #: share one ``<block>__missing`` flag, 1 where every column of the block
+    #: is missing; the released copy blanks the whole block there. Columns
+    #: still get their own flag for gaps outside whole-block rows when those
+    #: reach ``min_missing_fraction``. ``{name: [columns]}``, ``"auto"`` (found
+    #: by ``synthdata.missing_blocks.find_blocks`` on the indicator-fit rows,
+    #: named ``block_1``, ...; see ``missing_blocks.csv``) or ``{}`` (off).
+    #: Indicator-only columns cannot be in a block.
+    blocks: dict | str = dataclasses.field(default_factory=dict)
+    #: Auto blocks group columns whose missing rows overlap by at least this
+    #: Jaccard similarity (on average over pairs). Also used by the
+    #: ``missing_blocks.csv`` report.
+    block_min_jaccard: float = 0.9
 
 
 @dataclasses.dataclass
@@ -1477,6 +1490,21 @@ def _validate(cfg: Config) -> None:
             f"imputation.method must be one of {IMPUTATION_METHODS}, got {cfg.imputation.method!r}"
         )
     indicators = cfg.imputation.missing_indicators
+    if not 0 < indicators.block_min_jaccard <= 1:
+        raise ValueError("imputation.missing_indicators.block_min_jaccard must be in (0, 1]")
+    if isinstance(indicators.blocks, str):
+        if indicators.blocks != "auto":
+            raise ValueError(
+                "imputation.missing_indicators.blocks must be 'auto' or a mapping of block "
+                f"names to column lists, got {indicators.blocks!r}"
+            )
+    elif not isinstance(indicators.blocks, dict) or not all(
+        isinstance(cols, list) and len(cols) >= 2 for cols in indicators.blocks.values()
+    ):
+        raise ValueError(
+            "imputation.missing_indicators.blocks must map each block name to a list of "
+            "at least two columns"
+        )
     if not 0 < indicators.min_missing_fraction <= 1:
         raise ValueError("imputation.missing_indicators.min_missing_fraction must be in (0, 1]")
     if indicators.indicator_only_fraction is not None and not (
