@@ -335,7 +335,7 @@ def run_generation(
                 _build_one(replicate_name(name, replicate), seed + replicate, build_fn, top_up)
 
     remask = cfg.imputation.missing_indicators.remask_synthetic and bool(
-        dataset.missing_indicator_columns
+        dataset.missing_indicator_columns or dataset.missing_block_columns
     )
 
     cart = {}
@@ -375,7 +375,9 @@ def run_generation(
         released = output_dir / "released" / f"{name}.csv"
         if remask and (overwrite or not released.exists()):
             ensure_dir(released.parent)
-            out = remask_synthetic(df, dataset.missing_indicator_columns)
+            out = remask_synthetic(
+                df, dataset.missing_indicator_columns, dataset.missing_block_columns
+            )
             if not dataset.indicator_only_values.empty:
                 filled, report = _cart_fill(df, replicate_seed)
                 out = pd.concat([out, filled], axis=1)

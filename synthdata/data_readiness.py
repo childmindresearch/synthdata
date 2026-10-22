@@ -164,6 +164,7 @@ def assess(dataset: Dataset, cfg: DataReadinessConfig) -> pd.DataFrame:
     """
     train = dataset.train_df
     indicators = set(getattr(dataset, "missing_indicator_columns", {}) or {})
+    indicators |= set(getattr(dataset, "missing_block_columns", {}) or {})
     features = [c for c in dataset.feature_columns if c in train.columns and c not in indicators]
     categorical = set(dataset.categorical_columns)
     nominal = set(dataset.nominal_columns)
