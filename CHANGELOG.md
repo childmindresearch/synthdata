@@ -4,6 +4,15 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.18.0 (2026-10-27)
+
+Default generator list and a TabularARGN default change. Runs that keep the default `generation.synthcity.names` or TabularARGN params produce different models, so use a new experiment id; the golden runs do not use ddpm or TabularARGN and stay valid.
+
+### Changed
+
+- **ddpm is off by default.** It is no longer in the default `generation.synthcity.names` or in the shipped `config_sim.yaml`, `config_loris.yaml` and `config_hepatitis.yaml`. In the untuned simulated-data comparison it still learned the columns independently (its correlation and mutual-information errors matched the independent-marginals baseline, and its TSTR was below it). Add `ddpm` to `generation.synthcity.names` to run it. CDTD (`generation.cdtd`) is the diffusion model to use instead.
+- **TabularARGN value protection is off by default** (`generation.tabularargn.params: {value_protection: false}`). With it on, mostlyai-engine 2.7.3 can still write its `_RARE_` token even with `rare_category_replacement_method: sample`, and the run then stops with "tabularargn made categories ... not in train". The reason and the repro are in `docs/verification.md`.
+
 ## 0.16.2 (2026-10-22)
 
 No result or config changes; old results stay comparable and no golden re-record is needed.

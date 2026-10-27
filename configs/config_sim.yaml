@@ -86,7 +86,7 @@ generation:
   synthcity:
     enabled: true
     # Bayesian network does not scale reliably to this dataset width.
-    names: [ctgan, tvae, adsgan, pategan, rtvae, ddpm, arf]
+    names: [ctgan, tvae, adsgan, pategan, rtvae, arf]
 
   tabpfn:
     enabled: true
