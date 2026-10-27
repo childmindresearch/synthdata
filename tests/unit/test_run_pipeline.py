@@ -151,6 +151,29 @@ def test_a_second_run_on_the_same_output_root_stops_at_once(tmp_path, monkeypatc
     assert run_pipeline.run_stages(_args("--stages", "impute"), log, echo=False) == 0
 
 
+def test_a_broken_generator_environment_stops_before_any_stage(tmp_path, monkeypatch):
+    from synthdata.generation import env_preflight
+
+    config = tmp_path / "cfg.yaml"
+    config.write_text("data: {source: uci, uci_id: 46}\ngeneration:\n  cdtd: {enabled: true}\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        run_pipeline, "run_stages", lambda *a, **k: pytest.fail("no stage should start")
+    )
+
+    def broken(cfg):
+        raise env_preflight.EnvPreflightError("cdtd: uv sync failed")
+
+    monkeypatch.setattr(run_pipeline, "run_preflight", broken)
+    with pytest.raises(SystemExit, match="cdtd: uv sync failed"):
+        run_pipeline.main(["--config", str(config)])
+    # Without the generate stage the environments are not checked.
+    monkeypatch.setattr(run_pipeline, "run_stages", lambda *a, **k: 0)
+    with pytest.raises(SystemExit) as exit_info:
+        run_pipeline.main(["--config", str(config), "--stages", "evaluate"])
+    assert exit_info.value.code == 0
+
+
 def test_a_config_with_no_generator_stops_before_any_stage(tmp_path, monkeypatch):
     config = tmp_path / "cfg.yaml"
     config.write_text(

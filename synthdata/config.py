@@ -959,6 +959,14 @@ class ComputeConfig:
     #: most remaining work first; 0/None keeps each model on one GPU,
     #: assigned round-robin, with no memory check.
     fits_per_gpu: str | int | None = "auto"
+    #: Before any stage, when the generate stage is selected, ``synthdata-run``
+    #: checks each enabled generator that has its own environment (TabularARGN,
+    #: CDTD): its submodule checkout, ``uv sync --frozen --project <env>`` (a
+    #: no-op when the environment matches its lock file) and whether its torch
+    #: imports and sees CUDA. A failure stops the run at once. False skips the
+    #: sync (for an offline machine whose environments are already set up); the
+    #: other checks still run.
+    sync_envs: bool = True
 
 
 #: Values of ``evaluation.class_averaging``.

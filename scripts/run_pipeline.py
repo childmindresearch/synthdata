@@ -23,6 +23,11 @@ connection does not stop it; the command prints the log path and the
 process id and returns at once. Rerunning with the same ``--experiment-id``
 resumes: finished models, HPO trials and evaluation checkpoints are reused.
 
+When the generate stage is selected, every enabled generator with its own
+environment (TabularARGN, CDTD) is checked first (``compute.sync_envs``, see
+``synthdata.generation.env_preflight``): its submodule, ``uv sync --frozen``
+and a torch import, so a broken environment stops the run in seconds.
+
 Only one run at a time may use an output root: a second ``synthdata-run``
 on the same ``<output root>`` stops at once, since both would write the same
 experiment, HPO studies and GPU slot table.
@@ -47,6 +52,7 @@ from filelock import BaseFileLock, FileLock, Timeout
 
 from synthdata.config import NO_GENERATOR_MESSAGE, load_config
 from synthdata.dashboard import DashboardWriter, dashboard_path
+from synthdata.generation.env_preflight import EnvPreflightError, run_preflight
 from synthdata.resources import ResourceMonitor
 
 #: Stage name -> module run with ``python -m``, in pipeline order.
@@ -328,6 +334,12 @@ def main(argv: list[str] | None = None) -> None:
     if "generate" in args.stages and not cfg.generation.enabled_generators():
         # Stop before imputation runs, not after it with an empty experiment.
         sys.exit("synthdata-run: " + NO_GENERATOR_MESSAGE.format(path=args.config))
+    if "generate" in args.stages:
+        # A missing generator environment would otherwise fail hours in.
+        try:
+            run_preflight(cfg)
+        except EnvPreflightError as exc:
+            sys.exit(f"synthdata-run: {exc}")
     logs = log_dir(cfg)
     logs.mkdir(parents=True, exist_ok=True)
     try:  # fail fast, before detaching, if another run holds this output root

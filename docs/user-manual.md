@@ -227,6 +227,7 @@ compute:
   memory_reserve_gib: 16   # RAM kept free for everything else
   memory_per_worker_gib: 14  # RAM one model needs; leave out to estimate from the column count
   fits_per_gpu: auto       # each fit on the least busy GPU, no limit; a number caps fits per GPU
+  sync_envs: true          # synthdata-run installs TabularARGN's and CDTD's environments first
 ```
 
 With `workers: auto`, the count is the CPU cores divided by `cores_per_worker`, then lowered to fit free memory, `max_workers` and the number of models. A 24-core machine with 125 GB runs 6 models at once. Each model sets its own seeds, so the results are the same as running one model at a time with the same `cores_per_worker`; the integration tests check this byte for byte. Changing `cores_per_worker` can change results in the last digits on the CPU, because the order of floating-point sums depends on the thread count, so keep it fixed across runs you compare.
@@ -392,7 +393,7 @@ Synthcity models are chosen with `generation.synthcity.names`. TabPFN runs when 
 TabularARGN ([MOSTLY AI 2025](https://arxiv.org/abs/2501.12012)) comes from MOSTLY AI's `mostlyai-engine` package. That package pins its own PyTorch version and an old `psutil`, which clash with this project's, so it is installed into a separate environment and the pipeline runs it as a subprocess:
 
 ```bash
-uv sync --project envs/tabularargn     # once; downloads its own PyTorch
+uv sync --project envs/tabularargn     # optional: synthdata-run does this for you (below)
 ```
 
 Then set `generation.tabularargn.enabled: true`. It learns from the imputed data, like the synthcity models, and is fitted once per replicate (output `tabularargn.csv`). It has no hyperparameter search: the library stops training early on its own validation split. `generation.tabularargn.params` passes arguments to `TabularARGN()` (for example `model: MOSTLY_AI/Large`, `max_epochs`, or `max_training_time` in minutes), and `sample_params` passes arguments to its `sample()`. For a categorical target, the class quotas are given to the model as fixed target values, so each class gets exactly its share. Its value protection (on by default) hides categories too rare to release; the default `rare_category_replacement_method: sample` replaces them with a common category instead of a `_RARE_` token. `env_dir` points to the environment if you keep it elsewhere.
@@ -400,8 +401,16 @@ Then set `generation.tabularargn.enabled: true`. It learns from the imputed data
 CDTD ([Mueller, Gruber & Fok, ICLR 2025](https://arxiv.org/abs/2312.10431)) is a diffusion model built for tables with many categorical columns. Its code is the authors' `cdtd_simple`, pinned as the submodule `submodules/cdtd_simple` (fetched by `git submodule update --init`). It needs Python 3.13 and a newer PyTorch than this project, so it too has its own environment:
 
 ```bash
-uv sync --project envs/cdtd            # once; downloads Python 3.13 and its own PyTorch
+uv sync --project envs/cdtd            # optional: downloads Python 3.13 and its own PyTorch
 ```
+
+You do not have to run these yourself. Whenever the generate stage is selected, `synthdata-run` checks every enabled generator that has its own environment before any stage starts, and stops at once with the reason if one fails:
+
+1. The source it needs is checked out (CDTD's `submodules/cdtd_simple`; if it is empty, the message gives the `git submodule update --init` command).
+2. `uv sync --frozen --project <env>` installs the environment exactly as its lock file says. The first time this downloads its Python and PyTorch (several GB); after that it changes nothing, and the whole check takes about 10 seconds per environment, most of it the PyTorch import.
+3. The environment's own Python imports PyTorch, and `synthdata-run` prints whether it sees CUDA (before the log file starts, and before `--detach` moves the run to the background), for example `synthdata-run: cdtd: envs/cdtd ready, torch 2.14.1+cu130, CUDA available (1 GPU)`. A CPU-only PyTorch is reported but does not stop the run.
+
+Set `compute.sync_envs: false` to skip step 2, for example on a machine without internet whose environments are already installed; steps 1 and 3 still run. `synthdata-generate` on its own does not run these checks.
 
 Then set `generation.cdtd.enabled: true` (output `cdtd.csv`). It learns from the imputed data and has no hyperparameter search. `fit_params` sets the training length (`num_steps_train`, default 30000 steps of 4096 rows, the authors' default), `params` the network, and `sample_params` the sampling steps (`num_steps`, default 200). CDTD cannot be told which class to generate, so for class quotas one fit draws `pool_factor` (default 3) times the rows needed and fills each class from that pool; a class the model makes too rarely stays short and is listed in `diagnostics/class_sampling.csv`.
 
@@ -710,6 +719,7 @@ All training runs locally: the pipeline downloads the TabPFN weights and, for `d
 | `data.sensitive_columns now lists the secret columns ...` | Set `data.protected_columns` (even to `[]`) to confirm the column-role meaning. |
 | `... cannot be both a quasi-identifier ... and sensitive` | Put the column in only one of those lists. |
 | `data split fractions ... must each be a multiple of 1/k` | Use shares like 0.6/0.2/0.2 or 0.5/0.2/0.3. |
+| `synthdata-run: cdtd: ...` or `tabularargn: ...` before any stage starts | The generator's own environment failed its check ([Generators](#generators)). An empty `submodules/cdtd_simple`: run the `git submodule update --init` command in the message. `uv sync --frozen ... failed`: no internet (set `compute.sync_envs: false` if the environment is already installed) or a package index that cannot be reached. `cannot import torch`: the environment is broken; delete `envs/<name>/.venv` and run again. |
 | `generation.hpo.enabled needs a tuning split` | Set `data.tuning_fraction` above 0, or turn HPO off. |
 | Stratified split error about NaN in the target | Set `data.drop_rows_missing_target: true`. |
 | `No imputed data found. Run synthdata-impute ... first.` | Run stage 2 first, with the same config and `data.version`. |

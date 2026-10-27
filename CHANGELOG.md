@@ -4,6 +4,15 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.21.0 (2026-10-27)
+
+No result changes; old results stay comparable and no golden re-record is needed.
+
+### Added
+
+- **`synthdata-run` sets up and checks the separate generator environments first.** When the generate stage is selected and TabularARGN or CDTD is enabled, it checks the needed submodule checkout (`submodules/cdtd_simple`), runs `uv sync --frozen --project envs/<name>` (a no-op once installed) and imports PyTorch in that environment, printing whether it sees CUDA. Any failure stops the run before imputation, with the command to fix it, instead of failing when generation reaches that model hours later. You no longer need to run `uv sync --project envs/<name>` by hand.
+- New config key `compute.sync_envs` (default `true`); `false` skips the `uv sync` for offline machines whose environments are already installed.
+
 ## 0.16.2 (2026-10-22)
 
 No result or config changes; old results stay comparable and no golden re-record is needed.
