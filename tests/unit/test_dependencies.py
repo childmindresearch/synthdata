@@ -138,6 +138,26 @@ def test_desbordante_finds_the_hierarchy_in_its_own_environment():
     table = score_cfds(train, train, cfds, fds)
     assert "use=no" in set(table["lhs"])
     assert table.set_index("lhs").loc["use=no", "action"] == SKIP_LOGIC
+    # One-column left sides search chunk pairs; "sub" and "major" sit in different chunks.
+    chunked, _, _ = run_desbordante(
+        train,
+        ["sub", "ward", "use", "freq", "major"],
+        [],
+        "envs/desbordante",
+        1,
+        0.01,
+        0,
+        chunk_size=2,
+    )
+    assert (["sub"], "major") in chunked
+
+
+def test_wide_left_sides_are_refused_on_many_columns():
+    from synthdata.dependencies import MAX_WIDE_LHS_COLUMNS, run_desbordante
+
+    columns = [f"c{i}" for i in range(MAX_WIDE_LHS_COLUMNS + 1)]
+    with pytest.raises(ValueError, match="max_lhs 2"):
+        run_desbordante(pd.DataFrame(columns=columns), columns, [], "envs/desbordante", 2, 0.01, 0)
 
 
 def test_conditional_rules_find_skip_logic_and_drop_restated_fds():

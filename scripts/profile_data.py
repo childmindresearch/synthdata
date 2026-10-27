@@ -36,7 +36,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     parser.add_argument("--config", required=True, help="Path to the YAML config file.")
     parser.add_argument("--env-dir", default="envs/desbordante", help="Desbordante environment.")
-    parser.add_argument("--max-lhs", type=int, default=2, help="Most columns on the left side.")
+    parser.add_argument(
+        "--max-lhs",
+        type=int,
+        default=1,
+        help="Most columns on the left side (above 1 only for at most 50 candidate columns).",
+    )
     parser.add_argument(
         "--max-error", type=float, default=0.01, help="Largest share of rows breaking a rule."
     )

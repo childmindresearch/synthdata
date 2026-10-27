@@ -4,10 +4,11 @@ Three kinds of finding, each with a suggested action for a person to review:
 
 * **Functional dependencies** X -> Y between categorical (or few-valued
   numeric) columns, with X of up to ``max_lhs`` columns: knowing X fixes Y,
-  possibly up to a small error. Found by Desbordante's Pyro (Kruse & Naumann,
-  *PVLDB* 2018) in its own environment (``envs/desbordante``; Desbordante is
-  AGPL-3.0, so synthdata never imports it). Pyro's error measure counts
-  violating row pairs, which lets near-unique X "determine" anything, so each
+  possibly up to a small error. Found by Desbordante's Tane (Huhtala et al.,
+  *Computer Journal* 1999) in its own environment (``envs/desbordante``;
+  Desbordante is AGPL-3.0, so synthdata never imports it). Tane's error
+  measure counts violating row pairs, which lets near-unique X "determine"
+  anything, so each
   candidate is re-scored here with the g3 error (share of rows to remove for
   X -> Y to hold exactly; Kivinen & Mannila 1995) on the indicator-fit rows and
   on the holdout, and kept only with enough rows per X value and when it also
@@ -312,6 +313,10 @@ def ucc_rows(train: pd.DataFrame, uccs: list, max_columns: int = 3) -> pd.DataFr
     return pd.DataFrame(rows, columns=COLUMNS)
 
 
+#: Most FD candidate columns for a search with more than one left-side column.
+MAX_WIDE_LHS_COLUMNS = 50
+
+
 def run_desbordante(
     train: pd.DataFrame,
     fd_columns: list,
@@ -321,12 +326,22 @@ def run_desbordante(
     error: float,
     seed: int,
     cfd_minsup: int = 0,
+    chunk_size: int = 60,
 ) -> tuple[list, list, list]:
     """FDs ``[(lhs, rhs)]``, conditional FDs ``[(lhs pairs, rhs pair)]`` and UCCs from Desbordante.
 
     Runs in its own environment. Conditional FDs are searched on
-    ``fd_columns`` when ``cfd_minsup`` (rows) is above 0.
+    ``fd_columns`` when ``cfd_minsup`` (rows) is above 0. With ``max_lhs``
+    1 the FD search runs on pairs of ``chunk_size``-column chunks, which keeps
+    memory near 1 GB at 600 columns; wider left sides search all columns at
+    once and are refused above :data:`MAX_WIDE_LHS_COLUMNS` columns.
     """
+    if max_lhs > 1 and len(fd_columns) > MAX_WIDE_LHS_COLUMNS:
+        raise ValueError(
+            f"max_lhs {max_lhs} on {len(fd_columns)} candidate columns: the search grows "
+            f"too fast above {MAX_WIDE_LHS_COLUMNS} columns (about 9 GB at 80). "
+            "Use max_lhs 1, or run on a subset of columns."
+        )
     from synthdata.generation.sidecar import run_in_env
 
     columns = list(dict.fromkeys([*fd_columns, *ucc_columns]))
@@ -336,9 +351,10 @@ def run_desbordante(
         "cfd_columns": list(map(str, fd_columns)) if cfd_minsup > 0 else [],
         "cfd_minsup": int(cfd_minsup),
         "cfd_minconf": 1 - error,
-        # Pyro's pair-based error is looser than g3; candidates are re-scored here.
+        # Tane's pair-based error is looser than g3; candidates are re-scored here.
         "error": error,
         "max_lhs": max_lhs,
+        "chunk_size": chunk_size,
         "seed": seed,
     }
     data = _as_text(train[columns])
@@ -367,7 +383,7 @@ def dependencies_table(
     categorical: list,
     ucc_columns: list,
     env_dir: str | Path = "envs/desbordante",
-    max_lhs: int = 2,
+    max_lhs: int = 1,
     max_error: float = 0.01,
     min_rows_per_value: float = 5,
     min_r2: float = 0.95,
