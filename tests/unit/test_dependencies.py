@@ -7,13 +7,21 @@ import pandas as pd
 import pytest
 
 from synthdata.dependencies import (
+    BLANK,
     DERIVE,
     MERGE_HIERARCHY,
     PRIVACY_REVIEW,
     REVIEW,
+    SKIP_LOGIC,
     fd_candidate_columns,
     g3_error,
+    load_rules,
+    make_rule,
     numeric_redundancy,
+    rule_check_rows,
+    rule_error,
+    rule_violations,
+    score_cfds,
     score_fds,
     ucc_rows,
 )
@@ -39,6 +47,15 @@ def _programs(n=1200, seed=0, broken=0):
     frame["total"] = frame["a"] + frame["b"]
     frame.loc[: broken - 1, "major"] = "C" if broken else frame["major"]
     return frame
+
+
+def _skip(frame, seed=2):
+    """Add a gate question and an item that is blank whenever the answer is "no"."""
+    rng = np.random.default_rng(seed)
+    out = frame.copy()
+    out["use"] = rng.choice(["no", "yes"], len(out))
+    out["freq"] = np.where(out["use"] == "no", np.nan, rng.integers(1, 4, len(out)).astype(float))
+    return out
 
 
 def test_g3_counts_rows_to_remove_and_treats_blanks_as_values():
@@ -105,8 +122,74 @@ def test_desbordante_finds_the_hierarchy_in_its_own_environment():
     from synthdata.dependencies import run_desbordante
 
     train = _programs()
-    fds, uccs = run_desbordante(
-        train, ["major", "sub", "ward"], ["visit_id", "ward"], "envs/desbordante", 2, 0.01, 0
+    train = _skip(train)
+    fds, cfds, uccs = run_desbordante(
+        train,
+        ["major", "sub", "ward", "use", "freq"],
+        ["visit_id", "ward"],
+        "envs/desbordante",
+        2,
+        0.01,
+        0,
+        cfd_minsup=50,
     )
     assert (["sub"], "major") in fds
     assert ["visit_id"] in uccs
+    table = score_cfds(train, train, cfds, fds)
+    assert "use=no" in set(table["lhs"])
+    assert table.set_index("lhs").loc["use=no", "action"] == SKIP_LOGIC
+
+
+def test_conditional_rules_find_skip_logic_and_drop_restated_fds():
+    train, holdout = _skip(_programs()), _skip(_programs(400, seed=1), seed=3)
+    candidates = [
+        ([("use", "no")], ("freq", BLANK)),  # skip logic
+        ([("sub", "C1")], ("major", "C")),  # restates sub -> major
+        ([("use", "yes")], ("ward", "w1")),  # not a rule
+        ([("sub", None)], ("major", None)),  # plain FD, reported elsewhere
+    ]
+    table = score_cfds(train, holdout, candidates, fds=[(["sub"], "major")])
+    assert table["lhs"].tolist() == ["use=no"]
+    assert table.loc[0, "rhs"] == f"freq={BLANK}"
+    assert table.loc[0, "action"] == SKIP_LOGIC
+    assert table.loc[0, "support"] == (train["use"] == "no").sum()
+
+
+def test_rule_error_matches_two_and_two_point_zero_and_skips_absent_columns():
+    frame = pd.DataFrame({"x": [1, 1, 2], "y": [2.0, 2.0, 3.0]})
+    rule = make_rule([["x", "1"]], ["y", "2"])
+    assert rule_error(frame, rule) == (2, 0.0)
+    assert np.isnan(rule_error(frame.drop(columns="y"), rule)[1])
+
+
+def test_rules_file_and_evaluation_check(tmp_path):
+    from synthdata.missing_blocks import block_rules
+
+    real = _skip(_programs(400, seed=1))
+    rules = pd.DataFrame(
+        {
+            "kind": ["fd", "cfd", "block", "numeric"],
+            "lhs": ["sub", "use=no", "a", "a"],
+            "rhs": ["major", "freq", "", "total"],
+            "check_rule": [
+                make_rule([["sub", None]], ["major", None]),
+                make_rule([["use", "no"]], ["freq", BLANK]),
+                block_rules(["a", "b"]),
+                "",
+            ],
+            "accept": [True, True, False, True],
+        }
+    )
+    path = tmp_path / "rules.csv"
+    rules.to_csv(path, index=False)
+    loaded = load_rules(path)
+    assert loaded["kind"].tolist() == ["fd", "cfd"]
+
+    good = real.copy()
+    bad = real.copy()
+    bad["major"] = bad["major"].sample(frac=1, random_state=0).to_numpy()  # breaks sub -> major
+    violations = rule_violations(loaded, {"holdout": real, "good": good, "bad": bad})
+    assert violations["holdout"].max() == 0 and violations["good"].max() == 0
+    assert violations.loc[0, "bad"] > 0.5
+    rows = {r["model"]: r for r in rule_check_rows(violations, "holdout", ["good", "bad"])}
+    assert rows["good"]["status"] == "pass" and rows["bad"]["status"] == "warn"

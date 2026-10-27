@@ -371,15 +371,20 @@ The labels are guesses to check against the codebook: the data cannot show why a
 
 #### Redundant columns and hierarchies: `dependencies.csv`
 
-`uv run synthdata-dependencies --config configs/config_sim.yaml` writes `dependencies.csv` to the same folder (advisory; nothing changes). It uses [Desbordante](https://github.com/Desbordante/desbordante-core), which is AGPL-licensed, so it runs in its own environment that synthdata never imports. Set it up once with `uv sync --project envs/desbordante`. Desbordante has wheels for Linux and macOS only; on Windows, run it in WSL or on a Linux machine. Each row is one finding:
+`uv run synthdata-profile --config configs/config_sim.yaml` writes both `missing_blocks.csv` and `dependencies.csv` to the same folder (advisory; nothing changes); `synthdata-dependencies` writes only the second. It uses [Desbordante](https://github.com/Desbordante/desbordante-core), which is AGPL-licensed, so it runs in its own environment that synthdata never imports. Set it up once with `uv sync --project envs/desbordante`. Desbordante has wheels for Linux and macOS only; on Windows, run it in WSL or on a Linux machine. Each row is one finding:
 
 | `kind` | Meaning | `action` |
 | --- | --- | --- |
 | `fd` | Knowing the `lhs` columns (up to `--max-lhs`, default 2) fixes `rhs`, in all but `train_error` of the search-train rows (`--max-error`, default 1%), and it also holds on the holdout (`holdout_error`). Only rules with at least `--min-rows-per-value` (default 5) rows per `lhs` value are kept, so ID-like columns do not "determine" everything. Blanks count as a value | `merge_hierarchy` (exact, one categorical column with more values fixes another, like sub_program and program: candidates to model as one column), `derive` (exact: could be dropped and recomputed after generation), `review` (holds up to a few rows: maybe data errors) |
+| `cfd` | A conditional rule: in rows matching the fixed `lhs` values (`column=value`; `*` means any value), `rhs` holds, for at least `--cfd-min-support` (default 5%) of rows and in all but `train_error` of them, also on the holdout. Rules that restate a kept `fd` row are dropped | `skip_logic` (the rule sets a blank, e.g. `uses_substances=no` → `freq=<NA>`), else `review` |
 | `ucc` | The `lhs` role columns (quasi-identifiers, sensitive, protected) single out every row | `privacy_review` |
 | `numeric` | A linear model on the other continuous columns predicts `rhs` with cross-validated `r2` of at least `--min-r2` (default 0.95); `lhs` names the main predictors | `derive` (R² at least 0.99, e.g. a total of its items), else `review` |
 
-Use it to decide what to drop or merge in your data preparation. A column is only safe to drop if the rule is exact and you recompute it after generation.
+Use it to decide what to drop or merge in your data preparation.
+
+#### Checking synthetic data against accepted rules
+
+Rows of `dependencies.csv` (`fd`, `cfd`) and of `missing_blocks.csv` (blocks: "the first column is blank, so the others are too") carry a `check_rule`. Copy the file, delete the rows you don't accept (or add an `accept` column set to `false` for them), and point `evaluation.dependency_rules` at the copy. Evaluation then scores each synthetic dataset, as released (blanked by its missing flags), against those rules: `dependency_violations.csv` gives each rule's share of breaking rows per model and for the real holdout, and `checks.csv` gets a `dependency_rules` row per model that warns when its mean is more than 1 percentage point above the holdout's. This needs no Desbordante, so it runs anywhere. A column is only safe to drop if the rule is exact and you recompute it after generation.
 
 ### Caching
 

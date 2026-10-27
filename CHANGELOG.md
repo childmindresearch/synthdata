@@ -17,7 +17,9 @@ Imputed values change, so results are not comparable with earlier runs: use a ne
 
 - `missing_blocks.csv` (written by `synthdata-impute`, or on its own by the new `synthdata-missing-blocks --config ...`): columns that go missing together, and a candidate label for each missingness pattern (`skip_logic_candidate`, `form_not_given_candidate`, `item_missing`) with the decision-tree rule behind it, to review against the codebook.
 - `imputation.missing_indicators.blocks` (`{name: [columns]}` or `"auto"`, default `{}`) and `block_min_jaccard` (default 0.9): one `<name>__missing` flag per block, 1 where the whole block is missing; the released copy blanks the whole block there. Column flags then count only the gaps outside whole-block rows.
-- `dependencies.csv` from the new `synthdata-dependencies --config ...`: functional dependencies (with up to two determining columns), hierarchies, identifying sets of role columns and near-redundant numeric columns, each with a suggested action, to help slim the dataset. It runs Desbordante in its own environment (`uv sync --project envs/desbordante`; Linux or macOS, AGPL-licensed, so synthdata never imports it).
+- `dependencies.csv` from the new `synthdata-dependencies --config ...`: functional and conditional dependencies (with up to two determining columns; conditional ones catch skip logic), hierarchies, identifying sets of role columns and near-redundant numeric columns, each with a suggested action, to help slim the dataset. It runs Desbordante in its own environment (`uv sync --project envs/desbordante`; Linux or macOS, AGPL-licensed, so synthdata never imports it).
+- `synthdata-profile --config ...` writes `missing_blocks.csv` and, when `envs/desbordante` is set up, `dependencies.csv` in one go.
+- `evaluation.dependency_rules` (default `null`): a file of accepted rules (rows of `dependencies.csv` or `missing_blocks.csv` with a `check_rule`). Evaluation writes `dependency_violations.csv` and adds a `dependency_rules` row per model to `checks.csv`, warning when a model breaks the rules more often than the real holdout (plus 1 percentage point).
 
 ### Fixed
 

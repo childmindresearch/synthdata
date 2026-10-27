@@ -42,6 +42,7 @@ dependencies = [
 synthdata-impute = "scripts.run_imputation:main"
 synthdata-missing-blocks = "scripts.detect_missing_blocks:main"
 synthdata-dependencies = "scripts.find_dependencies:main"
+synthdata-profile = "scripts.profile_data:main"
  synthdata-imputation-benchmark = "scripts.run_imputation_benchmark:main"
 synthdata-generate = "scripts.run_generation:main"
 synthdata-evaluate = "scripts.run_evaluation:main"

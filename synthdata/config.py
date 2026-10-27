@@ -1034,6 +1034,14 @@ class EvaluationConfig:
     )
     custom: FrameworkSelectionConfig = dataclasses.field(default_factory=FrameworkSelectionConfig)
 
+    #: Accepted dependency rules to check synthetic data against: a copy of
+    #: ``dependencies.csv`` or ``missing_blocks.csv`` (``synthdata-profile``)
+    #: keeping only the rules you accept (or with an ``accept`` column). Each
+    #: model's share of rows breaking them, against the real holdout's, is a
+    #: ``dependency_rules`` row of ``checks.csv``; per rule in
+    #: ``dependency_violations.csv``. Needs ``run_checks``. ``null`` = off.
+    dependency_rules: str | None = None
+
     #: "linear" (min-max scale + sum) or "summation" (SynthEval's built-in strategy).
     ranking_strategy: str = "linear"
     #: Log-disparity fairness metric settings (see LogDisparityConfig).

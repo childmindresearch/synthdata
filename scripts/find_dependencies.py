@@ -37,6 +37,12 @@ def main() -> None:
     parser.add_argument(
         "--min-r2", type=float, default=0.95, help="Smallest R² for numeric redundancy."
     )
+    parser.add_argument(
+        "--cfd-min-support",
+        type=float,
+        default=0.05,
+        help="Smallest share of rows a conditional rule must cover (0 = no conditional search).",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -49,6 +55,7 @@ def main() -> None:
         max_error=args.max_error,
         min_rows_per_value=args.min_rows_per_value,
         min_r2=args.min_r2,
+        cfd_min_support=args.cfd_min_support,
     )
     with pd.option_context("display.max_rows", None, "display.width", 200):
         print(table.to_string(index=False))

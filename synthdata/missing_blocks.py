@@ -18,6 +18,7 @@ the data alone cannot prove why a value is missing.
   gives each block one ``<block>__missing`` flag instead of one per column.
 """
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -102,6 +103,19 @@ def missingness_rule(
     return auc, " | ".join(line.strip() for line in rule.strip().splitlines())
 
 
+def block_rules(columns: list) -> str:
+    """JSON list of rules "first column blank -> each other column blank".
+
+    In the format of ``synthdata.dependencies.make_rule``, so
+    ``evaluation.dependency_rules`` can check that synthetic data blanks the
+    block together.
+    """
+    from synthdata.dependencies import BLANK
+
+    first, *rest = columns
+    return json.dumps([{"lhs": [[first, BLANK]], "rhs": [c, BLANK]} for c in rest])
+
+
 def describe_patterns(
     frame: pd.DataFrame,
     columns: list,
@@ -133,6 +147,9 @@ def describe_patterns(
     * ``form_not_given_candidate``: a block missing as a whole in at least
       ``whole_block_share`` of its missing rows, with no clear rule.
     * ``item_missing``: neither; looks like ordinary missing answers.
+
+    Block rows also carry ``check_rule`` (see :func:`block_rules`), for
+    ``evaluation.dependency_rules``.
     """
     shares = frame[columns].isna().mean()
     candidates = [c for c in columns if shares[c] >= min_missing_fraction]
@@ -169,6 +186,7 @@ def describe_patterns(
                 "rule": rule,
                 "indicator_only": kind == "column" and members[0] in no_blocks,
                 "label": label,
+                "check_rule": block_rules(members) if kind == "block" else "",
             }
         )
     return pd.DataFrame(
@@ -184,6 +202,7 @@ def describe_patterns(
             "rule",
             "indicator_only",
             "label",
+            "check_rule",
         ],
     )
 

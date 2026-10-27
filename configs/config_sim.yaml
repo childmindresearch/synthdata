@@ -184,6 +184,9 @@ generation:
 evaluation:
   output_dir: output/sim/evaluation
   positive_class: 0 # Used only if the target is naturally binary.
+  # Accepted rules from synthdata-profile (dependencies.csv / missing_blocks.csv
+  # rows you keep) to check synthetic data against; null = off.
+  dependency_rules: null
   # Fixed reference rows scored next to the generators: real train rows
   # (utility ceiling, privacy floor) and independent column marginals.
   baselines: [train_copy, marginals]

@@ -3,9 +3,10 @@
 Run by synthdata/dependencies.py in this environment; imports nothing from
 synthdata. Reads ``--train`` (parquet, every column as text, blanks as the
 string "<NA>" so they compare equal) and ``--spec`` (JSON: ``error``,
-``max_lhs``, ``seed``, ``fd_columns``, ``ucc_columns``), and writes ``--out``
-(parquet, one row per finding: ``kind`` "afd" or "ucc", ``lhs`` and ``rhs``
-as JSON lists of column names).
+``max_lhs``, ``seed``, ``fd_columns``, ``cfd_columns``, ``cfd_minsup``,
+``cfd_minconf``, ``ucc_columns``), and writes ``--out`` (parquet, one row per
+finding: ``kind`` "afd", "cfd" or "ucc", ``lhs`` and ``rhs`` as JSON: column
+names, or for "cfd" ``[column, value]`` pairs where a null value is "any").
 """
 
 import argparse
@@ -42,6 +43,30 @@ def main() -> None:
                 }
             )
         print(f"Pyro: {len(rows)} approximate FDs on {len(fd_columns)} columns in {time.time() - start:.1f}s")
+
+    cfd_columns = spec.get("cfd_columns") or []
+    if len(cfd_columns) >= 2:
+        start = time.time()
+        algorithm = desbordante.cfd.algorithms.FDFirst()
+        algorithm.load_data(table=data[cfd_columns])
+        algorithm.execute(
+            cfd_minconf=spec["cfd_minconf"],
+            cfd_minsup=spec["cfd_minsup"],
+            cfd_max_lhs=spec["max_lhs"],
+        )
+        found = algorithm.get_cfds()
+        for cfd in found:
+            rows.append(
+                {
+                    "kind": "cfd",
+                    "lhs": json.dumps([[cfd_columns[i.attribute], i.value] for i in cfd.lhs]),
+                    "rhs": json.dumps([cfd_columns[cfd.rhs.attribute], cfd.rhs.value]),
+                }
+            )
+        print(
+            f"FDFirst: {len(found)} conditional FDs on {len(cfd_columns)} columns "
+            f"in {time.time() - start:.1f}s"
+        )
 
     ucc_columns = spec["ucc_columns"]
     if ucc_columns:

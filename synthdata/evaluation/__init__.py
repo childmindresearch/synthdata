@@ -215,6 +215,17 @@ def run_evaluation(
             screens=cfg.generation.hpo.constraints,
             seed=cfg.seed,
         )
+        if eval_cfg.dependency_rules:
+            from synthdata.dependencies import evaluate_rules
+
+            try:
+                extra = evaluate_rules(cfg, dataset, selected_datasets, output_dir)
+                checks_table = pd.concat(
+                    [checks_table, pd.DataFrame(extra, columns=checks_table.columns)],
+                    ignore_index=True,
+                )
+            except Exception as exc:  # noqa: BLE001 -- a check must never stop the evaluation
+                logger.warning("[checks] dependency rules could not be scored: %s", exc)
         checks_table.to_csv(output_dir / "checks.csv", index=False)
 
     artifact_manifest = artifacts.persist_evaluation_artifacts(
