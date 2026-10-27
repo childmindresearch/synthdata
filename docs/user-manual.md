@@ -369,6 +369,18 @@ Whether a value is missing often carries information (a test that was not ordere
 
 The labels are guesses to check against the codebook: the data cannot show why a value is missing. Blocks labelled skip logic or form not given are candidates for treating as "not assessed" rather than imputing.
 
+#### Redundant columns and hierarchies: `dependencies.csv`
+
+`uv run synthdata-dependencies --config configs/config_sim.yaml` writes `dependencies.csv` to the same folder (advisory; nothing changes). It uses [Desbordante](https://github.com/Desbordante/desbordante-core), which is AGPL-licensed, so it runs in its own environment that synthdata never imports. Set it up once with `uv sync --project envs/desbordante`. Desbordante has wheels for Linux and macOS only; on Windows, run it in WSL or on a Linux machine. Each row is one finding:
+
+| `kind` | Meaning | `action` |
+| --- | --- | --- |
+| `fd` | Knowing the `lhs` columns (up to `--max-lhs`, default 2) fixes `rhs`, in all but `train_error` of the search-train rows (`--max-error`, default 1%), and it also holds on the holdout (`holdout_error`). Only rules with at least `--min-rows-per-value` (default 5) rows per `lhs` value are kept, so ID-like columns do not "determine" everything. Blanks count as a value | `merge_hierarchy` (exact, one categorical column with more values fixes another, like sub_program and program: candidates to model as one column), `derive` (exact: could be dropped and recomputed after generation), `review` (holds up to a few rows: maybe data errors) |
+| `ucc` | The `lhs` role columns (quasi-identifiers, sensitive, protected) single out every row | `privacy_review` |
+| `numeric` | A linear model on the other continuous columns predicts `rhs` with cross-validated `r2` of at least `--min-r2` (default 0.95); `lhs` names the main predictors | `derive` (R² at least 0.99, e.g. a total of its items), else `review` |
+
+Use it to decide what to drop or merge in your data preparation. A column is only safe to drop if the rule is exact and you recompute it after generation.
+
 ### Caching
 
 Each imputation run is cached in its own folder:
