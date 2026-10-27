@@ -146,7 +146,7 @@ def fd_rows(
     more values (sub_program -> program) and ``derive`` for the rest; else
     ``review``.
     """
-    categorical = {str(c) for c in categorical}
+    categorical_set = {str(c) for c in categorical}
     rows = []
     value = pairs["value_error"] <= max_error
     listed = pairs[value | (pairs["train_error"] <= max_error)].copy()
@@ -164,7 +164,7 @@ def fd_rows(
         elif (
             exact
             and len(lhs) == 1
-            and {lhs[0], row.rhs} <= categorical
+            and {lhs[0], row.rhs} <= categorical_set
             and (row.lhs_values > row.rhs_values)
         ):
             action = MERGE_HIERARCHY
@@ -571,9 +571,11 @@ def compare_skip_logic(blocks: pd.DataFrame, dependencies: pd.DataFrame) -> pd.D
     cfds["column"] = cfds["rhs"].str.rsplit("=", n=1).str[0]
     cfds["text"] = cfds["lhs"] + " -> " + cfds["rhs"]
     label_of = {}
-    for row in blocks.itertuples():
-        for column in row.columns.split("; "):
-            label_of[column] = (row.pattern, row.label)
+    for pattern, members, label in zip(
+        blocks["pattern"], blocks["columns"], blocks["label"], strict=True
+    ):
+        for column in members.split("; "):
+            label_of[column] = (pattern, label)
     rows, matched = [], set()
     for row in blocks[blocks["label"] == BLOCKS_SKIP_LOGIC].itertuples():
         members = set(row.columns.split("; "))
