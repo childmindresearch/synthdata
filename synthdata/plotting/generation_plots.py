@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from synthdata.config import Config
-from synthdata.data import Dataset
+from synthdata.data import Dataset, remask_synthetic
 from synthdata.generation.hpo import default_storage_url
 from synthdata.plotting import (
     add_histogram_with_kde,
@@ -48,8 +48,14 @@ def plot_real_vs_synthetic(
     categorical_columns: list,
     ncols: int = 4,
     category_orders: dict | None = None,
+    missing_shares: dict | None = None,
 ):
-    """Per-column comparison with categorical bars and continuous KDEs."""
+    """Per-column comparison with categorical bars and continuous KDEs.
+
+    Blank cells are left out of both sides. ``missing_shares`` maps a column
+    to its (real, synthetic) share of blank cells, shown in the title when
+    either is above 0.
+    """
     import matplotlib.pyplot as plt
 
     n = len(feature_columns)
@@ -91,7 +97,11 @@ def plot_real_vs_synthetic(
                 ax, synth_df[col], bins=20, label="synthetic", alpha=0.4, color="C1"
             )
             ax.set_ylabel("density")
-        ax.set_title(wrapped_title(col), fontsize=9)
+        title = wrapped_title(col)
+        real_missing, synth_missing = (missing_shares or {}).get(col, (0.0, 0.0))
+        if real_missing or synth_missing:
+            title += f"\nmissing: real {real_missing:.0%}, synthetic {synth_missing:.0%}"
+        ax.set_title(title, fontsize=9)
         ax.legend(fontsize=7)
 
     for ax in axes_flat[len(feature_columns) :]:
@@ -141,6 +151,32 @@ def column_differences(
     return pd.Series(out, name="difference", dtype=float)
 
 
+def released_views(
+    cfg: Config, dataset: Dataset, synth_df: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame, list]:
+    """The real train split as recorded and the synthetic data as released.
+
+    Real cells that were missing stay blank, and synthetic cells are blanked
+    where the synthetic missing indicator is 1 (the ``released/`` copy), so
+    imputed values appear on neither side. Returns both frames with ordinal
+    labels restored, and the columns to compare (features without their
+    indicators, plus the target).
+    """
+    indicators, blocks = dataset.missing_indicator_columns, dataset.missing_block_columns
+    if (indicators or blocks) and cfg.imputation.missing_indicators.remask_synthetic:
+        synth_df = remask_synthetic(synth_df, indicators, blocks)
+    flags = set(indicators) | set(blocks)
+    columns = [c for c in dataset.feature_columns if c not in flags]
+    columns.append(dataset.target_column)
+    real_df = dataset.decode_ordinal_frame(dataset.train_df)
+    return real_df, dataset.decode_ordinal_frame(synth_df), columns
+
+
+def flags_exist(dataset: Dataset) -> bool:
+    """Whether the dataset has any missing flags (column or block)."""
+    return bool(dataset.missing_indicator_columns or dataset.missing_block_columns)
+
+
 def save_model_comparison(
     cfg: Config, dataset: Dataset, name: str, synth_df: pd.DataFrame, output_dir: str | Path
 ) -> None:
@@ -148,26 +184,48 @@ def save_model_comparison(
 
     Writes ``<name>.png`` (every column), ``<name>_top_columns.png`` (the
     TOP_COLUMNS columns that differ most) and the model's column of
-    ``column_differences.csv``, all under ``output_dir/generation``. The real
-    reference is the imputed train split (fully observed, so every column is
-    comparable), falling back to the raw train split.
+    ``column_differences.csv``, all under ``output_dir/generation``. These
+    compare the observed real train values with the released synthetic values
+    (see :func:`released_views`), and titles show each side's share of blank
+    cells. When there are missing indicators, ``<name>_filled.png`` also
+    compares the imputed train split with the filled synthetic data, which is
+    what the evaluation metrics score.
     """
     import matplotlib.pyplot as plt
 
     output_dir = Path(output_dir) / "generation"
-    real_model_df = (
-        dataset.train_imputed_df if dataset.train_imputed_df is not None else dataset.train_df
-    )
-    real_df = dataset.decode_ordinal_frame(real_model_df)
-    synth_df = dataset.decode_ordinal_frame(synth_df)
-    columns = dataset.feature_columns + [dataset.target_column]
+    real_df, released_df, columns = released_views(cfg, dataset, synth_df)
     categorical = dataset.all_categorical_columns
-    differences = column_differences(real_df, synth_df, columns, categorical)
+    differences = column_differences(real_df, released_df, columns, categorical)
     _record_differences(output_dir / "column_differences.csv", name, differences)
+    missing = {
+        c: (float(real_df[c].isna().mean()), float(released_df[c].isna().mean()))
+        for c in columns
+        if c in released_df.columns
+    }
     top = differences.sort_values(ascending=False, kind="stable").index[:TOP_COLUMNS].tolist()
-    for suffix, cols in (("", columns), ("_top_columns", top)):
+    figures = [
+        ("", real_df, released_df, columns, missing),
+        ("_top_columns", real_df, released_df, top, missing),
+    ]
+    if flags_exist(dataset) and dataset.train_imputed_df is not None:
+        figures.append(
+            (
+                "_filled",
+                dataset.decode_ordinal_frame(dataset.train_imputed_df),
+                dataset.decode_ordinal_frame(synth_df),
+                dataset.feature_columns + [dataset.target_column],
+                None,
+            )
+        )
+    for suffix, real, synth, cols, shares in figures:
         fig = plot_real_vs_synthetic(
-            real_df, synth_df, cols, categorical, category_orders=dataset.ordinal_category_orders
+            real,
+            synth,
+            cols,
+            categorical,
+            category_orders=dataset.ordinal_category_orders,
+            missing_shares=shares,
         )
         try:
             save_matplotlib_figure(
@@ -199,8 +257,6 @@ def save_generation_plots(
     """Save each model's real-vs-synthetic figures (see :func:`save_model_comparison`)."""
     import matplotlib.pyplot as plt
 
-    if dataset.train_imputed_df is None:
-        raise RuntimeError("save_generation_plots() requires imputed training data")
     for name, synth_df in synthetic_datasets.items():
         try:
             save_model_comparison(cfg, dataset, name, synth_df, output_dir)

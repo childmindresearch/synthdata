@@ -134,7 +134,7 @@ The settings you will most often change, by section:
 | `data.patient_id_column` | Groups rows by patient so no patient is in two splits | `research_subject_id` |
 | `data.quasi_identifier_columns`, `sensitive_columns`, `protected_columns`, `protected_bins` | Column roles for privacy and fairness, and the groups of a numeric protected column | see [section 5](#5-stage-1-load-and-split-the-data) |
 | `data.stratify_columns`, `stratify_bins` | What the split keeps balanced | `[target, gender, age]` |
-| `imputation.method` | How missing values are filled | `missforest`, `simple` |
+| `imputation.method` | How missing values are filled | `miceforest`, `missforest`, `simple` |
 | `generation.n_samples` | Synthetic rows per model | `null` (the real train size) |
 | `generation.n_replicates` | Times each model is retrained with a new seed | `1`, or `3` for confidence intervals |
 | `generation.synthcity.names` | Which synthcity generators run | `[ctgan, tvae, arf]` |
@@ -320,12 +320,17 @@ Most generators cannot handle missing values, so `synthdata-impute` fills them. 
 
 | `imputation.method` | What it is | When to use |
 | --- | --- | --- |
-| `missforest` (default) | Iterative random-forest imputation (scikit-learn `IterativeImputer`), as in Stekhoven and Bühlmann | Most datasets |
+| `miceforest` (default) | MICE with LightGBM forests and predictive mean matching (the `miceforest` library): each gap gets a real observed value from a row whose prediction is close | Most datasets |
+| `missforest` | Iterative random-forest imputation (scikit-learn `IterativeImputer`), as in Stekhoven and Bühlmann | Comparison with older runs |
 | `simple` | Median for continuous columns, most frequent value for categorical ones | Quick tests, CI |
 | `tabimpute` | TabPFN-based imputation | Experimental |
 | `refidiff` | Predictive plus diffusion hybrid; needs `uv sync --extra refidiff` | Experimental |
 
-`imputation.missforest` sets the number of trees and rounds; the defaults are smaller than the paper's so a 20,000 by 400 table imputes in minutes.
+Why `miceforest` is the default: MissForest fills each gap with the forests' average prediction. Averages shrink toward the middle, so continuous columns get a narrow spike, ordinal columns lose their extremes, and a categorical column whose other columns say little about it gets its most common class in every gap. Generators then learn those artifacts. `miceforest` predicts in the same way but copies the value from one of the `mean_match_candidates` observed rows with the closest prediction, so filled values are real values and keep the observed spread and category shares. Each filled cell is less likely to be exactly right, which is the price of a realistic distribution. No imputer can recover values that are missing for a reason the other columns don't show.
+
+`imputation.miceforest` sets the number of rounds (`iterations`, default 5), the donors per gap (`mean_match_candidates`, default 5) and LightGBM threads (`num_threads`, 0 = all cores). `imputation.missforest` sets the number of trees and rounds; the defaults are smaller than the paper's so a 20,000 by 400 table imputes in minutes.
+
+The `imputation/observed_vs_imputed` figure compares each column's observed values with its filled ones. Expect filled values to differ when the missing rows really differ from the rest (for example, a diagnosis missing for patients who were never assessed).
 
 ### No leakage from held-out rows
 
@@ -347,6 +352,45 @@ Whether a value is missing often carries information (a test that was not ordere
 - Columns missing in at least `min_missing_fraction` (default 5%) of search-train rows get an extra binary column `<column>__missing`. Generators learn these like any other column.
 - After generation, synthetic values whose indicator is 1 are blanked again. The result is written to `released/<model>.csv`, the copy you would share. The CSV next to it, without `released/`, is the imputed version that evaluation scores.
 - Columns missing in at least `indicator_only_fraction` (default 80%) of rows keep only their indicator. Their values are neither imputed nor generated; in the released copy, synthetic rows marked as recorded get values sampled from a CART model fitted on the observed train values (the synthpop method). Set it to `null` to impute and generate every column. List columns you always want generated in `keep_values_columns`.
+- Columns that go missing together (a form that was not given, items skipped by design) can share one flag. `blocks` names them, either as `{name: [column, ...]}` or as `"auto"` (columns whose missing rows overlap by at least `block_min_jaccard`, default 0.9, named `block_1`, `block_2`, ...). The flag `<name>__missing` is 1 where every column of the block is missing, and the released copy blanks the whole block there. A block column still gets its own flag for its other gaps if those reach `min_missing_fraction`. Indicator-only columns cannot be in a block. The default `{}` keeps one flag per column.
+
+#### Finding blocks: `missing_blocks.csv`
+
+`synthdata-impute` also writes `missing_blocks.csv` next to `data_readiness.csv` (advisory; nothing changes automatically). To get it without imputing, run `uv run synthdata-missing-blocks --config configs/config_sim.yaml`, which prints the table and a `blocks:` snippet to paste into the config. It uses the search-train rows. One row per block and per other column with any missing value (not only those that get a flag, since a rare gap can still be skip logic):
+
+| Column | Meaning |
+| --- | --- |
+| `columns`, `n_columns` | The columns of the pattern |
+| `missing_share` | Rows missing any of them |
+| `whole_share` | Of those, rows missing all of them |
+| `rule_auc`, `rule` | How well a depth-2 decision tree on the other columns predicts the missingness (cross-validated ROC AUC), and the tree's splits. The target and any column blank in more than 10% of the pattern's missing rows are left out, so another form missing in the same rows cannot pass for a rule |
+| `indicator_only` | The column is missing so often that only its flag is kept; such columns are never put in a block |
+| `label` | `skip_logic_candidate` (`rule_auc` at least 0.95: a rule such as "no substance use" may decide it), `form_not_given_candidate` (a block missing as a whole in at least 80% of its missing rows, no clear rule), or `item_missing` (ordinary missing answers) |
+
+The labels are guesses to check against the codebook: the data cannot show why a value is missing. Blocks labelled skip logic or form not given are candidates for treating as "not assessed" rather than imputing.
+
+#### Redundant columns and hierarchies: `dependencies.csv`
+
+`uv run synthdata-profile --config configs/config_sim.yaml` writes `missing_blocks.csv`, `dependencies.csv` and `skip_logic_comparison.csv` to the same folder (advisory; nothing changes). It needs the Desbordante environment below and stops with an error if it is missing; `--blocks-only` writes just `missing_blocks.csv`, which needs nothing extra. `synthdata-dependencies` writes only the dependencies files.
+
+Every column pair is scored exactly, and nothing is dropped to save time: `dependencies_pairs.parquet` has every ordered pair X -> Y of columns (continuous ones included) with its error on search-train and holdout, and `dependencies_rules.parquet` every significant one-condition rule. `dependencies.csv` is the readable shortlist: rules within `--max-error` (default 1%) on search-train, plus every UCC and every numeric column. Thresholds only pick the shortlist and the suggested action. On 681 columns and about 17,000 rows it takes roughly 15 to 30 minutes on one CPU core and little memory. With `--max-lhs 2` it also scores every pair of columns against every other column (`dependencies_pairs2.parquet`, rules within `--max-error` only, since all scores would be about 157 million rows at 681 columns); that takes hours. Rules with three or more determining columns are not searched: no exhaustive search is feasible at this width.
+
+[Desbordante](https://github.com/Desbordante/desbordante-core) finds the identifying sets (`ucc`). It is AGPL-licensed, so it runs in its own environment that synthdata never imports. Set it up once with `uv sync --project envs/desbordante`. Desbordante, and so this report, supports Linux (and macOS); on Windows, run it in WSL. Each row is one finding:
+
+| `kind` | Meaning | `action` |
+| --- | --- | --- |
+| `fd` | Knowing `lhs` (one column, or two with `--max-lhs 2`) fixes `rhs` in all but `train_error` of the search-train rows where `lhs` is answered (g3 error: the share of rows to remove for the rule to hold exactly; `lhs_answered` is the share of such rows). `holdout_error` is the same on the holdout. Counting only answered rows keeps two mostly blank columns from "fixing" each other through shared blanks; what a blank implies is in the one-condition rules and the blocks report. Each pair is also scored on rows where both columns are answered (`value_error`, `value_score`, `both_answered` in the pairs file), so a hierarchy still shows when the parent or child is often missing at random; `rows` says which view a listed row reports (`both answered` wins when both views hold), and its `check_rule` checks the same rows. `score` corrects for chance: an `lhs` with nearly one row per value fixes anything by accident. It compares the error with the error after shuffling `rhs`, scaled by the error of always guessing `rhs`'s most common value, so 1 is a real dependency and 0 is chance. Blanks count as a value | `id_like` (`score` below 0.5: holds by chance, `lhs` is close to an identifier), `merge_hierarchy` (exact on both splits, two categorical columns where `lhs` has more values, like sub_program and program: candidates to model as one column), `derive` (exact on both splits: could be dropped and recomputed after generation), `review` (holds up to a few rows, or only on search-train: maybe data errors) |
+| `cfd` | A one-condition rule `lhs` → `rhs` (`column=value`): in the `support` rows with that `lhs` value, `rhs` takes that value in all but `train_error` of them (also on the holdout: `holdout_error`). A rule counts only if chance cannot explain it: a binomial test against `rhs`'s overall share of that value, with `p_value` at most `--alpha` (default 0.05) divided by the number of rules tested. A value seen in only a few rows cannot pass, however clean it looks. For an answered `lhs` value the chance level is `rhs`'s share where `lhs` is answered. Rules of a column pair already listed as an `fd` row, and blank → blank rules (columns missing together, tens of thousands on wide data, grouped by the blocks report), are not repeated here; `dependencies_rules.parquet` has them all | `skip_logic` (the rule blanks `rhs` on an answered `lhs`, e.g. `uses_substances=no` → `freq=<NA>`), else `review` |
+| `ucc` | The `lhs` role columns (quasi-identifiers, sensitive, protected) single out every row | `privacy_review` |
+| `numeric` | Every continuous column, with the cross-validated `r2` of a linear model on the other continuous columns; `lhs` names the main predictors. Linear only: a nonlinear formula (BMI) can score lower than it should | `derive` (R² at least 0.99, e.g. a total of its items), `review` (at least `--min-r2`, default 0.95), else `none` |
+
+Skip logic is found two ways: the decision tree of `missing_blocks.csv` (`skip_logic_candidate`) and the one-condition rules of `dependencies.csv` (`skip_logic`). `skip_logic_comparison.csv` lines them up, one row per tree candidate and per rule the tree missed, with `found_by` set to `both`, `blocks only` or `cfd only`. The tree also finds gates that combine two columns or a range of a numeric column; the rules give an exact, checkable statement for single answers.
+
+Use it to decide what to drop or merge in your data preparation.
+
+#### Checking synthetic data against accepted rules
+
+Rows of `dependencies.csv` (`fd`, `cfd`) and of `missing_blocks.csv` (blocks: "the first column is blank, so the others are too") carry a `check_rule`. Copy the file, delete the rows you don't accept (or add an `accept` column set to `false` for them), and point `evaluation.dependency_rules` at the copy. Evaluation then scores each synthetic dataset, as released (blanked by its missing flags), against those rules: `dependency_violations.csv` gives each rule's share of breaking rows per model and for the real holdout, and `checks.csv` gets a `dependency_rules` row per model that warns when its mean is more than 1 percentage point above the holdout's. This needs no Desbordante, so it runs anywhere. A column is only safe to drop if the rule is exact and you recompute it after generation.
 
 ### Caching
 
@@ -620,7 +664,7 @@ Evaluation scores several synthetic datasets at once, each in its own process, u
 
 1. **At a glance.** Dataset, experiment, seed, the recommended model and its overall score, how it compares with the two baselines, the [output checks](#output-checks) count, and a "Read with care" list of warnings (for example, a single seed, a failed output check, a metric that failed for a model and is scored as its worst value, or an Anonymeter attack whose 95% interval is above 0).
 2. **Ranking.** One row per model with overall, utility, privacy and fairness scores (with intervals and "tied with best" when there are replicates), followed by how the scores were built and the trade-off plots.
-3. **Utility.** How far each model's columns are from the real ones (a table with each model's median and mean difference and its three worst columns; total variation distance for categorical columns, Kolmogorov-Smirnov statistic for continuous ones), a figure per model of its 12 columns that differ most, a link to its every-column figure and to `column_differences.csv` (every column and model), the holdout TSTR and TSTS table (the `baseline_train_copy` rows are the real-data ceiling), and a plot of every utility metric.
+3. **Utility.** How far each model's columns are from the real ones (a table with each model's median and mean difference and its three worst columns; total variation distance for categorical columns, Kolmogorov-Smirnov statistic for continuous ones), a figure per model of its 12 columns that differ most, a link to its every-column figure and to `column_differences.csv` (every column and model). These compare the real values that were recorded with the synthetic values as released (blanked where the synthetic missing indicator says missing), so imputed values are on neither side; each panel title gives both sides' share of blanks. `plots/generation/<model>_filled` shows the filled data the metrics score. Then come the holdout TSTR and TSTS table (the `baseline_train_copy` rows are the real-data ceiling), and a plot of every utility metric.
 4. **Privacy evidence.** The attack and distance results next to the baselines, with how to read each column, and a plot of every privacy metric.
 5. **Fairness.** Subgroup gap metrics, log disparity (with links to sunburst pages that show which subgroups are over- or under-represented), privacy by protected group (the gap and worst-group columns, each group's membership AUC and its patient counts), and a plot of every fairness metric.
 

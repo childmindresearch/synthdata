@@ -59,7 +59,7 @@ data:
 
 imputation:
   # Fitted on train minus tuning for HPO, then refitted on all of train.
-  method: missforest # missforest | simple (median/mode) | tabimpute | refidiff
+  method: miceforest # miceforest | missforest | simple (median/mode) | tabimpute | refidiff
   round_to_int_default: false # Keep continuous features continuous.
   missing_indicators:
     enabled: true
