@@ -539,3 +539,67 @@ def evaluate_rules(cfg, dataset, synthetic_datasets: dict, output_dir: str | Pat
     violations.to_csv(Path(output_dir) / "dependency_violations.csv", index=False)
     models = [name for name in sorted(synthetic_datasets) if not is_baseline(name)]
     return rule_check_rows(violations, "holdout", models)
+
+
+COMPARISON_FILENAME = "skip_logic_comparison.csv"
+
+
+def compare_skip_logic(blocks: pd.DataFrame, dependencies: pd.DataFrame) -> pd.DataFrame:
+    """Skip logic as found by the missing-blocks tree and by conditional FDs, side by side.
+
+    One row per missing-blocks pattern labelled ``skip_logic_candidate``, with
+    the conditional FDs (``skip_logic`` rows) that blank any of its columns,
+    then one row per such conditional FD that matches no candidate (it may
+    sit in a pattern with another label, shown in ``blocks_label``, or in no
+    pattern). ``found_by`` is "both", "blocks only" or "cfd only".
+    """
+    from synthdata.missing_blocks import SKIP_LOGIC as BLOCKS_SKIP_LOGIC
+
+    cfds = dependencies[dependencies["action"] == SKIP_LOGIC].copy()
+    cfds["column"] = cfds["rhs"].str.rsplit("=", n=1).str[0]
+    cfds["text"] = cfds["lhs"] + " -> " + cfds["rhs"]
+    label_of = {}
+    for row in blocks.itertuples():
+        for column in row.columns.split("; "):
+            label_of[column] = (row.pattern, row.label)
+    rows, matched = [], set()
+    for row in blocks[blocks["label"] == BLOCKS_SKIP_LOGIC].itertuples():
+        members = set(row.columns.split("; "))
+        hits = cfds[cfds["column"].isin(members)]
+        matched |= set(hits.index)
+        rows.append(
+            {
+                "columns": row.columns,
+                "blocks_pattern": row.pattern,
+                "blocks_label": row.label,
+                "tree_rule": row.rule,
+                "rule_auc": row.rule_auc,
+                "cfd_rules": " | ".join(hits["text"]),
+                "found_by": "both" if len(hits) else "blocks only",
+            }
+        )
+    for _, row in cfds.drop(index=list(matched)).iterrows():
+        pattern, label = label_of.get(row["column"], ("", ""))
+        rows.append(
+            {
+                "columns": row["column"],
+                "blocks_pattern": pattern,
+                "blocks_label": label,
+                "tree_rule": "",
+                "rule_auc": np.nan,
+                "cfd_rules": row["text"],
+                "found_by": "cfd only",
+            }
+        )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "columns",
+            "blocks_pattern",
+            "blocks_label",
+            "tree_rule",
+            "rule_auc",
+            "cfd_rules",
+            "found_by",
+        ],
+    )

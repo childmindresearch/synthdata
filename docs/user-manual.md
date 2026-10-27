@@ -371,7 +371,7 @@ The labels are guesses to check against the codebook: the data cannot show why a
 
 #### Redundant columns and hierarchies: `dependencies.csv`
 
-`uv run synthdata-profile --config configs/config_sim.yaml` writes both `missing_blocks.csv` and `dependencies.csv` to the same folder (advisory; nothing changes); `synthdata-dependencies` writes only the second. It uses [Desbordante](https://github.com/Desbordante/desbordante-core), which is AGPL-licensed, so it runs in its own environment that synthdata never imports. Set it up once with `uv sync --project envs/desbordante`. Desbordante has wheels for Linux and macOS only; on Windows, run it in WSL or on a Linux machine. Each row is one finding:
+`uv run synthdata-profile --config configs/config_sim.yaml` writes `missing_blocks.csv`, `dependencies.csv` and `skip_logic_comparison.csv` to the same folder (advisory; nothing changes). It needs the Desbordante environment below and stops with an error if it is missing; `--blocks-only` writes just `missing_blocks.csv`, which needs nothing extra. `synthdata-dependencies` writes only `dependencies.csv`. It uses [Desbordante](https://github.com/Desbordante/desbordante-core), which is AGPL-licensed, so it runs in its own environment that synthdata never imports. Set it up once with `uv sync --project envs/desbordante`. Desbordante, and so this report, supports Linux (and macOS); on Windows, run it in WSL. Each row is one finding:
 
 | `kind` | Meaning | `action` |
 | --- | --- | --- |
@@ -379,6 +379,8 @@ The labels are guesses to check against the codebook: the data cannot show why a
 | `cfd` | A conditional rule: in rows matching the fixed `lhs` values (`column=value`; `*` means any value), `rhs` holds, for at least `--cfd-min-support` (default 5%) of rows and in all but `train_error` of them, also on the holdout. Rules that restate a kept `fd` row are dropped | `skip_logic` (the rule sets a blank, e.g. `uses_substances=no` → `freq=<NA>`), else `review` |
 | `ucc` | The `lhs` role columns (quasi-identifiers, sensitive, protected) single out every row | `privacy_review` |
 | `numeric` | A linear model on the other continuous columns predicts `rhs` with cross-validated `r2` of at least `--min-r2` (default 0.95); `lhs` names the main predictors | `derive` (R² at least 0.99, e.g. a total of its items), else `review` |
+
+Skip logic is found two ways: the decision tree of `missing_blocks.csv` (`skip_logic_candidate`) and the conditional FDs of `dependencies.csv` (`skip_logic`). `skip_logic_comparison.csv` lines them up, one row per tree candidate and per conditional FD the tree missed, with `found_by` set to `both`, `blocks only` or `cfd only`. The tree also finds gates on numeric columns and patterns below the CFD support; conditional FDs give an exact, checkable rule and catch columns missing too rarely for the blocks report.
 
 Use it to decide what to drop or merge in your data preparation.
 

@@ -193,3 +193,30 @@ def test_rules_file_and_evaluation_check(tmp_path):
     assert violations.loc[0, "bad"] > 0.5
     rows = {r["model"]: r for r in rule_check_rows(violations, "holdout", ["good", "bad"])}
     assert rows["good"]["status"] == "pass" and rows["bad"]["status"] == "warn"
+
+
+def test_skip_logic_comparison_shows_which_method_found_what():
+    from synthdata.dependencies import compare_skip_logic
+
+    blocks = pd.DataFrame(
+        {
+            "pattern": ["block_1", "lab", "freq"],
+            "columns": ["form_x; form_y", "lab", "freq"],
+            "label": ["form_not_given_candidate", "item_missing", "skip_logic_candidate"],
+            "rule": ["", "", "|--- use <= 0.5"],
+            "rule_auc": [0.5, 0.5, 1.0],
+        }
+    )
+    dependencies = pd.DataFrame(
+        {
+            "lhs": ["use=no", "ward=w9", "sub"],
+            "rhs": [f"freq={BLANK}", f"form_y={BLANK}", "major"],
+            "action": [SKIP_LOGIC, SKIP_LOGIC, MERGE_HIERARCHY],
+        }
+    )
+    table = compare_skip_logic(blocks, dependencies).set_index("columns")
+    assert table.loc["freq", "found_by"] == "both"
+    assert table.loc["freq", "cfd_rules"] == f"use=no -> freq={BLANK}"
+    assert table.loc["form_y", "found_by"] == "cfd only"
+    assert table.loc["form_y", "blocks_label"] == "form_not_given_candidate"
+    assert len(table) == 2
