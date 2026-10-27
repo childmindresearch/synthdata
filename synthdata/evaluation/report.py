@@ -22,6 +22,7 @@ from synthdata.evaluation.combine import (
     simple_rank_summary,
     summarize_replicates,
 )
+from synthdata.evaluation.fairness_gaps import FAIRNESS_GAP_METRICS, FAIRNESS_SIGNAL_COLUMN
 from synthdata.evaluation.privacy_attacks import (
     ANONYMETER_METRICS,
     HOLDOUT_DISTANCE_METRICS,
@@ -165,6 +166,7 @@ def _load_extras(evaluation_dir: Path, combined: pd.DataFrame, extras: dict) -> 
         extras["ranking_summary"] = summarize_replicates(combined)
     readers = {
         "tstr_table": ("tstr_holdout.csv", {"index_col": 0}),
+        "fairness_gaps": ("fairness_gaps.csv", {"index_col": 0}),
         "ovr_per_class": ("ovr_per_class.csv", {"index_col": 0, "header": [0, 1]}),
         "privacy_attacks": ("privacy_attacks.csv", {}),
         "privacy_subgroups": ("privacy_subgroups.csv", {}),
@@ -767,17 +769,65 @@ def _subgroup_privacy_lines(combined, extras, paths: _Paths, links: _Links) -> l
     return lines
 
 
+def _fairness_gap_lines(extras, paths: _Paths, links: _Links) -> list:
+    """The ranked holdout fairness gaps (synthdata.evaluation.fairness_gaps)."""
+    lines = ["### Holdout fairness gaps (0 = the real data's gaps kept)", ""]
+    table = extras.get("fairness_gaps")
+    if table is None or table.empty:
+        return [*lines, "Holdout fairness gaps were not computed this run."]
+    columns = [
+        "holdout_balanced_accuracy",
+        "balanced_accuracy_ci_low",
+        FAIRNESS_SIGNAL_COLUMN,
+        *FAIRNESS_GAP_METRICS,
+    ]
+    shown = table[[c for c in columns if c in table.columns]].astype(float)
+    chance = table["chance_balanced_accuracy"].dropna()
+    lines += [
+        "The holdout TSTR classifier (the same fixed, class-balanced XGBoost) is fitted on each "
+        "synthetic dataset and on the real train split, and both predict the holdout. For each "
+        "class against the rest and each protected group against everyone else (the groups of "
+        "the gap metrics below), fairlearn gives each side's selection rate, true-positive rate "
+        "and false-positive rate. A gap is the group's rate minus the rest's. Each score is the "
+        "mean absolute difference between the synthetic-trained and the real-trained gap: "
+        "`demographic_parity_gap_error` (selection rate), `equal_opportunity_gap_error` "
+        "(true-positive rate) and `equalized_odds_gap_error` (the larger of the true- and "
+        "false-positive differences). 0 means the synthetic data keeps the real data's "
+        "disparities; erasing or inverting them scores high.",
+        "",
+        "A model whose synthetic-trained classifier has a holdout balanced accuracy whose "
+        "bootstrap 95% interval reaches chance"
+        + (f" ({chance.iloc[0]:.3f})" if len(chance) else "")
+        + " has no class signal for its gaps to mean anything: `fairness_signal` is 0, its "
+        "scores are blank and it is left out of the fairness ranking.",
+        "",
+        _dataframe_to_markdown(_collapse_replicates(shown).reset_index()),
+        "",
+        f"Tables: {links.maybe(paths.evaluation / 'fairness_gaps.csv')} (one row per model), "
+        f"{links.maybe(paths.evaluation / 'fairness_gaps_by_group.csv')} (every synthetic and "
+        "real gap per class and group).",
+    ]
+    return lines
+
+
 def _fairness_section(combined, extras, paths: _Paths, links: _Links) -> str:
     lines = [
         "## 5. Fairness",
         "",
-        "Three views: subgroup **gap metrics** (how differently a classifier trained on the "
-        "data treats protected subgroups), **log disparity** (Bhanot et al. 2021: how far "
-        "each protected subgroup x outcome is over- or under-represented) and **privacy by "
-        "protected group** (whether some groups' patients are easier to identify as training "
-        "members). Lower is better for every number below.",
+        "Four views: **holdout fairness gaps** (whether a model trained on the synthetic data "
+        "treats protected groups as one trained on the real data does; ranked), SynthEval's "
+        "subgroup **gap metrics** (reported only), **log disparity** (Bhanot et al. 2021: how "
+        "far each protected subgroup x outcome is over- or under-represented; ranked) and "
+        "**privacy by protected group** (whether some groups' patients are easier to identify "
+        "as training members). Lower is better for every number below.",
         "",
-        "### Subgroup gap metrics (0 = perfectly fair)",
+        *_fairness_gap_lines(extras, paths, links),
+        "",
+        "### Subgroup gap metrics (reported, not ranked)",
+        "",
+        "SynthEval fits these metrics' classifier and scores it inside the synthetic data, so a "
+        "dataset with no class signal predicts one class for every row and every gap is 0. "
+        "Read them next to the holdout fairness gaps above.",
         "",
     ]
     available = [
@@ -929,6 +979,8 @@ _FILE_DESCRIPTIONS = {
     "combined_evaluation.csv": "Every metric for every model: raw values and per-group scores.",
     "ranking_summary.csv": "One row per model: mean scores, confidence intervals, ties.",
     "tstr_holdout.csv": "Holdout TSTR scores per class, and TSTS (train and test on synthetic).",
+    "fairness_gaps.csv": "Holdout fairness gap errors per model, with the no-signal gate's balanced accuracy and interval.",
+    "fairness_gaps_by_group.csv": "Synthetic- and real-trained subgroup gaps per model, class and protected group.",
     "metric_directions.csv": "Whether higher, lower or closer to 0 is better for each metric, and its ideal value.",
     "ovr_per_class.csv": "Two-class SynthEval metrics per class (one vs rest).",
     "privacy_attacks.csv": "Every Anonymeter attack with interval and success rates.",

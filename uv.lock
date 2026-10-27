@@ -1037,6 +1037,22 @@ wheels = [
 ]
 
 [[package]]
+name = "fairlearn"
+version = "0.15.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "narwhals" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4e/f8/d1ef45777b36ff973bfc06bd33a30c568a6275466193f2a121919dd82106/fairlearn-0.15.0.tar.gz", hash = "sha256:dfdfbddc3b86d2a8e4e04e282bb29d7603f28559a28abeca97847bf5e0f79f80", size = 109889, upload-time = "2026-10-12T05:10:18.738Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/9d/e96346594f66e8933181b286cdf8b495bd71998ccbc7ae3ee5e33efa0cde/fairlearn-0.15.0-py3-none-any.whl", hash = "sha256:4f4656c25af384fc3369db719231680c4e83beb2e6e075e5dc3c2b27d06455c9", size = 141365, upload-time = "2026-10-12T05:10:17.692Z" },
+]
+
+[[package]]
 name = "fastai"
 version = "2.8.7"
 source = { registry = "https://pypi.org/simple" }
@@ -4605,11 +4621,12 @@ provides-extras = ["testing", "goggle", "all"]
 
 [[package]]
 name = "synthdata"
-version = "0.16.2"
+version = "0.20.0"
 source = { editable = "." }
 dependencies = [
     { name = "altair" },
     { name = "anonymeter" },
+    { name = "fairlearn" },
     { name = "filelock" },
     { name = "jupyter" },
     { name = "marimo" },
@@ -4665,6 +4682,7 @@ requires-dist = [
     { name = "anonymeter", specifier = ">=1.1.0" },
     { name = "catboost", marker = "extra == 'refidiff'" },
     { name = "causal-conv1d", marker = "extra == 'refidiff'", specifier = "==1.6.2.post1" },
+    { name = "fairlearn", specifier = ">=0.13" },
     { name = "filelock" },
     { name = "jupyter" },
     { name = "mamba-ssm", marker = "extra == 'refidiff'", specifier = "==2.3.1" },

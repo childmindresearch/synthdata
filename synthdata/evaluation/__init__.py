@@ -14,6 +14,7 @@ from synthdata.evaluation import (
     checks,
     combine,
     custom_eval,
+    fairness_gaps,
     report,
     synthcity_eval,
     syntheval_eval,
@@ -187,6 +188,21 @@ def run_evaluation(
     if privacy_subgroups_table is not None and not privacy_subgroups_table.empty:
         privacy_subgroups_table.to_csv(output_dir / "privacy_subgroups.csv", index=False)
 
+    fairness_gap_result = custom_eval.run_fairness_gap_evaluation(
+        selected_datasets,
+        dataset,
+        eval_cfg.custom,
+        cfg.seed,
+        compute_cfg=cfg.compute,
+        xgb_params=eval_cfg.xgboost_params,
+    )
+    fairness_gap_table = fairness_gaps.build_fairness_gap_table(fairness_gap_result)
+    if not fairness_gap_table.empty:
+        fairness_gap_table.to_csv(output_dir / "fairness_gaps.csv")
+        fairness_gaps.build_fairness_gap_detail(fairness_gap_result).to_csv(
+            output_dir / "fairness_gaps_by_group.csv", index=False
+        )
+
     combined = combine.build_combined_table(
         synthcity_results,
         benchmark_results,
@@ -196,6 +212,7 @@ def run_evaluation(
         rank_weights=eval_cfg.rank_weights,
         tstr_result=tstr_result,
         privacy_result=privacy_result,
+        fairness_gap_table=fairness_gap_table,
     )
 
     combined.to_csv(output_dir / "combined_evaluation.csv")
@@ -232,6 +249,7 @@ def run_evaluation(
         "log_disparity_reports": log_disparity_reports,
         "tstr_table": tstr_table,
         "privacy_result": privacy_result,
+        "fairness_gaps": fairness_gap_table,
         "ovr_per_class": ovr_per_class,
         "ranking_summary": ranking_summary,
         "checks": checks_table,
