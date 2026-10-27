@@ -152,7 +152,7 @@ def describe_patterns(
     ``evaluation.dependency_rules``.
     """
     shares = frame[columns].isna().mean()
-    candidates = [c for c in columns if shares[c] >= min_missing_fraction]
+    candidates = [c for c in columns if shares[c] > 0 and shares[c] >= min_missing_fraction]
     no_blocks = set(exclude_from_blocks or [])
     blocks = find_blocks(frame[[c for c in candidates if c not in no_blocks]].isna(), min_jaccard)
     in_block = {c for block in blocks for c in block}
@@ -232,7 +232,8 @@ def save_blocks_report(cfg, dataset, output_dir: str | Path | None = None) -> pd
     table = describe_patterns(
         frame,
         columns,
-        min_missing_fraction=indicators.min_missing_fraction,
+        # Every column with a gap: a rare pattern can still be skip logic.
+        min_missing_fraction=0.0,
         min_jaccard=indicators.block_min_jaccard,
         exclude_from_rules=[dataset.target_column],
         # These keep only their flag in the pipeline and cannot be in a block.

@@ -1,25 +1,24 @@
 """Redundant columns and hierarchies: an advisory report to help slim the dataset.
 
-Three kinds of finding, each with a suggested action for a person to review:
+Every finding is computed exactly and kept in full; thresholds only decide
+which rows the readable ``dependencies.csv`` lists and the suggested action.
 
-* **Functional dependencies** X -> Y between categorical (or few-valued
-  numeric) columns, with X of up to ``max_lhs`` columns: knowing X fixes Y,
-  possibly up to a small error. Found by Desbordante's Tane (Huhtala et al.,
-  *Computer Journal* 1999) in its own environment (``envs/desbordante``;
-  Desbordante is AGPL-3.0, so synthdata never imports it). Tane's error
-  measure counts violating row pairs, which lets near-unique X "determine"
-  anything, so each
-  candidate is re-scored here with the g3 error (share of rows to remove for
-  X -> Y to hold exactly; Kivinen & Mannila 1995) on the indicator-fit rows and
-  on the holdout, and kept only with enough rows per X value and when it also
-  holds on the holdout.
+* **Functional dependencies** X -> Y between any two columns (and, opt-in,
+  two-column X): knowing X fixes Y, up to the g3 error (share of rows to
+  remove for it to hold exactly; Kivinen & Mannila 1995), on the
+  indicator-fit rows and on the holdout, with a chance-corrected score so
+  that near-unique X does not pass as a rule. See
+  :mod:`synthdata.dependency_search`.
+* **One-condition rules** X = v -> Y = w, which include skip logic
+  (``use=no -> freq=<NA>``), kept when significant after a Bonferroni
+  correction.
 * **Unique column combinations** among the role columns (quasi-identifiers,
   sensitive, protected): column sets that single out every row. A privacy
-  finding, found by Desbordante's HyUCC.
-* **Numeric redundancy**: continuous columns that a linear model on the other
-  continuous columns predicts almost perfectly (cross-validated R²), such as a
-  score that is the sum of its items. Formulas like BMI are not linear but
-  still score high.
+  finding, found by Desbordante's HyUCC in its own environment
+  (``envs/desbordante``; Desbordante is AGPL-3.0, so synthdata never imports it).
+* **Numeric redundancy**: every continuous column's cross-validated R² from a
+  linear model on the other continuous columns, such as a score that is the
+  sum of its items.
 
 Blanks count as a value of their own, so skip patterns show up as
 dependencies too. Nothing is changed automatically.
@@ -44,6 +43,9 @@ DERIVE = "derive"
 REVIEW = "review"
 PRIVACY_REVIEW = "privacy_review"
 SKIP_LOGIC = "skip_logic"
+CO_MISSING = "co_missing"
+ID_LIKE = "id_like"
+NO_ACTION = "none"
 
 COLUMNS = [
     "kind",
@@ -52,26 +54,14 @@ COLUMNS = [
     "support",
     "train_error",
     "holdout_error",
-    "rows_per_lhs_value",
+    "score",
+    "p_value",
     "lhs_values",
     "rhs_values",
     "r2",
     "action",
     "check_rule",
 ]
-
-
-def fd_candidate_columns(frame: pd.DataFrame, categorical: list, max_values: int = 50) -> list:
-    """Categorical columns, plus numeric columns with at most ``max_values`` distinct values."""
-    categorical = set(categorical)
-    out = []
-    for column in frame.columns:
-        n = frame[column].nunique(dropna=False)
-        if n < 2:
-            continue
-        if column in categorical or n <= max_values:
-            out.append(column)
-    return out
 
 
 def _label(value) -> str:
@@ -132,37 +122,34 @@ def g3_error(frame: pd.DataFrame, lhs: list, rhs: str) -> float:
     return rule_error(frame, make_rule([[c, None] for c in lhs], [rhs, None]))[1]
 
 
-def score_fds(
-    train: pd.DataFrame,
-    holdout: pd.DataFrame,
-    candidates: list,
-    categorical: list,
-    max_error: float = 0.01,
-    min_rows_per_value: float = 5,
+def fd_rows(
+    pairs: pd.DataFrame, categorical: list, max_error: float = 0.01, min_score: float = 0.5
 ) -> pd.DataFrame:
-    """Re-score ``(lhs, rhs)`` candidates; keep those that hold on train and holdout.
+    """``fd`` report rows: every scored pair (see ``dependency_search``) within ``max_error``.
 
-    Kept: g3 error at most ``max_error`` on train and at most twice that on
-    the holdout, and on average at least ``min_rows_per_value`` train rows
-    per distinct ``lhs`` value. Action: ``merge_hierarchy`` for an exact
-    dependency between two categorical columns where the left one has more
-    values (sub_program -> program), ``derive`` for other exact ones, else
-    ``review``.
+    ``max_error`` only decides what is listed here (the all-pairs file has the
+    rest). Actions: ``id_like`` when the chance-corrected score is below
+    ``min_score`` (X has so many values that it fixes Y by accident);
+    otherwise, when exact on train and holdout, ``merge_hierarchy`` for two
+    categorical columns where X has more values (sub_program -> program) and
+    ``derive`` for the rest; else ``review``.
     """
-    categorical = set(categorical)
+    categorical = {str(c) for c in categorical}
     rows = []
-    for lhs, rhs in candidates:
-        lhs_values = int(_as_text(train[lhs]).drop_duplicates().shape[0])
-        per_value = len(train) / lhs_values
-        if per_value < min_rows_per_value:
-            continue
-        train_error = g3_error(train, lhs, rhs)
-        holdout_error = g3_error(holdout, lhs, rhs)
-        if train_error > max_error or not holdout_error <= 2 * max_error:
-            continue
-        rhs_values = int(train[rhs].nunique(dropna=False))
-        exact = train_error == 0 and holdout_error == 0
-        if exact and len(lhs) == 1 and {lhs[0], rhs} <= categorical and lhs_values > rhs_values:
+    listed = pairs[pairs["train_error"] <= max_error].sort_values(
+        ["score", "train_error"], ascending=[False, True]
+    )
+    for row in listed.itertuples():
+        lhs = row.lhs.split("; ")
+        exact = row.train_error == 0 and row.holdout_error == 0
+        if not row.score >= min_score:
+            action = ID_LIKE
+        elif (
+            exact
+            and len(lhs) == 1
+            and {lhs[0], row.rhs} <= categorical
+            and (row.lhs_values > row.rhs_values)
+        ):
             action = MERGE_HIERARCHY
         elif exact:
             action = DERIVE
@@ -171,72 +158,64 @@ def score_fds(
         rows.append(
             {
                 "kind": "fd",
-                "lhs": "; ".join(map(str, lhs)),
-                "rhs": str(rhs),
-                "support": len(train),
-                "train_error": train_error,
-                "holdout_error": holdout_error,
-                "rows_per_lhs_value": per_value,
-                "lhs_values": lhs_values,
-                "rhs_values": rhs_values,
+                "lhs": row.lhs,
+                "rhs": row.rhs,
+                "support": np.nan,
+                "train_error": row.train_error,
+                "holdout_error": row.holdout_error,
+                "score": row.score,
+                "p_value": np.nan,
+                "lhs_values": row.lhs_values,
+                "rhs_values": row.rhs_values,
                 "r2": np.nan,
                 "action": action,
-                "check_rule": make_rule([[c, None] for c in lhs], [rhs, None]),
+                "check_rule": make_rule([[c, None] for c in lhs], [row.rhs, None]),
             }
         )
     return pd.DataFrame(rows, columns=COLUMNS)
 
 
-def score_cfds(
-    train: pd.DataFrame,
-    holdout: pd.DataFrame,
-    candidates: list,
-    fds: list,
-    max_error: float = 0.01,
-    min_support: int = 20,
+def condition_rows(
+    rules: pd.DataFrame, pairs: pd.DataFrame, max_error: float = 0.01
 ) -> pd.DataFrame:
-    """Re-score conditional FDs ``(lhs pairs, rhs pair)``; keep those that hold on both splits.
+    """``cfd`` report rows: one-condition rules with confidence at least 1 - ``max_error``.
 
-    Dropped: rules without a fixed value (plain FDs, reported by
-    :func:`score_fds`), rules implied by a kept FD ``fds`` (``sub = C1 ->
-    major = C`` restates sub -> major), and rules applying to fewer than
-    ``min_support`` train rows (5 holdout rows). Kept: error at most
-    ``max_error`` on train and twice that on the holdout. Action
-    ``skip_logic`` when the rule sets a blank (``uses_substances = no ->
-    frequency blank``), else ``review``.
+    ``rules`` holds only rules that passed the significance test (see
+    ``dependency_search``); ``max_error`` only decides what is listed here.
+    Rules of an X -> Y pair that is itself listed as an ``fd`` row are left
+    out (they restate it; the rules file has them). Action ``skip_logic``
+    when the rule blanks Y on an answered X (``use=no -> freq=<NA>``),
+    ``co_missing`` when X is blank too (the blocks report covers those),
+    else ``review``.
     """
-    implied = [(set(lhs), rhs) for lhs, rhs in fds]
-    rows, seen = [], set()
-    for lhs, rhs in candidates:
-        if all(value is None for _, value in [*lhs, rhs]):
-            continue
-        attributes = {c for c, _ in lhs}
-        if any(rhs[0] == fd_rhs and fd_lhs <= attributes for fd_lhs, fd_rhs in implied):
-            continue
-        rule = make_rule(lhs, rhs)
-        if rule in seen:
-            continue
-        seen.add(rule)
-        support, train_error = rule_error(train, rule)
-        holdout_support, holdout_error = rule_error(holdout, rule)
-        if support < min_support or train_error > max_error:
-            continue
-        if holdout_support < 5 or not holdout_error <= 2 * max_error:
-            continue
+    within = pairs[pairs["train_error"] <= max_error]
+    listed_fds = set(zip(within["lhs"], within["rhs"], strict=True))
+    listed = rules[rules["confidence"] >= 1 - max_error]
+    keep = [pair not in listed_fds for pair in zip(listed["lhs"], listed["rhs"], strict=True)]
+    listed = listed[keep]
+    rows = []
+    for row in listed.sort_values(["rhs", "support"], ascending=[True, False]).itertuples():
+        if row.rhs_value != BLANK:
+            action = REVIEW
+        elif row.lhs_value == BLANK:
+            action = CO_MISSING
+        else:
+            action = SKIP_LOGIC
         rows.append(
             {
                 "kind": "cfd",
-                "lhs": _side(lhs),
-                "rhs": _side([rhs]),
-                "support": support,
-                "train_error": train_error,
-                "holdout_error": holdout_error,
-                "rows_per_lhs_value": np.nan,
+                "lhs": _side([(row.lhs, row.lhs_value)]),
+                "rhs": _side([(row.rhs, row.rhs_value)]),
+                "support": row.support,
+                "train_error": 1 - row.confidence,
+                "holdout_error": 1 - row.holdout_confidence,
+                "score": np.nan,
+                "p_value": row.p_value,
                 "lhs_values": np.nan,
                 "rhs_values": np.nan,
                 "r2": np.nan,
-                "action": SKIP_LOGIC if rhs[1] == BLANK else REVIEW,
-                "check_rule": rule,
+                "action": action,
+                "check_rule": make_rule([[row.lhs, row.lhs_value]], [row.rhs, row.rhs_value]),
             }
         )
     return pd.DataFrame(rows, columns=COLUMNS)
@@ -245,12 +224,13 @@ def score_cfds(
 def numeric_redundancy(
     train: pd.DataFrame, columns: list, min_r2: float = 0.95, seed: int = 0
 ) -> pd.DataFrame:
-    """Continuous columns predicted from the other continuous ones with R² >= ``min_r2``.
+    """Every continuous column's cross-validated R² from the other continuous ones.
 
-    Linear regression on median-filled values, 5-fold cross-validated R²
-    (``derive`` from 0.99, else ``review``); ``lhs`` lists up to three
-    predictors with the largest standardized coefficients (at least a tenth of
-    the largest).
+    Linear regression on median-filled values, 5-fold cross-validated R².
+    ``min_r2`` only sets the action: ``derive`` from 0.99, ``review`` from
+    ``min_r2``, else ``none``. ``lhs`` lists up to three predictors with the
+    largest standardized coefficients (at least a tenth of the largest).
+    Linear only: a nonlinear formula can score lower than it should.
     """
     from sklearn.linear_model import LinearRegression
     from sklearn.model_selection import KFold, cross_val_score
@@ -266,8 +246,6 @@ def numeric_redundancy(
     for column in numeric:
         x, y = scaled.drop(columns=[column]), scaled[column]
         r2 = float(np.mean(cross_val_score(LinearRegression(), x, y, cv=folds, scoring="r2")))
-        if r2 < min_r2:
-            continue
         weights = pd.Series(LinearRegression().fit(x, y).coef_, index=x.columns).abs()
         top = weights.nlargest(3)
         top = top[top >= 0.1 * top.iloc[0]]
@@ -280,18 +258,19 @@ def numeric_redundancy(
                 "rhs": str(column),
                 "train_error": np.nan,
                 "holdout_error": np.nan,
-                "rows_per_lhs_value": np.nan,
+                "score": np.nan,
+                "p_value": np.nan,
                 "lhs_values": np.nan,
                 "rhs_values": np.nan,
                 "r2": r2,
-                "action": DERIVE if r2 >= 0.99 else REVIEW,
+                "action": DERIVE if r2 >= 0.99 else REVIEW if r2 >= min_r2 else NO_ACTION,
             }
         )
-    return pd.DataFrame(rows, columns=COLUMNS)
+    return pd.DataFrame(rows, columns=COLUMNS).sort_values("r2", ascending=False)
 
 
-def ucc_rows(train: pd.DataFrame, uccs: list, max_columns: int = 3) -> pd.DataFrame:
-    """Unique column combinations of up to ``max_columns`` columns (all rows singled out)."""
+def ucc_rows(train: pd.DataFrame, uccs: list) -> pd.DataFrame:
+    """Every minimal unique column combination (all rows singled out)."""
     rows = [
         {
             "kind": "ucc",
@@ -301,80 +280,34 @@ def ucc_rows(train: pd.DataFrame, uccs: list, max_columns: int = 3) -> pd.DataFr
             "rhs": "",
             "train_error": 0.0,
             "holdout_error": np.nan,
-            "rows_per_lhs_value": 1.0,
+            "score": np.nan,
+            "p_value": np.nan,
             "lhs_values": len(train),
             "rhs_values": np.nan,
             "r2": np.nan,
             "action": PRIVACY_REVIEW,
         }
         for cols in uccs
-        if len(cols) <= max_columns
     ]
     return pd.DataFrame(rows, columns=COLUMNS)
 
 
-#: Most FD candidate columns for a search with more than one left-side column.
-MAX_WIDE_LHS_COLUMNS = 50
+def run_hyucc(train: pd.DataFrame, ucc_columns: list, env_dir: str | Path) -> list:
+    """All minimal unique column combinations of ``ucc_columns``, from Desbordante's HyUCC.
 
-
-def run_desbordante(
-    train: pd.DataFrame,
-    fd_columns: list,
-    ucc_columns: list,
-    env_dir: str | Path,
-    max_lhs: int,
-    error: float,
-    seed: int,
-    cfd_minsup: int = 0,
-    chunk_size: int = 60,
-) -> tuple[list, list, list]:
-    """FDs ``[(lhs, rhs)]``, conditional FDs ``[(lhs pairs, rhs pair)]`` and UCCs from Desbordante.
-
-    Runs in its own environment. Conditional FDs are searched on
-    ``fd_columns`` when ``cfd_minsup`` (rows) is above 0. With ``max_lhs``
-    1 the FD search runs on pairs of ``chunk_size``-column chunks, which keeps
-    memory near 1 GB at 600 columns; wider left sides search all columns at
-    once and are refused above :data:`MAX_WIDE_LHS_COLUMNS` columns.
+    Runs in its own environment (Desbordante is AGPL-3.0). HyUCC is exact and
+    has no size limit.
     """
-    if max_lhs > 1 and len(fd_columns) > MAX_WIDE_LHS_COLUMNS:
-        raise ValueError(
-            f"max_lhs {max_lhs} on {len(fd_columns)} candidate columns: the search grows "
-            f"too fast above {MAX_WIDE_LHS_COLUMNS} columns (about 9 GB at 80). "
-            "Use max_lhs 1, or run on a subset of columns."
-        )
     from synthdata.generation.sidecar import run_in_env
 
-    columns = list(dict.fromkeys([*fd_columns, *ucc_columns]))
-    spec = {
-        "fd_columns": list(map(str, fd_columns)),
-        "ucc_columns": list(map(str, ucc_columns)),
-        "cfd_columns": list(map(str, fd_columns)) if cfd_minsup > 0 else [],
-        "cfd_minsup": int(cfd_minsup),
-        "cfd_minconf": 1 - error,
-        # Tane's pair-based error is looser than g3; candidates are re-scored here.
-        "error": error,
-        "max_lhs": max_lhs,
-        "chunk_size": chunk_size,
-        "seed": seed,
-    }
-    data = _as_text(train[columns])
+    if not ucc_columns:
+        return []
+    data = _as_text(train[ucc_columns])
     data.columns = data.columns.map(str)
+    spec = {"ucc_columns": list(data.columns)}
     found = run_in_env(env_dir, "run_desbordante.py", data, spec, "desbordante")
-    names = {str(c): c for c in columns}
-    fds, cfds, uccs = [], [], []
-    for row in found.itertuples():
-        if row.kind == "cfd":
-            lhs = [(names[c], value) for c, value in json.loads(row.lhs)]
-            column, value = json.loads(row.rhs)
-            if lhs:
-                cfds.append((lhs, (names[column], value)))
-            continue
-        lhs = [names[c] for c in json.loads(row.lhs)]
-        if row.kind == "afd" and lhs:
-            fds.append((lhs, names[json.loads(row.rhs)[0]]))
-        elif row.kind == "ucc":
-            uccs.append(lhs)
-    return fds, cfds, uccs
+    names = {str(c): c for c in ucc_columns}
+    return [[names[c] for c in json.loads(lhs)] for lhs in found["lhs"]]
 
 
 def dependencies_table(
@@ -385,50 +318,55 @@ def dependencies_table(
     env_dir: str | Path = "envs/desbordante",
     max_lhs: int = 1,
     max_error: float = 0.01,
-    min_rows_per_value: float = 5,
     min_r2: float = 0.95,
-    cfd_min_support: float = 0.05,
+    alpha: float = 0.05,
+    permutations: int = 5,
     seed: int = 0,
-) -> pd.DataFrame:
-    """Every finding on ``train`` (re-scored on ``holdout``), one row each (see the module docstring).
+) -> tuple[pd.DataFrame, dict]:
+    """The report (see the module docstring) and the full tables behind it.
 
-    ``cfd_min_support`` is the smallest share of train rows (at least 20 rows)
-    a conditional FD must apply to; 0 skips the conditional search.
+    Returns ``(report, tables)``, where ``tables`` has ``pairs`` (every
+    ordered column pair), ``rules`` (every significant one-condition rule)
+    and, with ``max_lhs`` 2, ``pairs2`` (two-column rules within
+    ``max_error``).
     """
-    fd_columns = fd_candidate_columns(train, categorical)
-    min_support = max(20, int(cfd_min_support * len(train))) if cfd_min_support > 0 else 0
-    fds, cfds, uccs = run_desbordante(
-        train, fd_columns, ucc_columns, env_dir, max_lhs, max_error, seed, min_support
-    )
-    fd_table = score_fds(train, holdout, fds, categorical, max_error, min_rows_per_value)
-    kept = set(fd_table["check_rule"])
-    kept_fds = [
-        (lhs, rhs) for lhs, rhs in fds if make_rule([[c, None] for c in lhs], [rhs, None]) in kept
-    ]
+    from synthdata.dependency_search import single_column_search, two_column_search
+
+    if max_lhs not in (1, 2):
+        raise ValueError(
+            f"max_lhs must be 1 or 2, not {max_lhs}: three or more determining columns "
+            "cannot be searched exhaustively on wide data"
+        )
+    train_text, holdout_text = _as_text(train), _as_text(holdout)
+    pairs, rules = single_column_search(train_text, holdout_text, permutations, alpha, seed)
+    tables = {"pairs": pairs, "rules": rules}
+    scored = pairs
+    if max_lhs == 2:
+        tables["pairs2"] = two_column_search(
+            train_text, holdout_text, pairs, max_error, permutations, seed
+        )
+        scored = pd.concat([pairs, tables["pairs2"]], ignore_index=True)
     continuous = [c for c in train.columns if c not in set(categorical)]
     frames = [
-        fd_table,
-        score_cfds(train, holdout, cfds, kept_fds, max_error, max(min_support, 20)),
-        ucc_rows(train, uccs),
+        fd_rows(scored, categorical, max_error),
+        condition_rows(rules, pairs, max_error),
+        ucc_rows(train, run_hyucc(train, ucc_columns, env_dir)),
         numeric_redundancy(train, continuous, min_r2, seed),
     ]
     frames = [f for f in frames if not f.empty]
-    if not frames:
-        return pd.DataFrame(columns=COLUMNS)
-    logger.info(
-        "Dependencies: Desbordante found %d FD(s) and %d conditional FD(s); %d and %d kept.",
-        len(fds),
-        len(cfds),
-        len(fd_table),
-        int(sum((f["kind"] == "cfd").sum() for f in frames)),
-    )
-    return pd.concat(frames, ignore_index=True)
+    report = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=COLUMNS)
+    return report, tables
 
 
 def save_dependencies_report(
     cfg, dataset, output_dir: str | Path | None = None, **options
 ) -> pd.DataFrame:
-    """Write ``dependencies.csv`` for ``dataset``; ``options`` go to :func:`dependencies_table`."""
+    """Write ``dependencies.csv`` and its full tables for ``dataset``.
+
+    ``options`` go to :func:`dependencies_table`. The full tables are
+    ``dependencies_pairs.parquet``, ``dependencies_rules.parquet`` and, with
+    two determining columns, ``dependencies_pairs2.parquet``.
+    """
     from synthdata.experiment import imputation_output_dir
     from synthdata.missing_blocks import detection_frame
 
@@ -444,14 +382,55 @@ def save_dependencies_report(
     ]
     ucc_columns = [c for c in dataset.role_columns if c in train.columns]
     options.setdefault("seed", cfg.seed)
-    table = dependencies_table(train, holdout, categorical, ucc_columns, **options)
-    path = Path(output_dir or imputation_output_dir(cfg)) / DEPENDENCIES_FILENAME
-    path.parent.mkdir(parents=True, exist_ok=True)
-    table.to_csv(path, index=False)
+    table, tables = dependencies_table(train, holdout, categorical, ucc_columns, **options)
+    folder = Path(output_dir or imputation_output_dir(cfg))
+    folder.mkdir(parents=True, exist_ok=True)
+    table.to_csv(folder / DEPENDENCIES_FILENAME, index=False)
+    for name, frame in tables.items():
+        frame.to_parquet(folder / f"dependencies_{name}.parquet", index=False)
     logger.info(
-        "Dependencies: actions %s. Review %s.", table["action"].value_counts().to_dict(), path
+        "Dependencies: %s. Review %s; every pair and rule is in dependencies_*.parquet.",
+        table.groupby(["kind", "action"]).size().to_dict(),
+        folder / DEPENDENCIES_FILENAME,
     )
     return table
+
+
+def add_report_arguments(parser) -> None:
+    """The dependency-report options shared by ``synthdata-dependencies`` and ``synthdata-profile``."""
+    parser.add_argument("--env-dir", default="envs/desbordante", help="Desbordante environment.")
+    parser.add_argument(
+        "--max-lhs",
+        type=int,
+        choices=[1, 2],
+        default=1,
+        help="Determining columns per rule; 2 scores every column pair against every column "
+        "(hours on hundreds of columns).",
+    )
+    parser.add_argument(
+        "--max-error",
+        type=float,
+        default=0.01,
+        help="Rules within this error are listed in dependencies.csv (all are in the parquet files).",
+    )
+    parser.add_argument(
+        "--min-r2", type=float, default=0.95, help="R² from which a numeric column gets 'review'."
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.05,
+        help="Significance level for one-condition rules (Bonferroni-corrected).",
+    )
+    parser.add_argument(
+        "--permutations", type=int, default=5, help="Shuffles for the chance-corrected score."
+    )
+
+
+def report_options(args) -> dict:
+    """Keyword options for :func:`save_dependencies_report` from parsed arguments."""
+    names = ["env_dir", "max_lhs", "max_error", "min_r2", "alpha", "permutations"]
+    return {name: getattr(args, name) for name in names}
 
 
 #: Evaluation: a model fails the rules check when its mean rule error is more

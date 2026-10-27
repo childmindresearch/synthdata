@@ -8,12 +8,17 @@ import pytest
 
 from synthdata.dependencies import (
     BLANK,
+    CO_MISSING,
     DERIVE,
+    ID_LIKE,
     MERGE_HIERARCHY,
+    NO_ACTION,
     PRIVACY_REVIEW,
     REVIEW,
     SKIP_LOGIC,
-    fd_candidate_columns,
+    _as_text,
+    condition_rows,
+    fd_rows,
     g3_error,
     load_rules,
     make_rule,
@@ -21,10 +26,9 @@ from synthdata.dependencies import (
     rule_check_rows,
     rule_error,
     rule_violations,
-    score_cfds,
-    score_fds,
     ucc_rows,
 )
+from synthdata.dependency_search import single_column_search, two_column_search
 from synthdata.generation.sidecar import resolve_env_dir
 
 pytestmark = pytest.mark.unit
@@ -65,31 +69,48 @@ def test_g3_counts_rows_to_remove_and_treats_blanks_as_values():
     assert g3_error(blanks, ["x"], "y") == 0
 
 
-def test_hierarchy_is_found_and_spurious_rules_are_dropped():
+def _search(train, holdout, **options):
+    return single_column_search(_as_text(train), _as_text(holdout), **options)
+
+
+CATEGORICAL = ["major", "sub", "ward", "visit_id", "use"]
+
+
+def test_every_pair_is_scored_and_chance_rules_are_labelled_not_dropped():
     train, holdout = _programs(seed=0), _programs(400, seed=1)
-    categorical = ["major", "sub", "ward", "visit_id"]
-    candidates = [(["sub"], "major"), (["visit_id"], "ward"), (["major"], "ward")]
-    table = score_fds(train, holdout, candidates, categorical).set_index("lhs")
-    assert table.loc["sub", "rhs"] == "major"
-    assert table.loc["sub", "action"] == MERGE_HIERARCHY
-    # visit_id "determines" ward only because it is unique; major does not determine ward.
-    assert list(table.index) == ["sub"]
+    pairs, _ = _search(train, holdout)
+    n = train.shape[1]
+    assert len(pairs) == n * (n - 1)  # every ordered pair, continuous columns included
+    table = fd_rows(pairs, CATEGORICAL).set_index(["lhs", "rhs"])
+    assert table.loc[("sub", "major"), "action"] == MERGE_HIERARCHY
+    assert table.loc[("sub", "major"), "score"] > 0.9
+    # visit_id is unique, so it "fixes" ward by chance: listed, with a low score.
+    assert table.loc[("visit_id", "ward"), "action"] == ID_LIKE
+    assert table.loc[("visit_id", "ward"), "score"] < 0.1
+    assert ("major", "ward") not in table.index
 
 
 def test_near_hierarchy_with_a_few_bad_rows_is_flagged_for_review():
     train, holdout = _programs(seed=0, broken=5), _programs(400, seed=1)
-    table = score_fds(train, holdout, [(["sub"], "major")], ["major", "sub"])
-    assert table.loc[0, "action"] == REVIEW
-    assert 0 < table.loc[0, "train_error"] <= 0.01
+    pairs, _ = _search(train, holdout)
+    row = fd_rows(pairs, CATEGORICAL).set_index(["lhs", "rhs"]).loc[("sub", "major")]
+    assert row["action"] == REVIEW
+    assert 0 < row["train_error"] <= 0.01
 
 
-def test_multi_column_exact_rule_is_derive():
+def test_two_column_exact_rule_is_derive():
     train = _programs(seed=0)
     train["pair"] = train["major"] + "-" + train["ward"]
     holdout = _programs(400, seed=1)
     holdout["pair"] = holdout["major"] + "-" + holdout["ward"]
-    table = score_fds(train, holdout, [(["major", "ward"], "pair")], ["major", "ward", "pair"])
-    assert table.loc[0, "action"] == DERIVE
+    columns = ["major", "ward", "pair", "use"]
+    train, holdout = _skip(train)[columns], _skip(holdout)[columns]
+    pairs, _ = _search(train, holdout)
+    two = two_column_search(_as_text(train), _as_text(holdout), pairs, 0.01)
+    table = fd_rows(two, columns).set_index(["lhs", "rhs"])
+    assert table.loc[("major; ward", "pair"), "action"] == DERIVE
+    # pair alone fixes major and ward, so pairs with it add nothing and are skipped.
+    assert not any(lhs.startswith("pair") or "; pair" in lhs for lhs, _ in table.index)
 
 
 def test_numeric_sum_is_redundant_and_noise_is_not():
@@ -98,81 +119,50 @@ def test_numeric_sum_is_redundant_and_noise_is_not():
     assert (table["action"] == DERIVE).all()
     rng = np.random.default_rng(0)
     noise = pd.DataFrame(rng.normal(size=(300, 3)), columns=["p", "q", "r"])
-    assert numeric_redundancy(noise, ["p", "q", "r"]).empty
+    table = numeric_redundancy(noise, ["p", "q", "r"])
+    assert len(table) == 3 and (table["action"] == NO_ACTION).all()  # reported, not dropped
 
 
-def test_candidate_columns_and_ucc_rows():
-    frame = _programs()
-    assert fd_candidate_columns(frame, ["major", "sub", "ward", "visit_id"]) == [
-        "major",
-        "sub",
-        "ward",
-        "visit_id",
-    ]
-    rows = ucc_rows(frame, [["visit_id"], ["a", "b", "major", "ward"]])
-    assert rows["lhs"].tolist() == ["visit_id"]
-    assert rows.loc[0, "action"] == PRIVACY_REVIEW
+def test_ucc_rows_keep_every_size():
+    rows = ucc_rows(_programs(), [["visit_id"], ["a", "b", "major", "ward"]])
+    assert rows["lhs"].tolist() == ["visit_id", "a; b; major; ward"]
+    assert (rows["action"] == PRIVACY_REVIEW).all()
 
 
 @pytest.mark.skipif(
     shutil.which("uv") is None or not (resolve_env_dir("envs/desbordante") / ".venv").exists(),
     reason="needs `uv sync --project envs/desbordante` (Linux or macOS)",
 )
-def test_desbordante_finds_the_hierarchy_in_its_own_environment():
-    from synthdata.dependencies import run_desbordante
+def test_hyucc_finds_the_identifier_in_its_own_environment():
+    from synthdata.dependencies import run_hyucc
 
-    train = _programs()
-    train = _skip(train)
-    fds, cfds, uccs = run_desbordante(
-        train,
-        ["major", "sub", "ward", "use", "freq"],
-        ["visit_id", "ward"],
-        "envs/desbordante",
-        2,
-        0.01,
-        0,
-        cfd_minsup=50,
-    )
-    assert (["sub"], "major") in fds
-    assert ["visit_id"] in uccs
-    table = score_cfds(train, train, cfds, fds)
-    assert "use=no" in set(table["lhs"])
-    assert table.set_index("lhs").loc["use=no", "action"] == SKIP_LOGIC
-    # One-column left sides search chunk pairs; "sub" and "major" sit in different chunks.
-    chunked, _, _ = run_desbordante(
-        train,
-        ["sub", "ward", "use", "freq", "major"],
-        [],
-        "envs/desbordante",
-        1,
-        0.01,
-        0,
-        chunk_size=2,
-    )
-    assert (["sub"], "major") in chunked
+    uccs = run_hyucc(_programs(), ["visit_id", "ward", "major"], "envs/desbordante")
+    assert uccs == [["visit_id"]]
 
 
-def test_wide_left_sides_are_refused_on_many_columns():
-    from synthdata.dependencies import MAX_WIDE_LHS_COLUMNS, run_desbordante
+def test_more_than_two_determining_columns_are_refused():
+    from synthdata.dependencies import dependencies_table
 
-    columns = [f"c{i}" for i in range(MAX_WIDE_LHS_COLUMNS + 1)]
-    with pytest.raises(ValueError, match="max_lhs 2"):
-        run_desbordante(pd.DataFrame(columns=columns), columns, [], "envs/desbordante", 2, 0.01, 0)
+    frame = _programs(50)
+    with pytest.raises(ValueError, match="max_lhs must be 1 or 2"):
+        dependencies_table(frame, frame, CATEGORICAL, [], max_lhs=3)
 
 
-def test_conditional_rules_find_skip_logic_and_drop_restated_fds():
+def test_one_condition_rules_find_skip_logic_and_ignore_rare_values():
     train, holdout = _skip(_programs()), _skip(_programs(400, seed=1), seed=3)
-    candidates = [
-        ([("use", "no")], ("freq", BLANK)),  # skip logic
-        ([("sub", "C1")], ("major", "C")),  # restates sub -> major
-        ([("use", "yes")], ("ward", "w1")),  # not a rule
-        ([("sub", None)], ("major", None)),  # plain FD, reported elsewhere
-    ]
-    table = score_cfds(train, holdout, candidates, fds=[(["sub"], "major")])
-    assert table["lhs"].tolist() == ["use=no"]
-    assert table.loc[0, "rhs"] == f"freq={BLANK}"
-    assert table.loc[0, "action"] == SKIP_LOGIC
-    assert table.loc[0, "support"] == (train["use"] == "no").sum()
+    train.loc[:1, "ward"] = "w9"  # two rows: a clean "rule" that chance explains
+    pairs, rules = _search(train, holdout)
+    table = condition_rows(rules, pairs).set_index(["lhs", "rhs"])
+    row = table.loc[("use=no", f"freq={BLANK}")]
+    assert row["action"] == SKIP_LOGIC
+    assert row["support"] == (train["use"] == "no").sum()
+    assert row["holdout_error"] == 0
+    # freq blank -> use=no restates the listed FD freq -> use, so it is not repeated.
+    assert (f"freq={BLANK}", "use=no") not in table.index
+    assert not any(lhs.startswith("ward=w9") for lhs, _ in table.index)
+    # sub=C1 -> major=C restates the listed FD sub -> major.
+    assert not any(lhs.startswith("sub=") and rhs.startswith("major=") for lhs, rhs in table.index)
+    assert CO_MISSING not in set(table["action"])
 
 
 def test_rule_error_matches_two_and_two_point_zero_and_skips_absent_columns():

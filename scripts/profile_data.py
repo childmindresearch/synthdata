@@ -8,8 +8,9 @@ output folder:
   and what kind of gap each pattern looks like (skip logic found by a
   decision tree).
 * ``dependencies.csv`` (synthdata.dependencies): functional and conditional
-  dependencies (skip logic found by conditional FDs), hierarchies,
-  identifying sets and near-redundant numeric columns. Needs Desbordante:
+  dependencies (skip logic found by one-condition rules), hierarchies,
+  identifying sets and numeric redundancy, plus the full tables in
+  ``dependencies_*.parquet``. Needs Desbordante (for identifying sets):
   ``uv sync --project envs/desbordante`` (Linux; WSL on Windows). Without it
   the command stops with an error unless ``--blocks-only`` is given.
 * ``skip_logic_comparison.csv``: the two skip-logic views side by side.
@@ -25,6 +26,7 @@ import argparse
 
 from synthdata.config import load_config
 from synthdata.data import load_dataset
+from synthdata.dependencies import add_report_arguments, report_options
 from synthdata.generation.sidecar import resolve_env_dir
 from synthdata.missing_blocks import save_blocks_report
 from synthdata.utils import get_logger, set_global_seed
@@ -35,22 +37,7 @@ logger = get_logger("profile_data")
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     parser.add_argument("--config", required=True, help="Path to the YAML config file.")
-    parser.add_argument("--env-dir", default="envs/desbordante", help="Desbordante environment.")
-    parser.add_argument(
-        "--max-lhs",
-        type=int,
-        default=1,
-        help="Most columns on the left side (above 1 only for at most 50 candidate columns).",
-    )
-    parser.add_argument(
-        "--max-error", type=float, default=0.01, help="Largest share of rows breaking a rule."
-    )
-    parser.add_argument(
-        "--cfd-min-support",
-        type=float,
-        default=0.05,
-        help="Smallest share of rows a conditional rule must cover (0 = no conditional search).",
-    )
+    add_report_arguments(parser)
     parser.add_argument(
         "--blocks-only",
         action="store_true",
@@ -79,10 +66,7 @@ def main() -> None:
     dependencies = save_dependencies_report(
         cfg,
         dataset,
-        env_dir=args.env_dir,
-        max_lhs=args.max_lhs,
-        max_error=args.max_error,
-        cfd_min_support=args.cfd_min_support,
+        **report_options(args),
     )
     comparison = compare_skip_logic(blocks, dependencies)
     path = imputation_output_dir(cfg) / COMPARISON_FILENAME
