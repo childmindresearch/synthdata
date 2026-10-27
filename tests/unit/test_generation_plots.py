@@ -109,3 +109,45 @@ def test_model_comparison_writes_both_figures_and_one_table_column_per_model(
     assert len(table) == len(dataset.feature_columns) + 1 > 0
     assert (table["copy"] == 0).all()
     assert TOP_COLUMNS == 12
+
+
+def test_numeric_labels_sort_by_value_even_when_stored_as_text():
+    from synthdata.plotting import ordered_categories
+
+    labels = {"1.0", "10.0", "2.0", "11.0", "Unknown"}
+    assert ordered_categories(labels) == ["1.0", "2.0", "10.0", "11.0", "Unknown"]
+    assert ordered_categories({1.0, 10.0, "2"}) == [1.0, "2", 10.0]
+    # A configured order still wins.
+    assert ordered_categories({"1", "10", "2"}, ["10", "2", "1"]) == ["10", "2", "1"]
+
+
+def test_comparison_uses_observed_real_and_released_synthetic(make_config, make_dataset):
+    from pathlib import Path
+
+    from synthdata.plotting.generation_plots import released_views, save_model_comparison
+
+    rng = np.random.default_rng(0)
+    n = 200
+    raw = pd.DataFrame(
+        {"a": rng.normal(size=n), "b": rng.normal(size=n), "target": rng.integers(0, 2, n)}
+    )
+    raw.loc[::2, "b"] = np.nan
+    raw["b__missing"] = raw["b"].isna().astype(int)
+    cfg = make_config()
+    dataset = make_dataset(df=raw, feature_columns=["a", "b", "b__missing"])
+    dataset.missing_indicator_columns = {"b__missing": "b"}
+    # Imputation and generation filled b with a spike at 100.
+    dataset.train_imputed_df = dataset.train_df.fillna({"b": 100.0})
+    synthetic = dataset.train_imputed_df.reset_index(drop=True)
+
+    real, released, columns = released_views(cfg, dataset, synthetic)
+    assert columns == ["a", "b", "target"]
+    assert (released["b"] == 100).sum() == 0  # the imputed spike is blanked again
+    assert released["b"].isna().mean() == pytest.approx(real["b"].isna().mean())
+
+    save_model_comparison(cfg, dataset, "model", synthetic, cfg.plots.output_dir)
+    generation = Path(cfg.plots.output_dir) / "generation"
+    assert (generation / "model_filled.png").exists()
+    table = pd.read_csv(generation / "column_differences.csv", index_col=0)
+    assert table.index.tolist() == ["a", "b", "target"]
+    assert (table["model"] == 0).all()

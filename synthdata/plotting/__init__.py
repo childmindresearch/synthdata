@@ -12,15 +12,26 @@ from synthdata.utils import ensure_dir, get_logger
 logger = get_logger(__name__)
 
 
+def _label_sort_key(value) -> tuple:
+    """Sort numbers (and labels that read as numbers, e.g. "10.0") by value, then text."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = float("nan")
+    return (0, number, "") if number == number else (1, 0.0, str(value))
+
+
 def ordered_categories(values: set, configured_order: list | None = None) -> list:
-    """Return category labels in configured order with a safe fallback for extras."""
+    """Return category labels in configured order, then the rest sorted.
+
+    Labels outside the configured order sort by numeric value when they read
+    as numbers, so codes stored as text come out 1, 2, ..., 10 rather than
+    1, 10, 11, 2.
+    """
     present = set(values)
     ordered = [value for value in configured_order or [] if value in present]
     extras = present - set(ordered)
-    try:
-        return ordered + sorted(extras)
-    except TypeError:
-        return ordered + sorted(extras, key=str)
+    return ordered + sorted(extras, key=_label_sort_key)
 
 
 def _shorten(text: str, width: int) -> str:

@@ -1,6 +1,6 @@
 [project]
 name = "synthdata"
-version = "0.16.2"
+version = "0.17.0"
 description = "Sandbox for synthetic data generation and evaluation"
 authors = [
     {name = "Alp Erkent", email = "alp.erkent@childmind.org"},
@@ -30,12 +30,19 @@ dependencies = [
     "filelock",
     "psutil",
     "python-dotenv",
+    # Default imputer (imputation.method: miceforest). miceforest 6.0.5 calls a
+    # private LightGBM method whose signature changed in 4.7, so cap LightGBM.
+    "miceforest>=6.0.5",
+    "lightgbm>=4.1.0,<4.7",
     "torch>=2.7.1",
     "torchvision>=0.22.1",
 ]
 
 [project.scripts]
 synthdata-impute = "scripts.run_imputation:main"
+synthdata-missing-blocks = "scripts.detect_missing_blocks:main"
+synthdata-dependencies = "scripts.find_dependencies:main"
+synthdata-profile = "scripts.profile_data:main"
  synthdata-imputation-benchmark = "scripts.run_imputation_benchmark:main"
 synthdata-generate = "scripts.run_generation:main"
 synthdata-evaluate = "scripts.run_evaluation:main"
