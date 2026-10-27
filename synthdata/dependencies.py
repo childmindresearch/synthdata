@@ -43,7 +43,6 @@ DERIVE = "derive"
 REVIEW = "review"
 PRIVACY_REVIEW = "privacy_review"
 SKIP_LOGIC = "skip_logic"
-CO_MISSING = "co_missing"
 ID_LIKE = "id_like"
 NO_ACTION = "none"
 
@@ -184,23 +183,21 @@ def condition_rows(
     ``dependency_search``); ``max_error`` only decides what is listed here.
     Rules of an X -> Y pair that is itself listed as an ``fd`` row are left
     out (they restate it; the rules file has them). Action ``skip_logic``
-    when the rule blanks Y on an answered X (``use=no -> freq=<NA>``),
-    ``co_missing`` when X is blank too (the blocks report covers those),
-    else ``review``.
+    when the rule blanks Y on an answered X (``use=no -> freq=<NA>``), else
+    ``review``. Blank -> blank rules (columns missing together) stay in the
+    rules file only: they number in the tens of thousands on wide data, and
+    the missing-blocks report groups them into blocks.
     """
     within = pairs[pairs["train_error"] <= max_error]
     listed_fds = set(zip(within["lhs"], within["rhs"], strict=True))
     listed = rules[rules["confidence"] >= 1 - max_error]
     keep = [pair not in listed_fds for pair in zip(listed["lhs"], listed["rhs"], strict=True)]
     listed = listed[keep]
+    # Blank -> blank rules restate co-missingness, which the blocks report groups.
+    listed = listed[~((listed["lhs_value"] == BLANK) & (listed["rhs_value"] == BLANK))]
     rows = []
     for row in listed.sort_values(["rhs", "support"], ascending=[True, False]).itertuples():
-        if row.rhs_value != BLANK:
-            action = REVIEW
-        elif row.lhs_value == BLANK:
-            action = CO_MISSING
-        else:
-            action = SKIP_LOGIC
+        action = SKIP_LOGIC if row.rhs_value == BLANK else REVIEW
         rows.append(
             {
                 "kind": "cfd",

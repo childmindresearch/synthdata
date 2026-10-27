@@ -8,7 +8,6 @@ import pytest
 
 from synthdata.dependencies import (
     BLANK,
-    CO_MISSING,
     DERIVE,
     ID_LIKE,
     MERGE_HIERARCHY,
@@ -148,6 +147,25 @@ def test_more_than_two_determining_columns_are_refused():
         dependencies_table(frame, frame, CATEGORICAL, [], max_lhs=3)
 
 
+def test_shared_blanks_do_not_make_a_dependency():
+    rng = np.random.default_rng(0)
+    n = 2000
+    blank = rng.random(n) < 0.85  # two drugs, missing together, unrelated when answered
+    frame = pd.DataFrame(
+        {
+            "drug_a": np.where(blank, np.nan, rng.normal(size=n).round(2)),
+            "drug_b": np.where(blank, np.nan, rng.integers(0, 15, n).astype(float)),
+        }
+    )
+    pairs, rules = _search(frame.iloc[:1500], frame.iloc[1500:])
+    row = pairs.set_index(["lhs", "rhs"]).loc[("drug_a", "drug_b")]
+    assert row["lhs_answered"] == pytest.approx(0.15, abs=0.03)
+    assert row["score"] < 0.2  # drug_a is near-unique where answered: chance
+    blank_rule = rules[(rules["lhs"] == "drug_a") & (rules["lhs_value"] == BLANK)]
+    assert blank_rule["rhs_value"].tolist() == [BLANK]  # co-missingness kept in the rules file
+    assert condition_rows(rules, pairs).empty  # ...but not repeated in the shortlist
+
+
 def test_one_condition_rules_find_skip_logic_and_ignore_rare_values():
     train, holdout = _skip(_programs()), _skip(_programs(400, seed=1), seed=3)
     train.loc[:1, "ward"] = "w9"  # two rows: a clean "rule" that chance explains
@@ -162,7 +180,6 @@ def test_one_condition_rules_find_skip_logic_and_ignore_rare_values():
     assert not any(lhs.startswith("ward=w9") for lhs, _ in table.index)
     # sub=C1 -> major=C restates the listed FD sub -> major.
     assert not any(lhs.startswith("sub=") and rhs.startswith("major=") for lhs, rhs in table.index)
-    assert CO_MISSING not in set(table["action"])
 
 
 def test_rule_error_matches_two_and_two_point_zero_and_skips_absent_columns():

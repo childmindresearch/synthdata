@@ -4,7 +4,11 @@ Every ordered pair of columns is scored from its contingency counts, so
 nothing is skipped for speed and no error cutoff decides what is computed:
 
 * **FD error** of X -> Y: the g3 error (Kivinen & Mannila 1995), the share
-  of rows to remove for "X fixes Y" to hold exactly, on train and holdout.
+  of rows to remove for "X fixes Y" to hold exactly, on train and holdout,
+  counted on the rows where X is answered (``lhs_answered`` is their share).
+  Otherwise two mostly blank columns "fix" each other through their shared
+  blanks; what a blank X implies is in the one-condition rules
+  (``X=<NA> -> Y=<NA>``) and the missing-blocks report.
 * **Chance-corrected score**: a near-unique X "fixes" any Y by accident (each
   value has one or two rows). The score compares the error with the error
   for a shuffled Y, scaled by the error of guessing Y's most common value:
@@ -21,7 +25,8 @@ nothing is skipped for speed and no error cutoff decides what is computed:
   however clean they look.
 
 Blanks are a value of their own. Two determining columns (``max_lhs`` 2)
-score every pair of columns against every other column; that is about
+score every pair of columns (on rows where both are answered) against every
+other column; that is about
 n_columns³ / 2 checks (157 million at 681 columns, hours), so it is opt-in.
 Three or more determining columns are not searched: the count grows by
 another factor of the number of columns.
@@ -35,6 +40,9 @@ import pandas as pd
 
 from synthdata.utils import get_logger
 
+#: Text of a blank cell (``synthdata.dependencies.BLANK``).
+BLANK = "<NA>"
+
 logger = get_logger(__name__)
 
 #: Columns of the all-pairs table.
@@ -42,10 +50,11 @@ PAIR_COLUMNS = [
     "lhs",
     "rhs",
     "train_error",
-    "holdout_error",
     "null_error",
     "baseline_error",
     "score",
+    "holdout_error",
+    "lhs_answered",
     "lhs_values",
     "rhs_values",
 ]
@@ -110,6 +119,28 @@ def _null_g3(a: np.ndarray, ka: int, b: np.ndarray, kb: int, shuffles: list) -> 
     return float(1 - table.max(axis=2).sum() / (len(shuffles) * len(a)))
 
 
+def _blank_code(labels: np.ndarray) -> int:
+    """Code of the blank label, or -1 when the column has no blanks."""
+    blank = np.flatnonzero(labels == BLANK)
+    return int(blank[0]) if len(blank) else -1
+
+
+def _answered(codes: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    """Row positions where the column is not blank."""
+    return np.flatnonzero(codes != _blank_code(labels))
+
+
+def _fd_scores(a: np.ndarray, ka: int, b: np.ndarray, kb: int, shuffles: list) -> tuple:
+    """g3 error, shuffled-``b`` error, most-common-value error and chance-corrected score."""
+    if len(a) == 0:
+        return (np.nan,) * 4
+    error = g3(a, ka, b, kb)
+    null = _null_g3(a, ka, b, kb, shuffles)
+    baseline = 1 - np.bincount(b, minlength=kb).max() / len(b)
+    score = (null - error) / baseline if baseline > 0 else np.nan
+    return error, null, baseline, score
+
+
 def _pair_count(a: np.ndarray, b: np.ndarray, kb: int, va: np.ndarray, vb: np.ndarray):
     """Rows of each (``va``, ``vb``) value pair."""
     keys, counts = np.unique(a * kb + b, return_counts=True)
@@ -140,36 +171,42 @@ def single_column_search(
     sizes = [len(lab) for lab in labels]
     n = len(tr)
     rng = np.random.default_rng(seed)
-    shuffles = [rng.permutation(n) for _ in range(permutations)]
     shares = [np.bincount(tr[:, j], minlength=sizes[j]) / n for j in range(len(columns))]
-    baseline = [1 - s.max() for s in shares]
     observed = [int((s > 0).sum()) for s in shares]
     tests = sum(observed) * (len(columns) - 1)
     log_cut = np.log(alpha / max(tests, 1))
+    answered_tr = [_answered(tr[:, j], labels[j]) for j in range(len(columns))]
+    blank_code = [_blank_code(lab) for lab in labels]
+    answered_ho = [_answered(ho[:, j], labels[j]) for j in range(len(columns))]
     pairs, rules = [], []
+    last_i, shuffles = -1, []
     for i, j in itertools.permutations(range(len(columns)), 2):
         a, b, ka, kb = tr[:, i], tr[:, j], sizes[i], sizes[j]
-        count_a, best, best_count = best_counts(a, ka, b, kb)
-        train_error = 1 - best_count.sum() / n
-        null = _null_g3(a, ka, b, kb, shuffles)
+        if i != last_i:
+            rows_i = answered_tr[i]
+            shuffles = [rng.permutation(len(rows_i)) for _ in range(permutations)]
+            last_i = i
         pairs.append(
             (
                 columns[i],
                 columns[j],
-                train_error,
-                g3(ho[:, i], ka, ho[:, j], kb),
-                null,
-                baseline[j],
-                (null - train_error) / baseline[j],
+                *_fd_scores(a[rows_i], ka, b[rows_i], kb, shuffles),
+                g3(ho[answered_ho[i], i], ka, ho[answered_ho[i], j], kb),
+                len(rows_i) / n,
                 observed[i],
                 observed[j],
             )
         )
+        count_a, best, best_count = best_counts(a, ka, b, kb)
         # One-condition rules: values whose best match is too frequent to be chance.
         values = np.flatnonzero((count_a > 0) & (2 * best_count > count_a))
         if not len(values):
             continue
-        share = shares[j][best[values]]
+        # Chance level for an answered X value: Y's shares where X is answered, so
+        # columns blank together do not make every answered value look like a rule.
+        answered_share = np.bincount(b[rows_i], minlength=kb) / max(len(rows_i), 1)
+        blank_value = values == blank_code[i]
+        share = np.where(blank_value, shares[j][best[values]], answered_share[best[values]])
         support, hits = count_a[values], best_count[values]
         # P(at least `hits` of `support` rows by chance); exact rules need share^support <= cut.
         possible = support * np.log(share) <= log_cut
@@ -239,38 +276,36 @@ def two_column_search(
     fixed = {k: set() for k in range(len(columns))}
     for lhs, rhs in zip(exact["lhs"], exact["rhs"], strict=True):
         fixed[index[lhs]].add(index[rhs])
-    baseline = dict(zip(pairs["rhs"], pairs["baseline_error"], strict=False))
+    answered_tr = [_answered(tr[:, k], labels[k]) for k in range(len(columns))]
+    answered_ho = [_answered(ho[:, k], labels[k]) for k in range(len(columns))]
     rng = np.random.default_rng(seed)
     rows = []
     total = len(columns) * (len(columns) - 1) // 2
     for done, (i, j) in enumerate(itertools.combinations(range(len(columns)), 2), start=1):
         kb = sizes[j]
+        rows_tr = np.intersect1d(answered_tr[i], answered_tr[j], assume_unique=True)
+        rows_ho = np.intersect1d(answered_ho[i], answered_ho[j], assume_unique=True)
         joint, inverse = np.unique(
-            np.r_[tr[:, i] * kb + tr[:, j], ho[:, i] * kb + ho[:, j]], return_inverse=True
+            np.r_[tr[rows_tr, i] * kb + tr[rows_tr, j], ho[rows_ho, i] * kb + ho[rows_ho, j]],
+            return_inverse=True,
         )
-        lhs_tr, lhs_ho, k_lhs = inverse[:n], inverse[n:], len(joint)
+        lhs_tr, lhs_ho, k_lhs = inverse[: len(rows_tr)], inverse[len(rows_tr) :], len(joint)
+        if not len(rows_tr):
+            continue
+        shuffles = [rng.permutation(len(rows_tr)) for _ in range(permutations)]
         for c in range(len(columns)):
             if c in (i, j) or c in fixed[i] or c in fixed[j]:
                 continue
-            train_error = g3(lhs_tr, k_lhs, tr[:, c], sizes[c])
-            if train_error > max_error:
+            target = tr[rows_tr, c]
+            if g3(lhs_tr, k_lhs, target, sizes[c]) > max_error:
                 continue
-            null = np.mean(
-                [
-                    g3(lhs_tr, k_lhs, rng.permutation(tr[:, c]), sizes[c])
-                    for _ in range(permutations)
-                ]
-            )
-            base = baseline[columns[c]]
             rows.append(
                 (
                     f"{columns[i]}; {columns[j]}",
                     columns[c],
-                    train_error,
-                    g3(lhs_ho, k_lhs, ho[:, c], sizes[c]),
-                    null,
-                    base,
-                    (null - train_error) / base,
+                    *_fd_scores(lhs_tr, k_lhs, target, sizes[c], shuffles),
+                    g3(lhs_ho, k_lhs, ho[rows_ho, c], sizes[c]),
+                    len(rows_tr) / n,
                     int(len(np.unique(lhs_tr))),
                     int(len(np.unique(tr[:, c]))),
                 )
