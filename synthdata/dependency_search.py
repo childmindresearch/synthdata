@@ -8,7 +8,12 @@ nothing is skipped for speed and no error cutoff decides what is computed:
   counted on the rows where X is answered (``lhs_answered`` is their share).
   Otherwise two mostly blank columns "fix" each other through their shared
   blanks; what a blank X implies is in the one-condition rules
-  (``X=<NA> -> Y=<NA>``) and the missing-blocks report.
+  (``X=<NA> -> Y=<NA>``) and the missing-blocks report. A blank Y counts as
+  a value here (X may decide that Y is skipped).
+* **Value view** (``value_*``): the same on rows where both X and Y are
+  answered (``both_answered``), so a hierarchy whose child or parent is
+  often missing at random still shows: sub_program -> major_program holds on
+  the recorded values even if major_program is blank in half the rows.
 * **Chance-corrected score**: a near-unique X "fixes" any Y by accident (each
   value has one or two rows). The score compares the error with the error
   for a shuffled Y, scaled by the error of guessing Y's most common value:
@@ -24,7 +29,7 @@ nothing is skipped for speed and no error cutoff decides what is computed:
   values of all pairs tested. Rows of a value seen once or twice cannot pass,
   however clean they look.
 
-Blanks are a value of their own. Two determining columns (``max_lhs`` 2)
+Two determining columns (``max_lhs`` 2)
 score every pair of columns (on rows where both are answered) against every
 other column; that is about
 n_columns³ / 2 checks (157 million at 681 columns, hours), so it is opt-in.
@@ -55,6 +60,10 @@ PAIR_COLUMNS = [
     "score",
     "holdout_error",
     "lhs_answered",
+    "value_error",
+    "value_score",
+    "value_holdout_error",
+    "both_answered",
     "lhs_values",
     "rhs_values",
 ]
@@ -107,16 +116,21 @@ def g3(a: np.ndarray, ka: int, b: np.ndarray, kb: int) -> float:
     return float(1 - best_counts(a, ka, b, kb)[2].sum() / len(a))
 
 
-def _null_g3(a: np.ndarray, ka: int, b: np.ndarray, kb: int, shuffles: list) -> float:
-    """Mean g3 of ``a`` -> ``b`` over the row shuffles of ``b``, in one count when it fits."""
-    if not shuffles:
+def _null_g3(a: np.ndarray, ka: int, shuffled: list, kb: int) -> float:
+    """Mean g3 of ``a`` -> each array in ``shuffled`` (``b`` in random row orders)."""
+    if not shuffled:
         return float("nan")
     if ka * kb > 8 * len(a) + 1024:
-        return float(np.mean([g3(a, ka, b[s], kb) for s in shuffles]))
+        return float(np.mean([g3(a, ka, b, kb) for b in shuffled]))
     size = ka * kb
-    keys = np.concatenate([a * kb + b[s] + k * size for k, s in enumerate(shuffles)])
-    table = np.bincount(keys, minlength=len(shuffles) * size).reshape(len(shuffles), ka, kb)
-    return float(1 - table.max(axis=2).sum() / (len(shuffles) * len(a)))
+    keys = np.concatenate([a * kb + b + k * size for k, b in enumerate(shuffled)])
+    table = np.bincount(keys, minlength=len(shuffled) * size).reshape(len(shuffled), ka, kb)
+    return float(1 - table.max(axis=2).sum() / (len(shuffled) * len(a)))
+
+
+def _orders(mask: np.ndarray, permutations: list) -> list:
+    """Random orders of the rows in ``mask``: each global permutation filtered to them."""
+    return [perm[mask[perm]] for perm in permutations]
 
 
 def _blank_code(labels: np.ndarray) -> int:
@@ -126,19 +140,40 @@ def _blank_code(labels: np.ndarray) -> int:
 
 
 def _answered(codes: np.ndarray, labels: np.ndarray) -> np.ndarray:
-    """Row positions where the column is not blank."""
-    return np.flatnonzero(codes != _blank_code(labels))
+    """Boolean mask of rows where the column is not blank."""
+    return codes != _blank_code(labels)
 
 
-def _fd_scores(a: np.ndarray, ka: int, b: np.ndarray, kb: int, shuffles: list) -> tuple:
+def _fd_scores(a: np.ndarray, ka: int, b: np.ndarray, kb: int, shuffled: list) -> tuple:
     """g3 error, shuffled-``b`` error, most-common-value error and chance-corrected score."""
     if len(a) == 0:
         return (np.nan,) * 4
     error = g3(a, ka, b, kb)
-    null = _null_g3(a, ka, b, kb, shuffles)
+    null = _null_g3(a, ka, shuffled, kb)
     baseline = 1 - np.bincount(b, minlength=kb).max() / len(b)
     score = (null - error) / baseline if baseline > 0 else np.nan
     return error, null, baseline, score
+
+
+def _views(a, a_ho, ka, b, b_ho, kb, masks, orders_a, permutations) -> tuple:
+    """Scores of ``a`` -> ``b`` where ``a`` is answered, then where both are answered.
+
+    ``masks`` holds the answered masks of ``a``, ``a_ho``, ``b`` and ``b_ho``;
+    ``orders_a`` the random orders of ``a``'s answered rows.
+    """
+    mask_a, mask_a_ho, mask_b, mask_b_ho = masks
+    answered = (
+        *_fd_scores(a[mask_a], ka, b[mask_a], kb, [b[o] for o in orders_a]),
+        g3(a_ho[mask_a_ho], ka, b_ho[mask_a_ho], kb),
+        mask_a.mean(),
+    )
+    both = mask_a & mask_b
+    if both.sum() == mask_a.sum():  # b has no blanks where a is answered: the same rows
+        return answered + (answered[0], answered[3], answered[4], answered[5])
+    both_ho = mask_a_ho & mask_b_ho
+    shuffled = [b[o] for o in _orders(both, permutations)]
+    scores = _fd_scores(a[both], ka, b[both], kb, shuffled)
+    return answered + (scores[0], scores[3], g3(a_ho[both_ho], ka, b_ho[both_ho], kb), both.mean())
 
 
 def _pair_count(a: np.ndarray, b: np.ndarray, kb: int, va: np.ndarray, vb: np.ndarray):
@@ -175,24 +210,33 @@ def single_column_search(
     observed = [int((s > 0).sum()) for s in shares]
     tests = sum(observed) * (len(columns) - 1)
     log_cut = np.log(alpha / max(tests, 1))
-    answered_tr = [_answered(tr[:, j], labels[j]) for j in range(len(columns))]
+    masks_tr = [_answered(tr[:, j], labels[j]) for j in range(len(columns))]
+    masks_ho = [_answered(ho[:, j], labels[j]) for j in range(len(columns))]
     blank_code = [_blank_code(lab) for lab in labels]
-    answered_ho = [_answered(ho[:, j], labels[j]) for j in range(len(columns))]
+    permutation_list = [rng.permutation(n) for _ in range(permutations)]
     pairs, rules = [], []
-    last_i, shuffles = -1, []
+    last_i, orders_i = -1, []
     for i, j in itertools.permutations(range(len(columns)), 2):
         a, b, ka, kb = tr[:, i], tr[:, j], sizes[i], sizes[j]
         if i != last_i:
-            rows_i = answered_tr[i]
-            shuffles = [rng.permutation(len(rows_i)) for _ in range(permutations)]
+            rows_i = np.flatnonzero(masks_tr[i])
+            orders_i = _orders(masks_tr[i], permutation_list)
             last_i = i
         pairs.append(
             (
                 columns[i],
                 columns[j],
-                *_fd_scores(a[rows_i], ka, b[rows_i], kb, shuffles),
-                g3(ho[answered_ho[i], i], ka, ho[answered_ho[i], j], kb),
-                len(rows_i) / n,
+                *_views(
+                    a,
+                    ho[:, i],
+                    ka,
+                    b,
+                    ho[:, j],
+                    kb,
+                    (masks_tr[i], masks_ho[i], masks_tr[j], masks_ho[j]),
+                    orders_i,
+                    permutation_list,
+                ),
                 observed[i],
                 observed[j],
             )
@@ -259,12 +303,13 @@ def two_column_search(
     permutations: int = 5,
     seed: int = 0,
 ) -> pd.DataFrame:
-    """Every rule {A, B} -> C with train error at most ``max_error``, in ``PAIR_COLUMNS`` form.
+    """Every rule {A, B} -> C within ``max_error`` in either view, in ``PAIR_COLUMNS`` form.
 
-    Each pair of columns is scored against every other column. C is skipped
-    when A or B alone already fixes it exactly (the pair adds nothing), and
-    the result keeps only rules within ``max_error``, because all scores
-    would be ~n³/2 rows; the single-column table has every pair.
+    Each pair of columns is scored against every other column, on rows where
+    A and B are answered (and, for the value view, C too). C is skipped when
+    A or B alone already fixes it exactly (the pair adds nothing), and the
+    result keeps only rules within ``max_error``, because all scores would be
+    ~n³/2 rows; the single-column table has every pair.
     """
     start = time.time()
     columns = list(dict.fromkeys([*pairs["lhs"], *pairs["rhs"]]))
@@ -272,42 +317,54 @@ def two_column_search(
     sizes = [len(lab) for lab in labels]
     n = len(tr)
     index = {c: k for k, c in enumerate(columns)}
-    exact = pairs[pairs["train_error"] == 0]
+    exact = pairs[(pairs["train_error"] == 0) | (pairs["value_error"] == 0)]
     fixed = {k: set() for k in range(len(columns))}
     for lhs, rhs in zip(exact["lhs"], exact["rhs"], strict=True):
         fixed[index[lhs]].add(index[rhs])
-    answered_tr = [_answered(tr[:, k], labels[k]) for k in range(len(columns))]
-    answered_ho = [_answered(ho[:, k], labels[k]) for k in range(len(columns))]
+    masks_tr = [_answered(tr[:, k], labels[k]) for k in range(len(columns))]
+    masks_ho = [_answered(ho[:, k], labels[k]) for k in range(len(columns))]
     rng = np.random.default_rng(seed)
+    permutation_list = [rng.permutation(n) for _ in range(permutations)]
     rows = []
     total = len(columns) * (len(columns) - 1) // 2
     for done, (i, j) in enumerate(itertools.combinations(range(len(columns)), 2), start=1):
         kb = sizes[j]
-        rows_tr = np.intersect1d(answered_tr[i], answered_tr[j], assume_unique=True)
-        rows_ho = np.intersect1d(answered_ho[i], answered_ho[j], assume_unique=True)
         joint, inverse = np.unique(
-            np.r_[tr[rows_tr, i] * kb + tr[rows_tr, j], ho[rows_ho, i] * kb + ho[rows_ho, j]],
-            return_inverse=True,
+            np.r_[tr[:, i] * kb + tr[:, j], ho[:, i] * kb + ho[:, j]], return_inverse=True
         )
-        lhs_tr, lhs_ho, k_lhs = inverse[: len(rows_tr)], inverse[len(rows_tr) :], len(joint)
-        if not len(rows_tr):
+        lhs_tr, lhs_ho, k_lhs = inverse[:n], inverse[n:], len(joint)
+        mask, mask_ho = masks_tr[i] & masks_tr[j], masks_ho[i] & masks_ho[j]
+        if not mask.any():
             continue
-        shuffles = [rng.permutation(len(rows_tr)) for _ in range(permutations)]
+        orders = _orders(mask, permutation_list)
         for c in range(len(columns)):
             if c in (i, j) or c in fixed[i] or c in fixed[j]:
                 continue
-            target = tr[rows_tr, c]
-            if g3(lhs_tr, k_lhs, target, sizes[c]) > max_error:
+            target, kc = tr[:, c], sizes[c]
+            both = mask & masks_tr[c]
+            within = g3(lhs_tr[mask], k_lhs, target[mask], kc) <= max_error or (
+                both.any() and g3(lhs_tr[both], k_lhs, target[both], kc) <= max_error
+            )
+            if not within:
                 continue
+            scores = _views(
+                lhs_tr,
+                lhs_ho,
+                k_lhs,
+                target,
+                ho[:, c],
+                kc,
+                (mask, mask_ho, masks_tr[c], masks_ho[c]),
+                orders,
+                permutation_list,
+            )
             rows.append(
                 (
                     f"{columns[i]}; {columns[j]}",
                     columns[c],
-                    *_fd_scores(lhs_tr, k_lhs, target, sizes[c], shuffles),
-                    g3(lhs_ho, k_lhs, ho[rows_ho, c], sizes[c]),
-                    len(rows_tr) / n,
-                    int(len(np.unique(lhs_tr))),
-                    int(len(np.unique(tr[:, c]))),
+                    *scores,
+                    int(len(np.unique(lhs_tr[mask]))),
+                    int(len(np.unique(target))),
                 )
             )
         if done % 1000 == 0:

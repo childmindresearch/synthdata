@@ -50,6 +50,7 @@ COLUMNS = [
     "kind",
     "lhs",
     "rhs",
+    "rows",
     "support",
     "train_error",
     "holdout_error",
@@ -76,19 +77,25 @@ def _as_text(frame: pd.DataFrame) -> pd.DataFrame:
     return frame.apply(lambda column: column.map(_label)).astype(str)
 
 
-def make_rule(lhs: list, rhs) -> str:
+def make_rule(lhs: list, rhs, answered: list | None = None) -> str:
     """JSON rule: ``lhs`` and ``rhs`` as ``[column, value]``; a null value means "any".
 
     A functional dependency X -> Y has only nulls; a conditional one fixes some
     values, e.g. ``{"lhs": [["uses_substances", "no"]], "rhs": ["freq", "<NA>"]}``.
+    ``answered`` lists columns that must be non-blank for the rule to apply
+    (an FD scored on answered rows).
     """
-    return json.dumps({"lhs": [list(item) for item in lhs], "rhs": list(rhs)})
+    rule = {"lhs": [list(item) for item in lhs], "rhs": list(rhs)}
+    if answered:
+        rule["answered"] = list(answered)
+    return json.dumps(rule)
 
 
 def rule_error(frame: pd.DataFrame, rule: str | dict) -> tuple[int, float]:
     """Rows the rule applies to, and the share of them to remove for it to hold.
 
-    The rule applies to rows matching every fixed left-side value. With a
+    The rule applies to rows matching every fixed left-side value where every
+    ``answered`` column (if the rule lists any) is not blank. With a
     fixed right-side value the error is the share of those rows without it;
     otherwise it is the g3 error of "the "any" left-side columns fix the
     right-side column" within them (Kivinen & Mannila 1995). NaN when a
@@ -96,7 +103,7 @@ def rule_error(frame: pd.DataFrame, rule: str | dict) -> tuple[int, float]:
     """
     rule = json.loads(rule) if isinstance(rule, str) else rule
     lhs, (rhs, rhs_value) = rule["lhs"], rule["rhs"]
-    columns = [c for c, _ in lhs] + [rhs]
+    columns = [c for c, _ in lhs] + [rhs] + list(rule.get("answered", []))
     if frame.empty or any(c not in frame.columns for c in columns):
         return 0, float("nan")
     text = _as_text(frame[list(dict.fromkeys(columns))])
@@ -104,6 +111,8 @@ def rule_error(frame: pd.DataFrame, rule: str | dict) -> tuple[int, float]:
     for column, value in lhs:
         if value is not None:
             applies &= text[column] == str(value)
+    for column in rule.get("answered", []):
+        applies &= text[column] != BLANK
     rows = text[applies]
     if rows.empty:
         return 0, float("nan")
@@ -126,18 +135,27 @@ def fd_rows(
 ) -> pd.DataFrame:
     """``fd`` report rows: every scored pair (see ``dependency_search``) within ``max_error``.
 
-    ``max_error`` only decides what is listed here (the all-pairs file has the
-    rest). Actions: ``id_like`` when the chance-corrected score is below
-    ``min_score`` (X has so many values that it fixes Y by accident);
-    otherwise, when exact on train and holdout, ``merge_hierarchy`` for two
-    categorical columns where X has more values (sub_program -> program) and
-    ``derive`` for the rest; else ``review``.
+    A pair is listed when either view holds within ``max_error``: rows where
+    X is answered (a blank Y is a value), or rows where both are answered
+    (``rows`` says which view the row reports; the value view wins when both
+    hold, since it tests the recorded values). ``max_error`` only decides what
+    is listed here (the all-pairs file has the rest). Actions: ``id_like``
+    when the view's chance-corrected score is below ``min_score`` (X has so
+    many values that it fixes Y by accident); otherwise, when exact on train
+    and holdout, ``merge_hierarchy`` for two categorical columns where X has
+    more values (sub_program -> program) and ``derive`` for the rest; else
+    ``review``.
     """
     categorical = {str(c) for c in categorical}
     rows = []
-    listed = pairs[pairs["train_error"] <= max_error].sort_values(
-        ["score", "train_error"], ascending=[False, True]
-    )
+    value = pairs["value_error"] <= max_error
+    listed = pairs[value | (pairs["train_error"] <= max_error)].copy()
+    use_value = listed["value_error"] <= max_error
+    views = {"train_error": "value_error", "holdout_error": "value_holdout_error"}
+    for name, source in {**views, "score": "value_score"}.items():
+        listed[name] = listed[source].where(use_value, listed[name])
+    listed["rows"] = np.where(use_value, "both answered", "lhs answered")
+    listed = listed.sort_values(["score", "train_error"], ascending=[False, True])
     for row in listed.itertuples():
         lhs = row.lhs.split("; ")
         exact = row.train_error == 0 and row.holdout_error == 0
@@ -154,11 +172,13 @@ def fd_rows(
             action = DERIVE
         else:
             action = REVIEW
+        answered = [*lhs, row.rhs] if row.rows == "both answered" else lhs
         rows.append(
             {
                 "kind": "fd",
                 "lhs": row.lhs,
                 "rhs": row.rhs,
+                "rows": row.rows,
                 "support": np.nan,
                 "train_error": row.train_error,
                 "holdout_error": row.holdout_error,
@@ -168,7 +188,7 @@ def fd_rows(
                 "rhs_values": row.rhs_values,
                 "r2": np.nan,
                 "action": action,
-                "check_rule": make_rule([[c, None] for c in lhs], [row.rhs, None]),
+                "check_rule": make_rule([[c, None] for c in lhs], [row.rhs, None], answered),
             }
         )
     return pd.DataFrame(rows, columns=COLUMNS)
@@ -188,7 +208,7 @@ def condition_rows(
     rules file only: they number in the tens of thousands on wide data, and
     the missing-blocks report groups them into blocks.
     """
-    within = pairs[pairs["train_error"] <= max_error]
+    within = pairs[(pairs["train_error"] <= max_error) | (pairs["value_error"] <= max_error)]
     listed_fds = set(zip(within["lhs"], within["rhs"], strict=True))
     listed = rules[rules["confidence"] >= 1 - max_error]
     keep = [pair not in listed_fds for pair in zip(listed["lhs"], listed["rhs"], strict=True)]

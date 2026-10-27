@@ -147,6 +147,23 @@ def test_more_than_two_determining_columns_are_refused():
         dependencies_table(frame, frame, CATEGORICAL, [], max_lhs=3)
 
 
+def test_hierarchy_shows_when_the_parent_is_often_blank():
+    train, holdout = _programs(seed=0), _programs(400, seed=1)
+    for frame, seed in ((train, 5), (holdout, 6)):
+        blank = np.random.default_rng(seed).random(len(frame)) < 0.5
+        frame.loc[blank, "major"] = np.nan  # parent missing at random in half the rows
+    pairs, _ = _search(train, holdout)
+    row = pairs.set_index(["lhs", "rhs"]).loc[("sub", "major")]
+    assert row["train_error"] > 0.3  # sub cannot predict which rows are blank
+    assert row["value_error"] == 0 and row["both_answered"] == pytest.approx(0.5, abs=0.05)
+    table = fd_rows(pairs, CATEGORICAL).set_index(["lhs", "rhs"])
+    assert table.loc[("sub", "major"), "rows"] == "both answered"
+    assert table.loc[("sub", "major"), "action"] == MERGE_HIERARCHY
+    # The rule checks only rows where both are answered.
+    rule = table.loc[("sub", "major"), "check_rule"]
+    assert rule_error(holdout, rule) == ((holdout[["sub", "major"]].notna().all(axis=1)).sum(), 0.0)
+
+
 def test_shared_blanks_do_not_make_a_dependency():
     rng = np.random.default_rng(0)
     n = 2000
