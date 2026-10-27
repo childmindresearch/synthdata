@@ -52,7 +52,7 @@ A plain-language guide to every number in `report.md` and `combined_evaluation.c
 | `performance.linear_model`, `mlp`, `xgb` | Train-on-synthetic, test-on-real scores of three model types. | Higher |
 | `performance.feat_rank_distance.corr` | Whether a model trained on synthetic data ranks the features as important in the same order as one trained on real data. | Higher |
 | `performance.*_augmentation` | Gain from adding synthetic rows to the real training rows. Unranked. | Higher |
-| `detection.detection_xgb`, `mlp`, `linear` | AUC of a classifier trained to tell real rows from synthetic ones. 0.5 = cannot tell them apart. | Lower (towards 0.5) |
+| `detection.detection_xgb`, `mlp`, `linear` | AUC of a classifier trained to tell real rows from synthetic ones. 0.5 = cannot tell them apart. `xgb` and `mlp` are unranked: with hundreds of columns XGBoost tells every generator apart (AUC 1.0) and MLP misses dependence between columns, so neither separates generators. | Lower (towards 0.5) |
 | `detection.detection_gmm` | Not a real detector (it ignores the labels). Unranked. | - |
 
 ## Privacy: could the synthetic data reveal a real patient?

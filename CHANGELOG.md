@@ -4,6 +4,19 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.19.0 (2026-10-27)
+
+Changes generated data and the ranking: use a new experiment id, since cached synthetic sets keep their old format and old rankings counted detection. The golden runs need re-recording on the Linux GPU machine (detection values and rounded generator output move).
+
+### Changed
+
+- **Synthetic numbers get the train format.** Every numeric (non-categorical) column of every generator's output is clipped to the train min and max and rounded to the train column's decimal places, as SDV does by default (rdt's `FloatFormatter` rules, reimplemented in `synthdata/generation/numeric_format.py` and checked against rdt 2.0.0). Counts that are whole numbers in train stay whole numbers: ARF wrote decimals into them in about 95% of rows. No config key; categorical columns are not touched.
+- **XGBoost and MLP detection are reported but no longer ranked.** On the simulated clinical dataset XGBoost detection was 1.000 for every generator and the marginals baseline (so it rewarded only the copy of train), and MLP detection scored the marginals baseline like a copy. Both stay in `combined_evaluation.csv`; the linear detector stays ranked.
+
+### Fixed
+
+- synthcity fork: `detection_xgb` passed `depth: 3`, which XGBoost ignores, so its trees grew to depth 6. It now passes `max_depth: 3`.
+
 ## 0.16.2 (2026-10-22)
 
 No result or config changes; old results stay comparable and no golden re-record is needed.
