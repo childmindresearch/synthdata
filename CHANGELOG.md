@@ -4,6 +4,10 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.23.0 (2026-10-28)
+
+`configs/config_sim.yaml` now uses simulated dataset v1.3 (experiment id 1.3); results are not comparable with v1.2 runs.
+
 ## 0.22.1 (2026-10-28)
 
 Dashboard and log only; results stay comparable with 0.22.0 and no golden re-record is needed.

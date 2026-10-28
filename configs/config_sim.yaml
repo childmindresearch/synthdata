@@ -1,4 +1,4 @@
-# Simulated clinical data (sim 1.2), used to profile and test the
+# Simulated clinical data (sim 1.3), used to profile and test the
 # pipeline before LORIS runs. Paths are relative to the repository root; the
 # data files live only on the owner's machine (data/ is git-ignored).
 #
@@ -23,16 +23,16 @@ compute:
 
 experiment:
   tag: sim_v1
-  id: "1.2" # Reusing an id resumes that experiment; null makes a new one per run.
+  id: "1.3" # Reusing an id resumes that experiment; null makes a new one per run.
 
 data:
-  # Source and schema (simulated data 1.2). The CSV's first two columns are
+  # Source and schema (simulated data 1.3). The CSV's first two columns are
   # identifiers that the schema leaves out: research_subject_id (one per
   # patient) and encounter_number (one per row).
   source: csv
-  path: data/simulated/sim_v1.2.csv
-  version: "1.2" # Use a new value whenever the source data changes.
-  variable_schema_path: data/simulated/sim_v1.2_variable_schema.csv
+  path: data/simulated/sim_v1.3.csv
+  version: "1.3" # Use a new value whenever the source data changes.
+  variable_schema_path: data/simulated/sim_v1.3_variable_schema.csv
   data_dir: data/simulated # Cached splits and imputed data.
 
   # Modeling columns
@@ -45,7 +45,7 @@ data:
   # to infer; protected columns are the fairness groups. QIs and sensitive
   # columns must not overlap; neither may hold the target or patient ID.
   # A small representative set while the final lists are being chosen.
-  quasi_identifier_columns: [age_reg, birth_year, gender, region, Ethnicity]
+  quasi_identifier_columns: [age_reg, gender, region, Ethnicity]
   sensitive_columns: [Income, Anxiety disorder]
   protected_columns: [gender, age_reg, Ethnicity]
   # Groups for numeric protected columns (fairness metrics, log disparity).
