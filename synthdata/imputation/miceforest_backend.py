@@ -22,8 +22,15 @@ Observed values are returned unchanged, and the target column is neither an
 input nor an output. The kernel sees the columns as ``c0``, ``c1``, ...:
 LightGBM rejects feature names with JSON characters (``"``, ``,``, ``:``,
 brackets and braces), so the original names never reach it.
+
+Binary columns are matched on LightGBM's log-odds. When a forest is certain
+(a predicted probability of exactly 0 or 1, common for a rare level or a
+column the others determine) miceforest's ``logodds`` returns an infinity and
+its nearest-neighbour search stops on it; :func:`_finite_logodds` clips the
+probabilities just inside (0, 1) first, which keeps their order.
 """
 
+import contextlib
 import dataclasses
 from typing import Any
 
@@ -47,6 +54,34 @@ class FittedMiceForest:
     modeled: list
     seed: int
     kernel: Any
+
+
+#: Probabilities are clipped to [_EPS, 1 - _EPS] before taking log-odds.
+_EPS = 1e-12
+
+
+@contextlib.contextmanager
+def _finite_logodds():
+    """Make miceforest's log-odds finite while the block runs.
+
+    ``miceforest.imputation_kernel`` (6.0.5) maps binary predictions through
+    ``utils.logodds``, which divides by ``1 - p`` without a guard; a ``p`` of
+    exactly 0 or 1 gives an infinity that scipy's KDTree rejects ("data must
+    be finite"). Clipping in float64 keeps every other value unchanged.
+    """
+    from miceforest import imputation_kernel
+
+    original = imputation_kernel.logodds
+
+    def clipped(probability):
+        p = np.clip(np.asarray(probability, dtype=np.float64), _EPS, 1.0 - _EPS)
+        return np.log(p / (1.0 - p))
+
+    imputation_kernel.logodds = clipped  # ty: ignore[invalid-assignment]
+    try:
+        yield
+    finally:
+        imputation_kernel.logodds = original
 
 
 def _kernel_names(state: FittedMiceForest) -> dict:
@@ -129,7 +164,8 @@ def fit(
         mean_match_candidates=cfg.mean_match_candidates,
         random_state=seed,
     )
-    state.kernel.mice(cfg.iterations, num_threads=cfg.num_threads, deterministic=True)
+    with _finite_logodds():
+        state.kernel.mice(cfg.iterations, num_threads=cfg.num_threads, deterministic=True)
     filled = _from_kernel(state.kernel.complete_data(dataset=0), state).set_axis(fit_df.index)
     return state, _decode(filled, fit_df, state)
 
@@ -147,9 +183,10 @@ def transform(state: FittedMiceForest, frame: pd.DataFrame) -> pd.DataFrame:
         )
     if not missing:
         return _decode(encoded, frame, state)
-    imputed = state.kernel.impute_new_data(
-        _to_kernel(encoded, state).reset_index(drop=True),
-        random_state=np.random.RandomState(state.seed),
-    )
+    with _finite_logodds():
+        imputed = state.kernel.impute_new_data(
+            _to_kernel(encoded, state).reset_index(drop=True),
+            random_state=np.random.RandomState(state.seed),
+        )
     filled = _from_kernel(imputed.complete_data(dataset=0), state).set_axis(frame.index)
     return _decode(filled, frame, state)

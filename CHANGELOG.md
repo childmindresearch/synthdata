@@ -4,6 +4,14 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.23.2 (2026-10-28)
+
+No config changes and no golden re-record needed. Imputed values change only for binary columns where the imputation model is certain (a predicted probability of exactly 0 or 1), which used to stop the run.
+
+### Fixed
+
+- miceforest imputation no longer stops with `ValueError: data must be finite, check for nan or inf values` on a binary column with a very rare level. LightGBM then predicts a probability of exactly 0 or 1, and miceforest's log-odds for mean matching became infinite. The probabilities are now clipped to [1e-12, 1 - 1e-12] before the log-odds, which keeps their order.
+
 ## 0.23.1 (2026-10-28)
 
 No result or config changes; old results stay comparable and no golden re-record is needed.
