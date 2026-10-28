@@ -20,7 +20,7 @@ from synthdata import gpu_slots
 from synthdata.compute import resolve_workers, run_per_model
 from synthdata.config import Config
 from synthdata.data import Dataset, read_like, remask_synthetic
-from synthdata.generation import cart_fill, class_quota
+from synthdata.generation import cart_fill, class_quota, numeric_format
 from synthdata.generation import hpo as hpo_mod
 from synthdata.generation import synthcity_backend as sc
 from synthdata.generation import tabpfn_backend as tpfn
@@ -449,6 +449,21 @@ def run_generation(
             return None
         return df
 
+    formats = {}
+
+    def _numeric_format():
+        """Decimals and range of each numeric train column, learned once (numeric_format)."""
+        if not formats:
+            reference = (
+                dataset.train_imputed_df
+                if dataset.train_imputed_df is not None
+                else dataset.train_df
+            )
+            categorical = set(dataset.all_categorical_columns)
+            numeric = [c for c in reference.columns if c not in categorical]
+            formats["train"] = numeric_format.learn_format(reference, numeric)
+        return formats["train"]
+
     def _build_one(name, replicate_seed, build_fn, top_up=True):
         path = output_dir / f"{name}.csv"
         if path.exists() and not gen_cfg.force_retrain:
@@ -490,6 +505,7 @@ def run_generation(
                 )
             df.attrs.pop("class_sampling", None)
             _record_class_sampling(name, report)
+        df = numeric_format.apply_format(df, _numeric_format())
         df.to_csv(path, index=False)
         _write_released(name, df, overwrite=True, replicate_seed=replicate_seed)
         synthetic_datasets[name] = df
