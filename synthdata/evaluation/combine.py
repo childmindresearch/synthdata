@@ -20,8 +20,10 @@ from synthdata.evaluation.catalog import (
     TSTR_METRICS,
     is_custom_syntheval_metric,
     is_redundant_synthcity_submetric,
+    is_syntheval_fairness_gap,
 )
 from synthdata.evaluation.custom_eval import build_log_disparity_summary_table
+from synthdata.evaluation.fairness_gaps import FAIRNESS_GAP_METRICS, FAIRNESS_SIGNAL_COLUMN
 from synthdata.evaluation.privacy_attacks import (
     ANONYMETER_METRICS,
     HOLDOUT_DISTANCE_METRICS,
@@ -129,6 +131,10 @@ def _syntheval_frames(
     columns = [(_framework(col), types[col], col) for col in raw.columns]
     raw.columns = pd.MultiIndex.from_tuples(columns)
     oriented.columns = pd.MultiIndex.from_tuples(columns)
+    # Their classifier is fitted and scored inside the synthetic data, so a
+    # dataset with no class signal gets a perfect 0; the holdout fairness
+    # gaps (_fairness_gap_frames) are ranked instead.
+    oriented = oriented[[c for c in oriented.columns if not is_syntheval_fairness_gap(c[2])]]
     return raw, oriented
 
 
@@ -228,6 +234,29 @@ def _privacy_attack_frames(
     return pd.concat([raw, fairness], axis=1), oriented
 
 
+def _fairness_gap_frames(
+    table: pd.DataFrame | None, model_names: list
+) -> "tuple[pd.DataFrame, pd.DataFrame]":
+    """Holdout fairness gap errors as custom fairness columns (lower is better).
+
+    A model that failed the gate has NaN errors; :func:`build_combined_table`
+    leaves those out of its fairness score instead of scoring them worst.
+    The gate flag is reported, not ranked.
+    """
+    if table is None or table.empty:
+        empty = pd.DataFrame(index=model_names)
+        return empty, empty
+    table = table.reindex(model_names)
+    metrics = [m for m in FAIRNESS_GAP_METRICS if m in table.columns]
+    raw = table[[*metrics, FAIRNESS_SIGNAL_COLUMN]].astype(float)
+    oriented = -raw[metrics]
+    raw.columns = pd.MultiIndex.from_tuples([("custom", "fairness", c) for c in raw.columns])
+    oriented.columns = pd.MultiIndex.from_tuples(
+        [("custom", "fairness", c) for c in oriented.columns]
+    )
+    return raw, oriented
+
+
 def _minmax_scale(col: pd.Series) -> pd.Series:
     """Per-column min-max scaling; NaN-safe (ties -> 0.5, NaNs preserved)."""
     valid = col.dropna()
@@ -283,6 +312,7 @@ _KNOWN_IDEALS = {
     "subgroup_distance_mia_auc_gap": 0.0,
     "subgroup_distance_mia_auc_max": 0.5,
     **{name: 0.0 for name in LOG_DISPARITY_METRICS},
+    **{name: 0.0 for name in FAIRNESS_GAP_METRICS},
 }
 
 
@@ -337,6 +367,7 @@ def build_combined_table(
     rank_weights: dict | None = None,
     tstr_result: dict | None = None,
     privacy_result: dict | None = None,
+    fairness_gap_table: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build the single combined, ranked, multi-index evaluation table.
 
@@ -344,6 +375,11 @@ def build_combined_table(
     adds the holdout TSTR macro scores as a ``("custom", "utility")`` group, and
     ``privacy_result`` (from :func:`synthdata.evaluation.custom_eval.run_privacy_evaluation`)
     the Anonymeter risks and holdout-referenced distances as ``("custom", "privacy")``.
+    ``fairness_gap_table`` (from
+    :func:`synthdata.evaluation.fairness_gaps.build_fairness_gap_table`) adds
+    the holdout fairness gap errors to ``("custom", "fairness")``; they and
+    log disparity are the ranked fairness metrics (SynthEval's subgroup gaps
+    are reported only).
 
     Ranking scheme -- a hierarchical *mean-of-means*, not a flat sum, so a
     framework/type with many metric columns (e.g. synthcity's ~7-column
@@ -376,11 +412,12 @@ def build_combined_table(
     ld_raw, ld_oriented = _log_disparity_frames(log_disparity_reports, model_names)
     ts_raw, ts_oriented = _tstr_frames(tstr_result, model_names)
     pa_raw, pa_oriented = _privacy_attack_frames(privacy_result, model_names)
+    fg_raw, fg_oriented = _fairness_gap_frames(fairness_gap_table, model_names)
 
-    raw_parts = [df for df in (sc_raw, se_raw, ld_raw, ts_raw, pa_raw) if not df.empty]
+    raw_parts = [df for df in (sc_raw, se_raw, ld_raw, ts_raw, pa_raw, fg_raw) if not df.empty]
     oriented_parts = [
         df
-        for df in (sc_oriented, se_oriented, ld_oriented, ts_oriented, pa_oriented)
+        for df in (sc_oriented, se_oriented, ld_oriented, ts_oriented, pa_oriented, fg_oriented)
         if not df.empty
     ]
 
@@ -390,7 +427,11 @@ def build_combined_table(
     raw_df = pd.concat(raw_parts, axis=1)
     oriented_df = pd.concat(oriented_parts, axis=1)
 
-    scaled_df = oriented_df.apply(_minmax_scale, axis=0).apply(_missing_as_worst, axis=0)
+    scaled_df = oriented_df.apply(_minmax_scale, axis=0)
+    # A gated fairness gap (no class signal) is left out, not scored worst.
+    gated = [c for c in scaled_df.columns if c[2] in FAIRNESS_GAP_METRICS]
+    others = [c for c in scaled_df.columns if c not in gated]
+    scaled_df[others] = scaled_df[others].apply(_missing_as_worst, axis=0)
 
     combined = raw_df.copy()
 
@@ -417,16 +458,23 @@ def build_combined_table(
             combined[(_ALL, type_, _RANK)] = combined[group_rank_cols].mean(axis=1, skipna=True)
 
     # Step 4: overall rank -- WEIGHTED GEOMETRIC MEAN of the type-level rollups.
+    # A type a model has no score for (every one of its metrics left out, as
+    # for a gated fairness gap) drops out of that model's mean; a type no
+    # model has a score for weighs on every row alike.
     log_total = pd.Series(0.0, index=combined.index)
-    weight_total = 0.0
+    weight_total = pd.Series(0.0, index=combined.index)
     for type_ in _TYPES:
         key = (_ALL, type_, _RANK)
         weight = rank_weights.get(type_, 1.0)
         if key in combined.columns and weight > 0:
-            floored = combined[key].fillna(0.0).clip(lower=GEOMETRIC_FLOOR)
-            log_total = log_total + weight * np.log(floored)
-            weight_total += weight
-    overall = np.exp(log_total / weight_total) if weight_total else log_total
+            scores = combined[key]
+            present = scores.notna() if scores.notna().any() else pd.Series(True, scores.index)
+            floored = scores.fillna(0.0).clip(lower=GEOMETRIC_FLOOR)
+            log_total = log_total + (weight * np.log(floored)).where(present, 0.0)
+            weight_total = weight_total + present * weight
+    overall = np.exp(log_total / weight_total.where(weight_total > 0, 1.0)).where(
+        weight_total > 0, 0.0
+    )
     combined[(_ALL, "overall", _RANK)] = overall
 
     combined.columns = pd.MultiIndex.from_tuples(

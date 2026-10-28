@@ -269,6 +269,21 @@ def is_custom_syntheval_metric(name: str) -> bool:
 #: in the combined evaluation table, since they are not part of upstream SynthEval.
 SYNTHEVAL_CUSTOM_FAIRNESS_KEYS = {"equalized_odds", "equal_opportunity"}
 
+#: SynthEval's subgroup gaps (statistical parity and the fork's equalized
+#: odds and equal opportunity) and their per-group sub-columns. Reported but
+#: not ranked: their classifier is fitted and scored inside the synthetic
+#: data, so a dataset with no class signal predicts one class and scores a
+#: perfect 0 (docs/verification.md). The holdout fairness gaps
+#: (synthdata.evaluation.fairness_gaps) are ranked instead.
+SYNTHEVAL_FAIRNESS_GAP_KEYS = {"statistical_parity", *SYNTHEVAL_CUSTOM_FAIRNESS_KEYS}
+_SYNTHEVAL_FAIRNESS_GAP_PREFIXES = ("sp_", *_SYNTHEVAL_CUSTOM_SUBMETRIC_PREFIXES)
+
+
+def is_syntheval_fairness_gap(name: str) -> bool:
+    """Whether a SynthEval result column is one of the unranked subgroup gaps."""
+    return name in SYNTHEVAL_FAIRNESS_GAP_KEYS or name.startswith(_SYNTHEVAL_FAIRNESS_GAP_PREFIXES)
+
+
 # ---------------------------------------------------------------------------
 # custom (log disparity + the syntheval-fork-only fairness metrics above)
 # ---------------------------------------------------------------------------
@@ -300,8 +315,12 @@ TSTR_NAME = "tstr"
 #: Custom privacy evaluators (synthdata.evaluation.privacy_attacks).
 PRIVACY_ATTACK_NAMES = ("anonymeter", "holdout_distance")
 
+#: Name of the holdout fairness-gap evaluator (synthdata.evaluation.fairness_gaps).
+FAIRNESS_GAPS_NAME = "fairness_gaps"
+
 CUSTOM_METRIC_TYPE = {
     TSTR_NAME: "utility",
+    FAIRNESS_GAPS_NAME: "fairness",
     **{name: "privacy" for name in PRIVACY_ATTACK_NAMES},
     **{name: "fairness" for name in LOG_DISPARITY_METRICS},
     **{name: "fairness" for name in SYNTHEVAL_CUSTOM_FAIRNESS_KEYS},

@@ -4,6 +4,17 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.20.0 (2026-10-27)
+
+Changes the fairness score and so the overall ranking: rankings from earlier versions are not comparable. Generated data is unchanged, so re-evaluating an existing experiment is enough (no new experiment id needed for generation). The golden runs need re-recording on the Linux GPU machine (new columns and fairness ranks).
+
+### Changed
+
+- **New ranked fairness metrics: holdout fairness gaps** (custom evaluator `fairness_gaps`, on by default). The holdout TSTR classifier is fitted on each synthetic dataset and on the real train split, and both predict the holdout. Per class and protected group, fairlearn gives the demographic parity, equal opportunity and equalized odds gaps, and each score (`demographic_parity_gap_error`, `equal_opportunity_gap_error`, `equalized_odds_gap_error`) is the average distance between the synthetic and the real gap: 0 keeps the real disparities, while erasing or inverting them scores high. When the synthetic-trained classifier does not beat chance on the holdout (bootstrap 95% interval of balanced accuracy), the scores are blank, `fairness_signal` is 0, and the model is left out of the fairness score instead of being scored worst.
+- **SynthEval's statistical parity, equalized odds and equal opportunity are reported but no longer ranked.** Their classifier is fitted and scored inside the synthetic data, so a dataset with no class signal predicted one class and scored a perfect 0. On the simulated clinical dataset, ARF, TabularARGN, DDPM and the marginals baseline did, and CDTD, the one generator with a learnable signal, ranked last on fairness. With the new scores, TabularARGN keeps the real gaps best (demographic parity error 0.056), then ARF (0.077) and CDTD (0.110); DDPM and the marginals baseline are gated.
+- New output files `fairness_gaps.csv` (per model) and `fairness_gaps_by_group.csv` (every gap per class and group), a new report subsection, and new `combined_evaluation.csv` columns under `custom/fairness`.
+- New dependency: `fairlearn`.
+
 ## 0.19.0 (2026-10-27)
 
 Changes generated data and the ranking: use a new experiment id, since cached synthetic sets keep their old format and old rankings counted detection. The golden runs need re-recording on the Linux GPU machine (detection values and rounded generator output move).

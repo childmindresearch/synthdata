@@ -18,10 +18,17 @@ import pandas as pd
 from synthdata.compute import run_per_model
 from synthdata.config import ComputeConfig
 from synthdata.data import Dataset
-from synthdata.evaluation.catalog import LOG_DISPARITY_METRICS, TSTR_NAME, resolve_selection
+from synthdata.evaluation.catalog import (
+    FAIRNESS_GAPS_NAME,
+    LOG_DISPARITY_METRICS,
+    TSTR_NAME,
+    resolve_selection,
+)
+from synthdata.evaluation.fairness_gaps import fairness_gap_scores, real_holdout_predictions
 from synthdata.evaluation.privacy_attacks import (
     ANONYMETER_NAME,
     HOLDOUT_DISTANCE_NAME,
+    protected_group_masks,
     run_privacy_attack_evaluation,
 )
 from synthdata.evaluation.tstr import TSTRScores, target_classes, tstr_scores
@@ -34,6 +41,7 @@ _LOG_DISPARITY_NAME = "log_disparity"
 #: Every evaluator ``evaluation.custom`` selects from, with its type.
 _CUSTOM_EVALUATORS = {
     _LOG_DISPARITY_NAME: "fairness",
+    FAIRNESS_GAPS_NAME: "fairness",
     TSTR_NAME: "utility",
     ANONYMETER_NAME: "privacy",
     HOLDOUT_DISTANCE_NAME: "privacy",
@@ -251,6 +259,71 @@ def run_tstr_evaluation(
         "tsts": {name: pair[1] for name, pair in run.results.items() if pair[1] is not None},
         "classes": [str(c) for c in classes],
     }
+
+
+def run_fairness_gap_evaluation(
+    synthetic_datasets: dict[str, pd.DataFrame],
+    dataset: Dataset,
+    selection_cfg,
+    seed: int,
+    compute_cfg=None,
+    xgb_params: dict | None = None,
+) -> dict:
+    """Subgroup gaps of the TSTR classifier, synthetic against real (fairness_gaps).
+
+    Returns ``{model: FairnessGaps}``, or ``{}`` when the evaluator is not
+    selected, the target is not categorical, there is no test split or no
+    protected column has a group with enough holdout rows. A model whose fit
+    fails is logged and left out.
+    """
+    if not _selected(selection_cfg, FAIRNESS_GAPS_NAME):
+        return {}
+    if not dataset.target_is_categorical:
+        logger.info("[custom] fairness gaps need a categorical target; skipping")
+        return {}
+    if dataset.test_imputed_df is None or dataset.test_imputed_df.empty:
+        logger.warning("[custom] fairness gaps need a test split; skipping")
+        return {}
+    target = dataset.target_column
+    train_df = dataset.require_imputed(dataset.train_imputed_df, "train_imputed_df")
+    test_df = dataset.test_imputed_df
+    masks = {
+        key: holdout
+        for key, (_, holdout) in protected_group_masks(
+            train_df,
+            test_df,
+            list(dataset.protected_columns),
+            list(dataset.nominal_columns),
+            dataset.protected_bins,
+        ).items()
+    }
+    if not masks:
+        logger.info("[custom] fairness gaps: no protected group to compare; skipping")
+        return {}
+    classes = target_classes(train_df[target], target in dataset.ordinal_columns)
+    real = real_holdout_predictions(
+        train_df, test_df, target, dataset.nominal_columns, classes, seed, xgb_params
+    )
+    run = run_per_model(
+        functools.partial(fairness_gap_scores, xgb_params=xgb_params, real_predictions=real),
+        {
+            name: (
+                syn_df[train_df.columns],
+                train_df,
+                test_df,
+                target,
+                dataset.nominal_columns,
+                classes,
+                masks,
+                seed,
+            )
+            for name, syn_df in synthetic_datasets.items()
+        },
+        compute_cfg or ComputeConfig(workers=1),
+        n_columns=train_df.shape[1],
+        label="fairness gaps",
+    )
+    return run.results
 
 
 def build_tstr_table(tstr_result: dict) -> pd.DataFrame:
