@@ -457,8 +457,12 @@ class SynthcityModelsConfig:
     #: Train synthcity generators at all.
     enabled: bool = True
     #: synthcity plugin names to train: "ctgan", "tvae", "rtvae", "adsgan",
-    #: "pategan" (differentially private GAN), "bayesian_network" and "ddpm".
-    #: Bayesian networks and DDPM scale poorly to hundreds of columns.
+    #: "pategan" (differentially private GAN), "bayesian_network", "ddpm" and "arf".
+    #: Bayesian networks and DDPM scale poorly to hundreds of columns. DDPM is
+    #: left out by default: on the wide simulated data it still learns the
+    #: columns independently (correlation and MI errors equal the
+    #: independent-marginals baseline); add "ddpm" to try it. CDTD
+    #: (``generation.cdtd``) is the diffusion model to use instead.
     names: list = dataclasses.field(
         default_factory=lambda: [
             "ctgan",
@@ -467,7 +471,6 @@ class SynthcityModelsConfig:
             "bayesian_network",
             "pategan",
             "rtvae",
-            "ddpm",
             "arf",
         ]
     )
@@ -530,13 +533,14 @@ class TabularARGNConfig:
     #: The environment's folder (relative paths are from the repo root).
     env_dir: str = "envs/tabularargn"
     #: Arguments for ``TabularARGN()`` (e.g. ``model: MOSTLY_AI/Large``,
-    #: ``max_epochs``, ``max_training_time`` in minutes, ``value_protection``).
-    #: Empty keeps the library defaults.
-    params: dict = dataclasses.field(default_factory=dict)
-    #: Arguments for ``TabularARGN.sample()``. Value protection (on by default)
-    #: hides categories too rare to release; ``sample`` draws a common category
-    #: in their place instead of the library's ``_RARE_`` token, which is not a
-    #: real value of the column.
+    #: ``max_epochs``, ``max_training_time`` in minutes). Value protection is
+    #: off by default: mostlyai-engine 2.7.3 still writes its ``_RARE_`` token
+    #: with ``rare_category_replacement_method: sample``, and that token is not
+    #: a value of the column, so the run stops (see docs/verification.md).
+    params: dict = dataclasses.field(default_factory=lambda: {"value_protection": False})
+    #: Arguments for ``TabularARGN.sample()``. With value protection turned on,
+    #: ``sample`` is meant to draw a common category in place of a rare one
+    #: instead of the ``_RARE_`` token.
     sample_params: dict = dataclasses.field(
         default_factory=lambda: {"rare_category_replacement_method": "sample"}
     )

@@ -423,7 +423,7 @@ output/<name>/imputation/data_v_<version>/
 | `adsgan` | GAN | Adds an identifiability penalty for privacy |
 | `pategan` | GAN with differential privacy | Trains under a formal privacy budget; usually lower utility |
 | `bayesian_network` | Probabilistic graphical model | Does not scale to hundreds of columns |
-| `ddpm` | Diffusion model (TabDDPM) | Slow on wide data |
+| `ddpm` | Diffusion model (TabDDPM) | Off by default: on wide data it learns the columns independently. Use CDTD as the diffusion model instead |
 | `arf` | Adversarial random forests | CPU only |
 | TabPFN `standard` | Foundation model | Generates features, then assigns labels from TabPFN's predicted class probabilities |
 | TabPFN `custom` | Foundation model | Generates features and target jointly |
@@ -439,7 +439,7 @@ TabularARGN ([MOSTLY AI 2025](https://arxiv.org/abs/2501.12012)) comes from MOST
 uv sync --project envs/tabularargn     # once; downloads its own PyTorch
 ```
 
-Then set `generation.tabularargn.enabled: true`. It learns from the imputed data, like the synthcity models, and is fitted once per replicate (output `tabularargn.csv`). It has no hyperparameter search: the library stops training early on its own validation split. `generation.tabularargn.params` passes arguments to `TabularARGN()` (for example `model: MOSTLY_AI/Large`, `max_epochs`, or `max_training_time` in minutes), and `sample_params` passes arguments to its `sample()`. For a categorical target, the class quotas are given to the model as fixed target values, so each class gets exactly its share. Its value protection (on by default) hides categories too rare to release; the default `rare_category_replacement_method: sample` replaces them with a common category instead of a `_RARE_` token. `env_dir` points to the environment if you keep it elsewhere.
+Then set `generation.tabularargn.enabled: true`. It learns from the imputed data, like the synthcity models, and is fitted once per replicate (output `tabularargn.csv`). It has no hyperparameter search: the library stops training early on its own validation split. `generation.tabularargn.params` passes arguments to `TabularARGN()` (for example `model: MOSTLY_AI/Large`, `max_epochs`, or `max_training_time` in minutes), and `sample_params` passes arguments to its `sample()`. For a categorical target, the class quotas are given to the model as fixed target values, so each class gets exactly its share. Its value protection is off by default (`params: {value_protection: false}`): in mostlyai-engine 2.7.3, turning it on can still write a `_RARE_` token, which is not a value of the column, even with `rare_category_replacement_method: sample`, and the run then stops. `env_dir` points to the environment if you keep it elsewhere.
 
 CDTD ([Mueller, Gruber & Fok, ICLR 2025](https://arxiv.org/abs/2312.10431)) is a diffusion model built for tables with many categorical columns. Its code is the authors' `cdtd_simple`, pinned as the submodule `submodules/cdtd_simple` (fetched by `git submodule update --init`). It needs Python 3.13 and a newer PyTorch than this project, so it too has its own environment:
 
