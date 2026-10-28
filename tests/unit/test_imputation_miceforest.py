@@ -95,6 +95,24 @@ def test_is_deterministic_and_transform_never_refits(fitted):
     assert set(first.loc[filled, "grade"]) <= set(blanked["grade"].dropna())
 
 
+def test_column_names_lightgbm_rejects_round_trip():
+    # LightGBM refuses feature names with JSON characters; the kernel must
+    # never see them, and the output keeps the original names.
+    names = {"x": "x [a,b]", "y": 'y: "b"', "colour": "colour {c}"}
+    frame = _frame(n=300).rename(columns=names)
+    rows = frame.index[::4]
+    blanked = _blanked(frame, rows, columns=(names["y"], names["colour"]))
+    features = [names.get(c, c) for c in FEATURES]
+    categorical = [names.get(c, c) for c in CATEGORICAL]
+    nominal = [names.get(c, c) for c in NOMINAL]
+    state, imputed = miceforest_backend.fit(blanked, features, categorical, nominal, seed=1)
+    assert list(imputed.columns) == list(frame.columns)
+    assert not imputed[features].isna().any().any()
+    again = miceforest_backend.transform(state, blanked)
+    assert list(again.columns) == list(frame.columns)
+    assert not again[features].isna().any().any()
+
+
 def test_columns_without_a_model_are_rejected():
     frame = _frame(300)
     state, _ = miceforest_backend.fit(
