@@ -4,6 +4,53 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.23.0 (2026-10-28)
+
+Simulated clinical data 1.3. `configs/config_sim.yaml` now reads `data/simulated/sim_v1.3.csv` and its schema (experiment id and `data.version` "1.3"), so results are not comparable with 1.2 runs. Build 1.3 on any machine that holds 1.2 with `uv run python scripts/build_sim_v1_3.py` (deterministic, fixed seed; 1.2 is left untouched). It prints a change log with the rows each rule changed. 1.3 has 321 schema columns (1.2 had 454). Golden runs use the committed fixture, not this data, so no re-record is needed.
+
+### Added
+
+- **`scripts/build_sim_v1_3.py`** builds 1.3 from 1.2.
+
+### Changed (sim 1.3 data)
+
+Dependencies the 1.2 simulation left out are enforced first, on the raw columns, each by changing the dependent column as little as possible:
+
+- **`sub_program` nests in `major_program`** and `lhin` in `region`. Each child level maps to one parent (the one it appears with most often, while every parent keeps at least one child). The parent is then set from the child, which also fills blank parents. In 1.2 the pairs were nearly independent, so most rows change. `encounter_location_name` is dropped (too granular to release).
+- **Clinical consistency:**
+  - Schizophrenia Primary Diagnosis implies Schizophrenia spectrum disorder.
+  - A measured clozapine level implies Treatment with Clozapine and an antipsychotic.
+  - Clozapine treatment, a long-acting injectable or an antipsychotic detected on a screen implies an antipsychotic.
+  - A measured lithium level implies a mood stabilizer.
+  - A suicide plan implies self-injury was considered.
+  - Horror or fear from a life event (J1) implies at least one life event.
+  - Recent psychiatric admissions are no more than lifetime ones.
+  - Not enforced: Age at First Hospitalization against age, because its age bands are not in the schema.
+
+Then the columns are consolidated:
+
+- **Dropped:** `encounter_end_year`; `birth_year` (`age_reg` already equals the start year minus the birth year, so it is the age at admission and replaces `birth_year` as a quasi-identifier); Born in Canada, Canadian citizenship, Speak English; the duplicate sources Admitted From, Discharged To and Discharge Reason (they agreed with the kept encounter columns on only 12-17% of rows).
+- **Labs:**
+  - Only `<analyte>_last` is kept (`_mean` and `_first` are dropped).
+  - hct, RBC, non-HDL and eGFR are dropped, since they are redundant with or derivable from kept analytes.
+  - Each kept `_last` is now categorical with levels `missing`/`low`/`normal`/`high`, using adult reference ranges (sex-specific for hgb, creatinine and GGT) and therapeutic ranges for clozapine and valproic acid.
+  - HDL is not on a clinical scale in 1.2 (median about 9 times the clinical value), so it uses the central 95% of its observed values.
+  - A low or high level with under 20 rows joins `normal` (B12 high, Hb A1c low, neutrophil high).
+  - The labs are nominal, because an ordinal order must list every level, so `missing` cannot sit outside low < normal < high.
+  - Per-analyte counts become `cbc_count`, `renal_count`, `lipid_count` and `liver_count` (the max over the panel); single counts stay for glucose, Hb A1c, TSH, CRP, B12, clozapine, valproic acid and lithium.
+- **Drug screens:**
+  - Screens run are now `n_uds` (urine panel), `n_cannab_screens` and `n_ap_screens`.
+  - Positives are 0/1 groups: `opioid_pos_any`, `oat_pos_any`, `cocaine_pos_any`, `benzodia_pos_any`, `cannab_pos_any`, `ethanol_pos_any` and `ap_level_detected_any`.
+  - All per-drug `_neg` and `_pos` counts are dropped.
+- **Medication classes:**
+  - The 10 psychiatric core classes stay as 0/1 flags (they were counts typed continuous).
+  - The other 36 become 7 flags: `med_sedative_other`, `med_anti_infective`, `med_gi`, `med_cardiometabolic`, `med_endocrine`, `med_neuro` and `med_other_somatic`.
+  - New `n_med_classes` counts how many of the 46 classes are present.
+- **`Location of Birth`** replaces Continent of Birth. It adds a Canada level and splits North America (not Canada) from the rest; the data cannot separate the United States.
+- **`main_income_source`** (employment, government, other or none) replaces the seven Income flags. `Income` is kept.
+- **Rare levels:** levels under 20 rows become `Other` in the admit source (2 levels, 34 rows).
+- **Code 8 ("did not occur" / not applicable) becomes missing** in ADL Personal Hygiene, Walking and Wheeling, Self-Injury Intent, Life Event (J1), History of Medication Adherence, Time Since Last Discharge and the four Risk of Unemployment items. Those columns now have ordinal orders, as do the two Discharge Readiness items. Available Social Supports ("Not needed" has no place on the scale) and Education stay nominal.
+
 ## 0.22.1 (2026-10-28)
 
 Dashboard and log only; results stay comparable with 0.22.0 and no golden re-record is needed.

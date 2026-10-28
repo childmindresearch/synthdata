@@ -146,7 +146,7 @@ The settings you will most often change, by section:
 The three example configs are templates, not defaults for your data:
 
 - [`config_hepatitis.yaml`](../configs/config_hepatitis.yaml): small, one row per patient, CPU-friendly.
-- [`config_sim.yaml`](../configs/config_sim.yaml): a wide (680-column), multi-visit, three-class dataset with profiled GPU budgets. Start here for real clinical data.
+- [`config_sim.yaml`](../configs/config_sim.yaml): a wide (321 schema columns), multi-visit, three-class dataset with profiled GPU budgets. Start here for real clinical data. It reads simulated data 1.3, which `uv run python scripts/build_sim_v1_3.py` builds from 1.2 (it prints what it changed); 1.2 had 454 columns.
 - [`config_loris.yaml`](../configs/config_loris.yaml): the LORIS dataset, which shows the `binary_target` option for a multi-class target.
 
 ### Long runs and remote machines
@@ -548,7 +548,7 @@ A good way to set budgets for a new dataset:
 4. Set the timeout to trials × time per trial × 1.5, so one slow model cannot eat into another's budget.
 5. Check the whole run fits your time: the timeouts, plus `default_fit_h_est` for every model, plus one final fit per tuned model.
 
-[`config_sim.yaml`](../configs/config_sim.yaml) shows the result for a 12,600 by 682 search-train table on one GPU: about 30 hours per GAN or VAE and roughly 3.5 to 5 days in total. The timing table is in [verification.md, HPO budgets](verification.md#hpo-budgets). For a quick look at a new dataset, turn HPO off or use a handful of trials.
+[`config_sim.yaml`](../configs/config_sim.yaml) shows the result for a 12,600 by 682 search-train table (sim 1.2; 1.3 is narrower, so these budgets are generous for it) on one GPU: about 30 hours per GAN or VAE and roughly 3.5 to 5 days in total. The timing table is in [verification.md, HPO budgets](verification.md#hpo-budgets). For a quick look at a new dataset, turn HPO off or use a handful of trials.
 
 ### Outputs
 
