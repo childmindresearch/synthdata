@@ -143,7 +143,7 @@ def fd_rows(
     when the view's chance-corrected score is below ``min_score`` (X has so
     many values that it fixes Y by accident); otherwise, when exact on train
     and holdout, ``merge_hierarchy`` for two categorical columns where X has
-    more values (sub_program -> program) and ``derive`` for the rest; else
+    more values (city -> country) and ``derive`` for the rest; else
     ``review``.
     """
     categorical_set = {str(c) for c in categorical}
