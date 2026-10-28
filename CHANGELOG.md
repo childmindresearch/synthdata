@@ -4,6 +4,14 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.21.1 (2026-10-28)
+
+No code or config changes; results stay comparable with 0.21.0.
+
+### Changed
+
+- The golden reference runs (`tests/integration/fixtures/golden/baseline_run_linux_cuda.csv` and `baseline_run_linux_cpu.csv`) are re-recorded on Linux for 0.21.0. They now include the fairness gap-error columns and `fairness_signal` (0.20.0), the detection metrics without `depth` ignored (0.19.0), and generator outputs rounded to the train number format (0.19.0). The CUDA reference had last been recorded before 0.12.0, so it also picks up the subgroup privacy gap columns.
+
 ## 0.21.0 (2026-10-27)
 
 No result changes; old results stay comparable and no golden re-record is needed.
