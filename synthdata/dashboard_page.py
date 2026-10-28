@@ -305,6 +305,43 @@ def _parallel_note(d: dict) -> str:
     )
 
 
+def _row_badge(mine: list[dict], none_passed: bool, run_state: str) -> str:
+    """A model's label on the timeline: the step it is at, and "done" only at the end.
+
+    Running: which step runs. Between steps: which step finished last. Once
+    the run has ended: "done", green only if no step failed and no metric
+    failed; otherwise how many metrics failed (amber) or which step failed (red).
+    """
+    if not mine:
+        return _badge("waiting")
+    failed = [t["step"] for t in mine if t["status"] == "failed"]
+    if failed:
+        return _badge(
+            f"{failed[-1]} failed", {f"{failed[-1]} failed": (f"{failed[-1]} failed", "bad")}
+        )
+    running = [t for t in mine if t["status"] == "running"]
+    if running:
+        step = max(running, key=lambda t: t["start"] or "")["step"]
+        return _badge("running", {"running": (f"{step} running", "run")})
+    if any(t["status"] == "stopped" for t in mine):
+        return _badge("stopped")
+    n_failed = sum(t.get("metric_failures", 0) for t in mine)
+    if run_state != "running":
+        if none_passed:
+            return _badge("none passed")
+        if n_failed:
+            label = f"done, {n_failed} metric{'s' * (n_failed != 1)} failed"
+            return _badge(label, {label: (label, "warn")})
+        return _badge("done")
+    if none_passed:
+        return _badge("none passed")
+    last = max(mine, key=lambda t: t["end"] or "")["step"]
+    label = f"{last} done" + (
+        f", {n_failed} metric{'s' * (n_failed != 1)} failed" if n_failed else ""
+    )
+    return _badge(label, {label: (label, "warn" if n_failed else "muted")})
+
+
 def _timeline(d: dict) -> str:
     tasks = d["tasks"]
     planned = d.get("planned") or []
@@ -368,14 +405,7 @@ def _timeline(d: dict) -> str:
                 f'title="{_e(tip)}"></div>'
             )
             segs += _phases(s["tasks"], t1, pct, model, s["step"])
-        statuses = {t["status"] for t in mine}
-        status = next(
-            (s for s in ("failed", "running", "stopped", "none passed") if s in statuses), "done"
-        )
-        if model in none_passed and status == "done":
-            status = "none passed"
-        if not mine:
-            status = "waiting"
+        badge = _row_badge(mine, model in none_passed, d["run"]["state"])
         starts = [_at(t["start"], t1) for t in mine if t["start"]]
         ends = [_at(t["end"], t1) for t in mine if t["start"]]
         busy = sum(t["duration_s"] or 0 for t in mine)
@@ -401,7 +431,7 @@ def _timeline(d: dict) -> str:
             err += f'<div class="row-warn">failed metrics: {_e(listed)}</div>'
         rows.append(
             f'<div class="g-row"><div class="g-name"><span class="model">{_e(model)}</span>'
-            f"{_badge(status)}{dur}{extra}{err}</div>"
+            f"{badge}{dur}{extra}{err}</div>"
             f'<div class="g-track">{grid}{"".join(segs)}</div></div>'
         )
 
@@ -568,7 +598,11 @@ def _hpo(d: dict) -> str:
                 if s["best"] is None and s["complete"] and s.get("infeasible", 0) >= s["complete"]
                 else _num(s["best"])
             )
-            eta = _duration(s["eta_s"]) if s["eta_s"] is not None and status == "running" else "-"
+            if status in ("running", "queued", "paused"):
+                eta = _duration(s["eta_s"]) if s["eta_s"] is not None else "-"
+            else:
+                # Once the search is over: how long it took, first trial to last.
+                eta = _duration(s.get("total_s"))
             rows.append(
                 f'<tr><td class="model">{_e(s["model"])}</td>'
                 f"<td>{_badge(status)}{why}</td>"
@@ -582,7 +616,7 @@ def _hpo(d: dict) -> str:
             '<div class="scroll"><table><thead><tr><th>Model</th><th>Status</th>'
             "<th>Trials</th><th>Failed screens (trials)</th>"
             '<th class="num">Best</th><th>Trials and best so far</th><th class="num">Median trial</th>'
-            '<th class="num">Time left</th><th></th></tr></thead><tbody>'
+            '<th class="num">Time left / total</th><th></th></tr></thead><tbody>'
             + "".join(rows)
             + "</tbody></table></div>"
             '<p class="legend-row small">'
@@ -594,7 +628,9 @@ def _hpo(d: dict) -> str:
             '<span class="muted">x: trial number, y: the HPO objective; hover a dot for its '
             "screens</span></p>"
             '<p class="muted small">Best counts only trials that pass the sanity screens. '
-            "Time left is remaining trials times the median of the last ten, capped by the study's timeout. "
+            "While a search runs, the time column is what is left: remaining trials times the median of "
+            "the last ten, capped by the study's timeout. Once it ends, it is the total, from the first "
+            "trial's start to the last one's end. "
             "When no trial passes the screens, the model is fitted with synthcity's defaults.</p>"
         )
     return f'<section class="card"><h2>Hyperparameter search</h2>{body}</section>'

@@ -4,6 +4,16 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.22.1 (2026-10-28)
+
+Dashboard and log only; results stay comparable with 0.22.0 and no golden re-record is needed.
+
+### Changed
+
+- **Models timeline labels say where a model is.** While the run goes on, the label names the step: *synthcity running*, or *generation done* between steps. Only once the run has ended does it say *done*, and it is green only when nothing failed. Failed metrics turn it amber (*done, 12 metrics failed*), and a failed step turns it red (*synthcity failed*). Before, PATEGAN showed a green *done* after its synthcity and SynthEval metrics failed.
+- **HPO search table:** the median trial time stays after the search ends, and the last column shows the search's total time (first trial's start to last trial's end) instead of the time left once it is over. With `objective: auto` the main study's trials are copies of the probe's, stamped at copy time, so the median was lost once the search finished. It is now read from the probe study.
+- **Resources by task:** each generation fit and each HPO search logs what it used (`[ctgan__rep2] fit took 42 s (peak RAM ..., CPU ... cores on average, peak GPU memory ...)`, `[ctgan_hpo] HPO search took ...`). Once a generation worker has ended, these rows replace its single row, so replicates (×3) and tuned fits (`ctgan_hpo`) show apart, and the search shows under *HPO search*, as they already did for the evaluation steps.
+
 ## 0.22.0 (2026-10-28)
 
 Renames synthetic datasets, so use a new experiment id: cached sets under the old names are not reused. The generated data and the metrics are otherwise unchanged (same seeds per replicate). The golden runs need re-recording on the Linux GPU machine for the new row names (`ctgan` is now `ctgan__rep1`) and because tuned models whose search found no passing trial are no longer rows.

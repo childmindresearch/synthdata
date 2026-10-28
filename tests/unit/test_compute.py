@@ -232,3 +232,22 @@ def test_worker_output_names_its_model(capfd, monkeypatch):
     assert "[generation: tvae] printed 2" in output
     assert "[generation: ctgan] [" in output and "logged 1" in output
     assert any("finished after" in m and "2 of 2 done" in m for m in messages)
+
+
+def test_logged_usage_writes_a_line_the_dashboard_reads(caplog):
+    from synthdata import dashboard
+
+    with (
+        caplog.at_level("INFO", logger=compute.logger.name),
+        compute.logged_usage("ctgan__rep2", "fit"),
+    ):
+        sum(range(10**5))
+    (message,) = [r.getMessage() for r in caplog.records if "fit took" in r.getMessage()]
+    assert message.startswith("[ctgan__rep2] fit took ") and "(peak RAM " in message
+    line = f"[generation: ctgan] [22:00:00] synthdata.compute INFO: {message}\n"
+    parsed = dashboard.parse_log(
+        ["[2026-10-10 22:00:00 UTC] === generate: -m scripts.run_generation\n", line]
+    )
+    (phase,) = parsed["phase_usage"]
+    assert (phase["task"], phase["worker"]) == ("generation: ctgan__rep2", "generation: ctgan")
+    assert phase["usage"]["ram_gib"] > 0

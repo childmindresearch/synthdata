@@ -737,3 +737,70 @@ def test_a_search_with_no_passing_trial_ends_the_tuned_row_as_none_passed(tmp_pa
         "none passed",
         _minutes(3).replace(microsecond=0),
     )
+
+
+def _timeline_task(step, status, start, end, metric_failures=0):
+    return {
+        "step": step,
+        "model": "pategan__rep1",
+        "status": status,
+        "start": start,
+        "end": end,
+        "metric_failures": metric_failures,
+    }
+
+
+def test_a_model_label_names_its_step_and_says_done_only_at_the_end():
+    from synthdata.dashboard_page import _row_badge
+
+    gen = _timeline_task("generation", "done", "2026-10-10T22:01:00Z", "2026-10-10T22:05:00Z")
+    synthcity = _timeline_task("synthcity", "running", "2026-10-10T22:06:00Z", None)
+    assert "synthcity running" in _row_badge([gen, synthcity], False, "running")
+    synthcity.update(status="done", end="2026-10-10T22:07:00Z", metric_failures=12)
+    between = _row_badge([gen, synthcity], False, "running")
+    assert "synthcity done, 12 metrics failed" in between and "warn" in between
+    # At the end: "done", but not green when metrics failed.
+    end = _row_badge([gen, synthcity], False, "finished")
+    assert "done, 12 metrics failed" in end and "good" not in end
+    synthcity["metric_failures"] = 0
+    assert 'class="badge good"' in _row_badge([gen, synthcity], False, "finished")
+    gen["status"] = "failed"
+    assert "generation failed" in _row_badge([gen, synthcity], False, "finished")
+
+
+def test_each_fit_and_search_of_a_generation_worker_gets_its_own_resource_row():
+    resources = {
+        "tasks": [{"task": "generation: ctgan", "ram_peak": 3.0, "cpu_peak": 1, "vram_peak": 0}]
+    }
+    usage = {"ram_gib": 1.0, "cpu_cores": 2.0, "vram_gib": 0.5}
+    phases = [
+        {"task": "generation: ctgan__rep1", "worker": "generation: ctgan", "usage": usage},
+        {"task": "HPO search: ctgan_hpo", "worker": "generation: ctgan", "usage": usage},
+        {"task": "generation: ctgan_hpo__rep1", "worker": "generation: ctgan", "usage": usage},
+    ]
+    dashboard.add_worker_usage(resources, [], phases)
+    assert sorted(e["task"] for e in resources["tasks"]) == [
+        "HPO search: ctgan_hpo",
+        "generation: ctgan__rep1",
+        "generation: ctgan_hpo__rep1",
+    ]
+
+
+def test_a_finished_search_keeps_its_median_trial_and_gives_its_total(tmp_path):
+    db = tmp_path / "optuna.db"
+    storage = f"sqlite:///{db}"
+    start = datetime(2026, 10, 10, 22, 0)
+    probe = optuna.create_study(study_name="hpo_bn_probe", storage=storage, direction="maximize")
+    main = optuna.create_study(study_name="hpo_bn", storage=storage, direction="maximize")
+    for i in range(3):
+        trial = optuna.trial.create_trial(params={}, distributions={}, value=0.5)
+        trial.datetime_start = start + timedelta(minutes=2 * i)
+        trial.datetime_complete = start + timedelta(minutes=2 * i + 1)
+        probe.add_trial(trial)
+        # Copied into the main study: stamped at copy time, zero length.
+        copy = optuna.trial.create_trial(params={}, distributions={}, value=0.5)
+        copy.datetime_start = copy.datetime_complete = start + timedelta(minutes=6)
+        main.add_trial(copy)
+    (study,), _ = dashboard.read_hpo(db, {}, datetime.now(UTC))
+    assert study["median_trial_s"] == 60
+    assert study["total_s"] == 6 * 60
