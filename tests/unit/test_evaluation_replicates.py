@@ -11,12 +11,15 @@ pytestmark = pytest.mark.unit
 
 
 def test_replicate_names_round_trip():
-    assert replicate_name("ctgan", 0) == "ctgan"
-    assert replicate_name("ctgan", 2) == "ctgan__rep2"
-    assert split_replicate_name("ctgan__rep2") == ("ctgan", 2)
+    assert replicate_name("ctgan", 0) == "ctgan__rep1"
+    assert replicate_name("ctgan", 2) == "ctgan__rep3"
+    assert split_replicate_name("ctgan__rep3") == ("ctgan", 2)
+    assert split_replicate_name("ctgan__rep1") == ("ctgan", 0)
+    # A name from before every replicate carried the suffix is the first replicate.
     assert split_replicate_name("ctgan") == ("ctgan", 0)
-    assert split_replicate_name("baseline_marginals__rep1") == ("baseline_marginals", 1)
+    assert split_replicate_name("baseline_marginals__rep2") == ("baseline_marginals", 1)
     assert split_replicate_name("odd__repx") == ("odd__repx", 0)
+    assert split_replicate_name("odd__rep0") == ("odd__rep0", 0)
 
 
 def _combined(overall: dict) -> pd.DataFrame:

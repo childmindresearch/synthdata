@@ -138,7 +138,7 @@ Budgets come from `scripts/profile_hpo.py` on sim 1.2 (search-train 12597 x 682)
 | ddpm | 2 x 100 epochs, 157-465 s | 3.1 s (1.6-4.6 s by batch size) | 100-1000 epochs | 40 | 28.6 h |
 | tabpfgen_standard | 1000 SGLD steps, 35 s (RTX 5070 Ti, 2026-10-08) | | 100-2000 steps | 25 | 23 min |
 | tabpfgen_custom | 1000 SGLD steps, 31 s (RTX 5070 Ti, 2026-10-08) | | 100-2000 steps | 25 | 20 min |
-| tabpfn_standard | | | nothing to tune | 0 | |
+| tabpfn_standard_raw | | | nothing to tune | 0 | |
 | arf | 2 trials, 263-1316 s (one core; before the bounded-leaf fix no trial finished in 11 h) | 37 s per tree | 10-50 trees, early stopping on | 25 | 11.7 h |
 
 PATE-GAN's `generator_n_iter` (GAN epochs per teacher round, searched 1-100 by synthcity) is held at the plugin default of 10, and ARF's `early_stop` is held on (arfpy and R `arf` default) with trees capped at 50 (`HPO_FIXED_PARAMS`, `HPO_PARAM_RANGES`): one PATE-GAN draw of 91 epochs per round took 7.5 h. The untuned default models train for the top of `hpo.epoch_ranges` when the library default is longer (`untuned_params`): ADS-GAN's 10000 epochs would take about 50 h here, CTGAN's 2000 about 16 h. ARF runs on one core: arfpy's density estimation is single-threaded pandas. Both DDPM profiling trials (100 epochs) failed the category-coverage screen; longer trials are expected to pass. The GPU stayed under 3 GB per model and about 10% busy, so several studies can share one GPU.

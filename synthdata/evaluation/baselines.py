@@ -75,6 +75,4 @@ def build_baselines(
         else:
             frame = sample_marginals(train_df, n_samples, seed)
         baselines[baseline_name(kind)] = frame.reset_index(drop=True)[list(train_df.columns)]
-    if baselines:
-        logger.info("Scoring baseline reference rows: %s", sorted(baselines))
     return baselines

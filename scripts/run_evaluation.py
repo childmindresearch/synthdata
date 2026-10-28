@@ -23,15 +23,25 @@ from synthdata.evaluation import run_evaluation
 from synthdata.evaluation.combine import simple_rank_summary
 from synthdata.evaluation.tstr import tstr_xgb_params
 from synthdata.experiment import load_experiment
-from synthdata.utils import get_logger, set_global_seed
+from synthdata.utils import get_logger, set_global_seed, split_replicate_name
 
 logger = get_logger("run_evaluation")
 
 
 def _load_synthetic_datasets(cfg, reference) -> dict:
+    from synthdata.generation.hpo import default_best_params_path, untuned_fallbacks
+
     output_dir = Path(cfg.generation.output_dir)
+    # A tuned model whose search found no passing trial repeats its untuned
+    # one; sets an earlier version saved for it are not evaluated.
+    fallbacks = untuned_fallbacks(
+        cfg.generation.hpo.best_params_path or default_best_params_path(output_dir)
+    )
     datasets = {}
     for path in sorted(output_dir.glob("*.csv")):
+        if split_replicate_name(path.stem)[0] in fallbacks:
+            logger.info("skipping %s: no HPO trial passed, it repeats the untuned model", path.name)
+            continue
         try:
             df = read_like(path, reference)
         except pd.errors.EmptyDataError:

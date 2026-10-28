@@ -4,6 +4,24 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.22.0 (2026-10-28)
+
+Renames synthetic datasets, so use a new experiment id: cached sets under the old names are not reused. The generated data and the metrics are otherwise unchanged (same seeds per replicate). The golden runs need re-recording on the Linux GPU machine for the new row names (`ctgan` is now `ctgan__rep1`) and because tuned models whose search found no passing trial are no longer rows.
+
+### Changed
+
+- **Replicates are named `<model>__rep1`, `<model>__rep2`, `<model>__rep3`.** The first replicate used to keep the plain model name next to `__rep1` and `__rep2`, which read as one replicate too many. Even a single replicate is now `<model>__rep1`.
+- **The TabPFN variant fitted on data with missing values is `tabpfn_standard_raw` / `tabpfn_custom_raw`** (was `tabpfn_standard` / `tabpfn_custom`), next to `tabpfn_standard_imputed` / `tabpfn_custom_imputed`. The config value (`generation.tabpfn.data_variants: [raw]`) is unchanged.
+- **All generation runs in parallel.** TabPFN (each variant and data variant), TabPFGen, TabularARGN and CDTD now get a process of their own in the same pool as the synthcity models, instead of running one after another in the main process after them. TabPFN starts first, since its fits take longest on wide data. TabPFN picks its GPU itself and does not take a GPU slot, so watch its memory on a small GPU.
+- **A tuned model whose HPO search found no passing trial is no longer fitted or evaluated.** It would only repeat the untuned model (same settings, same seeds); before, its datasets were saved as copies and every metric was computed twice. The report lists it as *Not ranked* with the reason, and evaluation skips `<model>_hpo` sets an earlier version saved for such a model.
+- **Metric overview figures** (`metrics_utility`, `metrics_privacy`, `metrics_fairness`): no figure title (it overlapped the first row of panels; report.md explains the panels), metrics ordered by importance (TSTR and detection first for utility, Anonymeter and distance MIA first for privacy, the holdout fairness gap errors first for fairness; see `METRIC_PRIORITY` in `synthdata/plotting/evaluation_plots.py`), and models in one fixed order (generators by name, each tuned model after its untuned one, baselines last) in these and the rank trade-off plots. The report now embeds all three however tall they are, instead of linking them.
+- **Run dashboard, Models timeline:** every model the config will produce is listed from the start, each tuned model on its own row under its untuned one. The untuned row shows the untuned fits, the tuned row the HPO search and the tuned fits, or *none passed*. Fits in the main process count as *generation* (no separate *generation (main process)* step), the baselines' generation shows where evaluation draws them, and SynthEval's main and one-vs-rest or binary-target passes are one *syntheval* step with the later passes shaded. How many models run at once and with how many threads is one line above the timeline rather than repeated per step.
+- **Run dashboard, Resources:** tasks are no longer shown as running once the run has ended, and every model is listed with its peak use. Each worker process now logs its own peak RAM, average CPU and peak GPU memory when it finishes (`... finished after 42 s (peak RAM 1.20 GiB, CPU 2.10 cores on average, peak GPU memory 0.50 GiB); ...`), so models that finished between two once-a-minute samples are no longer missing.
+
+### Fixed
+
+- A worker process that had written its result but did not exit (synthcity's Bayesian network: joblib's idle process pool lingers for 300 s) held its slot and showed as still generating for 5 minutes. Workers now shut that pool down, and the parent stops a worker that has not exited 30 s after writing its result.
+
 ## 0.21.1 (2026-10-28)
 
 No code or config changes; results stay comparable with 0.21.0.

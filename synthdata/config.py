@@ -490,7 +490,7 @@ class TabPFNConfig:
     #: TabPFN handles missing values natively) and/or "imputed" (same imputed
     #: split used by every other model). Include both to compare how TabPFN
     #: performs with vs. without imputation; imputed-variant outputs are
-    #: cached as e.g. "tabpfn_standard_imputed" (raw keeps the unsuffixed name).
+    #: cached as e.g. "tabpfn_standard_imputed", raw ones as "tabpfn_standard_raw".
     data_variants: list = dataclasses.field(default_factory=lambda: ["raw"])
     #: TabPFN weights to load ("v2", "v2.5", "v2.6", "v3", "v3.5"). Pinned so a
     #: tabpfn upgrade cannot change the model silently. Each version has its
@@ -790,7 +790,7 @@ class GenerationConfig:
     #: ``baseline_train_copy`` reference then holds that many real train rows.
     n_samples: int | None = None
     #: Times each model is fitted and sampled, with seeds seed, seed+1, ...
-    #: Replicate r > 0 is saved as "<model>__rep<r>". With 2 or more, the
+    #: Replicates are saved as "<model>__rep1", "<model>__rep2", ... With 2 or more, the
     #: evaluation reports each score as a mean with a 95% confidence interval
     #: and flags models it cannot tell apart from the best. HPO runs once.
     n_replicates: int = 1

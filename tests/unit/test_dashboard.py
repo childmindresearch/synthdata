@@ -229,8 +229,10 @@ def test_collect_reads_stages_models_hpo_resources_and_problems(tmp_path):
     ]
     assert d["stages"][0]["duration_s"] == 300 and "RAM 2.0 GiB" in d["stages"][0]["peak"]
 
+    # ctgan's worker is searching: its untuned fits are done, and the search
+    # runs on the tuned model's row.
     status = {t["model"]: t["status"] for t in d["tasks"]}
-    assert status == {"ctgan": "running", "tvae": "failed", "arf": "done"}
+    assert status == {"ctgan": "done", "ctgan_hpo": "running", "tvae": "failed", "arf": "done"}
     tvae = next(t for t in d["tasks"] if t["model"] == "tvae")
     assert "CUDA out of memory" in tvae["error"]
     assert d["steps"] == [
@@ -239,7 +241,7 @@ def test_collect_reads_stages_models_hpo_resources_and_problems(tmp_path):
             "total": 4,
             "workers": 2,
             "cores": 4,
-            "done": 1,
+            "done": 2,
             "failed": 1,
             "running": 1,
             "with_metric_failures": 2,
@@ -247,6 +249,7 @@ def test_collect_reads_stages_models_hpo_resources_and_problems(tmp_path):
     ]
     assert {t["model"]: t["metric_failures"] for t in d["tasks"]} == {
         "ctgan": 1,
+        "ctgan_hpo": 0,
         "tvae": 0,
         "arf": 1,
     }
@@ -307,7 +310,7 @@ def test_finished_run_shows_results_and_page_renders(tmp_path):
     assert d["run"]["state"] == "finished" and d["run"]["elapsed_s"] == 50 * 60
     assert [s["status"] for s in d["stages"]] == ["done", "done", "done"]
     # A worker never reported as finished is not left "running" after the run ended.
-    assert {t["model"]: t["status"] for t in d["tasks"]}["ctgan"] == "stopped"
+    assert {t["model"]: t["status"] for t in d["tasks"]}["ctgan_hpo"] == "stopped"
     assert d["results"]["ranking"][0]["model"] == "ctgan"
     # Its search found no passing trial: the tuned row repeats the untuned model.
     assert [x["untuned"] for x in d["results"]["ranking"]] == [False, True, False]
@@ -322,7 +325,7 @@ def test_finished_run_shows_results_and_page_renders(tmp_path):
     # The ranking draws the interval and says tied in words, not with a status badge.
     assert 'class="cibar"' in page and '<span class="pill good">best</span>' in page
     # One timeline row per model, a segment per step, ticks and the stage bands.
-    assert page.count('class="seg ') == 3 and 'class="band"' in page and 'class="tick"' in page
+    assert page.count('class="seg ') == 4 and 'class="band"' in page and 'class="tick"' in page
 
 
 def test_replicates_fold_into_one_timeline_row_and_one_resource_row(tmp_path):
@@ -364,7 +367,8 @@ def test_replicates_fold_into_one_timeline_row_and_one_resource_row(tmp_path):
     assert arf_row.count('class="seg ') == 3
     assert "2 replicates" in arf_row
     assert page.count('<span class="model">arf__rep') == 0
-    assert "arf ×3" in page and "syntheval utility ×3" in page
+    # SynthEval's passes are one step in the resource table too.
+    assert "arf ×3" in page and "syntheval ×3" in page
 
 
 def test_long_logs_keep_their_start_and_end():
@@ -492,9 +496,10 @@ def test_main_process_fit_is_a_model_row_and_explains_a_quiet_log(tmp_path):
     )
     os.utime(log, (_minutes(6).timestamp(), _minutes(6).timestamp()))
     d = dashboard.collect(log, None, now=_minutes(120))
-    main = next(t for t in d["tasks"] if t["step"] == dashboard.MAIN_STEP)
-    assert (main["model"], main["status"]) == ("tabpfn_standard", "running")
-    assert [s["label"] for s in d["steps"]] == ["generation", dashboard.MAIN_STEP]
+    # A fit in the runner's own process is a generation row like the workers'.
+    main = next(t for t in d["tasks"] if t["model"] == "tabpfn_standard")
+    assert (main["step"], main["status"]) == (dashboard.MAIN_STEP, "running")
+    assert [s["label"] for s in d["steps"]] == ["generation"]
     assert "tabpfn_standard is fitting in the runner's own process" in d["run"]["note"]
 
     with open(log, "a", encoding="utf-8") as f:
@@ -507,7 +512,7 @@ def test_main_process_fit_is_a_model_row_and_explains_a_quiet_log(tmp_path):
             )
         )
     parsed = dashboard.parse_log(log.read_text(encoding="utf-8").splitlines())
-    (main,) = [t for t in parsed["tasks"] if t["step"] == dashboard.MAIN_STEP]
+    (main,) = [t for t in parsed["tasks"] if t.get("main")]
     assert main["status"] == "done" and main["end"] is not None
 
 
@@ -578,10 +583,10 @@ def test_generation_worker_splits_into_untuned_fits_hpo_and_tuned_fits():
     ]
 
 
-def test_one_vs_rest_passes_show_as_one_step():
+def test_syntheval_passes_show_as_one_step_with_a_phase_each():
     lines = [_runner(T0, "=== evaluate: -m scripts.run_evaluation")]
-    for i, cls in enumerate(("0", "1", "2")):
-        pool = f"syntheval ovr_{cls}"
+    for i, cls in enumerate(("main", "ovr_0", "ovr_1")):
+        pool = f"syntheval {cls}"
         lines += [
             _logline(
                 _minutes(10 * i),
@@ -603,13 +608,14 @@ def test_one_vs_rest_passes_show_as_one_step():
             ),
         ]
     parsed = dashboard.parse_log(lines)
-    assert list(parsed["pools"]) == [dashboard.OVR_STEP]
+    assert list(parsed["pools"]) == [dashboard.SYNTHEVAL_STEP]
     (task,) = parsed["tasks"]
     assert (task["status"], task["start"], task["end"]) == (
         "done",
         _minutes(1).replace(microsecond=0),
         _minutes(25).replace(microsecond=0),
     )
+    assert [p["kind"] for p in task["phases"]] == ["main", "one-vs-rest", "one-vs-rest"]
 
 
 def test_a_stopped_search_gives_its_reason():
@@ -662,3 +668,72 @@ def test_generation_segment_names_its_phases_and_trial_dots_name_the_objective()
     svg = page._sparkline(curve, True, "tstr_macro_f1")
     assert "trial 0: tstr_macro_f1 0.3" in svg
     assert "<b>tstr_macro_f1</b>" in svg and "higher is better" in svg
+
+
+def test_a_worker_reports_its_own_use_and_a_finished_run_has_no_active_task(tmp_path):
+    cfg, log = _write_run(tmp_path, finished=True)
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(
+            _logline(
+                _minutes(41),
+                "synthdata.compute",
+                "INFO",
+                "[synthcity] started tvae__rep1 (pid 7; 1 of 1)",
+            )
+            + _logline(
+                _minutes(41),
+                "synthdata.compute",
+                "INFO",
+                "[synthcity] tvae__rep1 finished after 20 s (peak RAM 1.50 GiB, CPU 2.25 cores "
+                "on average, peak GPU memory 0.50 GiB); 1 of 1 done",
+            )
+        )
+    d = dashboard.collect(log, cfg, now=_minutes(60))
+    # Finished between two samples, but listed with what it measured itself.
+    (entry,) = [e for e in d["resources"]["tasks"] if e["task"] == "synthcity: tvae__rep1"]
+    assert (entry["ram_peak"], entry["cpu_peak"], entry["vram_peak"]) == (1.5, 2.25, 512)
+    assert not any(e.get("active") for e in d["resources"]["tasks"])
+
+
+def test_a_search_with_no_passing_trial_ends_the_tuned_row_as_none_passed(tmp_path):
+    lines = [
+        _runner(T0, "=== generate: -m scripts.run_generation"),
+        _logline(
+            _minutes(1), "synthdata.compute", "INFO", "[generation] started bn (pid 7; 1 of 1)"
+        ),
+        "[generation: bn] "
+        + _logline(
+            _minutes(2),
+            "synthdata.generation.pipeline",
+            "INFO",
+            "[bn__rep1] generating synthetic data (n_samples=10, seed=42)",
+        ),
+        "[generation: bn] "
+        + _logline(_minutes(3), "synthdata.generation.hpo", "INFO", "[hpo_bn] trial 0 done"),
+        "[generation: bn] "
+        + _logline(
+            _minutes(4),
+            "synthdata.generation.pipeline",
+            "INFO",
+            "[bn_hpo] none passed: no HPO trial passed the screens, so bn_hpo would repeat bn",
+        ),
+        _logline(
+            _minutes(5),
+            "synthdata.compute",
+            "INFO",
+            "[generation] bn finished after 4 min; 1 of 1 done",
+        ),
+    ]
+    parsed = dashboard.parse_log(lines)
+    assert parsed["none_passed"] == {"bn"}
+    untuned, tuned = dashboard.split_tuned(parsed["tasks"], parsed["none_passed"])
+    assert (untuned["model"], untuned["status"], untuned["end"]) == (
+        "bn",
+        "done",
+        _minutes(3).replace(microsecond=0),
+    )
+    assert (tuned["model"], tuned["status"], tuned["start"]) == (
+        "bn_hpo",
+        "none passed",
+        _minutes(3).replace(microsecond=0),
+    )

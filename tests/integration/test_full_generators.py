@@ -18,8 +18,8 @@ pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
 SYNTHCITY = ["ctgan", "tvae", "adsgan", "bayesian_network", "pategan", "rtvae", "ddpm", "arf"]
 TABPFN = [
-    "tabpfn_standard",
-    "tabpfn_custom",
+    "tabpfn_standard_raw",
+    "tabpfn_custom_raw",
     "tabpfn_standard_imputed",
     "tabpfn_custom_imputed",
 ]
@@ -70,7 +70,7 @@ def full_run(tmp_path_factory):
 
 def test_every_generator_produced_valid_output(full_run):
     synthetic = full_run.synthetic()
-    assert sorted(synthetic) == EXPECTED
+    assert sorted(synthetic) == [f"{m}__rep1" for m in EXPECTED]
     n_samples = full_run.cfg.generation.n_samples
     for name, frame in synthetic.items():
         assert len(frame) == n_samples, name
@@ -80,6 +80,8 @@ def test_every_generator_produced_valid_output(full_run):
 
 def test_every_generator_was_evaluated(full_run):
     combined = full_run.combined()
-    assert sorted(m for m in combined.index if not m.startswith("baseline_")) == EXPECTED
+    assert sorted(m for m in combined.index if not m.startswith("baseline_")) == [
+        f"{m}__rep1" for m in EXPECTED
+    ]
     for dim in ("utility", "privacy", "fairness", "overall"):
         assert np.isfinite(combined[("__all__", dim, "rank")].astype(float)).all(), dim

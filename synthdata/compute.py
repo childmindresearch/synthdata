@@ -6,6 +6,7 @@ scores) both go through :func:`run_per_model`, so one config section decides
 how the machine's cores and memory are used.
 """
 
+import contextlib
 import dataclasses
 import io
 import logging
@@ -209,8 +210,75 @@ def _prefix_output(task: str) -> list[_Prefixed]:
     return list(swaps.values())
 
 
+def _usage(cpu_start: float) -> dict:
+    """This process's peak RAM, CPU seconds and peak GPU memory so far, with its children's.
+
+    The resource monitor samples once a minute and misses a model that
+    finishes between two samples; the process's own counters never do. Peak
+    RAM is this process's peak plus the largest of its finished children's
+    (a sidecar environment), an upper bound like the monitor's.
+    """
+    usage: dict = {}
+    times = os.times()
+    usage["cpu_s"] = times.user + times.system + times.children_user + times.children_system
+    usage["cpu_s"] -= cpu_start
+    try:
+        import resource
+
+        # ru_maxrss is in KiB on Linux, in bytes on macOS.
+        scale = 1 if sys.platform == "darwin" else 1024
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peak += resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+        usage["ram_gib"] = peak * scale / 1024**3
+    except (ImportError, OSError):  # Windows has no resource module
+        with contextlib.suppress(Exception):
+            import psutil
+
+            info = psutil.Process().memory_info()
+            usage["ram_gib"] = getattr(info, "peak_wset", info.rss) / 1024**3
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        with contextlib.suppress(Exception):
+            if torch.cuda.is_initialized():
+                usage["vram_gib"] = (
+                    sum(torch.cuda.max_memory_reserved(i) for i in range(torch.cuda.device_count()))
+                    / 1024**3
+                )
+    return usage
+
+
+def _usage_text(usage: dict, seconds: float) -> str:
+    """``" (peak RAM 1.2 GiB, CPU 3.1 cores on average, peak GPU memory 0.5 GiB)"``."""
+    parts = []
+    if usage.get("ram_gib") is not None:
+        parts.append(f"peak RAM {usage['ram_gib']:.2f} GiB")
+    if usage.get("cpu_s") is not None and seconds > 0:
+        parts.append(f"CPU {usage['cpu_s'] / seconds:.2f} cores on average")
+    if usage.get("vram_gib") is not None:
+        parts.append(f"peak GPU memory {usage['vram_gib']:.2f} GiB")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
+def _stop_idle_pools() -> None:
+    """Shut down joblib's reusable process pool, if this process started one.
+
+    Its idle workers live on for 300 s and kept a finished model's process
+    from exiting for those 5 minutes (synthcity's Bayesian network).
+    """
+    if "joblib" not in sys.modules:
+        return
+    with contextlib.suppress(Exception):
+        from joblib.externals.loky import reusable_executor
+
+        executor = getattr(reusable_executor, "_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True, kill_workers=True)
+
+
 def _child(fn, args, result_path: str, cores: int) -> None:
     """Run ``fn(*args)`` in a spawned process and pickle its outcome to ``result_path``."""
+    times = os.times()
+    cpu_start = times.user + times.system + times.children_user + times.children_system
     streams = _prefix_output(task) if (task := os.environ.get(TASK_ENV_VAR)) else []
     try:
         import torch
@@ -218,6 +286,7 @@ def _child(fn, args, result_path: str, cores: int) -> None:
         torch.set_num_threads(cores)
     except ImportError:
         pass
+    outcome: dict
     try:
         outcome = {"result": fn(*args)}
     except BaseException as exc:  # noqa: BLE001 - reported to the parent
@@ -225,10 +294,19 @@ def _child(fn, args, result_path: str, cores: int) -> None:
             "error": f"{type(exc).__name__}: {exc}",
             "traceback": traceback.format_exc(),
         }
+    _stop_idle_pools()
+    outcome["usage"] = _usage(cpu_start)
     for stream in streams:
         stream.close_line()
-    with open(result_path, "wb") as f:
+    # Written whole, then renamed: the parent takes the file's appearance as
+    # the model's end, even if this process is slow to exit.
+    with open(f"{result_path}.tmp", "wb") as f:
         pickle.dump(outcome, f)
+    os.replace(f"{result_path}.tmp", result_path)
+
+
+#: Seconds a worker may take to exit after writing its result before it is stopped.
+EXIT_GRACE_SECONDS = 30
 
 
 def _duration(seconds: float) -> str:
@@ -323,7 +401,7 @@ def run_per_model(
                 # monitor of synthdata-run can attribute its use to the model.
                 os.environ[TASK_ENV_VAR] = f"{label}: {name}"
                 process.start()
-                active[name] = (process, result_path, time.monotonic())
+                active[name] = (process, result_path, time.monotonic(), None)
                 logger.info(
                     "[%s] started %s (pid %s; %d of %d)",
                     label,
@@ -336,12 +414,29 @@ def run_per_model(
             for _ in range(max(n_workers, 1)):
                 start_next()
             while active:
-                done = [name for name, (process, *_) in active.items() if not process.is_alive()]
+                now = time.monotonic()
+                done = []
+                for name, (process, result_path, _, written) in active.items():
+                    if not process.is_alive():
+                        done.append(name)
+                    elif written is None and os.path.exists(result_path):
+                        active[name] = (*active[name][:3], now)
+                    elif written is not None and now - written > EXIT_GRACE_SECONDS:
+                        # The result is in; something left behind (a thread
+                        # or pool) keeps the process from exiting.
+                        logger.warning(
+                            "[%s] %s wrote its result but did not exit within %d s; stopping it",
+                            label,
+                            name,
+                            EXIT_GRACE_SECONDS,
+                        )
+                        process.terminate()
+                        done.append(name)
                 if not done:
                     time.sleep(0.2)
                     continue
                 for name in done:
-                    process, result_path, started = active.pop(name)
+                    process, result_path, started, written = active.pop(name)
                     process.join()
                     try:
                         with open(result_path, "rb") as f:
@@ -352,12 +447,14 @@ def run_per_model(
                             "without a result (killed, possibly out of memory)"
                         }
                     start_next()
+                    seconds = (written or time.monotonic()) - started
                     logger.info(
-                        "[%s] %s %s after %s; %d of %d done%s",
+                        "[%s] %s %s after %s%s; %d of %d done%s",
                         label,
                         name,
                         "failed" if "error" in outcomes[name] else "finished",
-                        _duration(time.monotonic() - started),
+                        _duration(seconds),
+                        _usage_text(outcomes[name].get("usage") or {}, seconds),
                         len(outcomes),
                         len(tasks),
                         f", running: {', '.join(active)}" if active else "",

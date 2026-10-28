@@ -109,10 +109,11 @@ class _Links:
             return self.file(path, label)
         return f"`{label or path.name}` (not produced this run)"
 
-    def plots(self, directory: Path, pattern: str = "*") -> list[str]:
+    def plots(self, directory: Path, pattern: str = "*", embed_large: bool = False) -> list[str]:
         """Images in ``directory`` embedded inline, interactive HTML pages linked.
 
-        A PNG taller than MAX_EMBED_HEIGHT_PX is linked instead of embedded.
+        A PNG taller than MAX_EMBED_HEIGHT_PX is linked instead of embedded,
+        unless ``embed_large``.
         """
         if not directory.is_dir():
             return []
@@ -121,7 +122,7 @@ class _Links:
             title = path.stem.replace("_", " ")
             if path.suffix.lower() in _IMAGE_SUFFIXES:
                 height = _png_height(path)
-                if height is not None and height > MAX_EMBED_HEIGHT_PX:
+                if not embed_large and height is not None and height > MAX_EMBED_HEIGHT_PX:
                     lines += [f"- {self.file(path, title)} (large figure, open it on its own)", ""]
                 else:
                     lines += [f"**{title}**", "", f"![{title}]({self.rel(path)})", ""]
@@ -241,13 +242,16 @@ def _collapse_replicates(table: pd.DataFrame) -> pd.DataFrame:
 
 def _metric_plots(paths: "_Paths", links: "_Links", metric_type: str) -> list[str]:
     """The metric overview figure of one type (plotting.save_metric_overview_plots)."""
-    plots = links.plots(paths.evaluation_plots, f"metrics_{metric_type}.*")
+    # Embedded however tall: these are the report's main figures.
+    plots = links.plots(paths.evaluation_plots, f"metrics_{metric_type}.*", embed_large=True)
     if not plots:
         return ["_Metric overview plot not rendered yet: run `synthdata-plot`._"]
     return [
-        f"Every {metric_type} metric, one panel each: the dot is the mean over seeds, the bar "
-        "its 95% interval, the title says which direction is better, a green dashed line marks "
-        "the ideal value where one exists, and grey rows are the baselines.",
+        f"Every {metric_type} metric, one panel each, most important first: the dot is the mean "
+        "over seeds, the bar its 95% interval, the title says which direction is better, a "
+        "green dashed line marks the ideal value where one exists, and grey rows are the "
+        "baselines (train copy = real data, marginals = no relationships between columns). "
+        "Models are in the same order in every figure.",
         "",
         *plots,
     ]
@@ -473,6 +477,15 @@ def _ranking_section(cfg, combined, extras, paths: _Paths, links: _Links) -> str
             f"untuned settings and repeat the untuned model ({pairs}). Read them as one model "
             "listed twice, not as a tuning result; check the `hpo` log lines for why every "
             "trial failed.",
+        ]
+    skipped = sorted(m for m in fallbacks if m not in index and fallbacks[m] in index)
+    if skipped:
+        names = ", ".join(f"`{m}`" for m in skipped)
+        lines += [
+            "",
+            f"Not ranked: {names}. No HPO trial passed the screens, so the tuned model would "
+            "only repeat the untuned one with the same settings and seeds; it was neither "
+            "refitted nor evaluated. Check the `hpo` log lines for why every trial failed.",
         ]
     if any(is_baseline(m) for m in index):
         lines += [

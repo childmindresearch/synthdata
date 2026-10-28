@@ -29,6 +29,8 @@ STATUS_LABEL = {
     "paused": ("paused", "warn"),
     "not run": ("no trials", "muted"),
     "no pass": ("none passed, defaults used", "warn"),
+    "none passed": ("none passed", "warn"),
+    "waiting": ("waiting", "muted"),
 }
 #: Categorical colors for the steps on the model timeline (--k1 ...).
 STEP_COLORS = 7
@@ -229,7 +231,16 @@ def _segments(tasks: list[dict], t1: float) -> list[dict]:
     return out
 
 
-PHASE_LABEL = {"fit": "untuned fits", "HPO": "HPO search", "tuned fit": "tuned fits"}
+PHASE_LABEL = {
+    "fit": "untuned fits",
+    "HPO": "HPO search",
+    "tuned fit": "tuned fits",
+    "main": "main pass",
+    "one-vs-rest": "one-vs-rest passes",
+    "binary": "binary-target pass",
+}
+#: Shading over a bar for each phase; the first phase of a step is the plain bar.
+PHASE_CLASS = {"HPO": "hpo", "tuned fit": "tuned", "one-vs-rest": "pass2", "binary": "pass2"}
 
 
 def _phase_spans(tasks: list[dict], t1: float) -> list[list]:
@@ -239,7 +250,8 @@ def _phase_spans(tasks: list[dict], t1: float) -> list[list]:
         for phase in t.get("phases") or []:
             start, end = _at(phase["start"], t1), _at(phase["end"], t1)
             if spans and spans[-1][0] == phase["kind"]:
-                spans[-1][2] = end
+                spans[-1][1] = min(spans[-1][1], start)
+                spans[-1][2] = max(spans[-1][2], end)
                 spans[-1][3] += 1
             else:
                 spans.append([phase["kind"], start, end, 1])
@@ -247,17 +259,19 @@ def _phase_spans(tasks: list[dict], t1: float) -> list[list]:
 
 
 def _phase_text(kind: str, start: float, end: float, n: int) -> str:
-    return PHASE_LABEL[kind] + (f" ({n})" if kind != "HPO" else "") + f" {_duration(end - start)}"
+    counted = kind not in ("HPO", "main", "binary")
+    label = PHASE_LABEL.get(kind, kind)
+    return label + (f" ({n})" if counted else "") + f" {_duration(end - start)}"
 
 
-def _phases(tasks: list[dict], t1: float, pct, model: str) -> list[str]:
-    """Shading over a generation worker's bar: its HPO search and its tuned fits."""
+def _phases(tasks: list[dict], t1: float, pct, model: str, step: str) -> list[str]:
+    """Shading over a bar: HPO search and tuned fits, or SynthEval's later passes."""
     out = []
     for kind, start, end, n in _phase_spans(tasks, t1):
-        if kind == "fit":
-            continue  # the bar itself is untuned fitting
-        tip = f"{model} · generation · {_phase_text(kind, start, end, n)}"
-        cls = "hpo" if kind == "HPO" else "tuned"
+        cls = PHASE_CLASS.get(kind)
+        if cls is None:
+            continue  # the bar itself is untuned fitting, or SynthEval's main pass
+        tip = f"{model} · {step} · {_phase_text(kind, start, end, n)}"
         out.append(
             f'<div class="phase {cls}" style="left:{pct(start):.2f}%;'
             f'width:{max(pct(end) - pct(start), 0.3):.2f}%" title="{_e(tip)}"></div>'
@@ -265,14 +279,41 @@ def _phases(tasks: list[dict], t1: float, pct, model: str) -> list[str]:
     return out
 
 
+def _row_order(d: dict, by_model: dict) -> list[str]:
+    """Planned models first, in run order; a tuned model under its untuned one; then the rest."""
+    planned = [p["model"] for p in d.get("planned") or []]
+    seen = list(dict.fromkeys(planned + list(by_model)))
+    family = {m: i for i, m in enumerate(dict.fromkeys(m.removesuffix("_hpo") for m in seen))}
+    baseline = {m: m.startswith("baseline_") for m in seen}
+    return sorted(
+        seen,
+        key=lambda m: (baseline[m], family[m.removesuffix("_hpo")], m.endswith("_hpo")),
+    )
+
+
+def _parallel_note(d: dict) -> str:
+    """How many models ran at once and with how many CPU threads, once for the whole run."""
+    pools = [s for s in d["steps"] if s.get("workers")]
+    if not pools:
+        return ""
+    cores = sorted({s["cores"] for s in pools})
+    parts = ", ".join(f"{s['label']} {s['workers']}" for s in pools)
+    return (
+        f'<p class="muted small">Models at a time: {_e(parts)}; '
+        f"{_e(' or '.join(str(c) for c in cores))} CPU threads each "
+        "(<code>compute.workers</code>, <code>compute.cores_per_worker</code>).</p>"
+    )
+
+
 def _timeline(d: dict) -> str:
     tasks = d["tasks"]
-    if not d["steps"] and not tasks:
+    planned = d.get("planned") or []
+    if not d["steps"] and not tasks and not planned:
         return (
-            '<section class="card"><h2>Models</h2><p class="empty">No per-model workers have started. '
-            "Each model's start and finish appear here when <code>compute.workers</code> is more than 1."
+            '<section class="card"><h2>Models</h2><p class="empty">No model has started yet.'
             "</p></section>"
         )
+    none_passed = set(d.get("none_passed") or [])
     t1 = _ts(d["run"]["ended"]) or _ts(d["generated"]) or datetime.now(UTC).timestamp()
     t0 = _ts(d["run"]["started"]) or min(
         (_at(t["start"], t1) for t in tasks if t["start"]), default=t1
@@ -283,6 +324,9 @@ def _timeline(d: dict) -> str:
         return (t - t0) / span * 100
 
     steps = list(dict.fromkeys([s["label"] for s in d["steps"]] + [t["step"] for t in tasks]))
+    if "generation" in steps:
+        steps.remove("generation")
+        steps.insert(0, "generation")
     color = {step: f"var(--k{i % STEP_COLORS + 1})" for i, step in enumerate(steps)}
     ticks = _ticks(t0, t1)
     grid = "".join(f'<i class="tick" style="left:{pct(t):.2f}%"></i>' for t in ticks)
@@ -291,27 +335,28 @@ def _timeline(d: dict) -> str:
     by_model: dict[str, list] = {}
     for t in sorted(tasks, key=lambda t: (t["start"] or "~", t["order"])):
         by_model.setdefault(base_model(t["model"]), []).append(t)
-    # A tuned model (ctgan_hpo) sits under its untuned one, whose generation
-    # worker also trained it; families keep the order they started in.
-    family = {m: i for i, m in enumerate(dict.fromkeys(m.removesuffix("_hpo") for m in by_model))}
-    by_model = dict(
-        sorted(by_model.items(), key=lambda kv: (family[kv[0].removesuffix("_hpo")], kv[0]))
-    )
     rows = []
-    for model, mine in by_model.items():
+    for model in _row_order(d, by_model):
+        mine = by_model.get(model, [])
         segs = []
         for s in _segments(mine, t1):
             n = len(s["tasks"])
             # What the segment did: its phases (untuned fits, search, tuned
-            # fits) for a generation worker, else its replicates.
+            # fits, SynthEval passes), else its replicates.
             spans = _phase_spans(s["tasks"], t1)
-            if spans:
+            if spans and s["step"] == "generation":
                 what = ", ".join(_phase_text(*span) for span in spans)
-            elif n > 1:
-                what = f"{n} replicates"
             else:
-                what = "" if s["tasks"][0]["model"] == model else s["tasks"][0]["model"]
-            parts = [model, s["step"], what, s["status"], _duration(s["end"] - s["start"])]
+                what = f"{n} replicates" if n > 1 else ""
+                if not what and s["tasks"][0]["model"] != model:
+                    what = s["tasks"][0]["model"]
+                if any(span[0] in PHASE_CLASS for span in spans):
+                    passes = ", ".join(_phase_text(*span) for span in spans)
+                    what = f"{what}, {passes}" if what else passes
+            status = s["status"]
+            if status == "done" and model in none_passed and s["step"] == "generation":
+                status = "none passed"
+            parts = [model, s["step"], what, status, _duration(s["end"] - s["start"])]
             tip = " · ".join(p for p in parts if p)
             n_failed = sum(t.get("metric_failures", 0) for t in s["tasks"])
             if n_failed:
@@ -322,20 +367,31 @@ def _timeline(d: dict) -> str:
                 f'width:{max(pct(s["end"]) - pct(s["start"]), 0.4):.2f}%;background:{color[s["step"]]}" '
                 f'title="{_e(tip)}"></div>'
             )
-        segs += _phases(mine, t1, pct, model)
+            segs += _phases(s["tasks"], t1, pct, model, s["step"])
         statuses = {t["status"] for t in mine}
-        status = next((s for s in ("failed", "running", "stopped") if s in statuses), "done")
+        status = next(
+            (s for s in ("failed", "running", "stopped", "none passed") if s in statuses), "done"
+        )
+        if model in none_passed and status == "done":
+            status = "none passed"
+        if not mine:
+            status = "waiting"
         starts = [_at(t["start"], t1) for t in mine if t["start"]]
         ends = [_at(t["end"], t1) for t in mine if t["start"]]
         busy = sum(t["duration_s"] or 0 for t in mine)
         wall = _duration(max(ends) - min(starts)) if starts else "-"
         dur = f'<span class="g-dur" title="first start to last finish; {_e(_duration(busy))} of worker time">{_e(wall)}</span>'
-        study = hpo.get(model)
+        study = hpo.get(model.removesuffix("_hpo")) if model.endswith("_hpo") else None
         extra = ""
         if study and study["target"]:
             extra = f'<span class="muted small">HPO {study["complete"] + study["pruned"]}/{study["target"]}</span>'
         errors = [f"{t['step']}: {t['error']}" for t in mine if t.get("error")]
         err = f'<div class="row-error">{_e(errors[-1])}</div>' if errors else ""
+        if model in none_passed:
+            err += (
+                '<div class="row-note muted small">no HPO trial passed the screens: the untuned '
+                "model stands in, this one is not fitted or evaluated</div>"
+            )
         metric_steps = {}
         for t in mine:
             if t.get("metric_failures"):
@@ -371,30 +427,41 @@ def _timeline(d: dict) -> str:
     )
 
     summary = []
-    for step in d["steps"]:
-        queued = step["total"] - sum(t["step"] == step["label"] for t in tasks)
-        text = f"{step['done']} of {step['total']} done"
-        if step["failed"]:
-            text += f", {step['failed']} failed"
-        if step["running"]:
-            text += f", {step['running']} running"
-        if step.get("with_metric_failures"):
-            text += f", {step['with_metric_failures']} with failed metrics"
+    for label in steps:
+        step = next((st for st in d["steps"] if st["label"] == label), None)
+        mine = [t for t in tasks if t["step"] == label]
+        total = max(step["total"] if step else 0, len(mine))
+        if label == "generation":
+            # Units, the untuned and tuned bars of one worker, and baselines.
+            total = len(mine)
+        done = sum(t["status"] in ("done", "none passed") for t in mine)
+        text = f"{done} of {total} done"
+        failed = sum(t["status"] == "failed" for t in mine)
+        running = sum(t["status"] == "running" for t in mine)
+        if failed:
+            text += f", {failed} failed"
+        if running:
+            text += f", {running} running"
+        with_failures = sum(bool(t.get("metric_failures")) for t in mine)
+        if with_failures:
+            text += f", {with_failures} with failed metrics"
+        queued = total - len(mine)
         if queued > 0:
             text += f", {queued} waiting"
-        if step.get("workers"):
-            text += f" · {step['workers']} at a time, {step['cores']} CPU threads each"
         summary.append(
-            f'<li><i class="sw" style="background:{color[step["label"]]}"></i>'
-            f'<b>{_e(step["label"])}</b> <span class="muted">{_e(text)}</span></li>'
+            f'<li><i class="sw" style="background:{color[label]}"></i>'
+            f'<b>{_e(label)}</b> <span class="muted">{_e(text)}</span></li>'
         )
     legend = (
-        f'<ul class="steps-legend">{"".join(summary)}</ul>'
-        '<p class="muted small">One bar per model; each colored segment is one step, from its '
-        "first replicate's start to its last one's finish. Hover a segment for details. "
+        f'<ul class="steps-legend">{"".join(summary)}</ul>{_parallel_note(d)}'
+        '<p class="muted small">One bar per model, listed from the start; a tuned model '
+        "(<code>_hpo</code>) sits under its untuned one. Each colored segment is one step, from "
+        "its first replicate's start to its last one's finish; hover it for details. "
         "Striped: running; red outline: failed; amber outline: finished, but some metrics failed "
-        "(listed under Problems). On a generation bar, the plain part is the untuned fits, "
-        "the light part the HPO search and the dark part the tuned fits.</p>"
+        "(listed under Problems). Generation: the untuned model's bar is its untuned fits; the "
+        "tuned model's bar is the HPO search (light) and the tuned fits (dark), and says "
+        '"none passed" when no trial passed the screens. SynthEval: the plain part is the main '
+        "pass, the shaded part the one-vs-rest or binary-target passes.</p>"
     )
     return (
         f'<section class="card"><h2>Models</h2>{legend}'
@@ -596,6 +663,10 @@ def _resource_table(tasks: list[dict]) -> str:
         'group by step</label><label><input type="radio" name="res-by" value="model"> group by model</label></span></h3>'
         f'<div class="scroll"><table class="res" data-by="step">{head}<tbody>{_resource_rows(tasks, "step")}</tbody></table>'
         f'<table class="res" data-by="model" hidden>{head}<tbody>{_resource_rows(tasks, "model")}</tbody></table></div>'
+        '<p class="muted small">"Now" is the latest sample while the run goes on. Peaks are the '
+        "larger of the once-a-minute samples and what each model's worker process measured "
+        "itself when it ended (its peak RAM and GPU memory, its CPU use averaged over its run), "
+        "so a model that finished between two samples is listed too.</p>"
     )
 
 
@@ -820,6 +891,7 @@ button{font:inherit;font-size:12px;padding:4px 10px;border-radius:6px;border:1px
 .phase{position:absolute;top:3px;bottom:3px;pointer-events:auto}
 .phase.hpo{background:rgba(255,255,255,.55)}
 .phase.tuned{background:rgba(0,0,0,.35)}
+.phase.pass2{background:rgba(0,0,0,.22)}
 @keyframes slide{to{background-position:28px 0}}
 .g-stages .g-track{background:none}
 .band{position:absolute;top:1px;bottom:1px;border:1px solid var(--axis);border-radius:3px;background:var(--page);font-size:11px;color:var(--ink2);overflow:hidden;white-space:nowrap}

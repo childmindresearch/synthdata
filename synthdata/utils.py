@@ -48,16 +48,34 @@ REPLICATE_SEPARATOR = "__rep"
 
 
 def replicate_name(name: str, replicate: int) -> str:
-    """Dataset name for replicate ``replicate`` of ``name`` (replicate 0 keeps ``name``)."""
-    return name if replicate == 0 else f"{name}{REPLICATE_SEPARATOR}{replicate}"
+    """Dataset name for replicate ``replicate`` (counted from 0) of ``name``: ``ctgan__rep1``, ``ctgan__rep2``, ..."""
+    return f"{name}{REPLICATE_SEPARATOR}{replicate + 1}"
 
 
 def split_replicate_name(name: str) -> tuple[str, int]:
-    """Inverse of :func:`replicate_name`: ``"ctgan__rep2"`` -> ``("ctgan", 2)``."""
+    """Inverse of :func:`replicate_name`: ``"ctgan__rep2"`` -> ``("ctgan", 1)``.
+
+    A name without the suffix (a dataset from before every replicate carried
+    one) counts as the first replicate.
+    """
     base, sep, index = str(name).rpartition(REPLICATE_SEPARATOR)
-    if sep and base and index.isdigit():
-        return base, int(index)
+    if sep and base and index.isdigit() and int(index) >= 1:
+        return base, int(index) - 1
     return str(name), 0
+
+
+def model_sort_key(name: str) -> tuple:
+    """Order of models in every figure and table: generators by name, each tuned
+    model right after its untuned one, baselines last; replicates in turn.
+
+    ``sorted(models, key=model_sort_key)`` gives the same order whatever
+    order the models were scored or ranked in, so a model sits in the same
+    place in every plot.
+    """
+    base, replicate = split_replicate_name(str(name))
+    tuned = base.endswith("_hpo")
+    family = base.removesuffix("_hpo")
+    return (family.startswith("baseline_"), family, tuned, replicate)
 
 
 def resolve_device(device: str = "auto") -> str:
