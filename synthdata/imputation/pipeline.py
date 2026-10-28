@@ -1,7 +1,8 @@
 """Method-agnostic imputation pipeline: caching, dispatch, rounding, validation.
 
 :func:`run_imputation` dispatches to the configured backend
-(``synthdata.imputation.sklearn_backend`` for ``missforest``/``simple``,
+(``synthdata.imputation.miceforest_backend`` for ``miceforest``,
+``synthdata.imputation.sklearn_backend`` for ``missforest``/``simple``,
 ``tabimpute_backend`` or ``refidiff_backend``), fitting it twice (see
 :func:`_impute_splits`), then applies shared post-processing (rounding,
 caching to CSV, validation reporting) identically regardless of which backend
@@ -73,7 +74,27 @@ def _fit_and_apply(
     ``apply_to`` can inform each other's imputations but never ``fit_df``'s.
     """
     method = cfg.imputation.method
-    if method in ("missforest", "simple"):
+    if method == "miceforest":
+        from synthdata.imputation import miceforest_backend
+
+        state, fit_imputed = miceforest_backend.fit(
+            fit_df,
+            dataset.feature_columns,
+            dataset.categorical_columns,
+            dataset.nominal_columns,
+            seed=cfg.seed,
+            miceforest_cfg=cfg.imputation.miceforest,
+            model_columns=[
+                c
+                for c in dataset.feature_columns
+                if fit_df[c].isna().any() or apply_to[c].isna().any()
+            ],
+        )
+
+        def _transform(frame: pd.DataFrame) -> pd.DataFrame:
+            return miceforest_backend.transform(state, frame)
+
+    elif method in ("missforest", "simple"):
         from synthdata.imputation import sklearn_backend
 
         state, fit_imputed = sklearn_backend.fit(
@@ -302,6 +323,8 @@ def _cache_key_payload(cfg: Config, dataset: Dataset) -> dict:
     }
     if imp_cfg.method == "refidiff":
         payload["refidiff"] = dataclasses.asdict(imp_cfg.refidiff)
+    if imp_cfg.method == "miceforest":
+        payload["miceforest"] = dataclasses.asdict(imp_cfg.miceforest)
     if imp_cfg.method == "missforest":
         payload["missforest"] = dataclasses.asdict(imp_cfg.missforest)
     return payload

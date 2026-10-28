@@ -523,8 +523,11 @@ def _distribution_summary(directory: Path, links: _Links) -> list[str]:
     lines = [
         "How far each column's synthetic distribution is from the real train split: total "
         "variation distance for categorical columns, Kolmogorov-Smirnov statistic for "
-        "continuous ones (0 identical, 1 disjoint). Each model's figure shows its "
-        "columns that differ most; the full figure has every column. Every column and "
+        "continuous ones (0 identical, 1 disjoint). Both sides leave out blank cells: real "
+        "values that were missing and synthetic values blanked by their missing indicator "
+        "(as in `released/`), so imputed values are not compared. Each model's figure "
+        "shows its columns that differ most; the full figure has every column, and "
+        "`<model>_filled` compares the filled data the metrics score. Every column and "
         f"model: {links.file(table_path)}.",
         "",
     ]
@@ -938,6 +941,7 @@ _FILE_DESCRIPTIONS = {
     "imputation_drift.csv": "Per-column drift between the HPO-phase and final imputation.",
     "imputation_validation_report.csv": "Per-column check that imputed values are plausible.",
     "data_readiness.csv": "Columns likely to be hard to model, with a suggested change (advisory).",
+    "missing_blocks.csv": "Columns missing together and each missingness pattern's candidate label (advisory).",
     "hpo_best_params.json": "Best hyperparameters found per model.",
     "generation_failures.json": "Models whose generation failed in this run, with the error.",
     "optuna_studies.db": "Optuna studies (open with optuna-dashboard).",
@@ -989,7 +993,12 @@ def _file_index_section(paths: _Paths, links: _Links, report_path: Path) -> str:
     if paths.manifest is not None:
         add(paths.manifest)
         add(paths.manifest.parent / "config_snapshot.json")
-    for name in ("data_readiness.csv", "imputation_validation_report.csv", "imputation_drift.csv"):
+    for name in (
+        "data_readiness.csv",
+        "missing_blocks.csv",
+        "imputation_validation_report.csv",
+        "imputation_drift.csv",
+    ):
         add(paths.imputation / name)
     if paths.data is not None:
         for name in ("split_report.csv", "full.csv", "train.csv", "test.csv"):

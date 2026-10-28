@@ -63,7 +63,7 @@ data:
 
 imputation:
   # Fitted on train minus tuning for HPO, then refitted on all of train.
-  method: missforest # missforest | simple (median/mode) | tabimpute | refidiff
+  method: miceforest # miceforest | missforest | simple (median/mode) | tabimpute | refidiff
   round_to_int_default: false # Keep continuous features continuous.
   missing_indicators:
     enabled: true
@@ -71,6 +71,9 @@ imputation:
     # 80%+ missing: generate only the indicator, fill 'recorded' rows by CART on release.
     # null = impute and generate every column as usual.
     indicator_only_fraction: 0.8
+    # One flag per block of columns missing together: {name: [cols]}, "auto", or {} (off).
+    # See missing_blocks.csv (synthdata-missing-blocks) before choosing.
+    blocks: {}
 
 generation:
   output_dir: output/sim/synthetic_data
@@ -86,7 +89,7 @@ generation:
   synthcity:
     enabled: true
     # Bayesian network does not scale reliably to this dataset width.
-    names: [ctgan, tvae, adsgan, pategan, rtvae, ddpm, arf]
+    names: [ctgan, tvae, adsgan, pategan, rtvae, arf]
 
   tabpfn:
     enabled: true
@@ -181,6 +184,9 @@ generation:
 evaluation:
   output_dir: output/sim/evaluation
   positive_class: 0 # Used only if the target is naturally binary.
+  # Accepted rules from synthdata-profile (dependencies.csv / missing_blocks.csv
+  # rows you keep) to check synthetic data against; null = off.
+  dependency_rules: null
   # Fixed reference rows scored next to the generators: real train rows
   # (utility ceiling, privacy floor) and independent column marginals.
   baselines: [train_copy, marginals]

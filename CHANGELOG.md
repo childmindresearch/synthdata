@@ -17,6 +17,36 @@ Changes generated data and the ranking: use a new experiment id, since cached sy
 
 - synthcity fork: `detection_xgb` passed `depth: 3`, which XGBoost ignores, so its trees grew to depth 6. It now passes `max_depth: 3`.
 
+## 0.18.0 (2026-10-27)
+
+Default generator list and a TabularARGN default change. Runs that keep the default `generation.synthcity.names` or TabularARGN params produce different models, so use a new experiment id; the golden runs do not use ddpm or TabularARGN and stay valid.
+
+### Changed
+
+- **ddpm is off by default.** It is no longer in the default `generation.synthcity.names` or in the shipped `config_sim.yaml`, `config_loris.yaml` and `config_hepatitis.yaml`. In the untuned simulated-data comparison it still learned the columns independently (its correlation and mutual-information errors matched the independent-marginals baseline, and its TSTR was below it). Add `ddpm` to `generation.synthcity.names` to run it. CDTD (`generation.cdtd`) is the diffusion model to use instead.
+- **TabularARGN value protection is off by default** (`generation.tabularargn.params: {value_protection: false}`). With it on, mostlyai-engine 2.7.3 can still write its `_RARE_` token even with `rare_category_replacement_method: sample`, and the run then stops with "tabularargn made categories ... not in train". The reason and the repro are in `docs/verification.md`.
+
+## 0.17.0 (2026-10-22)
+
+Imputed values change, so results are not comparable with earlier runs: use a new experiment id and re-record the golden runs.
+
+### Changed
+
+- New default imputer `imputation.method: miceforest`: MICE with LightGBM forests and predictive mean matching (the `miceforest` library, new dependency; LightGBM capped below 4.7). Each gap gets a real observed value from a row with a close prediction, so filled columns keep their spread and category shares instead of MissForest's narrow spikes and single-class fills. Settings in `imputation.miceforest` (`iterations`, `mean_match_candidates`, `num_threads`). `missforest` is still available. The example configs now use `miceforest`. Run `uv sync` to install it.
+- Real-vs-synthetic figures (`plots/generation/<model>.png`, `<model>_top_columns.png`) and `column_differences.csv` now compare the real train values that were recorded with the synthetic values as released (blanked where the synthetic missing indicator is 1), so imputed values appear on neither side. Panel titles show each side's share of blanks. The old filled-vs-filled view, which is what the metrics score, is `<model>_filled.png` (written when there are missing indicators).
+
+### Added
+
+- `missing_blocks.csv` (written by `synthdata-impute`, or on its own by the new `synthdata-missing-blocks --config ...`): columns that go missing together, and a candidate label for each missingness pattern (every column with a gap) (`skip_logic_candidate`, `form_not_given_candidate`, `item_missing`) with the decision-tree rule behind it, to review against the codebook.
+- `imputation.missing_indicators.blocks` (`{name: [columns]}` or `"auto"`, default `{}`) and `block_min_jaccard` (default 0.9): one `<name>__missing` flag per block, 1 where the whole block is missing; the released copy blanks the whole block there. Column flags then count only the gaps outside whole-block rows.
+- `dependencies.csv` from the new `synthdata-dependencies --config ...`: to help slim the dataset, an exact search over every column pair, with no cutoffs and nothing dropped. It covers functional dependencies, with a chance-corrected score so identifier-like columns are labelled `id_like` instead of passing as rules. It covers one-condition rules, which catch skip logic, kept when a Bonferroni-corrected binomial test says chance can't explain them. It also covers hierarchies, every identifying set of role columns (Desbordante's HyUCC) and every numeric column's linear R². Each finding has a suggested action. `--max-error` (default 1%) only picks the readable shortlist; `dependencies_pairs.parquet` and `dependencies_rules.parquet` hold everything. `--max-lhs 2` (opt-in, hours) adds two-column rules. Desbordante runs in its own environment (`uv sync --project envs/desbordante`; Linux or macOS, AGPL-licensed, so synthdata never imports it).
+- `synthdata-profile --config ...` writes `missing_blocks.csv`, `dependencies.csv` and `skip_logic_comparison.csv` (skip logic found by the blocks report's tree and by conditional FDs, side by side). It needs `envs/desbordante` (Linux; WSL on Windows) and stops with an error without it; `--blocks-only` skips the Desbordante part.
+- `evaluation.dependency_rules` (default `null`): a file of accepted rules (rows of `dependencies.csv` or `missing_blocks.csv` with a `check_rule`). Evaluation writes `dependency_violations.csv` and adds a `dependency_rules` row per model to `checks.csv`, warning when a model breaks the rules more often than the real holdout (plus 1 percentage point).
+
+### Fixed
+
+- Categorical axes in the plots sort labels that read as numbers by value (1, 2, ..., 10), even when they are stored as text; before, they sorted as text (1, 10, 11, 2). Schema `ordinal_order` still wins.
+
 ## 0.16.2 (2026-10-22)
 
 No result or config changes; old results stay comparable and no golden re-record is needed.
