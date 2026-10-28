@@ -6,11 +6,7 @@ Each entry says what a user sees change, which config keys or output files are n
 
 ## 0.23.0 (2026-10-28)
 
-Simulated clinical data 1.3. `configs/config_sim.yaml` now reads `data/simulated/sim_v1.3.csv` and its schema (experiment id and `data.version` "1.3"), so results are not comparable with 1.2 runs. Build 1.3 on any machine that holds 1.2 with `uv run python scripts/build_sim_v1_3.py` (deterministic, fixed seed; 1.2 is left untouched). It prints a change log with the rows each rule changed. 1.3 has 321 schema columns (1.2 had 454). Golden runs use the committed fixture, not this data, so no re-record is needed.
-
-### Added
-
-- **`scripts/build_sim_v1_3.py`** builds 1.3 from 1.2.
+Simulated clinical data 1.3. `configs/config_sim.yaml` now reads `data/simulated/sim_v1.3.csv` and its schema (experiment id and `data.version` "1.3"), so results are not comparable with 1.2 runs. 1.3 is built from 1.2 outside the repository; copy `sim_v1.3.csv` and `sim_v1.3_variable_schema.csv` into `data/simulated/` on each machine that runs it. 1.3 has 321 schema columns (1.2 had 454). Golden runs use the committed fixture, not this data, so no re-record is needed.
 
 ### Changed (sim 1.3 data)
 

@@ -146,7 +146,7 @@ The settings you will most often change, by section:
 The three example configs are templates, not defaults for your data:
 
 - [`config_hepatitis.yaml`](../configs/config_hepatitis.yaml): small, one row per patient, CPU-friendly.
-- [`config_sim.yaml`](../configs/config_sim.yaml): a wide (321 schema columns), multi-visit, three-class dataset with profiled GPU budgets. Start here for real clinical data. It reads simulated data 1.3, which `uv run python scripts/build_sim_v1_3.py` builds from 1.2 (it prints what it changed); 1.2 had 454 columns.
+- [`config_sim.yaml`](../configs/config_sim.yaml): a wide (321 schema columns), multi-visit, three-class dataset with profiled GPU budgets. Start here for real clinical data. It reads simulated data 1.3 (CHANGELOG 0.23.0 lists what changed from 1.2, which had 454 columns).
 - [`config_loris.yaml`](../configs/config_loris.yaml): the LORIS dataset, which shows the `binary_target` option for a multi-class target.
 
 ### Long runs and remote machines
