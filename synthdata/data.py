@@ -610,8 +610,8 @@ def decode_ordinal_columns(df: pd.DataFrame, ordinal_categories: dict) -> pd.Dat
 
 
 _IDENTIFIER_NAME = re.compile(
-    # A bare "name" counts only as the whole column name: "encounter_location_name"
-    # or "program_name" name places and programs, not people.
+    # A bare "name" counts only as the whole column name: "site_name" or
+    # "program_name" name places and programs, not people.
     r"^name$|(^|_)(id|mrn|ssn|nhs|first_?name|last_?name|surname|full_?name|given_?name|"
     r"family_?name|patient_?name|dob|birth_?date|date_of_birth|email|e_?mail|phone|address|"
     r"street|zip|zipcode|postcode|postal_?code)($|_)",
