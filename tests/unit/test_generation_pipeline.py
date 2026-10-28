@@ -1,5 +1,6 @@
 """Unit tests for generation pipeline schema wiring."""
 
+import copy
 from pathlib import Path
 
 import numpy as np
@@ -7,7 +8,7 @@ import pandas as pd
 import pytest
 
 from synthdata.generation.class_quota import class_quotas
-from synthdata.generation.pipeline import run_generation
+from synthdata.generation.pipeline import _only, generation_units, run_generation
 
 pytestmark = pytest.mark.unit
 
@@ -67,7 +68,7 @@ def test_tabpfn_generation_forwards_schema_derived_feature_roles(make_config, ma
     assert arguments[3] == len(dataset.train_df)  # n_samples: null matches train
     assert keyword_arguments["target_is_categorical"] is True
     assert keyword_arguments["variable_schema_fingerprint"] is None
-    assert result["tabpfn_custom"].equals(generated)
+    assert result["tabpfn_custom_raw__rep1"].equals(generated)
 
 
 def test_continuous_target_fails_before_tabpfn_cache_lookup(make_config, make_dataset, mocker):
@@ -78,7 +79,7 @@ def test_continuous_target_fails_before_tabpfn_cache_lookup(make_config, make_da
 
     output_path = Path(cfg.generation.output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    cached_path = output_path / "tabpfn_custom.csv"
+    cached_path = output_path / "tabpfn_custom_raw__rep1.csv"
     cached_contents = "cached,target\n1,0\n"
     cached_path.write_text(cached_contents)
     mock_generate = mocker.patch("synthdata.generation.pipeline.tpfn.generate_tabpfn_custom")
@@ -108,13 +109,13 @@ def test_each_replicate_is_built_with_its_own_seed(make_config, make_dataset, mo
 
     result = run_generation(cfg, dataset)
 
-    assert sorted(result) == ["ctgan", "ctgan__rep1", "ctgan__rep2"]
+    assert sorted(result) == ["ctgan__rep1", "ctgan__rep2", "ctgan__rep3"]
     assert [call.args[4] for call in mock_fit.call_args_list] == [
         cfg.seed,
         cfg.seed + 1,
         cfg.seed + 2,
     ]
-    assert result["ctgan__rep2"]["seed"].eq(cfg.seed + 2).all()
+    assert result["ctgan__rep3"]["seed"].eq(cfg.seed + 2).all()
     output_dir = Path(cfg.generation.output_dir)
     assert (output_dir / "ctgan__rep1.csv").exists()
 
@@ -135,7 +136,7 @@ def test_generated_numbers_get_the_train_decimals_and_range(make_config, make_da
     mocker.patch("synthdata.generation.pipeline.sc.make_loader")
     mocker.patch("synthdata.generation.pipeline.sc.fit_generate", return_value=generated)
 
-    result = run_generation(cfg, dataset)["arf"]
+    result = run_generation(cfg, dataset)["arf__rep1"]
 
     train = dataset.train_imputed_df
     assert (result["age"] % 1 == 0).all()
@@ -143,7 +144,7 @@ def test_generated_numbers_get_the_train_decimals_and_range(make_config, make_da
     assert result["group"].iloc[0] == train["group"].max()
     assert result["group"].dtype == train["group"].dtype
     assert result["smoker"].equals(generated["smoker"])
-    saved = pd.read_csv(Path(cfg.generation.output_dir) / "arf.csv")
+    saved = pd.read_csv(Path(cfg.generation.output_dir) / "arf__rep1.csv")
     assert (saved["age"] % 1 == 0).all()
 
 
@@ -170,8 +171,8 @@ def test_synthcity_models_are_drawn_to_the_train_class_shares(make_config, make_
     pd.testing.assert_series_equal(fit.call_args.kwargs["class_prior"], expected)
     record = pd.read_csv(Path(cfg.generation.output_dir) / "diagnostics" / "class_sampling.csv")
     assert record[["model", "class", "quota", "filled", "rounds"]].values.tolist() == [
-        ["ctgan", 0, 3, 3, 4],
-        ["ctgan", 1, 2, 1, 4],
+        ["ctgan__rep1", 0, 3, 3, 4],
+        ["ctgan__rep1", 1, 2, 1, 4],
     ]
 
 
@@ -199,7 +200,7 @@ def test_tabpfn_keeps_its_first_batch_without_refitting_for_short_classes(
 
     mocker.patch("synthdata.generation.pipeline.tpfn.generate_tabpfn_custom", side_effect=generate)
 
-    result = run_generation(cfg, dataset)["tabpfn_custom"]
+    result = run_generation(cfg, dataset)["tabpfn_custom_raw__rep1"]
 
     # Each extra batch would be a whole TabPFN refit: the short class stays short.
     quotas = class_quotas(dataset.train_df[target].value_counts(normalize=True), 100)
@@ -242,9 +243,9 @@ def test_a_failed_model_is_recorded_and_the_others_continue(make_config, make_da
 
     result = run_generation(cfg, dataset)
 
-    assert sorted(result) == ["ctgan"]
+    assert sorted(result) == ["ctgan__rep1"]
     assert read_failures(output_dir) == {
-        "pategan": "RuntimeError: CUDA out of memory. Tried to allocate 1.42 GiB"
+        "pategan__rep1": "RuntimeError: CUDA out of memory. Tried to allocate 1.42 GiB"
     }
 
 
@@ -276,27 +277,27 @@ def test_a_header_only_cached_set_is_refitted(make_config, make_dataset, mocker)
     cfg, dataset, fit = _one_synthcity_model(make_config, make_dataset, mocker)
     output_dir = Path(cfg.generation.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    dataset.train_df.head(0).to_csv(output_dir / "ctgan.csv", index=False)
+    dataset.train_df.head(0).to_csv(output_dir / "ctgan__rep1.csv", index=False)
 
     result = run_generation(cfg, dataset)
 
     assert fit.call_count == 1
-    assert len(result["ctgan"]) == len(dataset.train_df)
-    assert len(pd.read_csv(output_dir / "ctgan.csv")) == len(dataset.train_df)
+    assert len(result["ctgan__rep1"]) == len(dataset.train_df)
+    assert len(pd.read_csv(output_dir / "ctgan__rep1.csv")) == len(dataset.train_df)
 
 
 def test_a_valid_cached_set_is_reused(make_config, make_dataset, mocker):
     cfg, dataset, fit = _one_synthcity_model(make_config, make_dataset, mocker)
     output_dir = Path(cfg.generation.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    dataset.train_df.to_csv(output_dir / "ctgan.csv", index=False)
+    dataset.train_df.to_csv(output_dir / "ctgan__rep1.csv", index=False)
 
     run_generation(cfg, dataset)
 
     fit.assert_not_called()
 
 
-def test_hpo_without_a_feasible_trial_reuses_the_untuned_sets(make_config, make_dataset, mocker):
+def test_hpo_without_a_feasible_trial_skips_the_tuned_model(make_config, make_dataset, mocker):
     cfg, dataset, fit = _one_synthcity_model(make_config, make_dataset, mocker)
     cfg.generation.hpo.enabled = True
     cfg.generation.hpo.final_n_iter_override = None
@@ -309,7 +310,39 @@ def test_hpo_without_a_feasible_trial_reuses_the_untuned_sets(make_config, make_
 
     result = run_generation(cfg, dataset)
 
+    # Only the untuned fits: the tuned model would repeat them, so it is
+    # neither fitted nor saved (and so not evaluated).
     assert [call.args[4] for call in fit.call_args_list] == [cfg.seed, cfg.seed + 1]
-    for untuned, tuned in [("ctgan", "ctgan_hpo"), ("ctgan__rep1", "ctgan_hpo__rep1")]:
-        pd.testing.assert_frame_equal(result[tuned], result[untuned])
-        assert (Path(cfg.generation.output_dir) / f"{tuned}.csv").exists()
+    assert sorted(result) == ["ctgan__rep1", "ctgan__rep2"]
+    assert not list(Path(cfg.generation.output_dir).glob("ctgan_hpo*.csv"))
+
+
+def test_every_model_and_tabpfn_variant_is_a_generation_unit(make_config):
+    cfg = make_config()
+    gen = cfg.generation
+    gen.synthcity.names = ["ctgan", "tvae"]
+    gen.tabpfn.enabled = True
+    gen.tabpfn.variants = ["standard", "custom"]
+    gen.tabpfn.data_variants = ["raw", "imputed"]
+    gen.tabpfgen.enabled = True
+    gen.tabpfgen.variants = ["standard"]
+    gen.tabularargn.enabled = True
+    gen.cdtd.enabled = False
+
+    units = generation_units(gen)
+
+    assert units == [
+        "ctgan",
+        "tvae",
+        "tabpfn_standard_raw",
+        "tabpfn_custom_raw",
+        "tabpfn_standard_imputed",
+        "tabpfn_custom_imputed",
+        "tabpfgen_standard",
+        "tabularargn",
+    ]
+    for unit in units:
+        sub = copy.deepcopy(gen)
+        _only(sub, unit)
+        # Restricted to one unit, the config has exactly that unit.
+        assert generation_units(sub) == [unit]

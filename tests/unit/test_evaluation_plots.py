@@ -4,7 +4,13 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import pytest
 
-from synthdata.plotting.evaluation_plots import _base_model, _is_hpo, plot_rank_tradeoff
+from synthdata.plotting.evaluation_plots import (
+    _base_model,
+    _is_hpo,
+    metric_priority,
+    plot_rank_tradeoff,
+)
+from synthdata.utils import model_sort_key
 
 pytestmark = pytest.mark.unit
 
@@ -61,3 +67,30 @@ def test_metric_overview_folds_seeds_and_marks_directions():
     finally:
         plt.close(fig)
     assert plot_metric_overview(combined, directions, "fairness") is None
+
+
+def test_models_keep_one_order_and_metrics_go_by_importance():
+    models = [
+        "baseline_marginals__rep1",
+        "tvae__rep1",
+        "ctgan_hpo__rep2",
+        "ctgan__rep1",
+        "ctgan_hpo__rep1",
+    ]
+    assert sorted(models, key=model_sort_key) == [
+        "ctgan__rep1",
+        "ctgan_hpo__rep1",
+        "ctgan_hpo__rep2",
+        "tvae__rep1",
+        "baseline_marginals__rep1",
+    ]
+    utility = ["sanity.data_mismatch.score", "detection.detection_xgb.mean", "tstr_macro_auprc"]
+    assert sorted(utility, key=lambda m: metric_priority("utility", m)) == [
+        "tstr_macro_auprc",
+        "detection.detection_xgb.mean",
+        "sanity.data_mismatch.score",
+    ]
+    fairness = ["eqo_target_SEX", "equalized_odds", "equalized_odds_gap_error"]
+    assert sorted(fairness, key=lambda m: metric_priority("fairness", m))[0] == (
+        "equalized_odds_gap_error"
+    )

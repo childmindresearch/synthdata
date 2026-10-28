@@ -7,7 +7,7 @@ import pandas as pd
 
 from synthdata.config import Config
 from synthdata.plotting import save_matplotlib_figure, save_plotly_figure
-from synthdata.utils import get_logger, split_replicate_name
+from synthdata.utils import get_logger, model_sort_key, split_replicate_name
 
 logger = get_logger(__name__)
 
@@ -52,7 +52,9 @@ def plot_rank_tradeoff(
 
     fig, ax = plt.subplots(figsize=(11, 7))
     any_interval = False
-    for model, names in groups.groupby(groups, sort=False).groups.items():
+    by_model = groups.groupby(groups, sort=False).groups
+    for model in sorted(by_model, key=model_sort_key):
+        names = by_model[model]
         is_hpo = _is_hpo(str(model))
         color = palette[_base_model(str(model))]
         xs = pd.to_numeric(combined.loc[names, x_key], errors="coerce")
@@ -207,7 +209,9 @@ def plot_rank_tradeoff_3d(combined: pd.DataFrame):
                 ),
             )
         )
-    for model, names in groups.groupby(groups, sort=False).groups.items():
+    by_model = groups.groupby(groups, sort=False).groups
+    for model in sorted(by_model, key=model_sort_key):
+        names = by_model[model]
         is_hpo = _is_hpo(str(model))
         ranks = [float(combined.loc[names, key].astype(float).mean()) for key in rank_keys.values()]
         base = _base_model(str(model))
@@ -358,6 +362,102 @@ _DIRECTION_NOTE = {
 }
 
 
+#: Metrics of each type, most important first (the panel order of the
+#: overview figures). Each entry is a name or a name prefix; metrics matching
+#: none keep their order after the listed ones. Utility: how well models
+#: trained on synthetic data predict real holdout rows, then whether real
+#: and synthetic rows can be told apart, then joint and marginal fidelity,
+#: then the synthetic-only scores and real-data references. Privacy: attacks
+#: with a calibrated baseline (Anonymeter, distance MIA), then distance to
+#: train against holdout, then the other attack and distance scores, then
+#: the k-anonymity family. Fairness: how far a synthetic-trained model's group
+#: gaps are from the real-trained model's, then subgroup privacy, then the
+#: within-synthetic gaps.
+METRIC_PRIORITY = {
+    "utility": [
+        "tstr_macro_auprc",
+        "tstr_macro_f1",
+        "tstr_balanced_accuracy",
+        "avg_F1_diff_hout",
+        "performance.xgb.syn_ood",
+        "performance.mlp.syn_ood",
+        "performance.linear_model.syn_ood",
+        "detection.detection_xgb",
+        "auroc",
+        "avg_pMSE",
+        "detection.",
+        "stats.alpha_precision",
+        "stats.prdc",
+        "corr_mat_diff",
+        "mutual_inf_diff",
+        "stats.max_mean_discrepancy",
+        "stats.wasserstein_dist",
+        "pca_",
+        "avg_dwm_diff",
+        "avg_cio",
+        "ks_tvd_stat",
+        "frac_ks_sigs",
+        "avg_h_dist",
+        "stats.",
+        "avg_qMSE",
+        "nnaa",
+        "performance.feat_rank_distance",
+        "avg_F1_diff",
+        "performance.",
+        "tsts_",
+        "sanity.",
+    ],
+    "privacy": [
+        "anonymeter_",
+        "distance_mia_auc",
+        "dcr_closer_to_train_share",
+        "dcr_holdout_ratio",
+        "nndr_holdout_ratio",
+        "mia_",
+        "priv_loss_nnaa",
+        "priv_loss_nndr",
+        "eps_identif_risk",
+        "priv_loss_eps",
+        "privacy.identifiability_score",
+        "att_discl_risk",
+        "attack.",
+        "hit_rate",
+        "median_DCR",
+        "avg_nndr",
+        "privacy.delta-presence",
+        "privacy.k-map",
+        "privacy.k-anonymization",
+        "privacy.distinct l-diversity",
+    ],
+    "fairness": [
+        "equalized_odds_gap_error",
+        "equal_opportunity_gap_error",
+        "demographic_parity_gap_error",
+        "subgroup_distance_mia_auc_gap",
+        "subgroup_distance_mia_auc_max",
+        "log_disparity_mean_abs",
+        "log_disparity_share_significant",
+        "log_disparity_",
+        "equalized_odds",
+        "eqo_",
+        "equal_opportunity",
+        "eo_",
+        "statistical_parity",
+        "sp_",
+        "fairness_signal",
+    ],
+}
+
+
+def metric_priority(metric_type: str, metric: str) -> int:
+    """Position of ``metric`` in :data:`METRIC_PRIORITY` (unlisted metrics last)."""
+    order = METRIC_PRIORITY.get(metric_type, [])
+    for i, entry in enumerate(order):
+        if metric == entry or metric.startswith(entry):
+            return i
+    return len(order)
+
+
 def metric_overview_table(combined: pd.DataFrame, metric: tuple) -> pd.DataFrame:
     """Mean and 95% interval over seed replicates of one raw metric, per model.
 
@@ -404,14 +504,13 @@ def plot_metric_overview(
     ]
     if not metrics:
         return None
+    metrics = sorted(metrics, key=lambda key: metric_priority(metric_type, key[2]))
     first = metric_overview_table(combined, metrics[0])
-    models = [m for m in first.index if not is_baseline(m)] + [
-        m for m in first.index if is_baseline(m)
-    ]
+    models = sorted(first.index, key=model_sort_key)
     n_rows = math.ceil(len(metrics) / n_cols)
     height = max(1.6, 0.22 * len(models) + 0.9)
     fig, axes = plt.subplots(
-        n_rows, n_cols, figsize=(4.2 * n_cols, height * n_rows + 0.8), squeeze=False, sharey=True
+        n_rows, n_cols, figsize=(4.2 * n_cols, height * n_rows + 0.4), squeeze=False, sharey=True
     )
     y = range(len(models))
     for ax, key in zip(axes.flat, metrics, strict=False):
@@ -439,12 +538,8 @@ def plot_metric_overview(
     for ax in axes[:, 0]:
         ax.set_yticks(list(y), models)
         ax.invert_yaxis()
-    fig.suptitle(
-        f"{metric_type.capitalize()} metrics: mean over seeds (dot) with 95% interval (bar). "
-        "Grey rows are baselines: train copy = real data, marginals = no relationships. "
-        "Green dashed line: ideal value.",
-        fontsize=9,
-    )
+    # No figure title: report.md explains the panels, and a title overlapped
+    # the first row of panel titles.
     fig.tight_layout()
     return fig
 

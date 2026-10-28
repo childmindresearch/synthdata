@@ -85,6 +85,11 @@ _TASK_END = re.compile(
     r"^\[(?P<label>[^\]]+)\] (?P<model>\S+) (?P<outcome>finished|failed) after .+?; "
     r"(?P<k>\d+) of (?P<n>\d+) done"
 )
+#: What a worker used, at the end of its "finished after" line (synthdata.compute).
+_USAGE = re.compile(
+    r"\(peak RAM (?P<ram_gib>[\d.]+) GiB(?:, CPU (?P<cpu_cores>[\d.]+) cores on average)?"
+    r"(?:, peak GPU memory (?P<vram_gib>[\d.]+) GiB)?\)"
+)
 _TASK_FAIL = re.compile(r"^\[(?P<label>[^\]]+)\] (?P<model>\S+) failed: (?P<why>.*)")
 _EXPERIMENT = re.compile(r"^Experiment '(?P<id>[^']+)' \(tag=")
 #: The start of a final fit (not an HPO trial). In the runner's own process
@@ -94,19 +99,34 @@ _FIT_START = re.compile(r"^\[(?P<model>[^\]\s]+)\] generating synthetic data \(n
 _GENERATED = re.compile(r"^Generated/loaded \d+ synthetic datasets")
 #: Any line of an HPO study's own ("[hpo_ctgan] trial 3 ...", "[hpo_ctgan_probe] ...").
 _HPO_LINE = re.compile(r"^\[hpo_[^\]]+\] ")
-#: SynthEval's one-vs-rest passes (``syntheval ovr_<class>``, one per target
-#: class) are shown as one step; a model's bar spans all its passes.
-OVR_STEP = "syntheval one-vs-rest"
-_OVR_PASS = re.compile(r"\[syntheval ovr_[^\]:]+")
+#: SynthEval's passes (``syntheval main``, ``syntheval ovr_<class>`` once per
+#: target class, ``syntheval binary``) are one step; each pass is a phase of
+#: a model's bar.
+SYNTHEVAL_STEP = "syntheval"
+_SYNTHEVAL_PASS = re.compile(r"\[syntheval (?P<pass>[^\]:]+)")
 
 
-def merge_ovr_passes(text: str) -> str:
-    """Rename every ``syntheval ovr_<class>`` step label to :data:`OVR_STEP`."""
-    return _OVR_PASS.sub(f"[{OVR_STEP}", text)
+def merge_syntheval_passes(text: str) -> str:
+    """Rename every ``syntheval <pass>`` step label to :data:`SYNTHEVAL_STEP`."""
+    return _SYNTHEVAL_PASS.sub(f"[{SYNTHEVAL_STEP}", text)
 
 
-#: Step label for fits in the runner's own process.
-MAIN_STEP = "generation (main process)"
+def syntheval_pass(label: str) -> str | None:
+    """``"main"``, ``"one-vs-rest"`` or ``"binary"`` for a SynthEval step label, else None."""
+    if not label.startswith(f"{SYNTHEVAL_STEP} "):
+        return None
+    name = label.removeprefix(f"{SYNTHEVAL_STEP} ")
+    return "one-vs-rest" if name.startswith("ovr_") else name
+
+
+#: Step of the fits in the runner's own process (every model when
+#: ``compute.workers`` is 1, and the baselines): they count as generation.
+MAIN_STEP = "generation"
+#: "[ctgan_hpo] none passed: ..." (or the older "no trial passed the screens:
+#: reusing the untuned sets"): the tuned model is not fitted or evaluated.
+_NONE_PASSED = re.compile(
+    r"^\[(?P<model>[^\]\s]+)\] (?:none passed:|no trial passed the screens: reusing)"
+)
 _HPO_START = re.compile(
     r"^\[(?P<study>[^\]]+)\] starting hyperparameter optimization(?: of (?P<objective>\S+))?: "
     r"\d+ trial\(s\) remaining "
@@ -226,13 +246,15 @@ def parse_log(lines: list[str]) -> dict:
     outcome = None
     current_problem: dict | None = None
 
+    none_passed: set[str] = set()
+
     def close_main_fits(moment, status="done"):
         for entry in tasks.values():
-            if entry["step"] == MAIN_STEP and entry["status"] == "running":
+            if entry.get("main") and entry["status"] == "running":
                 entry.update(status=status, end=moment)
 
     for raw in lines:
-        line = merge_ovr_passes(raw.rstrip("\n"))
+        line = merge_syntheval_passes(raw.rstrip("\n"))
         if not line.strip():
             continue
         runner = _RUNNER.match(line)
@@ -339,31 +361,52 @@ def parse_log(lines: list[str]) -> dict:
         current_problem = None
         moment = clock.local(logline["hms"])
         msg, level = logline["msg"], logline["level"]
+        if task is None:
+            # The pool's own lines keep the pass in their label ("syntheval
+            # main"); the merged step gets it as a phase.
+            raw_msg = _LOGLINE.match(raw.rstrip("\n"))
+            msg = raw_msg["msg"] if raw_msg else msg
+        if m := _NONE_PASSED.match(msg):
+            none_passed.add(m["model"].removesuffix("_hpo"))
         if task is not None:
             _track_phase(tasks, task, msg, moment)
         if m := _EXPERIMENT.match(msg):
             experiment = m["id"]
         elif m := _POOL.match(msg):
-            pools[m["label"]] = {"total": int(m["n"]), "workers": int(m["w"]), "cores": int(m["c"])}
+            label = merge_syntheval_passes(f"[{m['label']}")[1:]
+            pool = pools.setdefault(label, {})
+            pool.update(
+                total=max(pool.get("total", 0), int(m["n"])),
+                workers=int(m["w"]),
+                cores=int(m["c"]),
+            )
         elif m := _TASK_START.match(msg):
-            pools.setdefault(m["label"], {"total": int(m["n"])})
-            earlier = tasks.get((m["label"], m["model"]))
-            tasks[(m["label"], m["model"])] = {
-                "step": m["label"],
+            label = merge_syntheval_passes(f"[{m['label']}")[1:]
+            pool = pools.setdefault(label, {})
+            pool["total"] = max(pool.get("total", 0), int(m["n"]))
+            earlier = tasks.get((label, m["model"]))
+            entry = tasks[(label, m["model"])] = {
+                "step": label,
                 "model": m["model"],
                 "status": "running",
-                # A merged step (OVR_STEP) runs each model once per pass.
+                # A merged step (SynthEval's passes) runs each model once per pass.
                 "start": earlier["start"] if earlier and earlier.get("start") else moment,
                 "end": None,
                 "pid": int(m["pid"]),
                 "order": int(m["i"]),
+                "phases": earlier.get("phases", []) if earlier else [],
             }
+            if (kind := syntheval_pass(m["label"])) is not None:
+                entry["phases"].append({"kind": kind, "name": kind, "start": moment, "end": None})
         elif m := _TASK_END.match(msg):
+            label = merge_syntheval_passes(f"[{m['label']}")[1:]
             entry = tasks.setdefault(
-                (m["label"], m["model"]),
-                {"step": m["label"], "model": m["model"], "start": None, "pid": None, "order": 0},
+                (label, m["model"]),
+                {"step": label, "model": m["model"], "start": None, "pid": None, "order": 0},
             )
             entry.update(status="failed" if m["outcome"] == "failed" else "done", end=moment)
+            if usage := _USAGE.search(msg):
+                entry["usage"] = {k: _float(v) for k, v in usage.groupdict().items()}
             _close_phase(entry, moment)
         elif task is None and (m := _FIT_START.match(msg)):
             close_main_fits(moment)
@@ -375,7 +418,16 @@ def parse_log(lines: list[str]) -> dict:
                 "start": moment,
                 "end": None,
                 "pid": None,
-                "order": sum(t["step"] == MAIN_STEP for t in tasks.values()) + 1,
+                "main": True,
+                "order": sum(bool(t.get("main")) for t in tasks.values()) + 1,
+                "phases": [
+                    {
+                        "kind": "tuned fit" if "_hpo" in m["model"] else "fit",
+                        "name": m["model"],
+                        "start": moment,
+                        "end": None,
+                    }
+                ],
             }
         elif task is None and _GENERATED.match(msg):
             close_main_fits(moment)
@@ -398,13 +450,14 @@ def parse_log(lines: list[str]) -> dict:
             failed_model = None
             if level != "WARNING" and (m := _TASK_FAIL.match(msg)):
                 failed_model = m["model"]
+                label = merge_syntheval_passes(f"[{m['label']}")[1:]
                 # Without the model's name, the same failure on many models
                 # folds into one problem that lists them.
-                msg = f"[{m['label']}] failed: {m['why']}"
+                msg = f"[{label}] failed: {m['why']}"
                 entry = tasks.setdefault(
-                    (m["label"], m["model"]),
+                    (label, m["model"]),
                     {
-                        "step": m["label"],
+                        "step": label,
                         "model": m["model"],
                         "start": None,
                         "end": moment,
@@ -435,6 +488,7 @@ def parse_log(lines: list[str]) -> dict:
         "problems": problems,
         "experiment": experiment,
         "latest": clock.latest,
+        "none_passed": none_passed,
     }
 
 
@@ -442,6 +496,9 @@ def _close_phase(entry: dict, moment) -> None:
     phases = entry.get("phases")
     if phases and phases[-1]["end"] is None:
         phases[-1]["end"] = moment
+    for phase in phases or []:
+        if phase["end"] is None:
+            phase["end"] = moment
 
 
 def _track_phase(tasks: dict, task: str, msg: str, moment) -> None:
@@ -525,6 +582,78 @@ def _group_problems(problems: list[dict], limit: int = 40) -> list[dict]:
     ]
 
 
+def split_tuned(tasks: list[dict], none_passed: set[str]) -> list[dict]:
+    """Give each tuned model (``ctgan_hpo``) a generation task of its own.
+
+    One generation worker trains a model's untuned fits, its HPO search and
+    its tuned fits; on the page the untuned model's bar ends where the search
+    starts, and the search and tuned fits go on the ``<model>_hpo`` bar. A
+    search where no trial passed ends the tuned bar as "none passed".
+    """
+    out = []
+    for task in tasks:
+        phases = task.get("phases") or []
+        first = next((i for i, ph in enumerate(phases) if ph["kind"] in ("HPO", "tuned fit")), None)
+        if task["step"] != "generation" or first is None or task.get("main"):
+            out.append(task)
+            continue
+        split_at = phases[first]["start"]
+        untuned = {**task, "phases": phases[:first]}
+        tuned = {
+            **task,
+            "model": f"{task['model']}_hpo",
+            "order": task.get("order", 0),
+            "phases": phases[first:],
+            "start": split_at,
+            "derived": True,
+        }
+        if task["status"] == "running":
+            untuned.update(status="done", end=split_at)
+        else:
+            untuned["end"] = split_at
+            untuned["status"] = "done" if task["status"] == "done" else task["status"]
+        if task["model"] in none_passed and tuned["status"] == "done":
+            tuned["status"] = "none passed"
+        untuned["usage"] = task.get("usage")
+        tuned.pop("usage", None)
+        out += [untuned, tuned]
+    return out
+
+
+def planned_models(cfg) -> list[dict]:
+    """Every model the config will generate and evaluate, in run order, before any starts.
+
+    ``hpo`` is True for a tuned model (``<model>_hpo``), which exists only if
+    its search finds a trial that passes the screens.
+    """
+    if cfg is None:
+        return []
+    try:
+        from synthdata.generation import hpo as hpo_mod
+        from synthdata.generation.pipeline import generation_units
+
+        gen = cfg.generation
+        models = []
+        for unit in generation_units(gen):
+            models.append({"model": unit, "hpo": False})
+            tunable = (gen.synthcity.enabled and unit in gen.synthcity.names) or (
+                gen.tabpfgen.enabled and unit.startswith("tabpfgen_")
+            )
+            if gen.hpo.enabled and tunable and hpo_mod.model_budget(gen.hpo, unit)[0] > 0:
+                models.append({"model": f"{unit}_hpo", "hpo": True})
+        models += [{"model": f"baseline_{kind}", "hpo": False} for kind in cfg.evaluation.baselines]
+        if cfg.evaluation.models:
+            wanted = set(cfg.evaluation.models)
+            models = [
+                m
+                for m in models
+                if m["model"] in wanted or any(w.startswith(m["model"] + "__rep") for w in wanted)
+            ] or models
+        return models
+    except Exception:  # noqa: BLE001 -- the page must build from any config
+        return []
+
+
 # ---------------------------------------------------------------- resources
 
 
@@ -536,8 +665,12 @@ def _read_csv(path: Path) -> list[dict]:
         return []
 
 
-def read_resources(log_path: Path) -> dict:
-    """Resource series (bucketed to ``MAX_POINTS``), stage peaks and use by model."""
+def read_resources(log_path: Path, live: bool = True) -> dict:
+    """Resource series (bucketed to ``MAX_POINTS``), stage peaks and use by model.
+
+    A task in the latest sample counts as active only while the run is
+    ``live``: after the run, that sample is just the last one taken.
+    """
     rows = _read_csv(companion_path(log_path, "resources.csv"))
     columns = [
         "pipeline_ram_gib",
@@ -578,7 +711,7 @@ def read_resources(log_path: Path) -> dict:
     latest_time = task_rows[-1]["time_utc"] if task_rows else None
     by_task: dict[str, dict] = {}
     for row in task_rows:
-        row["task"] = merge_ovr_passes(f"[{row['task']}")[1:]
+        row["task"] = merge_syntheval_passes(f"[{row['task']}")[1:]
         entry = by_task.setdefault(
             row["task"], {"task": row["task"], "ram_peak": 0.0, "cpu_peak": 0.0, "vram_peak": 0.0}
         )
@@ -586,10 +719,40 @@ def read_resources(log_path: Path) -> dict:
         entry["ram_peak"] = max(entry["ram_peak"], ram or 0)
         entry["cpu_peak"] = max(entry["cpu_peak"], cpu or 0)
         entry["vram_peak"] = max(entry["vram_peak"], vram or 0)
-        if row["time_utc"] == latest_time:
+        if live and row["time_utc"] == latest_time:
             entry.update(ram_now=ram, cpu_now=cpu, vram_now=vram, active=True)
     tasks = sorted(by_task.values(), key=lambda e: (not e.get("active"), -e["ram_peak"]))
     return {"series": series, "peaks": peaks, "tasks": tasks, "n_rows": len(rows)}
+
+
+def add_worker_usage(resources: dict, tasks: list[dict]) -> None:
+    """Fill the use by model with what each worker reported when it finished.
+
+    The monitor samples once a minute, so a model that finishes between two
+    samples is missing from ``_resources_by_task.csv``; every worker logs its
+    own peak RAM, average CPU and peak GPU memory as it ends
+    (:mod:`synthdata.compute`). The larger of the two peaks is kept.
+    """
+    by_task = {entry["task"]: entry for entry in resources["tasks"]}
+    for task in tasks:
+        usage = task.get("usage") or {}
+        if not usage or task.get("derived"):
+            continue
+        name = f"{task['step']}: {task['model']}"
+        entry = by_task.get(name)
+        if entry is None:
+            entry = by_task[name] = {
+                "task": name,
+                "ram_peak": 0.0,
+                "cpu_peak": 0.0,
+                "vram_peak": 0.0,
+            }
+            resources["tasks"].append(entry)
+        entry["ram_peak"] = max(entry["ram_peak"], usage.get("ram_gib") or 0)
+        entry["cpu_peak"] = max(entry["cpu_peak"], usage.get("cpu_cores") or 0)
+        entry["vram_peak"] = max(entry["vram_peak"], (usage.get("vram_gib") or 0) * 1024)
+        entry["from_worker"] = True
+    resources["tasks"].sort(key=lambda e: (not e.get("active"), -e["ram_peak"]))
 
 
 # ---------------------------------------------------------------- HPO
@@ -935,7 +1098,7 @@ def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
             metric_failures[problem["task"]] = metric_failures.get(problem["task"], 0) + 1
 
     tasks: list[dict] = []
-    for task in parsed["tasks"]:
+    for task in split_tuned(parsed["tasks"], parsed["none_passed"]):
         status = task["status"]
         if status == "running" and state in ("stopped", "failed", "finished"):
             status = "stopped"
@@ -952,6 +1115,7 @@ def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
                 else None,
                 "order": task.get("order", 0),
                 "error": task.get("error"),
+                "usage": task.get("usage"),
                 "metric_failures": metric_failures.get(f"{task['step']}: {task['model']}", 0),
                 "phases": [
                     {**phase, "start": _iso(phase["start"]), "end": _iso(phase["end"])}
@@ -975,7 +1139,12 @@ def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
             }
         )
     main_fit = next(
-        (t["model"] for t in tasks if t["step"] == MAIN_STEP and t["status"] == "running"), None
+        (
+            t["model"]
+            for t in parsed["tasks"]
+            if t.get("main") and t["status"] == "running" and state == "running"
+        ),
+        None,
     )
     if note and main_fit:
         note += (
@@ -984,14 +1153,24 @@ def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
         )
     generate = next((s for s in stages if s["name"] == "generate"), None)
     generating = state == "running" and generate is not None and generate["status"] == "running"
+    # The worker's status: once its search starts, that of the tuned model's bar.
     gen_status = {t["model"]: t["status"] for t in tasks if t["step"] == "generation"}
+    gen_status.update(
+        {
+            t["model"].removesuffix("_hpo"): t["status"]
+            for t in tasks
+            if t["step"] == "generation" and t["model"].endswith("_hpo") and not t.get("main")
+        }
+    )
+    gen_status = {m: "done" if s == "none passed" else s for m, s in gen_status.items()}
     for study in hpo:
         worker = gen_status.get(study["model"])
         study["status"] = hpo_status(study, generating, worker)
         if study["status"] == "stopped" and worker == "failed":
             study["stop"] = "generation failed"
 
-    resources = read_resources(log_path)
+    resources = read_resources(log_path, live=state == "running")
+    add_worker_usage(resources, tasks)
     machine = {}
     if same_host:
         affinity = getattr(os, "sched_getaffinity", None)  # Linux only
@@ -1036,6 +1215,8 @@ def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
         "stages": stages,
         "steps": steps,
         "tasks": tasks,
+        "planned": planned_models(cfg),
+        "none_passed": sorted(f"{m}_hpo" for m in parsed["none_passed"]),
         "hpo": hpo,
         "hpo_error": hpo_error,
         "resources": resources,

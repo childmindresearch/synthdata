@@ -31,6 +31,8 @@ CATEGORICAL = ["SEX", "SITE", "SMOKER", "SEVERITY", "DIAGNOSIS", "target"]
 NUMERIC = ["AGE", "BMI", "LAB_A", "LAB_B"]
 HPO_MODELS = ["bayesian_network", "ctgan"]
 MODELS = sorted([*HPO_MODELS, *(f"{m}_hpo" for m in HPO_MODELS)])
+#: Dataset names: one replicate each (``<model>__rep1``).
+DATASETS = [f"{m}__rep1" for m in MODELS]
 BASELINES = ["baseline_marginals", "baseline_train_copy"]
 
 
@@ -172,7 +174,7 @@ def test_imputed_splits_hold_the_same_rows_as_raw_splits(dataset):
 
 def test_every_configured_model_produced_valid_synthetic_data(pipeline_run, dataset):
     synthetic = pipeline_run.synthetic()
-    assert sorted(synthetic) == sorted(MODELS)
+    assert sorted(synthetic) == sorted(DATASETS)
     n_samples = pipeline_run.cfg.generation.n_samples
     train = dataset.train_imputed_df
     indicators = list(dataset.missing_indicator_columns)
@@ -290,7 +292,7 @@ def test_experiment_manifest_records_each_stage(pipeline_run):
     assert stages[:2] == ["generation", "evaluation"]
     assert "plots" in stages
     generation = manifest["runs"][0]
-    assert sorted(generation["artifacts"]["models"]) == sorted(MODELS)
+    assert sorted(generation["artifacts"]["models"]) == sorted(DATASETS)
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +331,7 @@ BOUNDED_METRICS = {
 
 def test_combined_table_has_one_complete_row_per_model(pipeline_run):
     combined = pipeline_run.combined()
-    assert sorted(combined.index) == sorted(MODELS + BASELINES)
+    assert sorted(combined.index) == sorted(DATASETS + [f"{b}__rep1" for b in BASELINES])
     assert set(combined.columns.get_level_values("framework")) >= {
         "synthcity",
         "syntheval",
@@ -397,7 +399,7 @@ def test_copying_training_rows_does_not_pay_off_overall(pipeline_run):
     # stricter "below every generator" would test the fixture, not the score.)
     overall = pipeline_run.combined()[("__all__", "overall", "rank")].astype(float)
     generators = overall[[m for m in overall.index if not m.startswith("baseline_")]]
-    assert overall["baseline_train_copy"] < generators.max(), overall.to_dict()
+    assert overall["baseline_train_copy__rep1"] < generators.max(), overall.to_dict()
 
 
 def test_combined_table_has_no_privacy_gate(pipeline_run):
@@ -456,7 +458,7 @@ def test_report_covers_every_model(pipeline_run):
 
 def test_privacy_attacks_table_has_every_attack_with_an_interval(pipeline_run):
     table = pd.read_csv(pipeline_run.evaluation_dir / "privacy_attacks.csv")
-    assert set(table["model"]) == set(MODELS + BASELINES)
+    assert set(table["model"]) == set(DATASETS + [f"{b}__rep1" for b in BASELINES])
     sensitive = pipeline_run.cfg.data.sensitive_columns
     for model, rows in table.groupby("model"):
         assert set(rows["attack"]) == {"singling_out", "linkability", "inference"}, model
@@ -466,7 +468,7 @@ def test_privacy_attacks_table_has_every_attack_with_an_interval(pipeline_run):
 
 def test_output_checks_ran_and_the_baselines_sit_where_they_must(pipeline_run):
     table = pd.read_csv(pipeline_run.evaluation_dir / "checks.csv")
-    assert set(table.loc[table["model"].isin(MODELS), "model"]) == set(MODELS)
+    assert set(table.loc[table["model"].isin(DATASETS), "model"]) == set(DATASETS)
     baseline_rows = table[table["model"].isin(BASELINES)]
     assert set(baseline_rows["check"]) == {
         "train_copy_has_the_lowest_privacy",
@@ -510,7 +512,7 @@ def test_plots_were_written_for_each_section(pipeline_run):
         dataset_plots / "data" / "missingness.png",
         dataset_plots / "imputation" / "observed_vs_imputed.png",
         pipeline_run.plots_dir / "evaluation" / "utility_vs_privacy.png",
-        *(pipeline_run.plots_dir / "generation" / f"{model}.png" for model in MODELS),
+        *(pipeline_run.plots_dir / "generation" / f"{model}.png" for model in DATASETS),
         *(pipeline_run.plots_dir / "hpo" / f"hpo_{m}_history.html" for m in ("ctgan",)),
     ]
     missing = [str(p) for p in expected if not p.is_file() or p.stat().st_size == 0]
@@ -525,22 +527,22 @@ def test_indicator_only_columns_are_filled_in_recorded_rows_only(indicator_only_
     dataset = load_dataset(indicator_only_run.cfg)
     sparse = dataset.indicator_only_values.columns.tolist()
     assert sorted(sparse) == ["BMI", "LAB_A"]
-    synthetic = indicator_only_run.synthetic()["arf"]
+    synthetic = indicator_only_run.synthetic()["arf__rep1"]
     assert not set(sparse) & set(synthetic.columns), "values are never generated directly"
     released_dir = indicator_only_run.generation_dir / "released"
-    released = pd.read_csv(released_dir / "arf.csv")
+    released = pd.read_csv(released_dir / "arf__rep1.csv")
     for column in sparse:
         recorded = synthetic[f"{column}__missing"] == 0
         assert released.loc[recorded, column].notna().all(), column
         assert released.loc[~recorded, column].isna().all(), column
         observed = source[column].dropna()
         assert released[column].min() >= observed.min(), column
-    report = pd.read_csv(released_dir / "arf_recorded_values.csv")
+    report = pd.read_csv(released_dir / "arf__rep1_recorded_values.csv")
     assert sorted(report["column"]) == sorted(sparse)
 
 
 def test_holdout_rows_do_not_influence_the_cart_fill(indicator_only_run, cart_canary_run):
-    for name in ("arf.csv", "arf_recorded_values.csv"):
+    for name in ("arf__rep1.csv", "arf__rep1_recorded_values.csv"):
         pd.testing.assert_frame_equal(
             pd.read_csv(indicator_only_run.generation_dir / "released" / name),
             pd.read_csv(cart_canary_run.generation_dir / "released" / name),
@@ -548,7 +550,7 @@ def test_holdout_rows_do_not_influence_the_cart_fill(indicator_only_run, cart_ca
 
 
 def test_arf_and_its_search_run_with_delta_held_at_arfpys_default(indicator_only_run):
-    assert sorted(indicator_only_run.synthetic()) == ["arf", "arf_hpo"]
+    assert sorted(indicator_only_run.synthetic()) == ["arf__rep1", "arf_hpo__rep1"]
     # synthcity searches delta over 0-50 but arfpy only accepts 0-0.5, so it is
     # held at 0 instead of searched; every trial must then complete.
     optuna, studies = _hpo_studies(indicator_only_run, ["arf"])

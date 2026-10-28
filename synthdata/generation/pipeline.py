@@ -85,20 +85,73 @@ def needs_imputed_data(gen_cfg) -> bool:
     )
 
 
-def _synthcity_worker(cfg: Config, dataset: Dataset, name: str, device: str):
-    """Run one synthcity model's whole chain (in its own process).
+#: Name suffix of each TabPFN data variant (``generation.tabpfn.data_variants``):
+#: "raw" fits on the train split with its missing values, which TabPFN handles
+#: natively; "imputed" on the imputed split every other model uses.
+TABPFN_DATA_SUFFIX = {"raw": "_raw", "imputed": "_imputed"}
 
-    Returns the model's synthetic datasets and the names this run generated
+
+def generation_units(gen_cfg) -> list[str]:
+    """The independent pieces of work of a generation run, one process each.
+
+    A unit is one model with everything it trains: its untuned fits, its HPO
+    search and its tuned fits (a synthcity model or a TabPFGen variant), or
+    one TabPFN variant on one data variant. Every unit's seeds are its own,
+    so units give the same datasets in any order or process.
+    """
+    units = list(gen_cfg.synthcity.names) if gen_cfg.synthcity.enabled else []
+    if gen_cfg.tabpfn.enabled:
+        units += [
+            f"tabpfn_{variant}{TABPFN_DATA_SUFFIX[data]}"
+            for data in gen_cfg.tabpfn.data_variants
+            for variant in gen_cfg.tabpfn.variants
+        ]
+    if gen_cfg.tabpfgen.enabled:
+        units += [f"tabpfgen_{variant}" for variant in gen_cfg.tabpfgen.variants]
+    if gen_cfg.tabularargn.enabled:
+        units.append("tabularargn")
+    if gen_cfg.cdtd.enabled:
+        units.append("cdtd")
+    return units
+
+
+def _only(gen_cfg, unit: str) -> None:
+    """Restrict ``gen_cfg`` (a copy) to the one unit ``unit`` of :func:`generation_units`."""
+    synthcity = unit in gen_cfg.synthcity.names and gen_cfg.synthcity.enabled
+    gen_cfg.synthcity.names = [unit] if synthcity else []
+    gen_cfg.synthcity.enabled = synthcity
+    tabpfn = [
+        (variant, data)
+        for data in gen_cfg.tabpfn.data_variants
+        for variant in gen_cfg.tabpfn.variants
+        if unit == f"tabpfn_{variant}{TABPFN_DATA_SUFFIX[data]}"
+    ]
+    gen_cfg.tabpfn.enabled = gen_cfg.tabpfn.enabled and bool(tabpfn)
+    if tabpfn:
+        gen_cfg.tabpfn.variants, gen_cfg.tabpfn.data_variants = [tabpfn[0][0]], [tabpfn[0][1]]
+    tabpfgen = unit.removeprefix("tabpfgen_") if unit.startswith("tabpfgen_") else None
+    gen_cfg.tabpfgen.enabled = gen_cfg.tabpfgen.enabled and tabpfgen in gen_cfg.tabpfgen.variants
+    if gen_cfg.tabpfgen.enabled:
+        gen_cfg.tabpfgen.variants = [tabpfgen]
+    gen_cfg.tabularargn.enabled = gen_cfg.tabularargn.enabled and unit == "tabularargn"
+    gen_cfg.cdtd.enabled = gen_cfg.cdtd.enabled and unit == "cdtd"
+
+
+def _unit_worker(cfg: Config, dataset: Dataset, unit: str, device: str):
+    """Run one unit's whole chain (in its own process).
+
+    Returns the unit's synthetic datasets and the names this run generated
     (not loaded from cache), which the parent plots.
     """
     sub = copy.deepcopy(cfg)
     sub.device = device
     sub.compute.workers = 1
-    sub.generation.synthcity.names = [name]
-    sub.generation.tabpfn.enabled = False
-    sub.generation.tabpfgen.enabled = False
-    sub.generation.tabularargn.enabled = False
-    sub.generation.cdtd.enabled = False
+    _only(sub.generation, unit)
+    if device.startswith("cuda:"):
+        # Backends that pick "cuda" themselves (TabPFN) use the current device.
+        import torch
+
+        torch.cuda.set_device(device)
     generated = []
     datasets = run_generation(
         sub, dataset, plot_callback=lambda n, df, extra: generated.append(n), _worker=True
@@ -106,20 +159,37 @@ def _synthcity_worker(cfg: Config, dataset: Dataset, name: str, device: str):
     return datasets, generated
 
 
-def _run_synthcity_workers(cfg: Config, dataset: Dataset, device: str) -> dict:
-    """Train every synthcity model in its own process (see synthdata.compute).
+#: Units without an HPO budget that still take long: TabPFN's fits grow with
+#: the square of the column count (about 6 h per replicate on the 9,000-row
+#: simulated clinical data), so they start first.
+_SLOW_UNITS = ("tabpfn_",)
 
-    Each model runs exactly the chain the sequential loop would run (its
-    seeds do not depend on the other models), so the outputs match a
-    sequential run with the same thread count. Models with the longest HPO
-    timeout start first. Unless ``compute.fits_per_gpu`` is off, each fit runs
-    on the least busy GPU, within the limit per GPU if one is set
-    (synthdata.gpu_slots); otherwise models go round-robin across the GPUs.
+
+def _unit_priority(gen_cfg, unit: str) -> float:
+    """Seconds of HPO budget (TabPFN first): the units that take longest start first."""
+    if unit.startswith(_SLOW_UNITS):
+        return float("inf")
+    budget = (
+        hpo_mod.model_budget(gen_cfg.hpo, unit)[1]
+        if gen_cfg.hpo.enabled and unit in gen_cfg.synthcity.names
+        else None
+    )
+    return float(budget or 0)
+
+
+def _run_unit_workers(cfg: Config, dataset: Dataset, device: str) -> dict:
+    """Train every unit (:func:`generation_units`) in its own process (see synthdata.compute).
+
+    Each unit runs exactly the chain the sequential loop would run (its
+    seeds do not depend on the other units), so the outputs match a
+    sequential run with the same thread count. The units that take longest
+    start first. Unless ``compute.fits_per_gpu`` is off, each synthcity fit
+    runs on the least busy GPU, within the limit per GPU if one is set
+    (synthdata.gpu_slots); otherwise units go round-robin across the GPUs.
     """
     gen_cfg = cfg.generation
-    names = list(gen_cfg.synthcity.names)
+    units = sorted(generation_units(gen_cfg), key=lambda u: -_unit_priority(gen_cfg, u))
     if gen_cfg.hpo.enabled:
-        names.sort(key=lambda n: hpo_mod.model_budget(gen_cfg.hpo, n)[1] or 0, reverse=True)
         # Create the Optuna tables once, so parallel studies never race to.
         hpo_mod.create_storage(gen_cfg.hpo, ensure_dir(gen_cfg.output_dir))
     n_gpus = 0
@@ -146,10 +216,10 @@ def _run_synthcity_workers(cfg: Config, dataset: Dataset, device: str) -> dict:
         )
     try:
         run = run_per_model(
-            _synthcity_worker,
+            _unit_worker,
             {
-                name: (cfg, dataset, name, f"cuda:{i % n_gpus}" if n_gpus > 1 else device)
-                for i, name in enumerate(names)
+                unit: (cfg, dataset, unit, f"cuda:{i % n_gpus}" if n_gpus > 1 else device)
+                for i, unit in enumerate(units)
             },
             cfg.compute,
             n_columns=len(dataset.train_df.columns),
@@ -158,8 +228,8 @@ def _run_synthcity_workers(cfg: Config, dataset: Dataset, device: str) -> dict:
     finally:
         gpu_slots.teardown()
     if run.failures:
-        # Finished models are cached, so a rerun only redoes the failed ones.
-        message = f"synthcity generation failed for {sorted(run.failures)}: " + "; ".join(
+        # Finished units are cached, so a rerun only redoes the failed ones.
+        message = f"generation failed for {sorted(run.failures)}: " + "; ".join(
             f"{n}: {e}" for n, e in run.failures.items()
         )
         if not gen_cfg.continue_on_model_failure:
@@ -259,13 +329,22 @@ def run_generation(
     seed = cfg.seed
     device = resolve_device(cfg.device)
 
-    # With more than one compute worker, every synthcity model runs in its
-    # own process first; the loop below then only collects their results.
-    worker_results = {}
-    names = gen_cfg.synthcity.names if gen_cfg.synthcity.enabled else []
+    # With more than one compute worker, every unit (a model with its HPO
+    # search and tuned fits, or one TabPFN variant) runs in its own process;
+    # this process then only collects and plots their results.
+    units = generation_units(gen_cfg)
     n_columns = len(dataset.train_df.columns)
-    if names and resolve_workers(cfg.compute, n_models=len(names), n_columns=n_columns) > 1:
-        worker_results = _run_synthcity_workers(cfg, dataset, device)
+    if (
+        not _worker
+        and len(units) > 1
+        and resolve_workers(cfg.compute, n_models=len(units), n_columns=n_columns) > 1
+    ):
+        collected: dict[str, pd.DataFrame] = {}
+        for datasets, generated in _run_unit_workers(cfg, dataset, device).values():
+            collected.update(datasets)
+            for name in generated:
+                _plot_generated(plot_callback, experiment, name, datasets[name], None)
+        return _finish(output_dir, collected, _worker)
 
     best_params_path = gen_cfg.hpo.best_params_path or hpo_mod.default_best_params_path(output_dir)
     best_params = hpo_mod.BestParamsCache(best_params_path)
@@ -323,9 +402,8 @@ def run_generation(
     def _cached_or_build(name, build_fn, top_up=True):
         """Load or build every replicate of ``name``; ``build_fn(seed, count)`` makes one.
 
-        Replicate ``r`` is saved as ``replicate_name(name, r)`` and generated
-        with seed ``cfg.seed + r`` (replicate 0 keeps the plain name and the
-        base seed), so the spread across replicates measures how much a
+        Replicate ``r`` (from 0) is saved as ``replicate_name(name, r)``
+        (``<name>__rep<r+1>``) and generated with seed ``cfg.seed + r``, so the spread across replicates measures how much a
         model's scores depend on its random seed. ``top_up=False`` keeps a
         class short instead of drawing more batches for it, for backends where
         each batch is a whole new fit (TabPFN: hours per fit on wide data).
@@ -384,47 +462,22 @@ def run_generation(
                 report.to_csv(released.with_name(f"{name}_recorded_values.csv"), index=False)
             out.to_csv(released, index=False)
 
-    def _reuse_untuned(name):
-        """Save the untuned sets of ``name`` as ``<name>_hpo``; False if one is missing.
+    def _skip_untuned_repeat(name):
+        """Leave ``<name>_hpo`` out when no HPO trial passed the screens.
 
-        When no HPO trial passes the screens, the tuned model gets the untuned
-        settings and the same seeds, so refitting it only repeats the untuned
-        fits (about 2 h for ddpm on the clinical data). The report still marks
-        the row as an untuned fallback (``hpo.untuned_fallbacks``).
+        The tuned model would get the untuned settings and the same seeds, so
+        it would only repeat the untuned fits (about 2 h for ddpm on the
+        clinical data) and be evaluated twice. The empty entry in the
+        best-params cache records the fallback (``hpo.untuned_fallbacks``);
+        evaluation leaves out any ``<name>_hpo`` set an earlier version saved.
         """
-        names = [replicate_name(name, r) for r in range(gen_cfg.n_replicates)]
-        if any(n not in synthetic_datasets for n in names):
-            return False
-        logger.info("[%s_hpo] no trial passed the screens: reusing the untuned sets", name)
-        copied = []
-        for replicate, untuned in enumerate(names):
-            tuned = replicate_name(f"{name}_hpo", replicate)
-            path = output_dir / f"{tuned}.csv"
-            # A set cached by an earlier run (perhaps a refit) stays as it is.
-            cached = (
-                None if gen_cfg.force_retrain or not path.exists() else _read_cached(tuned, path)
-            )
-            if cached is not None:
-                synthetic_datasets[tuned] = cached
-                continue
-            df = synthetic_datasets[untuned]
-            df.to_csv(path, index=False)
-            _write_released(tuned, df, overwrite=True, replicate_seed=seed + replicate)
-            synthetic_datasets[tuned] = df
-            _plot(tuned, df, None)
-            copied.append(untuned)
-        if copied and class_sampling_path.exists():
-            with FileLock(f"{class_sampling_path}.lock"):
-                rows = pd.read_csv(class_sampling_path)
-                copies = rows[rows["model"].isin(copied)].copy()
-                copies["model"] = copies["model"].map(
-                    lambda n: replicate_name(f"{name}_hpo", split_replicate_name(n)[1])
-                )
-                rows = rows[~rows["model"].isin(copies["model"])]
-                pd.concat([rows, copies], ignore_index=True).to_csv(
-                    class_sampling_path, index=False
-                )
-        return True
+        logger.info(
+            "[%s_hpo] none passed: no HPO trial passed the screens, so %s_hpo would repeat "
+            "%s; it is not fitted or evaluated",
+            name,
+            name,
+            name,
+        )
 
     def _read_cached(name, path):
         """The cached set at ``path``, or None (with a warning) when it must be refitted.
@@ -510,33 +563,19 @@ def run_generation(
         _write_released(name, df, overwrite=True, replicate_seed=replicate_seed)
         synthetic_datasets[name] = df
         base, replicate = split_replicate_name(name)
-        if replicate and df.equals(synthetic_datasets.get(base)):
+        first = replicate_name(base, 0)
+        if replicate and df.equals(synthetic_datasets.get(first)):
             logger.warning(
                 "[%s] replicate is identical to %s: this backend ignores the seed, so its "
                 "replicates add no uncertainty information",
                 name,
-                base,
+                first,
             )
         _plot(name, df, extra)
         return df
 
     def _plot(name, df, extra):
-        if plot_callback is None:
-            return
-        try:
-            plot_callback(name, df, extra)
-        except (ValueError, TypeError, OSError, RuntimeError) as exc:
-            # Plotting must never break generation: skip just this
-            # figure, but persist the skip to the experiment manifest so
-            # it's visible from the output directory, not just the console.
-            logger.warning("[%s] plot callback failed: %s", name, exc)
-            if experiment is not None:
-                experiment.record(
-                    "generation_plot_failed",
-                    model=name,
-                    error=str(exc),
-                    error_type=type(exc).__name__,
-                )
+        _plot_generated(plot_callback, experiment, name, df, extra)
 
     # ------------------------------------------------------------------
     # synthcity models
@@ -565,12 +604,6 @@ def run_generation(
         )
 
         for name in gen_cfg.synthcity.names:
-            if name in worker_results:
-                datasets, generated = worker_results[name]
-                synthetic_datasets.update(datasets)
-                for generated_name in generated:
-                    _plot(generated_name, datasets[generated_name], None)
-                continue
             _plan_work(name, gen_cfg)
             # The untuned fits take about as long as the tuned ones will (same
             # training-length cap), so their time is what the search leaves for them.
@@ -637,7 +670,8 @@ def run_generation(
                     if override and sc.plugin_accepts(name, "n_iter"):
                         params["n_iter"] = override
 
-                    if params == sc.untuned_params(name, gen_cfg.hpo) and _reuse_untuned(name):
+                    if params == sc.untuned_params(name, gen_cfg.hpo):
+                        _skip_untuned_repeat(name)
                         continue
 
                     _cached_or_build(
@@ -666,14 +700,13 @@ def run_generation(
     if gen_cfg.tabpfn.enabled:
         tpfn.validate_tabpfn_target(dataset.target_column, dataset.target_is_categorical)
         for data_variant in gen_cfg.tabpfn.data_variants:
+            suffix = TABPFN_DATA_SUFFIX[data_variant]
             if data_variant == "imputed":
                 train_df_variant = dataset.require_imputed(
                     dataset.train_imputed_df, "train_imputed_df"
                 )
-                suffix = "_imputed"
             else:
                 train_df_variant = dataset.train_df
-                suffix = ""
 
             if "standard" in gen_cfg.tabpfn.variants:
                 _cached_or_build(
@@ -875,6 +908,30 @@ def run_generation(
             ),
         )
 
+    return _finish(output_dir, synthetic_datasets, _worker)
+
+
+def _plot_generated(plot_callback, experiment, name, df, extra) -> None:
+    """Call ``plot_callback`` for one generated dataset; a failed plot never stops generation."""
+    if plot_callback is None:
+        return
+    try:
+        plot_callback(name, df, extra)
+    except (ValueError, TypeError, OSError, RuntimeError) as exc:
+        # Skip just this figure, but persist the skip to the experiment
+        # manifest so it's visible from the output directory, not just the console.
+        logger.warning("[%s] plot callback failed: %s", name, exc)
+        if experiment is not None:
+            experiment.record(
+                "generation_plot_failed",
+                model=name,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+
+
+def _finish(output_dir, synthetic_datasets: dict, _worker: bool) -> dict:
+    """Log what was generated and, in the parent, which models failed."""
     logger.info(
         "Generated/loaded %d synthetic datasets: %s",
         len(synthetic_datasets),

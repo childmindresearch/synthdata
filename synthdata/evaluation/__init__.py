@@ -68,17 +68,25 @@ def run_evaluation(
     n_samples = cfg.generation.rows_for(len(train_df))
     # Baselines are replicated like the generators so their scores carry the
     # same seed-to-seed spread.
-    for replicate in range(cfg.generation.n_replicates):
-        rows = baselines.build_baselines(
-            eval_cfg.baselines,
-            train_df,
-            n_samples,
-            cfg.seed + replicate,
+    # Each is logged like a generator's fit, so the run dashboard shows the
+    # baselines' generation next to the generators'.
+    built = {}
+    for kind in eval_cfg.baselines:
+        for replicate in range(cfg.generation.n_replicates):
+            name = replicate_name(baselines.baseline_name(kind), replicate)
+            logger.info(
+                "[%s] generating synthetic data (n_samples=%d, seed=%d)",
+                name,
+                n_samples,
+                cfg.seed + replicate,
+            )
+            rows = baselines.build_baselines([kind], train_df, n_samples, cfg.seed + replicate)
+            built.update({replicate_name(n, replicate): frame for n, frame in rows.items()})
+    if built:
+        logger.info(
+            "Generated/loaded %d synthetic datasets (baselines): %s", len(built), sorted(built)
         )
-        selected_datasets = {
-            **selected_datasets,
-            **{replicate_name(name, replicate): frame for name, frame in rows.items()},
-        }
+    selected_datasets = {**selected_datasets, **built}
     model_names = sorted(selected_datasets)
     logger.info("Evaluating %d models: %s", len(model_names), model_names)
 

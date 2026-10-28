@@ -106,6 +106,39 @@ def test_run_per_model_survives_a_killed_process():
     assert "exited with code 9" in run.failures["killed"]
 
 
+def _result_then_hang(x):
+    import threading
+    import time
+
+    # A non-daemon thread left behind keeps the process from exiting.
+    threading.Thread(target=time.sleep, args=(600,)).start()
+    return x
+
+
+def test_a_worker_that_does_not_exit_after_its_result_is_stopped(monkeypatch, caplog):
+    monkeypatch.setattr(compute, "EXIT_GRACE_SECONDS", 1)
+    with caplog.at_level("INFO", logger=compute.logger.name):
+        run = run_per_model(
+            _result_then_hang,
+            {"stuck": (7,)},
+            ComputeConfig(workers=1, cores_per_worker=1),
+            n_columns=1,
+            label="test",
+            isolate=True,
+        )
+    assert run.results == {"stuck": 7} and not run.failures
+    finished = next(r.getMessage() for r in caplog.records if "stuck finished" in r.getMessage())
+    # The finish line carries what the worker measured itself.
+    assert "(peak RAM " in finished and "cores on average" in finished
+
+
+def test_usage_text_lists_what_was_measured():
+    assert compute._usage_text({"ram_gib": 1.5, "cpu_s": 30.0, "vram_gib": 0.5}, 10) == (
+        " (peak RAM 1.50 GiB, CPU 3.00 cores on average, peak GPU memory 0.50 GiB)"
+    )
+    assert compute._usage_text({}, 10) == ""
+
+
 def test_usable_cpus_follows_the_slurm_allocation(monkeypatch):
     monkeypatch.setattr(
         "synthdata.compute.os.sched_getaffinity", lambda _pid: set(range(64)), raising=False
