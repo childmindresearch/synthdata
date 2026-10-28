@@ -286,6 +286,7 @@ def _child(fn, args, result_path: str, cores: int) -> None:
         torch.set_num_threads(cores)
     except ImportError:
         pass
+    outcome: dict
     try:
         outcome = {"result": fn(*args)}
     except BaseException as exc:  # noqa: BLE001 - reported to the parent

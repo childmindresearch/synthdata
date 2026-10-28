@@ -385,7 +385,7 @@ def parse_log(lines: list[str]) -> dict:
             pool = pools.setdefault(label, {})
             pool["total"] = max(pool.get("total", 0), int(m["n"]))
             earlier = tasks.get((label, m["model"]))
-            entry = tasks[(label, m["model"])] = {
+            entry: dict = {
                 "step": label,
                 "model": m["model"],
                 "status": "running",
@@ -396,6 +396,7 @@ def parse_log(lines: list[str]) -> dict:
                 "order": int(m["i"]),
                 "phases": earlier.get("phases", []) if earlier else [],
             }
+            tasks[(label, m["model"])] = entry
             if (kind := syntheval_pass(m["label"])) is not None:
                 entry["phases"].append({"kind": kind, "name": kind, "start": moment, "end": None})
         elif m := _TASK_END.match(msg):
@@ -633,7 +634,7 @@ def planned_models(cfg) -> list[dict]:
         from synthdata.generation.pipeline import generation_units
 
         gen = cfg.generation
-        models = []
+        models: list[dict] = []
         for unit in generation_units(gen):
             models.append({"model": unit, "hpo": False})
             tunable = (gen.synthcity.enabled and unit in gen.synthcity.names) or (

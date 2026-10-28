@@ -53,7 +53,7 @@ def plot_rank_tradeoff(
     fig, ax = plt.subplots(figsize=(11, 7))
     any_interval = False
     by_model = groups.groupby(groups, sort=False).groups
-    for model in sorted(by_model, key=model_sort_key):
+    for model in sorted(by_model, key=lambda m: model_sort_key(str(m))):
         names = by_model[model]
         is_hpo = _is_hpo(str(model))
         color = palette[_base_model(str(model))]
@@ -210,7 +210,7 @@ def plot_rank_tradeoff_3d(combined: pd.DataFrame):
             )
         )
     by_model = groups.groupby(groups, sort=False).groups
-    for model in sorted(by_model, key=model_sort_key):
+    for model in sorted(by_model, key=lambda m: model_sort_key(str(m))):
         names = by_model[model]
         is_hpo = _is_hpo(str(model))
         ranks = [float(combined.loc[names, key].astype(float).mean()) for key in rank_keys.values()]
