@@ -12,8 +12,8 @@ nothing is skipped for speed and no error cutoff decides what is computed:
   a value here (X may decide that Y is skipped).
 * **Value view** (``value_*``): the same on rows where both X and Y are
   answered (``both_answered``), so a hierarchy whose child or parent is
-  often missing at random still shows: sub_program -> major_program holds on
-  the recorded values even if major_program is blank in half the rows.
+  often missing at random still shows: a child -> parent rule holds on the
+  recorded values even when the parent is blank in half the rows.
 * **Chance-corrected score**: a near-unique X "fixes" any Y by accident (each
   value has one or two rows). The score compares the error with the error
   for a shuffled Y, scaled by the error of guessing Y's most common value:
@@ -32,7 +32,7 @@ nothing is skipped for speed and no error cutoff decides what is computed:
 Two determining columns (``max_lhs`` 2)
 score every pair of columns (on rows where both are answered) against every
 other column; that is about
-n_columns³ / 2 checks (157 million at 681 columns, hours), so it is opt-in.
+n_columns³ / 2 checks (over 100 million at about 700 columns, hours), so it is opt-in.
 Three or more determining columns are not searched: the count grows by
 another factor of the number of columns.
 """
