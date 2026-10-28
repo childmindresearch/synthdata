@@ -113,6 +113,25 @@ def test_column_names_lightgbm_rejects_round_trip():
     assert not again[features].isna().any().any()
 
 
+def test_a_rare_binary_level_is_imputed():
+    # With 3 positives in 2000 rows every leaf predicts exactly 0, and
+    # miceforest's log-odds would be -inf without the clip.
+    rng = np.random.default_rng(0)
+    n = 2000
+    x = rng.normal(size=n)
+    flag = np.zeros(n, dtype=int)
+    flag[rng.choice(n, 3, replace=False)] = 1
+    frame = pd.DataFrame({"x": x, "y": x + rng.normal(size=n), "rare": flag})
+    blanked = frame.copy()
+    blanked.loc[blanked.index[::5], "rare"] = np.nan
+    blanked.loc[blanked.index[1::7], "x"] = np.nan
+    state, imputed = miceforest_backend.fit(blanked, ["x", "y", "rare"], ["rare"], ["rare"], seed=1)
+    assert not imputed[["x", "rare"]].isna().any().any()
+    assert set(imputed["rare"]) <= {0, 1}
+    again = miceforest_backend.transform(state, blanked)
+    assert not again[["x", "rare"]].isna().any().any()
+
+
 def test_columns_without_a_model_are_rejected():
     frame = _frame(300)
     state, _ = miceforest_backend.fit(
