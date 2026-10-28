@@ -567,13 +567,13 @@ class TestIdentifierLikeColumns:
                 "sex": [0, 1] * (n // 2),
                 "VALID": [1] * n,  # "id" inside a word is not an identifier
                 # names a place, not a person
-                "encounter_location_name": ["ward a", "ward b", "clinic"] * (n // 3),
+                "site_name": ["site a", "site b", "site c"] * (n // 3),
                 "patient_name": ["x"] * n,
                 "name": ["x"] * n,
             }
         )
         flagged = identifier_like_columns(
-            df, list(df.columns), ["visit_code", "sex", "VALID", "encounter_location_name"]
+            df, list(df.columns), ["visit_code", "sex", "VALID", "site_name"]
         )
         assert flagged == ["MRN", "visit_code", "zip_code", "patient_name", "name"]
 
