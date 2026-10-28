@@ -4,6 +4,14 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.23.1 (2026-10-28)
+
+No result or config changes; old results stay comparable and no golden re-record is needed.
+
+### Fixed
+
+- miceforest imputation no longer stops with `LightGBMError: Do not support special JSON characters in feature name` when a column name contains `"`, `,`, `:`, brackets or braces. The imputer now gives LightGBM positional names (`c0`, `c1`, ...) and maps the results back, so output column names are unchanged.
+
 ## 0.23.0 (2026-10-28)
 
 `configs/config_sim.yaml` now uses simulated dataset v1.3 (experiment id 1.3); results are not comparable with v1.2 runs.

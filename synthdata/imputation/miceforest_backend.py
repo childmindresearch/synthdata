@@ -19,7 +19,9 @@ codes.
 The kernel is fitted once on ``fit_df`` and only applied afterwards, with
 donors from ``fit_df``; rows passed to :func:`transform` never shape it.
 Observed values are returned unchanged, and the target column is neither an
-input nor an output.
+input nor an output. The kernel sees the columns as ``c0``, ``c1``, ...:
+LightGBM rejects feature names with JSON characters (``"``, ``,``, ``:``,
+brackets and braces), so the original names never reach it.
 """
 
 import dataclasses
@@ -45,6 +47,19 @@ class FittedMiceForest:
     modeled: list
     seed: int
     kernel: Any
+
+
+def _kernel_names(state: FittedMiceForest) -> dict:
+    """``{column: name the kernel sees}``, positional so LightGBM accepts every name."""
+    return {column: f"c{i}" for i, column in enumerate(state.columns)}
+
+
+def _to_kernel(encoded: pd.DataFrame, state: FittedMiceForest) -> pd.DataFrame:
+    return encoded.rename(columns=_kernel_names(state))
+
+
+def _from_kernel(filled: pd.DataFrame, state: FittedMiceForest) -> pd.DataFrame:
+    return filled.rename(columns={v: k for k, v in _kernel_names(state).items()})
 
 
 def _encode(frame: pd.DataFrame, state: FittedMiceForest) -> pd.DataFrame:
@@ -107,14 +122,15 @@ def fit(
     encoded = _encode(fit_df, state).reset_index(drop=True)
     if not modeled:
         return state, transform(state, fit_df)
+    names = _kernel_names(state)
     state.kernel = mf.ImputationKernel(
-        encoded,
-        variable_schema=modeled,
+        _to_kernel(encoded, state),
+        variable_schema=[names[c] for c in modeled],
         mean_match_candidates=cfg.mean_match_candidates,
         random_state=seed,
     )
     state.kernel.mice(cfg.iterations, num_threads=cfg.num_threads, deterministic=True)
-    filled = state.kernel.complete_data(dataset=0).set_axis(fit_df.index)
+    filled = _from_kernel(state.kernel.complete_data(dataset=0), state).set_axis(fit_df.index)
     return state, _decode(filled, fit_df, state)
 
 
@@ -132,7 +148,8 @@ def transform(state: FittedMiceForest, frame: pd.DataFrame) -> pd.DataFrame:
     if not missing:
         return _decode(encoded, frame, state)
     imputed = state.kernel.impute_new_data(
-        encoded.reset_index(drop=True), random_state=np.random.RandomState(state.seed)
+        _to_kernel(encoded, state).reset_index(drop=True),
+        random_state=np.random.RandomState(state.seed),
     )
-    filled = imputed.complete_data(dataset=0).set_axis(frame.index)
+    filled = _from_kernel(imputed.complete_data(dataset=0), state).set_axis(frame.index)
     return _decode(filled, frame, state)
