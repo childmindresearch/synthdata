@@ -17,7 +17,7 @@ import pandas as pd
 from filelock import FileLock
 
 from synthdata import gpu_slots
-from synthdata.compute import resolve_workers, run_per_model
+from synthdata.compute import logged_usage, resolve_workers, run_per_model
 from synthdata.config import Config
 from synthdata.data import Dataset, read_like, remask_synthetic
 from synthdata.generation import cart_fill, class_quota, numeric_format
@@ -479,6 +479,11 @@ def run_generation(
             name,
         )
 
+    def _run_search(tuned_name, *args, **kwargs):
+        """``hpo.run_study``, its use logged as the tuned model's "HPO search"."""
+        with logged_usage(tuned_name, "HPO search"):
+            return hpo_mod.run_study(*args, **kwargs)
+
     def _read_cached(name, path):
         """The cached set at ``path``, or None (with a warning) when it must be refitted.
 
@@ -535,29 +540,31 @@ def run_generation(
         )
         # Backends without a seed argument draw from the global RNGs.
         set_global_seed(replicate_seed)
-        result = build_fn(replicate_seed, n_samples)
-        df, extra = result if isinstance(result, tuple) else (result, None)
-        if match_prior and dataset.target_column in df:
-            report = df.attrs.get("class_sampling")
-            if report is None:
-                # Backend without per-class sampling: draw whole new datasets
-                # (rejection sampling) until every class has its quota.
-                def sample(count, round_seed, labels):
-                    set_global_seed(round_seed)
-                    more = build_fn(round_seed, count)
-                    return more[0] if isinstance(more, tuple) else more
+        # One row per fit on the run dashboard's resource table.
+        with logged_usage(name, "fit"):
+            result = build_fn(replicate_seed, n_samples)
+            df, extra = result if isinstance(result, tuple) else (result, None)
+            if match_prior and dataset.target_column in df:
+                report = df.attrs.get("class_sampling")
+                if report is None:
+                    # Backend without per-class sampling: draw whole new datasets
+                    # (rejection sampling) until every class has its quota.
+                    def sample(count, round_seed, labels):
+                        set_global_seed(round_seed)
+                        more = build_fn(round_seed, count)
+                        return more[0] if isinstance(more, tuple) else more
 
-                df, report = class_quota.sample_to_quota(
-                    sample,
-                    dataset.target_column,
-                    train_prior,
-                    n_samples,
-                    replicate_seed,
-                    first_batch=df,
-                    max_rounds=class_quota.MAX_ROUNDS if top_up else 1,
-                )
-            df.attrs.pop("class_sampling", None)
-            _record_class_sampling(name, report)
+                    df, report = class_quota.sample_to_quota(
+                        sample,
+                        dataset.target_column,
+                        train_prior,
+                        n_samples,
+                        replicate_seed,
+                        first_batch=df,
+                        max_rounds=class_quota.MAX_ROUNDS if top_up else 1,
+                    )
+                df.attrs.pop("class_sampling", None)
+                _record_class_sampling(name, report)
         df = numeric_format.apply_format(df, _numeric_format())
         df.to_csv(path, index=False)
         _write_released(name, df, overwrite=True, replicate_seed=replicate_seed)
@@ -646,7 +653,8 @@ def run_generation(
                             class_prior=search_prior,
                             discrete_columns=dataset.all_categorical_columns,
                         )
-                        params = hpo_mod.run_study(
+                        params = _run_search(
+                            f"{name}_hpo",
                             f"hpo_{name}",
                             objective,
                             gen_cfg.hpo,
@@ -781,7 +789,8 @@ def run_generation(
                         ),
                         eval_fn,
                     )
-                    params = hpo_mod.run_study(
+                    params = _run_search(
+                        "tabpfgen_standard_hpo",
                         "hpo_tabpfgen_standard",
                         objective,
                         gen_cfg.hpo,
@@ -833,7 +842,8 @@ def run_generation(
                         eval_fn,
                         seed=seed,
                     )
-                    params = hpo_mod.run_study(
+                    params = _run_search(
+                        "tabpfgen_custom_hpo",
                         "hpo_tabpfgen_custom",
                         objective,
                         gen_cfg.hpo,

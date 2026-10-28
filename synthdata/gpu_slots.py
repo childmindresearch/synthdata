@@ -360,11 +360,29 @@ def free_cached_memory() -> None:
         torch.cuda.empty_cache()
 
 
+#: Largest GPU memory peak (GiB) of any fit since :func:`reset_seen_peak`, kept
+#: across the per-fit resets in :func:`_start_peak`; synthdata.compute reads it
+#: for the use of a whole phase (an HPO search is many fits).
+_seen_peak_gib = 0.0
+
+
+def reset_seen_peak() -> None:
+    global _seen_peak_gib
+    _seen_peak_gib = 0.0
+
+
+def seen_peak_gib() -> float:
+    return _seen_peak_gib
+
+
 def _start_peak(device: str | None) -> None:
+    global _seen_peak_gib
     try:
         import torch
     except ImportError:
         return
+    # Keep the previous fit's peak before resetting the counter for this one.
+    _seen_peak_gib = max(_seen_peak_gib, _peak_gib(device) or 0.0)
     if device and str(device).startswith("cuda") and torch.cuda.is_available():
         # Measuring must never stop a fit, e.g. for a device index this machine lacks.
         with contextlib.suppress(RuntimeError, ValueError):

@@ -259,6 +259,94 @@ def _usage_text(usage: dict, seconds: float) -> str:
     return f" ({', '.join(parts)})" if parts else ""
 
 
+def _rss_peak_gib() -> float | None:
+    """This process's peak resident memory (GiB) since the last :func:`_reset_rss_peak`."""
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) / 1024**2
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _reset_rss_peak() -> None:
+    """Restart the peak-memory count (Linux; elsewhere the peak is the process's)."""
+    with contextlib.suppress(OSError):
+        Path("/proc/self/clear_refs").write_text("5")
+
+
+def _gpu_peak_gib(reset: bool = False) -> float | None:
+    """GPU memory this process reserved at most (all devices), or None without CUDA."""
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return None
+    with contextlib.suppress(Exception):
+        if torch.cuda.is_initialized():
+            devices = range(torch.cuda.device_count())
+            if reset:
+                for i in devices:
+                    torch.cuda.reset_peak_memory_stats(i)
+                return 0.0
+            return sum(torch.cuda.max_memory_reserved(i) for i in devices) / 1024**3
+    return None
+
+
+@contextlib.contextmanager
+def logged_usage(name: str, what: str):
+    """Log what one phase of a model (``"fit"``, ``"HPO search"``) used when it ends.
+
+    ``[ctgan__rep1] fit took 42 s (peak RAM 1.20 GiB, CPU 2.10 cores on
+    average, peak GPU memory 0.50 GiB)``: the run dashboard lists each fit
+    and search of a generation worker as a row of its own. Peak RAM is this
+    process's (plus a sidecar process's, if one ran and grew), counted from
+    the phase's start on Linux.
+    """
+    from synthdata import gpu_slots
+
+    _reset_rss_peak()
+    _gpu_peak_gib(reset=True)
+    gpu_slots.reset_seen_peak()
+    times = os.times()
+    cpu_start = times.user + times.system + times.children_user + times.children_system
+    children_start = _children_peak_gib()
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        seconds = time.monotonic() - started
+        times = os.times()
+        usage: dict = {
+            "cpu_s": times.user
+            + times.system
+            + times.children_user
+            + times.children_system
+            - cpu_start
+        }
+        ram = _rss_peak_gib()
+        children = _children_peak_gib()
+        if ram is not None:
+            usage["ram_gib"] = ram + (
+                children if children and children > (children_start or 0) else 0
+            )
+        gpu = _gpu_peak_gib()
+        if gpu is not None or gpu_slots.seen_peak_gib():
+            usage["vram_gib"] = max(gpu or 0.0, gpu_slots.seen_peak_gib())
+        logger.info(
+            "[%s] %s took %s%s", name, what, _duration(seconds), _usage_text(usage, seconds)
+        )
+
+
+def _children_peak_gib() -> float | None:
+    """The largest peak RAM (GiB) of this process's finished children, or None."""
+    try:
+        import resource
+    except ImportError:
+        return None
+    scale = 1 if sys.platform == "darwin" else 1024
+    return resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * scale / 1024**3
+
+
 def _stop_idle_pools() -> None:
     """Shut down joblib's reusable process pool, if this process started one.
 

@@ -90,6 +90,9 @@ _USAGE = re.compile(
     r"\(peak RAM (?P<ram_gib>[\d.]+) GiB(?:, CPU (?P<cpu_cores>[\d.]+) cores on average)?"
     r"(?:, peak GPU memory (?P<vram_gib>[\d.]+) GiB)?\)"
 )
+#: A generation phase's own use (synthdata.compute.logged_usage): each fit
+#: ("[ctgan__rep2] fit took ...") and each search ("[ctgan_hpo] HPO search took ...").
+_PHASE_USAGE = re.compile(r"^\[(?P<model>[^\]\s]+)\] (?P<what>fit|HPO search) took ")
 _TASK_FAIL = re.compile(r"^\[(?P<label>[^\]]+)\] (?P<model>\S+) failed: (?P<why>.*)")
 _EXPERIMENT = re.compile(r"^Experiment '(?P<id>[^']+)' \(tag=")
 #: The start of a final fit (not an HPO trial). In the runner's own process
@@ -247,6 +250,7 @@ def parse_log(lines: list[str]) -> dict:
     current_problem: dict | None = None
 
     none_passed: set[str] = set()
+    phase_usage: list[dict] = []
 
     def close_main_fits(moment, status="done"):
         for entry in tasks.values():
@@ -368,6 +372,17 @@ def parse_log(lines: list[str]) -> dict:
             msg = raw_msg["msg"] if raw_msg else msg
         if m := _NONE_PASSED.match(msg):
             none_passed.add(m["model"].removesuffix("_hpo"))
+        if (m := _PHASE_USAGE.match(msg)) and (usage := _USAGE.search(msg)):
+            step = "generation" if m["what"] == "fit" else m["what"]
+            phase_usage.append(
+                {
+                    "task": f"{step}: {m['model']}",
+                    # The worker it ran in ("generation: ctgan"), whose own
+                    # row it replaces.
+                    "worker": task,
+                    "usage": {k: _float(v) for k, v in usage.groupdict().items()},
+                }
+            )
         if task is not None:
             _track_phase(tasks, task, msg, moment)
         if m := _EXPERIMENT.match(msg):
@@ -490,6 +505,7 @@ def parse_log(lines: list[str]) -> dict:
         "experiment": experiment,
         "latest": clock.latest,
         "none_passed": none_passed,
+        "phase_usage": phase_usage,
     }
 
 
@@ -726,20 +742,37 @@ def read_resources(log_path: Path, live: bool = True) -> dict:
     return {"series": series, "peaks": peaks, "tasks": tasks, "n_rows": len(rows)}
 
 
-def add_worker_usage(resources: dict, tasks: list[dict]) -> None:
+def add_worker_usage(resources: dict, tasks: list[dict], phases: list[dict] | None = None) -> None:
     """Fill the use by model with what each worker reported when it finished.
 
     The monitor samples once a minute, so a model that finishes between two
     samples is missing from ``_resources_by_task.csv``; every worker logs its
     own peak RAM, average CPU and peak GPU memory as it ends
-    (:mod:`synthdata.compute`). The larger of the two peaks is kept.
+    (:mod:`synthdata.compute`). The larger of the two peaks is kept. A
+    generation worker also logs each fit and search (``phases``, from
+    :func:`synthdata.compute.logged_usage`); once it has ended, those rows
+    replace its one row.
     """
     by_task = {entry["task"]: entry for entry in resources["tasks"]}
-    for task in tasks:
-        usage = task.get("usage") or {}
-        if not usage or task.get("derived"):
+    reports = [
+        (f"{task['step']}: {task['model']}", task.get("usage") or {})
+        for task in tasks
+        if not task.get("derived")
+    ]
+    # A generation worker's fits and search each logged their own use: they
+    # replace the worker's single row, so tuned fits and replicates show apart.
+    phases = phases or []
+    # A worker still running keeps its row for its use right now.
+    active = {e["task"] for e in resources["tasks"] if e.get("active")}
+    split_workers = {p["worker"] for p in phases if p.get("worker")} - active
+    reports = [(name, usage) for name, usage in reports if name not in split_workers]
+    reports += [(p["task"], p["usage"]) for p in phases]
+    for name in split_workers:
+        by_task.pop(name, None)
+    resources["tasks"] = [e for e in resources["tasks"] if e["task"] not in split_workers]
+    for name, usage in reports:
+        if not usage:
             continue
-        name = f"{task['step']}: {task['model']}"
         entry = by_task.get(name)
         if entry is None:
             entry = by_task[name] = {
@@ -812,6 +845,10 @@ def read_hpo(db_path: Path | None, budgets: dict, now: datetime) -> tuple[list[d
     with_trials = {study_id for _, study_id, *_ in trials}
     by_name = {name: study_id for study_id, name in studies.items()}
     for study_id, name in studies.items():
+        # Timing reads the probe study too: objective: auto copies its trials
+        # into the main study stamped at copy time, so their length is there.
+        base = name.removesuffix("_probe")
+        timing_ids = {by_name.get(base), by_name.get(base + "_probe")} - {None}
         if name.endswith("_probe"):
             # objective: auto's start-up trials; once copied into the main
             # study they show there, until then they stand in for it.
@@ -833,18 +870,22 @@ def read_hpo(db_path: Path | None, budgets: dict, now: datetime) -> tuple[list[d
         durations = []
         last_error = None
         first_start = None
-        for trial_id, _, number, state, start, end, value in rows:
+        last_end = None
+        for _, _, _, state, start, end, _ in (t for t in trials if t[1] in timing_ids):
             state = str(state).split(".")[-1]
-            counts[state] = counts.get(state, 0) + 1
-            started = _local_naive_to_utc(start)
+            started, finished = _local_naive_to_utc(start), _local_naive_to_utc(end)
             if started and (first_start is None or started < first_start):
                 first_start = started
-            finished = _local_naive_to_utc(end)
+            if finished and (last_end is None or finished > last_end):
+                last_end = finished
             seconds = (finished - started).total_seconds() if started and finished else 0
             # Trials copied from the objective probe (objective: auto) are
             # stamped at copy time: zero length, so they say nothing of speed.
             if seconds > 0.5 and state in ("COMPLETE", "PRUNED"):
                 durations.append(seconds)
+        for trial_id, _, number, state, _, _, value in rows:
+            state = str(state).split(".")[-1]
+            counts[state] = counts.get(state, 0) + 1
             if state == "FAIL" and trial_id in fail_reasons:
                 with contextlib.suppress(ValueError, TypeError):
                     last_error = json.loads(fail_reasons[trial_id])
@@ -898,6 +939,9 @@ def read_hpo(db_path: Path | None, budgets: dict, now: datetime) -> tuple[list[d
                 "median_trial_s": recent[len(recent) // 2] if recent else None,
                 "eta_s": eta,
                 "first_start": _iso(first_start),
+                "total_s": (last_end - first_start).total_seconds()
+                if first_start and last_end
+                else None,
                 "last_error": last_error,
             }
         )
@@ -1171,7 +1215,7 @@ def collect(log_path: Path, cfg=None, now: datetime | None = None) -> dict:
             study["stop"] = "generation failed"
 
     resources = read_resources(log_path, live=state == "running")
-    add_worker_usage(resources, tasks)
+    add_worker_usage(resources, tasks, parsed["phase_usage"])
     machine = {}
     if same_host:
         affinity = getattr(os, "sched_getaffinity", None)  # Linux only
