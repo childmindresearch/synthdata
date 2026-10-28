@@ -1,0 +1,21 @@
+# Separate environment for Desbordante (data profiling: functional
+# dependencies, unique column combinations), used by the advisory
+# `synthdata-dependencies` report (synthdata/dependencies.py).
+#
+# Desbordante is AGPL-3.0, while synthdata is MIT, so synthdata never imports
+# it: the report writes the data to parquet and runs run_desbordante.py here in
+# a subprocess. PyPI has wheels for Linux x86_64 and macOS only; on Windows use
+# WSL. Install with
+#   uv sync --project envs/desbordante
+[project]
+name = "synthdata-desbordante"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "desbordante==2.5.0",
+    "pandas>=2.2",
+    "pyarrow",
+]
+
+[tool.uv]
+package = false

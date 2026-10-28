@@ -128,10 +128,22 @@ SYNTHCITY_REDUNDANT_SUBMETRIC_SUFFIXES = ("_naive",)
 #: mixture (the labels are ignored) and reads one mixture component's
 #: probability as "synthetic", so it scores about 0.5 whether the synthetic
 #: data is a fresh draw, shifted or shuffled (re-audit N2).
+#:
+#: ``detection_xgb`` and ``detection_mlp`` saturate or fail on wide data. On
+#: the simulated clinical data (681 columns, 16800 rows a side) XGBoost
+#: detection was 1.000 for every generator and the marginals baseline, and
+#: still 0.998 for TabularARGN at the intended depth 3: no single column
+#: separates the sets (largest single-column AUC 0.59), the classifier adds up
+#: hundreds of small differences. Min-max scaling then made the copy of train
+#: (0.966) the best and every generator equally worst. The MLP detector scored
+#: the marginals baseline 0.51, as hard to spot as a copy (0.50), so it cannot
+#: see dependence between columns. Both stay in the table (docs/verification.md).
 SYNTHCITY_UNRANKED_SUBMETRICS = frozenset(
     {
         "performance.feat_rank_distance.pvalue",
         "detection.detection_gmm.mean",
+        "detection.detection_xgb.mean",
+        "detection.detection_mlp.mean",
         "privacy.delta-presence.score",
         "privacy.k-anonymization.gt",
         "privacy.k-anonymization.syn",
