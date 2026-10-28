@@ -119,6 +119,34 @@ def test_each_replicate_is_built_with_its_own_seed(make_config, make_dataset, mo
     assert (output_dir / "ctgan__rep1.csv").exists()
 
 
+def test_generated_numbers_get_the_train_decimals_and_range(make_config, make_dataset, mocker):
+    cfg = make_config()
+    cfg.generation.tabpfn.enabled = False
+    cfg.generation.tabpfgen.enabled = False
+    cfg.generation.hpo.enabled = False
+    cfg.generation.synthcity.names = ["arf"]
+    cfg.generation.match_class_prior = False
+    dataset = make_dataset(nominal_columns=["smoker"])
+    dataset.train_imputed_df = dataset.train_df.fillna(dataset.train_df.median(numeric_only=True))
+    generated = dataset.train_imputed_df.copy()
+    generated["age"] = generated["age"] + 0.4  # whole numbers in train
+    generated["group"] = generated["group"].astype(float)
+    generated.loc[generated.index[0], "group"] = 7.6  # above the train max of 2
+    mocker.patch("synthdata.generation.pipeline.sc.make_loader")
+    mocker.patch("synthdata.generation.pipeline.sc.fit_generate", return_value=generated)
+
+    result = run_generation(cfg, dataset)["arf"]
+
+    train = dataset.train_imputed_df
+    assert (result["age"] % 1 == 0).all()
+    assert result["age"].between(train["age"].min(), train["age"].max()).all()
+    assert result["group"].iloc[0] == train["group"].max()
+    assert result["group"].dtype == train["group"].dtype
+    assert result["smoker"].equals(generated["smoker"])
+    saved = pd.read_csv(Path(cfg.generation.output_dir) / "arf.csv")
+    assert (saved["age"] % 1 == 0).all()
+
+
 def test_synthcity_models_are_drawn_to_the_train_class_shares(make_config, make_dataset, mocker):
     from synthdata.generation.class_quota import ClassSamplingReport
 

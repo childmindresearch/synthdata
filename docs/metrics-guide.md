@@ -52,7 +52,7 @@ A plain-language guide to every number in `report.md` and `combined_evaluation.c
 | `performance.linear_model`, `mlp`, `xgb` | Train-on-synthetic, test-on-real scores of three model types. | Higher |
 | `performance.feat_rank_distance.corr` | Whether a model trained on synthetic data ranks the features as important in the same order as one trained on real data. | Higher |
 | `performance.*_augmentation` | Gain from adding synthetic rows to the real training rows. Unranked. | Higher |
-| `detection.detection_xgb`, `mlp`, `linear` | AUC of a classifier trained to tell real rows from synthetic ones. 0.5 = cannot tell them apart. | Lower (towards 0.5) |
+| `detection.detection_xgb`, `mlp`, `linear` | AUC of a classifier trained to tell real rows from synthetic ones. 0.5 = cannot tell them apart. `xgb` and `mlp` are unranked: with hundreds of columns XGBoost tells every generator apart (AUC 1.0) and MLP misses dependence between columns, so neither separates generators. | Lower (towards 0.5) |
 | `detection.detection_gmm` | Not a real detector (it ignores the labels). Unranked. | - |
 
 ## Privacy: could the synthetic data reveal a real patient?
@@ -97,9 +97,13 @@ Protected columns are set in `data.protected_columns`, and the groups of a numer
 
 | Metric | What it measures | Read it as |
 | --- | --- | --- |
-| `statistical_parity` | A classifier trained on the synthetic data: difference in the share of positive predictions between a protected group and everyone else. | 0 is ideal (equal rates). |
-| `equal_opportunity` | Difference in true-positive rate (recall) between a group and everyone else. | 0 is ideal. |
-| `equalized_odds` | Mean of the differences in true-positive and false-positive rates. | 0 is ideal. |
+| `demographic_parity_gap_error` | The holdout TSTR classifier, trained once on the synthetic and once on the real data, predicts the holdout. For each class and protected group: the group's share of predictions in that class minus everyone else's. The score is the average distance between the synthetic-trained and the real-trained gap. | 0 is ideal (the real disparity kept). Blank when `fairness_signal` is 0. |
+| `equal_opportunity_gap_error` | The same for the true-positive rate (recall). | 0 is ideal. |
+| `equalized_odds_gap_error` | The same, taking the larger of the true- and false-positive rate differences. | 0 is ideal. |
+| `fairness_signal` | 1 when the synthetic-trained classifier beats chance on the holdout (bootstrap 95% interval of balanced accuracy above 1 / classes); otherwise the three scores above are blank and not ranked. | Not ranked. |
+| `statistical_parity` | A classifier trained and tested on the synthetic data: difference in the share of positive predictions between a protected group and everyone else. Exactly 0 when the synthetic data has no class signal (the classifier predicts one class), so it is not ranked. | 0 means equal rates. Not ranked. |
+| `equal_opportunity` | Difference in true-positive rate (recall) between a group and everyone else, as above. | Not ranked. |
+| `equalized_odds` | Mean of the differences in true-positive and false-positive rates, as above. | Not ranked. |
 | `log_disparity_mean_abs` | How far each protected subgroup x outcome share drifts from its real share, in log-odds, averaged (Bhanot et al. 2021). | 0 is ideal. |
 | `log_disparity_share_significant` | Share of subgroups whose drift is significant after Benjamini-Hochberg correction. | 0 is ideal. |
 | `subgroup_distance_mia_auc_gap` | Fairness of privacy: `distance_mia_auc` computed inside each protected group, then the largest difference between two groups of the same protected column. | 0 is ideal (every group equally exposed). Not ranked. |

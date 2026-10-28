@@ -18,6 +18,7 @@ against, and :func:`chance_scores` the floor.
 """
 
 import dataclasses
+from collections.abc import Callable
 
 import numpy as np
 import pandas as pd
@@ -199,31 +200,20 @@ def _label_codes(values: pd.Series, classes: list) -> pd.Series:
     return values.astype(str).map({str(c): i for i, c in enumerate(classes)})
 
 
-def tstr_scores(
+def tstr_predictor(
     fit_df: pd.DataFrame,
     score_df: pd.DataFrame,
     target_column: str,
     nominal_columns: list,
     classes: list,
-    seeds: list,
-    n_bootstrap: int = 0,
-    groups: dict | None = None,
-    ordinal: bool = False,
     xgb_params: dict | None = None,
-) -> TSTRScores:
-    """Fit the fixed XGBoost on ``fit_df`` once per seed and score on ``score_df``.
+) -> tuple[np.ndarray, Callable[[int], np.ndarray]]:
+    """The scored rows' class codes and ``predict_proba(seed)`` of the fixed classifier.
 
-    ``classes`` fixes the label set (the real training classes), so a fit set
-    that lacks a class still yields a model scored over every class: that
-    class's F1 is then 0. Rows of ``fit_df`` with a label outside ``classes``
-    are dropped. Rows are weighted by inverse class frequency
-    (``compute_sample_weight("balanced")``), so every class counts equally.
-    ``n_bootstrap`` > 0 adds bootstrap standard errors (``boot_se``).
-    ``ordinal``: the target's classes are ordered and ``classes`` lists them
-    low to high, so kappa uses quadratic weights.
-    ``groups`` (``{column: labels aligned with score_df}``) adds the macro
-    AUPRC within each group (``group_auprc``), from the first seed's fit.
-    ``xgb_params`` overrides keys of :data:`XGB_PARAMS` (see :func:`tstr_xgb_params`).
+    This is the classifier :func:`tstr_scores` scores (see there for the
+    label handling and the class-balanced row weights); other metrics that
+    need its predictions on ``score_df`` call this so they use the same fit.
+    ``predict_proba(seed)`` returns one column per entry of ``classes``.
     """
     from sklearn.utils.class_weight import compute_sample_weight
     from xgboost import XGBClassifier
@@ -259,6 +249,39 @@ def tstr_scores(
             model.fit(x_fit, np.vectorize(to_local.get)(y_fit), sample_weight=sample_weight)
             proba[:, present] = model.predict_proba(x_score)
         return proba
+
+    return y_true, predict_proba
+
+
+def tstr_scores(
+    fit_df: pd.DataFrame,
+    score_df: pd.DataFrame,
+    target_column: str,
+    nominal_columns: list,
+    classes: list,
+    seeds: list,
+    n_bootstrap: int = 0,
+    groups: dict | None = None,
+    ordinal: bool = False,
+    xgb_params: dict | None = None,
+) -> TSTRScores:
+    """Fit the fixed XGBoost on ``fit_df`` once per seed and score on ``score_df``.
+
+    ``classes`` fixes the label set (the real training classes), so a fit set
+    that lacks a class still yields a model scored over every class: that
+    class's F1 is then 0. Rows of ``fit_df`` with a label outside ``classes``
+    are dropped. Rows are weighted by inverse class frequency
+    (``compute_sample_weight("balanced")``), so every class counts equally.
+    ``n_bootstrap`` > 0 adds bootstrap standard errors (``boot_se``).
+    ``ordinal``: the target's classes are ordered and ``classes`` lists them
+    low to high, so kappa uses quadratic weights.
+    ``groups`` (``{column: labels aligned with score_df}``) adds the macro
+    AUPRC within each group (``group_auprc``), from the first seed's fit.
+    ``xgb_params`` overrides keys of :data:`XGB_PARAMS` (see :func:`tstr_xgb_params`).
+    """
+    y_true, predict_proba = tstr_predictor(
+        fit_df, score_df, target_column, nominal_columns, classes, xgb_params
+    )
 
     f1s, auprcs, aurocs, balanced, kappas, per_class = [], [], [], [], [], []
     first_proba = None

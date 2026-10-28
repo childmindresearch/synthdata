@@ -1037,6 +1037,22 @@ wheels = [
 ]
 
 [[package]]
+name = "fairlearn"
+version = "0.15.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "narwhals" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4e/f8/d1ef45777b36ff973bfc06bd33a30c568a6275466193f2a121919dd82106/fairlearn-0.15.0.tar.gz", hash = "sha256:dfdfbddc3b86d2a8e4e04e282bb29d7603f28559a28abeca97847bf5e0f79f80", size = 109889, upload-time = "2026-10-12T05:10:18.738Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/9d/e96346594f66e8933181b286cdf8b495bd71998ccbc7ae3ee5e33efa0cde/fairlearn-0.15.0-py3-none-any.whl", hash = "sha256:4f4656c25af384fc3369db719231680c4e83beb2e6e075e5dc3c2b27d06455c9", size = 141365, upload-time = "2026-10-12T05:10:17.692Z" },
+]
+
+[[package]]
 name = "fastai"
 version = "2.8.7"
 source = { registry = "https://pypi.org/simple" }
@@ -2364,6 +2380,22 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d6/54/cfe61301667036ec958cb99bd3efefba235e65cdeb9c84d24a8293ba1d90/mdurl-0.1.2.tar.gz", hash = "sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba", size = 8729, upload-time = "2022-08-14T12:40:10.846Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b3/38/89ba8ad64ae25be8de66a6d463314cf1eb366222074cfda9ee839c56a4b4/mdurl-0.1.2-py3-none-any.whl", hash = "sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8", size = 9979, upload-time = "2022-08-14T12:40:09.779Z" },
+]
+
+[[package]]
+name = "miceforest"
+version = "6.0.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "lightgbm" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "pyarrow" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cd/78/3ee5d988c0c08932defd3dfcbb17bd1cc818a4e723c9839b566d1f6191b3/miceforest-6.0.5.tar.gz", hash = "sha256:df96a5b4cfcb87554ae54c5be1bce538f8580b4b20203dc51e1806516efe71e1", size = 45429, upload-time = "2025-10-27T00:37:35.11Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/db/a1/f2a4425415ce92a3b088a6e7d86c881c441f84231f023c680b0eb34d330c/miceforest-6.0.5-py3-none-any.whl", hash = "sha256:a9b2432ac2430dd7621538e4ef04dbc49ad1eaa181eb36a59ee34f279da7c57e", size = 38780, upload-time = "2025-10-27T00:37:34.159Z" },
 ]
 
 [[package]]
@@ -4610,10 +4642,13 @@ source = { editable = "." }
 dependencies = [
     { name = "altair" },
     { name = "anonymeter" },
+    { name = "fairlearn" },
     { name = "filelock" },
     { name = "jupyter" },
+    { name = "lightgbm" },
     { name = "marimo" },
     { name = "matplotlib" },
+    { name = "miceforest" },
     { name = "numpy" },
     { name = "openpyxl" },
     { name = "optuna" },
@@ -4665,11 +4700,14 @@ requires-dist = [
     { name = "anonymeter", specifier = ">=1.1.0" },
     { name = "catboost", marker = "extra == 'refidiff'" },
     { name = "causal-conv1d", marker = "extra == 'refidiff'", specifier = "==1.6.2.post1" },
+    { name = "fairlearn", specifier = ">=0.13" },
     { name = "filelock" },
     { name = "jupyter" },
+    { name = "lightgbm", specifier = ">=4.1.0,<4.7" },
     { name = "mamba-ssm", marker = "extra == 'refidiff'", specifier = "==2.3.1" },
     { name = "marimo" },
     { name = "matplotlib" },
+    { name = "miceforest", specifier = ">=6.0.5" },
     { name = "numpy" },
     { name = "openpyxl" },
     { name = "optuna" },

@@ -53,6 +53,31 @@ class TestBuildEvaluationReport:
             assert header in text
         assert "privacy gate" not in text.lower()
 
+    def test_fairness_section_shows_holdout_gaps_and_the_no_signal_gate(
+        self, make_config, make_dataset
+    ):
+        from synthdata.evaluation.fairness_gaps import FAIRNESS_GAP_METRICS
+
+        gaps = pd.DataFrame(
+            {
+                "fairness_signal": [1, 0],
+                "holdout_balanced_accuracy": [0.61, 0.33],
+                "balanced_accuracy_ci_low": [0.58, 0.31],
+                "balanced_accuracy_ci_high": [0.64, 0.35],
+                "chance_balanced_accuracy": [1 / 3, 1 / 3],
+                **{m: [0.04, float("nan")] for m in FAIRNESS_GAP_METRICS},
+            },
+            index=pd.Index(["model_a", "model_b"], name="model"),
+        )
+        extras = {"selected_datasets": {}, "fairness_gaps": gaps}
+        text = build_evaluation_report(make_config(), make_dataset(), _combined_table(), extras)
+        fairness = _section(text, "5. Fairness")
+        assert "### Holdout fairness gaps" in fairness
+        assert "demographic_parity_gap_error" in fairness
+        assert "reaches chance (0.333)" in fairness
+        assert "### Subgroup gap metrics (reported, not ranked)" in fairness
+        assert "fairness_gaps_by_group.csv" in fairness
+
     def test_recommends_top_overall_rank_model(self, make_config, make_dataset):
         cfg = make_config()
         dataset = make_dataset()

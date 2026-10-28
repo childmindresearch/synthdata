@@ -13,6 +13,60 @@ No result changes; old results stay comparable and no golden re-record is needed
 - **`synthdata-run` sets up and checks the separate generator environments first.** When the generate stage is selected and TabularARGN or CDTD is enabled, it checks the needed submodule checkout (`submodules/cdtd_simple`), runs `uv sync --frozen --project envs/<name>` (a no-op once installed) and imports PyTorch in that environment, printing whether it sees CUDA. Any failure stops the run before imputation, with the command to fix it, instead of failing when generation reaches that model hours later. You no longer need to run `uv sync --project envs/<name>` by hand.
 - New config key `compute.sync_envs` (default `true`); `false` skips the `uv sync` for offline machines whose environments are already installed.
 
+## 0.20.0 (2026-10-27)
+
+Changes the fairness score and so the overall ranking: rankings from earlier versions are not comparable. Generated data is unchanged, so re-evaluating an existing experiment is enough (no new experiment id needed for generation). The golden runs need re-recording on the Linux GPU machine (new columns and fairness ranks).
+
+### Changed
+
+- **New ranked fairness metrics: holdout fairness gaps** (custom evaluator `fairness_gaps`, on by default). The holdout TSTR classifier is fitted on each synthetic dataset and on the real train split, and both predict the holdout. Per class and protected group, fairlearn gives the demographic parity, equal opportunity and equalized odds gaps, and each score (`demographic_parity_gap_error`, `equal_opportunity_gap_error`, `equalized_odds_gap_error`) is the average distance between the synthetic and the real gap: 0 keeps the real disparities, while erasing or inverting them scores high. When the synthetic-trained classifier does not beat chance on the holdout (bootstrap 95% interval of balanced accuracy), the scores are blank, `fairness_signal` is 0, and the model is left out of the fairness score instead of being scored worst.
+- **SynthEval's statistical parity, equalized odds and equal opportunity are reported but no longer ranked.** Their classifier is fitted and scored inside the synthetic data, so a dataset with no class signal predicted one class and scored a perfect 0. On the simulated clinical dataset, ARF, TabularARGN, DDPM and the marginals baseline did, and CDTD, the one generator with a learnable signal, ranked last on fairness. With the new scores, TabularARGN keeps the real gaps best (demographic parity error 0.056), then ARF (0.077) and CDTD (0.110); DDPM and the marginals baseline are gated.
+- New output files `fairness_gaps.csv` (per model) and `fairness_gaps_by_group.csv` (every gap per class and group), a new report subsection, and new `combined_evaluation.csv` columns under `custom/fairness`.
+- New dependency: `fairlearn`.
+
+## 0.19.0 (2026-10-27)
+
+Changes generated data and the ranking: use a new experiment id, since cached synthetic sets keep their old format and old rankings counted detection. The golden runs need re-recording on the Linux GPU machine (detection values and rounded generator output move).
+
+### Changed
+
+- **Synthetic numbers get the train format.** Every numeric (non-categorical) column of every generator's output is clipped to the train min and max and rounded to the train column's decimal places, as SDV does by default (rdt's `FloatFormatter` rules, reimplemented in `synthdata/generation/numeric_format.py` and checked against rdt 2.0.0). Counts that are whole numbers in train stay whole numbers: ARF wrote decimals into them in about 95% of rows. No config key; categorical columns are not touched.
+- **XGBoost and MLP detection are reported but no longer ranked.** On the simulated clinical dataset XGBoost detection was 1.000 for every generator and the marginals baseline (so it rewarded only the copy of train), and MLP detection scored the marginals baseline like a copy. Both stay in `combined_evaluation.csv`; the linear detector stays ranked.
+
+### Fixed
+
+- synthcity fork: `detection_xgb` passed `depth: 3`, which XGBoost ignores, so its trees grew to depth 6. It now passes `max_depth: 3`.
+
+## 0.18.0 (2026-10-27)
+
+Default generator list and a TabularARGN default change. Runs that keep the default `generation.synthcity.names` or TabularARGN params produce different models, so use a new experiment id; the golden runs do not use ddpm or TabularARGN and stay valid.
+
+### Changed
+
+- **ddpm is off by default.** It is no longer in the default `generation.synthcity.names` or in the shipped `config_sim.yaml`, `config_loris.yaml` and `config_hepatitis.yaml`. In the untuned simulated-data comparison it still learned the columns independently (its correlation and mutual-information errors matched the independent-marginals baseline, and its TSTR was below it). Add `ddpm` to `generation.synthcity.names` to run it. CDTD (`generation.cdtd`) is the diffusion model to use instead.
+- **TabularARGN value protection is off by default** (`generation.tabularargn.params: {value_protection: false}`). With it on, mostlyai-engine 2.7.3 can still write its `_RARE_` token even with `rare_category_replacement_method: sample`, and the run then stops with "tabularargn made categories ... not in train". The reason and the repro are in `docs/verification.md`.
+
+## 0.17.0 (2026-10-22)
+
+Imputed values change, so results are not comparable with earlier runs: use a new experiment id and re-record the golden runs.
+
+### Changed
+
+- New default imputer `imputation.method: miceforest`: MICE with LightGBM forests and predictive mean matching (the `miceforest` library, new dependency; LightGBM capped below 4.7). Each gap gets a real observed value from a row with a close prediction, so filled columns keep their spread and category shares instead of MissForest's narrow spikes and single-class fills. Settings in `imputation.miceforest` (`iterations`, `mean_match_candidates`, `num_threads`). `missforest` is still available. The example configs now use `miceforest`. Run `uv sync` to install it.
+- Real-vs-synthetic figures (`plots/generation/<model>.png`, `<model>_top_columns.png`) and `column_differences.csv` now compare the real train values that were recorded with the synthetic values as released (blanked where the synthetic missing indicator is 1), so imputed values appear on neither side. Panel titles show each side's share of blanks. The old filled-vs-filled view, which is what the metrics score, is `<model>_filled.png` (written when there are missing indicators).
+
+### Added
+
+- `missing_blocks.csv` (written by `synthdata-impute`, or on its own by the new `synthdata-missing-blocks --config ...`): columns that go missing together, and a candidate label for each missingness pattern (every column with a gap) (`skip_logic_candidate`, `form_not_given_candidate`, `item_missing`) with the decision-tree rule behind it, to review against the codebook.
+- `imputation.missing_indicators.blocks` (`{name: [columns]}` or `"auto"`, default `{}`) and `block_min_jaccard` (default 0.9): one `<name>__missing` flag per block, 1 where the whole block is missing; the released copy blanks the whole block there. Column flags then count only the gaps outside whole-block rows.
+- `dependencies.csv` from the new `synthdata-dependencies --config ...`: to help slim the dataset, an exact search over every column pair, with no cutoffs and nothing dropped. It covers functional dependencies, with a chance-corrected score so identifier-like columns are labelled `id_like` instead of passing as rules. It covers one-condition rules, which catch skip logic, kept when a Bonferroni-corrected binomial test says chance can't explain them. It also covers hierarchies, every identifying set of role columns (Desbordante's HyUCC) and every numeric column's linear R². Each finding has a suggested action. `--max-error` (default 1%) only picks the readable shortlist; `dependencies_pairs.parquet` and `dependencies_rules.parquet` hold everything. `--max-lhs 2` (opt-in, hours) adds two-column rules. Desbordante runs in its own environment (`uv sync --project envs/desbordante`; Linux or macOS, AGPL-licensed, so synthdata never imports it).
+- `synthdata-profile --config ...` writes `missing_blocks.csv`, `dependencies.csv` and `skip_logic_comparison.csv` (skip logic found by the blocks report's tree and by conditional FDs, side by side). It needs `envs/desbordante` (Linux; WSL on Windows) and stops with an error without it; `--blocks-only` skips the Desbordante part.
+- `evaluation.dependency_rules` (default `null`): a file of accepted rules (rows of `dependencies.csv` or `missing_blocks.csv` with a `check_rule`). Evaluation writes `dependency_violations.csv` and adds a `dependency_rules` row per model to `checks.csv`, warning when a model breaks the rules more often than the real holdout (plus 1 percentage point).
+
+### Fixed
+
+- Categorical axes in the plots sort labels that read as numbers by value (1, 2, ..., 10), even when they are stored as text; before, they sorted as text (1, 10, 11, 2). Schema `ordinal_order` still wins.
+
 ## 0.16.2 (2026-10-22)
 
 No result or config changes; old results stay comparable and no golden re-record is needed.

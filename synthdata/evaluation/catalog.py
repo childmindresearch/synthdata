@@ -128,10 +128,22 @@ SYNTHCITY_REDUNDANT_SUBMETRIC_SUFFIXES = ("_naive",)
 #: mixture (the labels are ignored) and reads one mixture component's
 #: probability as "synthetic", so it scores about 0.5 whether the synthetic
 #: data is a fresh draw, shifted or shuffled (re-audit N2).
+#:
+#: ``detection_xgb`` and ``detection_mlp`` saturate or fail on wide data. On
+#: the simulated clinical data (681 columns, 16800 rows a side) XGBoost
+#: detection was 1.000 for every generator and the marginals baseline, and
+#: still 0.998 for TabularARGN at the intended depth 3: no single column
+#: separates the sets (largest single-column AUC 0.59), the classifier adds up
+#: hundreds of small differences. Min-max scaling then made the copy of train
+#: (0.966) the best and every generator equally worst. The MLP detector scored
+#: the marginals baseline 0.51, as hard to spot as a copy (0.50), so it cannot
+#: see dependence between columns. Both stay in the table (docs/verification.md).
 SYNTHCITY_UNRANKED_SUBMETRICS = frozenset(
     {
         "performance.feat_rank_distance.pvalue",
         "detection.detection_gmm.mean",
+        "detection.detection_xgb.mean",
+        "detection.detection_mlp.mean",
         "privacy.delta-presence.score",
         "privacy.k-anonymization.gt",
         "privacy.k-anonymization.syn",
@@ -257,6 +269,21 @@ def is_custom_syntheval_metric(name: str) -> bool:
 #: in the combined evaluation table, since they are not part of upstream SynthEval.
 SYNTHEVAL_CUSTOM_FAIRNESS_KEYS = {"equalized_odds", "equal_opportunity"}
 
+#: SynthEval's subgroup gaps (statistical parity and the fork's equalized
+#: odds and equal opportunity) and their per-group sub-columns. Reported but
+#: not ranked: their classifier is fitted and scored inside the synthetic
+#: data, so a dataset with no class signal predicts one class and scores a
+#: perfect 0 (docs/verification.md). The holdout fairness gaps
+#: (synthdata.evaluation.fairness_gaps) are ranked instead.
+SYNTHEVAL_FAIRNESS_GAP_KEYS = {"statistical_parity", *SYNTHEVAL_CUSTOM_FAIRNESS_KEYS}
+_SYNTHEVAL_FAIRNESS_GAP_PREFIXES = ("sp_", *_SYNTHEVAL_CUSTOM_SUBMETRIC_PREFIXES)
+
+
+def is_syntheval_fairness_gap(name: str) -> bool:
+    """Whether a SynthEval result column is one of the unranked subgroup gaps."""
+    return name in SYNTHEVAL_FAIRNESS_GAP_KEYS or name.startswith(_SYNTHEVAL_FAIRNESS_GAP_PREFIXES)
+
+
 # ---------------------------------------------------------------------------
 # custom (log disparity + the syntheval-fork-only fairness metrics above)
 # ---------------------------------------------------------------------------
@@ -288,8 +315,12 @@ TSTR_NAME = "tstr"
 #: Custom privacy evaluators (synthdata.evaluation.privacy_attacks).
 PRIVACY_ATTACK_NAMES = ("anonymeter", "holdout_distance")
 
+#: Name of the holdout fairness-gap evaluator (synthdata.evaluation.fairness_gaps).
+FAIRNESS_GAPS_NAME = "fairness_gaps"
+
 CUSTOM_METRIC_TYPE = {
     TSTR_NAME: "utility",
+    FAIRNESS_GAPS_NAME: "fairness",
     **{name: "privacy" for name in PRIVACY_ATTACK_NAMES},
     **{name: "fairness" for name in LOG_DISPARITY_METRICS},
     **{name: "fairness" for name in SYNTHEVAL_CUSTOM_FAIRNESS_KEYS},
