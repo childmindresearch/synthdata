@@ -4637,7 +4637,7 @@ provides-extras = ["testing", "goggle", "all"]
 
 [[package]]
 name = "synthdata"
-version = "0.20.0"
+version = "0.21.0"
 source = { editable = "." }
 dependencies = [
     { name = "altair" },
