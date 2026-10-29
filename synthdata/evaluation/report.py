@@ -811,11 +811,11 @@ def _fairness_gap_lines(extras, paths: _Paths, links: _Links) -> list:
         "false-positive differences). 0 means the synthetic data keeps the real data's "
         "disparities; erasing or inverting them scores high.",
         "",
-        "A model whose synthetic-trained classifier has a holdout balanced accuracy whose "
-        "bootstrap 95% interval reaches chance"
+        "`fairness_signal` is 0 when the bootstrap 95% interval of the synthetic-trained "
+        "classifier's holdout balanced accuracy reaches chance"
         + (f" ({chance.iloc[0]:.3f})" if len(chance) else "")
-        + " has no class signal for its gaps to mean anything: `fairness_signal` is 0, its "
-        "scores are blank and it is left out of the fairness ranking.",
+        + ". Such a classifier predicts much the same for every group, so its errors are about "
+        "the size of the real gaps: the score of a dataset that erased the disparities.",
         "",
         _dataframe_to_markdown(_collapse_replicates(shown).reset_index()),
         "",
@@ -995,7 +995,7 @@ _FILE_DESCRIPTIONS = {
     "combined_evaluation.csv": "Every metric for every model: raw values and per-group scores.",
     "ranking_summary.csv": "One row per model: mean scores, confidence intervals, ties.",
     "tstr_holdout.csv": "Holdout TSTR scores per class, and TSTS (train and test on synthetic).",
-    "fairness_gaps.csv": "Holdout fairness gap errors per model, with the no-signal gate's balanced accuracy and interval.",
+    "fairness_gaps.csv": "Holdout fairness gap errors per model, with the classifier's holdout balanced accuracy and interval.",
     "fairness_gaps_by_group.csv": "Synthetic- and real-trained subgroup gaps per model, class and protected group.",
     "metric_directions.csv": "Whether higher, lower or closer to 0 is better for each metric, and its ideal value.",
     "ovr_per_class.csv": "Two-class SynthEval metrics per class (one vs rest).",

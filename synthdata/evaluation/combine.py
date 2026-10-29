@@ -239,9 +239,7 @@ def _fairness_gap_frames(
 ) -> "tuple[pd.DataFrame, pd.DataFrame]":
     """Holdout fairness gap errors as custom fairness columns (lower is better).
 
-    A model that failed the gate has NaN errors; :func:`build_combined_table`
-    leaves those out of its fairness score instead of scoring them worst.
-    The gate flag is reported, not ranked.
+    ``fairness_signal`` is reported, not ranked.
     """
     if table is None or table.empty:
         empty = pd.DataFrame(index=model_names)
@@ -427,11 +425,7 @@ def build_combined_table(
     raw_df = pd.concat(raw_parts, axis=1)
     oriented_df = pd.concat(oriented_parts, axis=1)
 
-    scaled_df = oriented_df.apply(_minmax_scale, axis=0)
-    # A gated fairness gap (no class signal) is left out, not scored worst.
-    gated = [c for c in scaled_df.columns if c[2] in FAIRNESS_GAP_METRICS]
-    others = [c for c in scaled_df.columns if c not in gated]
-    scaled_df[others] = scaled_df[others].apply(_missing_as_worst, axis=0)
+    scaled_df = oriented_df.apply(_minmax_scale, axis=0).apply(_missing_as_worst, axis=0)
 
     combined = raw_df.copy()
 
@@ -458,23 +452,16 @@ def build_combined_table(
             combined[(_ALL, type_, _RANK)] = combined[group_rank_cols].mean(axis=1, skipna=True)
 
     # Step 4: overall rank -- WEIGHTED GEOMETRIC MEAN of the type-level rollups.
-    # A type a model has no score for (every one of its metrics left out, as
-    # for a gated fairness gap) drops out of that model's mean; a type no
-    # model has a score for weighs on every row alike.
     log_total = pd.Series(0.0, index=combined.index)
-    weight_total = pd.Series(0.0, index=combined.index)
+    weight_total = 0.0
     for type_ in _TYPES:
         key = (_ALL, type_, _RANK)
         weight = rank_weights.get(type_, 1.0)
         if key in combined.columns and weight > 0:
-            scores = combined[key]
-            present = scores.notna() if scores.notna().any() else pd.Series(True, scores.index)
-            floored = scores.fillna(0.0).clip(lower=GEOMETRIC_FLOOR)
-            log_total = log_total + (weight * np.log(floored)).where(present, 0.0)
-            weight_total = weight_total + present * weight
-    overall = np.exp(log_total / weight_total.where(weight_total > 0, 1.0)).where(
-        weight_total > 0, 0.0
-    )
+            floored = combined[key].fillna(0.0).clip(lower=GEOMETRIC_FLOOR)
+            log_total = log_total + weight * np.log(floored)
+            weight_total += weight
+    overall = np.exp(log_total / weight_total) if weight_total else log_total
     combined[(_ALL, "overall", _RANK)] = overall
 
     combined.columns = pd.MultiIndex.from_tuples(

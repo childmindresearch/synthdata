@@ -24,10 +24,13 @@ synthetic and the real gap (equalized odds takes the larger of its TPR and
 FPR differences, as fairlearn's ``equalized_odds_difference`` does). 0 means
 the real disparities are kept; erasing or inverting them scores high.
 
-Gate: when the synthetic-trained classifier's holdout balanced accuracy has
-a bootstrap 95% interval that reaches chance, its predictions carry no class
-signal and its gaps say nothing; the model's metrics are NaN, flagged
-``fairness_signal = 0``, and left out of the ranking.
+A classifier that learned nothing from the synthetic data predicts almost
+the same classes for every group, so its gaps are near 0 and each error is
+about the size of the real gap: it scores like a dataset that erased the
+disparities, which it has. No separate gate is needed for it, so every
+model gets a score. ``fairness_signal`` (1 when the bootstrap 95% interval
+of the classifier's holdout balanced accuracy is above chance) is reported
+next to the errors, unranked, to say which models are in that position.
 """
 
 import dataclasses
@@ -48,13 +51,13 @@ FAIRNESS_GAP_METRICS = (
     "equal_opportunity_gap_error",
 )
 
-#: Reported next to them, unranked: 1 when the classifier passed the gate.
+#: Reported next to them, unranked: 1 when the classifier beats chance on the holdout.
 FAIRNESS_SIGNAL_COLUMN = "fairness_signal"
 
 #: Smallest group, and smallest rest, scored on the holdout; smaller give noisy rates.
 MIN_GROUP_ROWS = 30
 
-#: Bootstrap draws for the balanced-accuracy interval of the gate.
+#: Bootstrap draws for the balanced-accuracy interval behind ``fairness_signal``.
 N_BOOTSTRAP = 200
 
 #: Two-sided level of that interval.
@@ -63,7 +66,7 @@ CONFIDENCE = 0.95
 
 @dataclasses.dataclass
 class FairnessGaps:
-    """One model's gap errors, the gate's evidence and the gaps behind them."""
+    """One model's gap errors, its holdout balanced accuracy and the gaps behind them."""
 
     errors: dict
     signal: bool
@@ -178,8 +181,6 @@ def fairness_gap_scores(
         group_gaps(y_true, y_syn, masks, len(classes)),
         group_gaps(y_true, real_predictions, masks, len(classes)),
     )
-    if not signal:
-        errors = dict.fromkeys(errors, float("nan"))
     joined["class"] = [str(classes[c]) for c in joined["class"]]
     return FairnessGaps(errors, bool(signal), accuracy, interval, chance, joined)
 
@@ -199,7 +200,7 @@ def real_holdout_predictions(
 
 
 def build_fairness_gap_table(results: dict) -> pd.DataFrame:
-    """Models x (gate evidence, gap errors) summary for the report and the ranking."""
+    """Models x (holdout balanced accuracy, gap errors) summary for the report and the ranking."""
     rows = {}
     for name, r in results.items():
         rows[name] = {
