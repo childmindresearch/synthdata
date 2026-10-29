@@ -4,6 +4,25 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.26.0 (2026-10-29)
+
+Changes metric values and the ranking, so re-evaluate with a new experiment id (generation is unchanged) and re-record the golden runs on the Linux GPU machine. No config edits are needed. Every verification row that was Open has been re-checked against results and fixed, taken out of the ranking or the defaults, or accepted with a reason; `docs/verification.md` has the checks and numbers.
+
+### Fixed
+
+- **synthcity `max_mean_discrepancy`** gave every synthetic set that was not a copy the same score (about 2/n) on wide data, because its kernel used gamma = 1 on unscaled columns. Columns are now scaled on the real data and the kernel width is the median-distance heuristic (Gretton et al. 2012).
+- **synthcity `prdc`** computed its neighbour radii on unscaled columns, so only the widest columns counted; it now uses the same scaling.
+- **synthcity `jensenshannon_dist`** gives each category of a categorical column its own bin (codes of columns with more than 10 categories were merged).
+- **synthcity performance metrics** use the macro (per-class) AUROC for 3+ classes instead of the micro average, and the XGBoost model gets the intended depth 3.
+- **SynthEval `p_mse`** codes categorical columns as indicators, so a change in category shares is seen.
+- **SynthEval `corr_diff`** uses the correlation ratio eta (it was eta squared), and a constant synthetic column no longer makes the whole metric blank.
+- **SynthEval `mia_precision`**: an attacker that flags no row now scores as no skill instead of the worst privacy, and only precision above chance counts as risk.
+
+### Changed
+
+- **Reported but no longer ranked:** synthcity `ks_test` (SynthEval's ks_test covers it), the synthcity sanity distance scores and `common_rows_proportion`, and SynthEval `mia_recall`.
+- **Off by default** (run only when named in `evaluation.synthcity.metrics`; they were already unranked after failing the known-answer checks): the three augmentation metrics, `detection_gmm`, the k-anonymity family (`k-anonymization`, `k-map`, `distinct l-diversity`, `delta-presence`) and `data_leakage_linear`/`data_leakage_mlp`. Evaluation runs fewer model fits.
+
 ## 0.25.1 (2026-10-29)
 
 No result or config changes; no golden re-record is needed.

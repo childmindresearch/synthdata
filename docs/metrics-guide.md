@@ -41,19 +41,19 @@ A plain-language guide to every number in `report.md` and `combined_evaluation.c
 | Metric | What it measures | Better |
 | --- | --- | --- |
 | `sanity.data_mismatch` | Share of columns whose data type differs. | Lower |
-| `sanity.common_rows_proportion` | Share of synthetic rows that are exact copies of real rows. | Lower (a privacy warning sign) |
-| `sanity.nearest_syn_neighbor_distance` | Typical distance from a real row to its nearest synthetic row. | Lower for utility, but 0 means copies |
-| `sanity.close_values_probability`, `distant_values_probability` | Share of synthetic rows very close to / very far from any real row. | Close: higher; distant: lower |
-| `stats.jensenshannon_dist`, `inv_kl_divergence`, `chi_squared_test`, `ks_test` | Column-by-column distribution similarity (Jensen-Shannon distance, inverse KL divergence, chi-squared and KS p-values). | Distance: lower; inverse KL and p-values: higher |
+| `sanity.common_rows_proportion` | Share of synthetic rows that are exact copies of real rows. A privacy warning sign; unranked (the holdout DCR measures it with a reference). | Lower |
+| `sanity.nearest_syn_neighbor_distance` | Typical distance from a real row to its nearest synthetic row, rescaled within each model, so it cannot tell near from far. Unranked. | - |
+| `sanity.close_values_probability`, `distant_values_probability` | Share of synthetic rows very close to / very far from any real row, on the same per-model rescaling. Unranked. | - |
+| `stats.jensenshannon_dist`, `inv_kl_divergence`, `chi_squared_test`, `ks_test` | Column-by-column distribution similarity (Jensen-Shannon distance, inverse KL divergence, chi-squared and KS p-values). synthcity's `ks_test` is unranked: it also runs on category codes; SynthEval's `ks_test` covers the same. | Distance: lower; inverse KL and p-values: higher |
 | `stats.max_mean_discrepancy` | Kernel distance between the whole real and synthetic distributions. | Lower |
 | `stats.wasserstein_dist` | Sinkhorn divergence (about half the squared earth mover's distance) on min-max scaled columns. Runs in plain PyTorch, without KeOps. | Lower |
 | `stats.prdc.precision`, `recall`, `density`, `coverage` | Precision: synthetic rows look like real ones. Recall and coverage: the synthetic data covers all kinds of real rows. Density: like precision, counting how many real neighbours each synthetic row has. | Higher |
 | `stats.alpha_precision.*` | Alpha-precision (realistic rows), beta-recall (diversity) and authenticity (rows not copied from train). | Higher |
 | `performance.linear_model`, `mlp`, `xgb` | Train-on-synthetic, test-on-real scores of three model types. | Higher |
 | `performance.feat_rank_distance.corr` | Whether a model trained on synthetic data ranks the features as important in the same order as one trained on real data. | Higher |
-| `performance.*_augmentation` | Gain from adding synthetic rows to the real training rows. Unranked. | Higher |
+| `performance.*_augmentation` | Gain from adding synthetic rows to the real training rows. Off by default (it barely moves with synthetic quality); runs and stays unranked when named in `evaluation.synthcity.metrics`. | Higher |
 | `detection.detection_xgb`, `mlp`, `linear` | AUC of a classifier trained to tell real rows from synthetic ones. 0.5 = cannot tell them apart. `xgb` and `mlp` are unranked: with hundreds of columns XGBoost tells every generator apart (AUC 1.0) and MLP misses dependence between columns, so neither separates generators. | Lower (towards 0.5) |
-| `detection.detection_gmm` | Not a real detector (it ignores the labels). Unranked. | - |
+| `detection.detection_gmm` | Not a real detector (it ignores the labels). Off by default; unranked when named. | - |
 
 ## Privacy: could the synthetic data reveal a real patient?
 
@@ -79,7 +79,7 @@ Privacy numbers are evidence from specific attacks, not guarantees. Compare ever
 | `median_DCR` | Distance to closest record (median, normalised). 0 = copies. | Higher |
 | `hit_rate` | Share of synthetic rows that match a real row within a small tolerance. | Lower |
 | `eps_identif_risk`, `priv_loss_eps` | Epsilon-identifiability: share of real rows whose closest synthetic row is closer than their closest real row; the privacy loss compares training with holdout rows. | Lower |
-| `mia_recall`, `mia_precision` | A membership-inference classifier (LightGBM) trying to tell training rows from holdout rows using the synthetic data. | Near the no-skill level is best; lower is better |
+| `mia_recall`, `mia_precision` | A membership-inference classifier (LightGBM) trying to tell training rows from holdout rows using the synthetic data. Only precision is ranked: recall alone is best for an attacker that flags no one. | Precision at or below 0.5 (no skill) is best |
 | `att_discl_risk` | Attribute disclosure: can an attacker infer a sensitive column of a training row by matching on the others? | Lower |
 
 ### synthcity
@@ -87,8 +87,8 @@ Privacy numbers are evidence from specific attacks, not guarantees. Compare ever
 | Metric | What it measures | Better |
 | --- | --- | --- |
 | `privacy.identifiability_score` | Like epsilon-identifiability above. | Lower |
-| `privacy.k-anonymization`, `k-map`, `distinct l-diversity`, `delta-presence` | Cluster-size proxies named after the classic definitions. They score a collapsed generator as very private, so they are unranked. | - |
-| `attack.data_leakage_xgb` | Can a classifier trained on synthetic data predict the sensitive columns of real rows? (linear and mlp versions are unranked). | Lower |
+| `privacy.k-anonymization`, `k-map`, `distinct l-diversity`, `delta-presence` | Cluster-size proxies named after the classic definitions. They score a collapsed generator as very private, so they are off by default and unranked when named in `evaluation.synthcity.metrics`. | - |
+| `attack.data_leakage_xgb` | Can a classifier trained on synthetic data predict the sensitive columns of real rows? (linear and mlp versions are off by default and unranked when named). | Lower |
 | `privacy.DomiasMIA_prior` | Density-based membership attack. Opt-in only: it fails on wide data. | Lower |
 
 ## Fairness: does the synthetic data treat groups like the real data does?
