@@ -113,7 +113,7 @@ generation:
     # instead; on the sim run it chose three different objectives.) All
     # candidates are logged on every trial (scripts/hpo_analysis.py compare).
     objective: tstr_macro_auprc
-    # evaluation.xgboost_params subsample rows and columns, so one TSTR fit
+    # When evaluation.xgboost_params subsample rows or columns, one TSTR fit
     # depends on its seed; 3 seeds keep that noise out of the trial scores.
     tstr_seeds: 3
     objective_candidates: [tstr_macro_auprc, tstr_macro_auroc, tstr_macro_f1]
@@ -205,16 +205,15 @@ evaluation:
   # weight (per-class values in ovr_per_class.csv); binary = once on the
   # binary_target collapse (see config_loris.yaml), which must then be enabled.
   class_averaging: ovr_macro
-  # XGBoost that predicts the target in holdout TSTR, the HPO objective and its
-  # real-data ceiling. These are a collaborator's tuned parameters for their own
-  # baseline model on this data; keys left out keep the defaults (80 trees,
-  # depth 4, learning rate 0.08, no subsampling). With subsample/colsample_bytree
-  # below 1 the fit depends on its seed: tstr_seeds (3) averages that out here,
-  # and generation.hpo.tstr_seeds (3) in the HPO objective. null = defaults. Changing it changes
-  # the HPO objective, so use a new experiment id.
-  xgboost_params:
-    { n_estimators: 300, max_depth: 5, learning_rate: 0.01, subsample: 0.8,
-      colsample_bytree: 0.6, min_child_weight: 1, gamma: 0.1 }
+  # XGBoost that predicts the target in holdout TSTR, the HPO objective, its
+  # real-data ceiling and the fairness gaps. null = defaults (80 trees, depth 4,
+  # learning rate 0.08, no subsampling). To tune it on the real train rows, run
+  # python -m scripts.tune_tstr_xgboost --config <this file> and paste the
+  # printed line here. With subsample/colsample_bytree below 1 the fit depends
+  # on its seed: tstr_seeds (3) averages that out here, and
+  # generation.hpo.tstr_seeds (3) in the HPO objective. Changing it changes the
+  # HPO objective, so use a new experiment id.
+  xgboost_params: null
   # Custom privacy metrics (Anonymeter, holdout-referenced DCR/NNDR).
   # unit: row = every row is an individual (each synthetic row is released as its
   # own record); patient = attacks target one encounter per patient and the

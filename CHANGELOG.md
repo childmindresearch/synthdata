@@ -11,6 +11,11 @@ Changes the fairness score and so the ranking; re-evaluating an existing experim
 ### Changed
 
 - **Every model gets holdout fairness gap errors.** From 0.20.0, a model whose synthetic-trained classifier did not beat chance on the holdout had blank errors and was left out of the fairness score. That gate was not needed: such a classifier predicts much the same for every group, so its errors come out about as large as the real gaps, the score of a dataset that erased the disparities. Leaving those models out let the independent-marginals baseline be ranked on log disparity alone (it came first overall in a simulated-data check) and made models flip between replicates. `fairness_signal` and the balanced-accuracy interval stay in `fairness_gaps.csv`, reported but not ranked.
+- **`config_sim.yaml` uses the default TSTR XGBoost** (`evaluation.xgboost_params: null`) instead of parameters a collaborator tuned for another model. A run with this config needs a new experiment id.
+
+### Added
+
+- **`scripts/tune_tstr_xgboost.py`** tunes the TSTR XGBoost on the real train rows outside the tuning split (Optuna, macro AUPRC, patient-grouped stratified folds), scores the defaults and the configured parameters on the same folds with the gain's standard error, and prints the `evaluation.xgboost_params` line to paste. See the user manual, "Utility: holdout TSTR".
 
 ## 0.24.0 (2026-10-29)
 
