@@ -4,6 +4,18 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.27.0 (2026-10-29)
+
+TabularARGN and CDTD are now on by default. Results of the other models are unchanged, but a run with the default config now also trains these two, so use a new experiment id. The golden runs need re-recording on the Linux GPU machine, because the fixture's baseline run now uses miceforest.
+
+### Changed
+
+- **TabularARGN and CDTD on by default** (`generation.tabularargn.enabled` and `generation.cdtd.enabled` are now `true`), and the example configs list both. `synthdata-run` installs their environments on first use. To run `synthdata-generate` on its own, or on a machine without internet, install them first (`uv sync --project envs/tabularargn`, `uv sync --project envs/cdtd`) or set `enabled: false`.
+- **Integration tests follow the current defaults.** The fixture's baseline run now uses miceforest, the default imputer, and new checks cover the class quotas (`diagnostics/class_sampling.csv` and the synthetic class shares), the holdout fairness gaps (`fairness_gaps.csv` and the combined table) and the TSTR kappa in `tstr_holdout.csv`. MissForest stays covered by the imputation-only run. The fixture's DCR screen is set to 0.75: it is measured on about 40 tuning rows there, so the default 0.6 rejected sound trials by chance.
+- **One slow test module for the two models with their own environments**, `tests/integration/test_sidecar_generators.py`, which replaces `test_tabularargn.py` and `test_cdtd.py`. It trains both in one run, as the default config does, and checks their class quotas and ranking. With `SYNTHDATA_REQUIRE_SIDECARS=1` a missing environment fails the tests instead of skipping them.
+- **`scripts/scheduled_tests.sh`** runs the tiers CI skips on a Linux GPU box: the sidecar tests and the golden check. Its header has a weekly cron line.
+- **Leaner unit tests:** config tests that only checked that an accepted value passes are now one table-driven test, two exact duplicates were removed, and two overlapping HPO screen tests were merged (one fewer HPO scorer build).
+
 ## 0.26.0 (2026-10-29)
 
 Changes metric values and the ranking, so re-evaluate with a new experiment id (generation is unchanged) and re-record the golden runs on the Linux GPU machine. No config edits are needed. Every verification row that was Open has been re-checked against results and fixed, taken out of the ranking or the defaults, or accepted with a reason; `docs/verification.md` has the checks and numbers.

@@ -182,6 +182,8 @@ def test_a_config_with_no_generator_stops_before_any_stage(tmp_path, monkeypatch
         "  synthcity: {enabled: false}\n"
         "  tabpfn: {enabled: false}\n"
         "  tabpfgen: {enabled: false}\n"
+        "  tabularargn: {enabled: false}\n"
+        "  cdtd: {enabled: false}\n"
     )
     monkeypatch.chdir(tmp_path)  # the logs folder lands under the default output root
     monkeypatch.setattr(

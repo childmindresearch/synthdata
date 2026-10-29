@@ -47,9 +47,10 @@ data:
 
 imputation:
   enabled: true
-  # MissForest, the default; small forests keep CI fast. The indicator-only
-  # run in the tests switches to median/mode, so both imputers are covered.
-  method: missforest
+  # miceforest with its default settings, the pipeline default. The imputed
+  # run in the tests uses MissForest (small forests keep CI fast) and the
+  # indicator-only run median/mode, so the three CPU imputers are covered.
+  method: miceforest
   missforest: { n_estimators: 10, max_iter: 3 }
   device: cpu
   cache: true
@@ -80,6 +81,12 @@ generation:
     enabled: false
   tabpfgen:
     enabled: false
+  # On by default, but they need their own environments; the slow tier runs
+  # them (test_sidecar_generators.py).
+  tabularargn:
+    enabled: false
+  cdtd:
+    enabled: false
 
   # Resample synthetic data to the real train class shares.
   match_class_prior: true
@@ -103,7 +110,12 @@ generation:
     # path stays tested.
     pruner: median
     # Sanity screens; a trial that fails one can't be chosen as best.
-    constraints: { copy_margin: 0.02, min_category_coverage: 0.8, max_out_of_range: 0.01 }
+    # The DCR share is measured on about 40 tuning rows (standard error about
+    # 0.08 around the 0.5 of no memorization), so the default 0.6 rejects
+    # sound trials by chance here; 0.75 is three standard errors.
+    constraints:
+      { copy_margin: 0.02, min_category_coverage: 0.8, max_out_of_range: 0.01,
+        max_dcr_closer_to_train: 0.75 }
     metric_config:
       stats: [wasserstein_dist]
       performance: [xgb]

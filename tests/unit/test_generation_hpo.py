@@ -177,39 +177,29 @@ def test_tstr_objective_scores_tuning_and_logs_the_ceiling():
     assert len(good.constraints) == len(SCREENS)
 
 
-def test_class_share_gap_screen_fails_a_candidate_left_short_of_a_class():
-    train, tuning = _real(seed=0), _real(seed=1)
-    cfg = HPOConfig(tstr_seeds=1)
-    short = train.drop(train.index[train.target == 2][::2])
-    gap = SCREENS.index("class_share_gap")
-
-    matched = build_hpo_eval_fn(train, tuning, "target", ["color"], ["color"], True, [], cfg, 0)
-    assert matched(train).constraints[gap] == pytest.approx(-0.02)
-    assert matched(short).constraints[gap] > 0
-    unmatched = build_hpo_eval_fn(
-        train, tuning, "target", ["color"], ["color"], True, [], cfg, 0, match_prior=False
-    )
-    assert unmatched(short).constraints[gap] == -1.0
-
-
-def test_screens_not_enforced_are_logged_but_leave_the_trial_feasible():
+def test_class_share_gap_screen_fails_a_short_candidate_and_is_only_logged_when_off():
     train, tuning = _real(seed=0), _real(seed=1)
     short = train.drop(train.index[train.target == 2][::2])
     gap = SCREENS.index("class_share_gap")
-    cfg = HPOConfig(tstr_seeds=1, constraints=HPOConstraintsConfig(enforce=False))
 
-    score = build_hpo_eval_fn(train, tuning, "target", ["color"], ["color"], True, [], cfg, 0)(
-        short
-    )
-    assert all(v <= 0 for v in score.constraints)
-    assert score.attrs["screens"]["class_share_gap"] > 0
-    assert score.attrs["screen_details"]["class_share_gap"]["value"] > 0.02
-    assert score.attrs["screens_enforced"] is False
-    enforced = build_hpo_eval_fn(
-        train, tuning, "target", ["color"], ["color"], True, [], HPOConfig(tstr_seeds=1), 0
-    )(short)
-    assert enforced.constraints[gap] > 0
-    assert enforced.value == score.value
+    def eval_fn(match_prior=True, **constraints):
+        cfg = HPOConfig(tstr_seeds=1, constraints=HPOConstraintsConfig(**constraints))
+        args = (train, tuning, "target", ["color"], ["color"], True, [], cfg, 0)
+        return build_hpo_eval_fn(*args, match_prior=match_prior)
+
+    enforced = eval_fn()
+    assert enforced(train).constraints[gap] == pytest.approx(-0.02)
+    enforced_short = enforced(short)
+    assert enforced_short.constraints[gap] > 0
+    # Without class quotas the screen does not apply.
+    assert eval_fn(match_prior=False)(short).constraints[gap] == -1.0
+    # enforce: false logs the screen but leaves the trial feasible, same score.
+    logged = eval_fn(enforce=False)(short)
+    assert all(v <= 0 for v in logged.constraints)
+    assert logged.attrs["screens"]["class_share_gap"] > 0
+    assert logged.attrs["screen_details"]["class_share_gap"]["value"] > 0.02
+    assert logged.attrs["screens_enforced"] is False
+    assert logged.value == enforced_short.value
 
 
 def test_trials_stored_before_a_screen_was_added_stay_comparable():
