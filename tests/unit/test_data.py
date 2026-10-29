@@ -19,6 +19,7 @@ from synthdata.data import (
     load_dataset,
     load_variable_schema,
     mask_outliers_as_missing,
+    read_like,
     remap_binary_one_two,
     schema_column_roles,
     split_by_patient,
@@ -547,6 +548,25 @@ class TestLoadLocalFile:
         df.to_parquet(path, index=False)
         out, _ = _load_local_file(self._cfg(path))
         pd.testing.assert_frame_equal(out, df)
+
+    def test_true_false_column_with_blanks_reads_like_written_csvs(self, tmp_path):
+        # The raw split must hold the same labels as every CSV the pipeline
+        # writes and reads back (read_like), or comparisons see disjoint sets.
+        path = tmp_path / "data.csv"
+        pd.DataFrame(
+            {
+                "flag": [True, None, False, True],
+                "full": [True, False, True, False],
+                "target": [0, 1, 0, 1],
+            }
+        ).to_csv(path, index=False)
+        out, _ = _load_local_file(self._cfg(path))
+        assert out["flag"].tolist()[0] == "True" and pd.isna(out["flag"].iloc[1])
+        assert out["full"].dtype == bool
+        written = tmp_path / "written.csv"
+        out.to_csv(written, index=False)
+        back = read_like(written, out)
+        assert set(back["flag"].dropna()) == set(out["flag"].dropna()) == {"True", "False"}
 
     def test_unsupported_extension_raises(self, tmp_path):
         path = tmp_path / "data.json"

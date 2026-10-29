@@ -422,7 +422,7 @@ output/<name>/imputation/data_v_<version>/
 | `tvae` | Variational autoencoder | Often strong and fast |
 | `rtvae` | Variational autoencoder | Robust TVAE variant |
 | `adsgan` | GAN | Adds an identifiability penalty for privacy |
-| `pategan` | GAN with differential privacy | Trains under a formal privacy budget; usually lower utility |
+| `pategan` | GAN with differential privacy | Off by default: its output currently collapses (one value per column, or blank columns) |
 | `bayesian_network` | Probabilistic graphical model | Does not scale to hundreds of columns |
 | `ddpm` | Diffusion model (TabDDPM) | Off by default: on wide data it learns the columns independently. Use CDTD as the diffusion model instead |
 | `arf` | Adversarial random forests | CPU only |
