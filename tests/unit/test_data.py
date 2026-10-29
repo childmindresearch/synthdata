@@ -52,6 +52,14 @@ class TestVariableSchema:
         assert orders == {"severity": [0, 1, 2]}
         assert len(fingerprint) == 64
 
+    def test_true_false_order_is_read_as_the_data_text(self, tmp_path):
+        path = self._write_schema(
+            tmp_path,
+            'column,kind,ordinal_order\nflag,categorical,"[false, true]"\ntarget,categorical,\n',
+        )
+        schema, _ = load_variable_schema(path, ["flag", "target"])
+        assert schema["flag"]["ordinal_order"] == ["False", "True"]
+
     def test_schema_requires_exact_modeling_column_coverage(self, tmp_path):
         path = self._write_schema(
             tmp_path,
@@ -449,6 +457,20 @@ class TestEncodeOrdinalColumns:
         df = pd.DataFrame({"activity": ["Light", "Unheard Of"]})
         with pytest.raises(ValueError, match="Unheard Of"):
             encode_ordinal_columns(df, {"activity": ["Light", "Heavy"]})
+
+    def test_true_false_order_matches_bool_and_text_columns(self):
+        # A JSON [false, true] order; with blanks the column is read as text.
+        order = [False, True]
+        df = pd.DataFrame(
+            {
+                "with_blanks": ["True", np.nan, "False"],
+                "no_blanks": pd.Series([True, False, True], dtype=bool),
+            }
+        )
+        out = encode_ordinal_columns(df, {"with_blanks": order, "no_blanks": order})
+        assert out["with_blanks"].tolist()[0] == 1.0 and np.isnan(out["with_blanks"].iloc[1])
+        assert out["with_blanks"].iloc[2] == 0.0
+        assert out["no_blanks"].tolist() == [1.0, 0.0, 1.0]
 
     def test_raises_on_missing_column(self):
         df = pd.DataFrame({"other": [1, 2]})

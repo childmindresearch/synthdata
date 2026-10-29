@@ -518,6 +518,10 @@ def load_variable_schema(path: str | Path, modeling_columns: list) -> tuple[dict
                     f"Variable schema {schema_path} row {row_number} column {column!r} has duplicate "
                     "ordinal_order values."
                 )
+            # A JSON true/false must match the "True"/"False" text the data is
+            # read as (_bools_as_text) and that every written CSV holds.
+            if ordinal_order is not None:
+                ordinal_order = [str(v) if isinstance(v, bool) else v for v in ordinal_order]
         schema[column] = {"kind": kind, "ordinal_order": ordinal_order}
 
     logger.info(
@@ -552,6 +556,11 @@ def schema_column_roles(schema: dict, target_column: str) -> tuple[list, list, d
     return nominal_columns, ordinal_columns, ordinal_orders
 
 
+def _bool_label(value):
+    """``True``/``False`` (Python or NumPy) as the text ``"True"``/``"False"``; others unchanged."""
+    return str(bool(value)) if isinstance(value, (bool, np.bool_)) else value
+
+
 def encode_ordinal_columns(df: pd.DataFrame, ordinal_categories: dict) -> pd.DataFrame:
     """Map declared-ordinal columns to integers in their configured natural order.
 
@@ -578,7 +587,10 @@ def encode_ordinal_columns(df: pd.DataFrame, ordinal_categories: dict) -> pd.Dat
                 f"data.ordinal_column_categories references column {col!r}, which is not "
                 f"present in the loaded data. Available columns: {list(out.columns)}"
             )
-        cat_to_idx = {cat: idx for idx, cat in enumerate(categories)}
+        cat_to_idx = {_bool_label(cat): idx for idx, cat in enumerate(categories)}
+        # A True/False column without blanks is read as bool, one with blanks
+        # as "True"/"False" text: both match either spelling of the order.
+        out[col] = out[col].map(_bool_label, na_action="ignore")
         observed = set(out[col].dropna().unique().tolist())
         unknown = observed - set(cat_to_idx)
         if unknown:

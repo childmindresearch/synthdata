@@ -4,6 +4,14 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.25.1 (2026-10-29)
+
+No result or config changes; no golden re-record needed.
+
+### Fixed
+
+- Loading stopped with `data.ordinal_column_categories[...] does not include observed value(s) ['False', 'True']` for a True/False column with blanks whose schema `ordinal_order` is `[false, true]`. Since 0.24.0 such columns are read as the text `"True"`/`"False"`, but the JSON order still held booleans. The order is now read as that text, and ordinal encoding matches a True/False column whether it was read as booleans (no blanks) or as text.
+
 ## 0.25.0 (2026-10-29)
 
 Changes the fairness score and so the ranking; re-evaluating an existing experiment is enough (generation is unchanged). The golden runs need re-recording on the Linux GPU machine: models that had blank fairness gap errors now have values.
