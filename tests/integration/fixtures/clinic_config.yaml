@@ -102,6 +102,10 @@ generation:
     # objective: auto picks a TSTR score per model from the random start-up
     # trials (both trials here); the two best are refitted with one new seed.
     objective: auto
+    # The 60-row tuning split gives too little headroom for the gate to let
+    # any search run; it is off so the fixture exercises the search itself.
+    # The gate has its own unit tests (tests/unit/test_hpo_headroom.py).
+    skip_without_headroom: false
     n_startup_trials: 2
     refit_top_k: 2
     refit_seeds: 1

@@ -5,6 +5,7 @@ import optuna
 import pandas as pd
 import pytest
 
+from synthdata import dashboard
 from synthdata.config import HPOConfig
 from synthdata.evaluation.tstr import paired_gap, target_classes, tstr_scores
 from synthdata.generation.hpo import (
@@ -165,3 +166,22 @@ def test_run_study_skips_without_trials_when_the_objective_has_no_headroom(tmp_p
     )
     assert study.trials == [] and study.user_attrs[HEADROOM_SKIP_ATTR]
     assert headroom_skip(_hpo(), tmp_path, "hpo_missing") is None
+
+
+def test_a_skipped_search_is_logged_and_read_by_the_dashboard(tmp_path, caplog):
+    caplog.set_level("INFO", logger="synthdata")
+    run_study(
+        "hpo_ctgan",
+        _objective(0.0),
+        _hpo(),
+        tmp_path,
+        seed=0,
+        default_params={"x": 0.2},
+        headroom=HEADROOM,
+    )
+    line = next(r.getMessage() for r in caplog.records if "skipping the search" in r.getMessage())
+    assert line.startswith("[hpo_ctgan] skipping the search: defaults reach the ceiling;")
+    assert "auprc: +0.0000 below the real-data ceiling (0.0 paired SEs)" in line
+    stop = next(pattern.match(line) for pattern, _ in dashboard._HPO_STOPS if pattern.match(line))
+    assert stop["reason"] == "defaults reach the ceiling"
+    assert dashboard._NONE_PASSED.match("[ctgan_hpo] no headroom: the search was skipped (x)")
