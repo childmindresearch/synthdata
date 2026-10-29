@@ -209,7 +209,8 @@ RUNS: dict[str, RunSpec] = {
     "indicator_only": RunSpec(IMPUTE_AND_GENERATE, INDICATOR_ONLY),
     "cart_canary": RunSpec(IMPUTE_AND_GENERATE, INDICATOR_ONLY, perturb_holdout=True),
     # Imputed splits only, for in-process evaluation of planted datasets.
-    "imputed": RunSpec(IMPUTATION),
+    # MissForest here, so the imputer the baseline replaced stays covered.
+    "imputed": RunSpec(IMPUTATION, {"imputation": {"method": "missforest"}}),
 }
 
 

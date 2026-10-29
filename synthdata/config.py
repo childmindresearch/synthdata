@@ -529,8 +529,9 @@ class TabularARGNConfig:
     stops training early on its own validation split.
     """
 
-    #: Off by default: needs the separate environment above.
-    enabled: bool = False
+    #: On by default (among the strongest models on the simulated clinical
+    #: data); ``synthdata-run`` installs the environment above on first use.
+    enabled: bool = True
     #: The environment's folder (relative paths are from the repo root).
     env_dir: str = "envs/tabularargn"
     #: Arguments for ``TabularARGN()`` (e.g. ``model: MOSTLY_AI/Large``,
@@ -558,8 +559,9 @@ class CDTDConfig:
     split, like the synthcity models. No HPO.
     """
 
-    #: Off by default: needs the separate environment above.
-    enabled: bool = False
+    #: On by default (among the strongest models on the simulated clinical
+    #: data); ``synthdata-run`` installs the environment above on first use.
+    enabled: bool = True
     #: The environment's folder (relative paths are from the repo root).
     env_dir: str = "envs/cdtd"
     #: The cdtd_simple checkout.

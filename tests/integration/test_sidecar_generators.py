@@ -1,13 +1,20 @@
-"""CDTD reference check and end-to-end run on the clinic fixture (``-m slow``).
+"""TabularARGN and CDTD, the generators with their own environments (``-m slow``).
 
-Needs its separate environment and the submodule
-(``git submodule update --init``, ``uv sync --project envs/cdtd``):
+They are on by default but need their environments, so CI leaves them out:
 
-    uv run pytest tests/integration/test_cdtd.py -m slow
+    git submodule update --init
+    uv sync --project envs/tabularargn
+    uv sync --project envs/cdtd
+    uv run pytest tests/integration/test_sidecar_generators.py -m slow
+
+A missing environment skips the tests, or fails them when
+``SYNTHDATA_REQUIRE_SIDECARS=1`` (the scheduled run, scripts/scheduled_tests.sh),
+so a broken install cannot pass as skipped.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 import textwrap
 
@@ -22,6 +29,7 @@ from .conftest import new_run, run_full_pipeline
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
 ENV = sidecar.REPO_ROOT / "envs" / "cdtd"
+ARGN_ENV = sidecar.REPO_ROOT / "envs" / "tabularargn"
 SOURCE = sidecar.REPO_ROOT / "submodules" / "cdtd_simple"
 STEPS = {"num_steps_train": 200, "num_steps_warmup": 10, "batch_size": 128}
 SAMPLE_STEPS = 10
@@ -73,12 +81,22 @@ out.to_parquet(sys.argv[4], index=False)
 """
 
 
+def _require(ready: bool, setup: str) -> None:
+    if ready:
+        return
+    message = f"needs its environment: {setup}"
+    if os.environ.get("SYNTHDATA_REQUIRE_SIDECARS") == "1":
+        pytest.fail(message, pytrace=False)
+    pytest.skip(message)
+
+
 @pytest.fixture(scope="module", autouse=True)
-def _needs_env():
-    if not (ENV / ".venv").exists() or not (SOURCE / "cdtd" / "__init__.py").exists():
-        pytest.skip(
-            "needs the CDTD environment: git submodule update --init; uv sync --project envs/cdtd"
-        )
+def _needs_envs():
+    _require(
+        (ENV / ".venv").exists() and (SOURCE / "cdtd" / "__init__.py").exists(),
+        "git submodule update --init; uv sync --project envs/cdtd",
+    )
+    _require((ARGN_ENV / ".venv").exists(), "uv sync --project envs/tabularargn")
 
 
 def _toy(n=400, seed=0):
@@ -136,10 +154,12 @@ def test_wrapper_reproduces_the_authors_recipe(tmp_path):
     )
 
 
+#: Both generators in one run, as the default config has them; short training.
 OVERRIDES = {
     "generation": {
         "synthcity": {"enabled": False},
         "hpo": {"enabled": False},
+        "tabularargn": {"enabled": True, "params": {"max_epochs": 20}},
         "cdtd": {
             "enabled": True,
             "fit_params": STEPS,
@@ -150,12 +170,33 @@ OVERRIDES = {
 
 
 @pytest.fixture(scope="module")
-def cdtd_run(tmp_path_factory):
-    return run_full_pipeline(new_run(tmp_path_factory, "cdtd", overrides=OVERRIDES))
+def sidecar_run(tmp_path_factory):
+    return run_full_pipeline(new_run(tmp_path_factory, "sidecars", overrides=OVERRIDES))
 
 
-def test_cdtd_output_is_complete(cdtd_run):
-    frame = cdtd_run.synthetic()["cdtd"]
-    assert 0 < len(frame) <= cdtd_run.cfg.generation.n_samples
+def test_tabularargn_meets_the_class_quotas_exactly(sidecar_run):
+    # The quotas are passed to TabularARGN as fixed target values.
+    frame = sidecar_run.synthetic()["tabularargn__rep1"]
+    assert len(frame) == sidecar_run.cfg.generation.n_samples
     assert not frame.isna().any().any()
-    assert "cdtd" in cdtd_run.combined().index
+    report = pd.read_csv(sidecar_run.generation_dir / "diagnostics" / "class_sampling.csv")
+    rows = report[report["model"] == "tabularargn__rep1"]
+    assert len(rows) == 2 and (rows["filled"] == rows["quota"]).all(), rows
+
+
+def test_cdtd_fills_the_quotas_from_its_pool(sidecar_run):
+    # CDTD cannot condition on the label: classes are drawn from a larger pool,
+    # so a class it makes too rarely may stay short, never over its quota.
+    frame = sidecar_run.synthetic()["cdtd__rep1"]
+    assert 0 < len(frame) <= sidecar_run.cfg.generation.n_samples
+    assert not frame.isna().any().any()
+    report = pd.read_csv(sidecar_run.generation_dir / "diagnostics" / "class_sampling.csv")
+    rows = report[report["model"] == "cdtd__rep1"]
+    assert len(rows) == 2 and (rows["filled"] <= rows["quota"]).all(), rows
+
+
+def test_both_are_evaluated_and_ranked(sidecar_run):
+    combined = sidecar_run.combined()
+    for name in ("tabularargn__rep1", "cdtd__rep1"):
+        assert name in combined.index
+        assert np.isfinite(combined.loc[name, ("__all__", "overall", "rank")])

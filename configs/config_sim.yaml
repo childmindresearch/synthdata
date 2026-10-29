@@ -101,6 +101,13 @@ generation:
   tabpfgen:
     enabled: false
 
+  # Run in their own environments, which synthdata-run installs on first use
+  # (user manual, Generators). No HPO; each is fitted once per replicate.
+  tabularargn:
+    enabled: true
+  cdtd:
+    enabled: true
+
   # Resample synthetic data to the real train class shares.
   match_class_prior: true
 

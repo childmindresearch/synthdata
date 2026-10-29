@@ -429,8 +429,8 @@ output/<name>/imputation/data_v_<version>/
 | TabPFN `standard` | Foundation model | Generates features, then assigns labels from TabPFN's predicted class probabilities |
 | TabPFN `custom` | Foundation model | Generates features and target jointly |
 | TabPFGen | Energy-based sampling | Off by default: its output is near-copies of training rows (see [verification](verification.md)) |
-| `tabularargn` | Autoregressive network (MOSTLY AI's TabularARGN) | Off by default. Runs in its own environment; no HPO (see below) |
-| `cdtd` | Diffusion model (CDTD) | Off by default. Runs in its own environment; no HPO (see below) |
+| `tabularargn` | Autoregressive network (MOSTLY AI's TabularARGN) | On by default; among the strongest models on the simulated clinical data. Runs in its own environment; no HPO (see below) |
+| `cdtd` | Diffusion model (CDTD) | On by default; among the strongest models on the simulated clinical data. Runs in its own environment; no HPO (see below) |
 
 Synthcity models are chosen with `generation.synthcity.names`. TabPFN runs when `generation.tabpfn.enabled` is true; `variants` picks `standard` and/or `custom`, and `data_variants` picks whether it learns from the `raw` data (TabPFN handles missing values itself) or the `imputed` data. Outputs are named by the data they learned from: `tabpfn_custom_raw` (with its missing values) and `tabpfn_custom_imputed`. `model_version` picks the TabPFN weights (default `v3.5`, which did slightly better than `v3` on Hepatitis and runs faster). Each version works only after you accept its non-commercial license on ux.priorlabs.ai with the account behind your `TABPFN_TOKEN`.
 
@@ -440,7 +440,7 @@ TabularARGN ([MOSTLY AI 2025](https://arxiv.org/abs/2501.12012)) comes from MOST
 uv sync --project envs/tabularargn     # optional: synthdata-run does this for you (below)
 ```
 
-Then set `generation.tabularargn.enabled: true`. It learns from the imputed data, like the synthcity models, and is fitted once per replicate (output `tabularargn.csv`). It has no hyperparameter search: the library stops training early on its own validation split. `generation.tabularargn.params` passes arguments to `TabularARGN()` (for example `model: MOSTLY_AI/Large`, `max_epochs`, or `max_training_time` in minutes), and `sample_params` passes arguments to its `sample()`. For a categorical target, the class quotas are given to the model as fixed target values, so each class gets exactly its share. Its value protection is off by default (`params: {value_protection: false}`): in mostlyai-engine 2.7.3, turning it on can still write a `_RARE_` token, which is not a value of the column, even with `rare_category_replacement_method: sample`, and the run then stops. `env_dir` points to the environment if you keep it elsewhere.
+It is on by default (`generation.tabularargn.enabled: true`; set it to `false` to leave it out). It learns from the imputed data, like the synthcity models, and is fitted once per replicate (output `tabularargn.csv`). It has no hyperparameter search: the library stops training early on its own validation split. `generation.tabularargn.params` passes arguments to `TabularARGN()` (for example `model: MOSTLY_AI/Large`, `max_epochs`, or `max_training_time` in minutes), and `sample_params` passes arguments to its `sample()`. For a categorical target, the class quotas are given to the model as fixed target values, so each class gets exactly its share. Its value protection is off by default (`params: {value_protection: false}`): in mostlyai-engine 2.7.3, turning it on can still write a `_RARE_` token, which is not a value of the column, even with `rare_category_replacement_method: sample`, and the run then stops. `env_dir` points to the environment if you keep it elsewhere.
 
 CDTD ([Mueller, Gruber & Fok, ICLR 2025](https://arxiv.org/abs/2312.10431)) is a diffusion model built for tables with many categorical columns. Its code is the authors' `cdtd_simple`, pinned as the submodule `submodules/cdtd_simple` (fetched by `git submodule update --init`). It needs Python 3.13 and a newer PyTorch than this project, so it too has its own environment:
 
@@ -454,9 +454,9 @@ You do not have to run these yourself. Whenever the generate stage is selected, 
 2. `uv sync --frozen --project <env>` installs the environment exactly as its lock file says. The first time this downloads its Python and PyTorch (several GB); after that it changes nothing, and the whole check takes about 10 seconds per environment, most of it the PyTorch import.
 3. The environment's own Python imports PyTorch, and `synthdata-run` prints whether it sees CUDA (before the log file starts, and before `--detach` moves the run to the background), for example `synthdata-run: cdtd: envs/cdtd ready, torch 2.14.1+cu130, CUDA available (1 GPU)`. A CPU-only PyTorch is reported but does not stop the run.
 
-Set `compute.sync_envs: false` to skip step 2, for example on a machine without internet whose environments are already installed; steps 1 and 3 still run. `synthdata-generate` on its own does not run these checks.
+Set `compute.sync_envs: false` to skip step 2, for example on a machine without internet whose environments are already installed; steps 1 and 3 still run. `synthdata-generate` on its own does not run these checks. Both models are on by default, so before running `synthdata-generate` on its own, install the two environments with the commands above, or set `enabled: false` for the ones you leave out.
 
-Then set `generation.cdtd.enabled: true` (output `cdtd.csv`). It learns from the imputed data and has no hyperparameter search. `fit_params` sets the training length (`num_steps_train`, default 30000 steps of 4096 rows, the authors' default), `params` the network, and `sample_params` the sampling steps (`num_steps`, default 200). CDTD cannot be told which class to generate, so for class quotas one fit draws `pool_factor` (default 3) times the rows needed and fills each class from that pool; a class the model makes too rarely stays short and is listed in `diagnostics/class_sampling.csv`.
+It is on by default (`generation.cdtd.enabled: true`, output `cdtd.csv`). It learns from the imputed data and has no hyperparameter search. `fit_params` sets the training length (`num_steps_train`, default 30000 steps of 4096 rows, the authors' default), `params` the network, and `sample_params` the sampling steps (`num_steps`, default 200). CDTD cannot be told which class to generate, so for class quotas one fit draws `pool_factor` (default 3) times the rows needed and fills each class from that pool; a class the model makes too rarely stays short and is listed in `diagnostics/class_sampling.csv`.
 
 ### Rows, class balance and replicates
 
@@ -799,6 +799,7 @@ To run the tests after changing code:
 ```bash
 uv run pytest tests/unit                                            # fast
 uv run --with catboost pytest tests/integration -m "integration and not slow and not regression"   # full pipeline on a small fixture, a few minutes
+scripts/scheduled_tests.sh                                          # Linux GPU box: TabularARGN, CDTD and the golden check
 ```
 
 ## 14. Glossary

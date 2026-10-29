@@ -18,7 +18,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from synthdata.config import Config
 from synthdata.data import load_dataset, load_imputed_splits
+from synthdata.evaluation.fairness_gaps import FAIRNESS_GAP_METRICS
 from synthdata.generation.hpo import SCREENS
 
 from .conftest import FIXTURE_CSV
@@ -167,6 +169,31 @@ def test_imputed_splits_hold_the_same_rows_as_raw_splits(dataset):
     assert rows(dataset.test_imputed_df) == rows(dataset.test_df)
 
 
+def test_default_imputer_fills_with_observed_train_values(dataset, pipeline_run):
+    # The fixture runs the default imputer, miceforest, whose mean matching
+    # copies each fill from an observed train value of the same column, so
+    # every imputed value is one that was observed in train or kept as observed
+    # in test (MissForest's averaged predictions would not be).
+    assert pipeline_run.cfg.imputation.method == Config().imputation.method == "miceforest"
+    round_rules = pipeline_run.cfg.imputation.round_rules
+    for column in NUMERIC:
+        if not dataset.full_df[column].isna().any():
+            continue
+        decimals = round_rules.get(column, 6)
+        observed = pd.concat([dataset.train_df[column], dataset.test_df[column]]).dropna()
+        imputed = pd.concat([dataset.train_imputed_df[column], dataset.test_imputed_df[column]])
+        values = imputed.astype(float).round(decimals)
+        assert values.isin(observed.astype(float).round(decimals)).all(), column
+
+
+def test_missforest_fills_every_gap(imputed_run):
+    assert imputed_run.cfg.imputation.method == "missforest"
+    split = load_imputed_splits(load_dataset(imputed_run.cfg))
+    assert split.full_df[FEATURES].isna().any().any()
+    for frame in (split.train_imputed_df, split.test_imputed_df):
+        assert not frame[COLUMNS].isna().any().any()
+
+
 # ---------------------------------------------------------------------------
 # Generation
 # ---------------------------------------------------------------------------
@@ -191,6 +218,20 @@ def test_every_configured_model_produced_valid_synthetic_data(pipeline_run, data
             assert generated <= categories, (name, column, generated - categories)
         # Both classes present, so downstream classifiers are trainable.
         assert frame["target"].nunique() == 2, name
+
+
+def test_class_quotas_match_the_real_train_shares(pipeline_run, dataset):
+    # match_class_prior (default on): each class gets its train share of the
+    # rows, recorded per model in diagnostics/class_sampling.csv.
+    n_samples = pipeline_run.cfg.generation.n_samples
+    shares = dataset.train_imputed_df["target"].astype(str).value_counts(normalize=True)
+    report = pd.read_csv(pipeline_run.generation_dir / "diagnostics" / "class_sampling.csv")
+    assert sorted(report["model"].unique()) == sorted(DATASETS)
+    assert (report["filled"] == report["quota"]).all(), report
+    for name, frame in pipeline_run.synthetic().items():
+        counts = frame["target"].astype(str).value_counts()
+        for label, share in shares.items():
+            assert abs(counts.get(label, 0) - share * n_samples) <= 1, (name, label)
 
 
 def test_missing_indicators_and_released_copies(pipeline_run, dataset):
@@ -316,6 +357,10 @@ BOUNDED_METRICS = {
     ("syntheval", "privacy", "hit_rate"): (0, 1),
     ("syntheval", "utility", "nnaa"): (0, 1),
     ("custom", "fairness", "log_disparity_share_significant"): (0, 1),
+    ("custom", "fairness", "demographic_parity_gap_error"): (0, 1),
+    ("custom", "fairness", "equalized_odds_gap_error"): (0, 1),
+    ("custom", "fairness", "equal_opportunity_gap_error"): (0, 1),
+    ("custom", "fairness", "fairness_signal"): (0, 1),
     ("custom", "utility", "tstr_macro_f1"): (0, 1),
     ("custom", "utility", "tstr_balanced_accuracy"): (0, 1),
     ("custom", "utility", "tstr_macro_auprc"): (0, 1),
@@ -432,13 +477,30 @@ def test_holdout_tstr_is_ranked_and_reported_per_class(pipeline_run):
     assert ("custom", "utility", "rank") in combined.columns
     table = pd.read_csv(pipeline_run.evaluation_dir / "tstr_holdout.csv", index_col=0)
     assert "trtr (real train)" not in table.index
-    assert {"f1_0", "f1_1", "tsts_macro_f1"} <= set(table.columns)
+    assert {"f1_0", "f1_1", "tsts_macro_f1", "tstr_kappa"} <= set(table.columns)
+    kappa = table["tstr_kappa"].astype(float)
+    assert np.isfinite(kappa).all() and kappa.between(-1, 1).all(), kappa.to_dict()
     # TSTS is reported next to TSTR but not ranked.
     assert ("custom", "utility", "tsts_macro_f1") in combined.columns
     directions = pd.read_csv(pipeline_run.evaluation_dir / "metric_directions.csv", index_col=2)
     assert directions.loc["tsts_macro_f1", "direction"] == "unranked"
     assert directions.loc["tstr_macro_f1", "direction"] == "higher"
     assert "tsts_macro_f1" in (pipeline_run.evaluation_dir / "report.md").read_text()
+
+
+def test_holdout_fairness_gaps_are_reported_for_every_dataset(pipeline_run):
+    # One row per dataset in fairness_gaps.csv, groups from data.protected_columns
+    # (AGE binned by data.protected_bins); the gap errors reach the combined table.
+    combined = pipeline_run.combined()
+    table = pd.read_csv(pipeline_run.evaluation_dir / "fairness_gaps.csv", index_col=0)
+    assert sorted(table.index) == sorted(combined.index)
+    by_group = pd.read_csv(pipeline_run.evaluation_dir / "fairness_gaps_by_group.csv")
+    assert not by_group.empty
+    for metric in FAIRNESS_GAP_METRICS:
+        np.testing.assert_allclose(
+            table.loc[combined.index, metric].astype(float),
+            combined[("custom", "fairness", metric)].astype(float),
+        )
 
 
 def test_ranking_summary_has_one_row_per_model(pipeline_run):

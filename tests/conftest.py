@@ -57,7 +57,7 @@ def make_config(tmp_path):
         data_version: str | None = None,
     ) -> Config:
         output_root = tmp_path / "output" / name
-        return Config(
+        cfg = Config(
             name=name,
             data=DataConfig(
                 source="csv",
@@ -70,6 +70,10 @@ def make_config(tmp_path):
             plots=PlotsConfig(output_dir=str(output_root / "plots")),
             experiment=ExperimentConfig(tag=tag, id=experiment_id),
         )
+        # On by default, but they train in their own environments; a test that
+        # needs one turns it on and mocks the subprocess.
+        cfg.generation.tabularargn.enabled = cfg.generation.cdtd.enabled = False
+        return cfg
 
     return _make_config
 

@@ -36,6 +36,7 @@ uv run --with catboost==1.2.10 pytest tests/integration \
   -m "integration and not slow and not network and not regression"        # integration, as CI (needs catboost)
 uv run --with catboost==1.2.10 pytest tests/integration -m regression     # golden check
 SYNTHDATA_UPDATE_GOLDEN=1 uv run --with catboost==1.2.10 pytest tests/integration -m regression  # re-record
+scripts/scheduled_tests.sh                                                # GPU box: sidecar generators + golden check
 
 uv run synthdata-run --config configs/config_hepatitis.yaml               # full pipeline
 uv run synthdata-run --config configs/config_sim.yaml --detach            # long run in background

@@ -34,14 +34,15 @@ def _fake_run(calls, *, sync_code=0, probe_code=0, probe_out=None):
 
 
 def test_only_enabled_sidecar_generators_are_checked():
-    cfg = Config()
-    assert ep.enabled_sidecar_envs(cfg.generation) == []
-    cfg.generation.cdtd.enabled = True
-    cfg.generation.tabularargn.enabled = True
+    cfg = Config()  # both on by default
     envs = ep.enabled_sidecar_envs(cfg.generation)
     assert [e.model for e in envs] == ["tabularargn", "cdtd"]
     assert envs[0].sources == []
     assert envs[1].sources == ["submodules/cdtd_simple"]
+    cfg.generation.cdtd.enabled = False
+    assert [e.model for e in ep.enabled_sidecar_envs(cfg.generation)] == ["tabularargn"]
+    cfg.generation.tabularargn.enabled = False
+    assert ep.enabled_sidecar_envs(cfg.generation) == []
 
 
 def test_ready_environment_is_synced_frozen_then_probed(tmp_path, monkeypatch):
@@ -115,7 +116,7 @@ def test_torch_that_does_not_import_stops_the_run(tmp_path, monkeypatch):
 
 def test_run_preflight_logs_each_environment(monkeypatch):
     cfg = Config()
-    cfg.generation.tabularargn.enabled = True
+    cfg.generation.cdtd.enabled = False
     cfg.compute.sync_envs = False
     seen = []
     monkeypatch.setattr(

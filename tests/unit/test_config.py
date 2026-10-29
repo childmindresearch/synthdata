@@ -133,6 +133,30 @@ class TestValidate:
     def test_valid_config_passes(self):
         _validate(self._base_valid())  # should not raise
 
+    @pytest.mark.parametrize(
+        ("path", "value"),
+        [
+            ("data.source", "uci"),
+            ("data.source", "parquet"),
+            *(("device", d) for d in ["auto", "cpu", "cuda", "mps"]),
+            *(("compute.fits_per_gpu", f) for f in ["auto", None, 0, 3]),
+            ("compute.workers", 3),
+            ("generation.tabpfn.data_variants", ["raw", "imputed"]),
+            *(("imputation.method", m) for m in ["simple", "missforest", "tabimpute", "refidiff"]),
+            *(("imputation.refidiff.denoiser", d) for d in ["auto", "mamba", "mlp"]),
+            ("evaluation.rank_weights", {"utility": 1.0, "privacy": 0.0, "fairness": 1.0}),
+        ],
+    )
+    def test_accepted_values_pass(self, path, value):
+        cfg = self._base_valid()
+        cfg.data.uci_id = 42  # for data.source: uci
+        *parents, leaf = path.split(".")
+        target = cfg
+        for parent in parents:
+            target = getattr(target, parent)
+        setattr(target, leaf, value)
+        _validate(cfg)  # should not raise
+
     def test_bad_data_source_raises(self):
         cfg = self._base_valid()
         cfg.data.source = "json"
@@ -268,10 +292,6 @@ class TestValidate:
         with pytest.raises(ValueError, match="data.uci_id"):
             _validate(cfg)
 
-    def test_uci_with_id_is_valid(self):
-        cfg = Config(data=DataConfig(source="uci", uci_id=42, target_column="target"))
-        _validate(cfg)  # should not raise
-
     def test_csv_requires_path(self):
         cfg = Config(data=DataConfig(source="csv", path=None, target_column="target"))
         with pytest.raises(ValueError, match="data.path"):
@@ -281,10 +301,6 @@ class TestValidate:
         cfg = Config(data=DataConfig(source="parquet", path=None, target_column="target"))
         with pytest.raises(ValueError, match="data.path"):
             _validate(cfg)
-
-    def test_parquet_with_path_is_valid(self):
-        cfg = Config(data=DataConfig(source="parquet", path="x.parquet", target_column="target"))
-        _validate(cfg)  # should not raise
 
     def test_empty_target_column_raises(self):
         cfg = self._base_valid()
@@ -298,12 +314,6 @@ class TestValidate:
         cfg.device = device
         with pytest.raises(ValueError, match="device"):
             _validate(cfg)
-
-    @pytest.mark.parametrize("device", ["auto", "cpu", "cuda", "mps"])
-    def test_valid_devices_pass(self, device):
-        cfg = self._base_valid()
-        cfg.device = device
-        _validate(cfg)  # should not raise
 
     def test_bad_ranking_strategy_raises(self):
         cfg = self._base_valid()
@@ -324,17 +334,6 @@ class TestValidate:
         cfg.compute.fits_per_gpu = fits
         with pytest.raises(ValueError, match="fits_per_gpu"):
             _validate(cfg)
-
-    @pytest.mark.parametrize("fits", ["auto", None, 0, 3])
-    def test_valid_fits_per_gpu_pass(self, fits):
-        cfg = self._base_valid()
-        cfg.compute.fits_per_gpu = fits
-        _validate(cfg)
-
-    def test_valid_explicit_compute_workers_pass(self):
-        cfg = self._base_valid()
-        cfg.compute.workers = 3
-        _validate(cfg)
 
     @pytest.mark.parametrize("field", ["max_workers", "cores_per_worker"])
     def test_non_positive_compute_integer_bounds_raise(self, field):
@@ -360,34 +359,17 @@ class TestValidate:
         with pytest.raises(ValueError, match="data_variants"):
             _validate(cfg)
 
-    def test_valid_tabpfn_data_variants_pass(self):
-        cfg = self._base_valid()
-        cfg.generation.tabpfn.data_variants = ["raw", "imputed"]
-        _validate(cfg)  # should not raise
-
     def test_bad_imputation_method_raises(self):
         cfg = self._base_valid()
         cfg.imputation.method = "bogus"
         with pytest.raises(ValueError, match="imputation.method"):
             _validate(cfg)
 
-    @pytest.mark.parametrize("method", ["tabimpute", "refidiff"])
-    def test_valid_imputation_methods_pass(self, method):
-        cfg = self._base_valid()
-        cfg.imputation.method = method
-        _validate(cfg)  # should not raise
-
     def test_bad_refidiff_denoiser_raises(self):
         cfg = self._base_valid()
         cfg.imputation.refidiff.denoiser = "bogus"
         with pytest.raises(ValueError, match="imputation.refidiff.denoiser"):
             _validate(cfg)
-
-    @pytest.mark.parametrize("denoiser", ["auto", "mamba", "mlp"])
-    def test_valid_refidiff_denoisers_pass(self, denoiser):
-        cfg = self._base_valid()
-        cfg.imputation.refidiff.denoiser = denoiser
-        _validate(cfg)  # should not raise
 
     def test_bad_refidiff_categorical_decode_policy_raises(self):
         cfg = self._base_valid()
@@ -502,10 +484,6 @@ class TestValidate:
         with pytest.raises(ValueError, match=leaf):
             _validate(cfg)
 
-    def test_binary_target_disabled_by_default_passes(self):
-        cfg = self._base_valid()
-        _validate(cfg)  # should not raise
-
     def test_binary_target_enabled_without_classes_raises(self):
         cfg = self._base_valid()
         cfg.evaluation.class_averaging = "binary"
@@ -593,10 +571,6 @@ class TestValidate:
         with pytest.raises(ValueError, match="evaluation.baselines"):
             _validate(cfg)
 
-    def test_rank_weights_default_passes(self):
-        cfg = self._base_valid()
-        _validate(cfg)  # should not raise
-
     def test_rank_weights_missing_key_raises(self):
         cfg = self._base_valid()
         cfg.evaluation.rank_weights = {"utility": 1.0, "privacy": 1.0}
@@ -619,11 +593,6 @@ class TestValidate:
         cfg.evaluation.rank_weights = {"utility": 1.0, "privacy": -0.5, "fairness": 1.0}
         with pytest.raises(ValueError, match="rank_weights"):
             _validate(cfg)
-
-    def test_rank_weights_zero_is_allowed(self):
-        cfg = self._base_valid()
-        cfg.evaluation.rank_weights = {"utility": 1.0, "privacy": 0.0, "fairness": 1.0}
-        _validate(cfg)  # should not raise
 
 
 class TestLoadConfig:
