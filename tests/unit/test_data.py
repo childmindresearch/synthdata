@@ -92,6 +92,40 @@ class TestVariableSchema:
         with pytest.raises(ValueError, match="duplicate ordinal_order"):
             load_variable_schema(path, ["severity", "target"])
 
+    def test_an_ordinal_true_false_column_with_blanks_loads(self, tmp_path):
+        # The schema order [false, true] parses to bools; the column, which
+        # has blanks, is loaded as the text "True"/"False".
+        raw_path = tmp_path / "raw.csv"
+        pd.DataFrame(
+            {"flag": [True, None, False, True], "age": [1, 2, 3, 4], "target": [0, 1, 0, 1]}
+        ).to_csv(raw_path, index=False)
+        schema_path = self._write_schema(
+            tmp_path,
+            'column,kind,ordinal_order\nflag,categorical,"[false, true]"\n'
+            "age,continuous,\ntarget,categorical,\n",
+        )
+        cfg = Config(
+            name="bool_ordinal",
+            data=DataConfig(
+                source="csv",
+                path=str(raw_path),
+                target_column="target",
+                variable_schema_path=str(schema_path),
+                data_dir=str(tmp_path / "derived"),
+                train_fraction=0.5,
+                tuning_fraction=0.0,
+                holdout_fraction=0.5,
+            ),
+        )
+
+        dataset = load_dataset(cfg)
+
+        assert dataset.full_df["flag"].tolist()[:1] == [1.0]
+        assert dataset.full_df["flag"].tolist()[2:] == [0.0, 1.0]
+        assert np.isnan(dataset.full_df["flag"].iloc[1])
+        decoded = dataset.decode_ordinal_frame(dataset.full_df)["flag"]
+        assert decoded.dropna().tolist() == [True, False, True]
+
     def test_load_dataset_uses_schema_roles_and_ordinal_encoding(self, tmp_path):
         raw_path = tmp_path / "raw.csv"
         pd.DataFrame(
