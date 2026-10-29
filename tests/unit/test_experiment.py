@@ -2,10 +2,12 @@
 
 import json
 
+import numpy as np
 import pytest
 
 from synthdata.experiment import (
     _timestamp_id,
+    config_hash,
     dataset_plots_dir,
     dataset_version_scope,
     load_experiment,
@@ -115,8 +117,37 @@ class TestRecordAppendOnly:
         assert manifest["runs"][0]["stage"] == "generation"
         assert manifest["runs"][0]["artifacts"] == {"model": "ctgan"}
         provenance = manifest["runs"][0]["provenance"]
-        assert set(provenance) == {"git_dirty", "submodules", "packages"}
+        assert {
+            "git_commit",
+            "git_dirty",
+            "git_diff_sha256",
+            "submodules",
+            "lockfile_sha256",
+            "packages",
+            "all_packages",
+            "python",
+            "platform",
+            "torch",
+            "gpus",
+            "env",
+        } <= set(provenance)
         assert "synthcity" in provenance["packages"]
+        assert provenance["all_packages"]["numpy"] == np.__version__
+        assert manifest["runs"][0]["config_sha256"] == config_hash(cfg)
+
+    def test_a_stage_with_another_config_keeps_its_own_snapshot(self, make_config):
+        cfg = make_config()
+        experiment = start_experiment(cfg)
+        root = experiment.manifest_path.parent
+        assert [p.name for p in root.glob("config_snapshot*.json")] == ["config_snapshot.json"]
+        load_experiment(cfg)  # same config: no new copy
+        assert len(list(root.glob("config_snapshot*.json"))) == 1
+        changed = make_config()
+        changed.seed = cfg.seed + 1
+        resumed = load_experiment(changed)
+        assert resumed.config_sha256 is not None
+        assert resumed.config_sha256 != experiment.config_sha256
+        assert (root / f"config_snapshot_{resumed.config_sha256[:12]}.json").exists()
 
     def test_second_record_appends_not_replaces(self, make_config):
         cfg = make_config()

@@ -1,9 +1,13 @@
 """Shared low-level helpers: seeding, device selection, logging, simple CSV/JSON caching."""
 
+import hashlib
 import json
 import logging
+import os
+import platform
 import random
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -149,29 +153,109 @@ def _git_output(*args: str) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+#: Environment variables that change results or their reproducibility.
+_PROVENANCE_ENV = (
+    "CUDA_VISIBLE_DEVICES",
+    "CUBLAS_WORKSPACE_CONFIG",
+    "PYTHONHASHSEED",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+)
+
+
+def _sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _torch_build() -> dict | None:
+    """torch's version and the CUDA/cuDNN it was built with.
+
+    Read without creating a CUDA context (no ``torch.cuda`` call that
+    initializes the device), so worker processes forked later are unaffected.
+    """
+    try:
+        import torch
+    except ImportError:
+        return None
+    try:
+        cudnn = torch.backends.cudnn.version()
+    except (RuntimeError, AttributeError, OSError):
+        cudnn = None
+    return {"version": torch.__version__, "cuda": torch.version.cuda, "cudnn": cudnn}
+
+
+def _gpus() -> list | None:
+    """``nvidia-smi``'s GPU name, driver and memory per device (None without it)."""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,driver_version,memory.total",
+                "--format=csv,noheader",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip().splitlines() if result.returncode == 0 else None
+
+
 def provenance() -> dict:
-    """Best-effort record of the code and packages a run used.
+    """Best-effort record of the code, packages and machine a run used.
 
     The root commit alone does not pin a run: the submodule checkouts or the
-    working tree can differ from it. Every field is ``None`` when it cannot be
-    read (no git, not a checkout, package missing); this never raises.
+    working tree can differ from it, and goldens differ by platform and CUDA
+    build. ``git_diff_sha256`` fingerprints uncommitted changes to tracked
+    files, so two dirty runs can be told apart. ``lockfile_sha256`` pins the
+    resolved dependency set (``uv.lock``, and ``envs/*/uv.lock`` for the
+    generators in their own environments); ``all_packages`` lists what was
+    actually installed, which can differ from the lock. Every field is
+    ``None`` when it cannot be read (no git, not a checkout, package or tool
+    missing); this never raises.
     """
-    from importlib.metadata import PackageNotFoundError, version
+    from importlib.metadata import PackageNotFoundError, distributions, version
 
     status = _git_output("status", "--porcelain", "--untracked-files=no")
     submodules = _git_output("submodule", "status")
+    diff = _git_output("diff", "HEAD", "--submodule=diff") if status else None
+    root = _git_output("rev-parse", "--show-toplevel")
     versions = {}
     for package in _PROVENANCE_PACKAGES:
         try:
             versions[package] = version(package)
         except PackageNotFoundError:
             versions[package] = None
+    installed = {}
+    for dist in distributions():
+        name = dist.metadata["Name"]
+        if name:
+            installed[name.lower()] = dist.version
     return {
+        "git_commit": _git_output("rev-parse", "HEAD"),
         "git_dirty": None if status is None else bool(status),
+        "git_diff_sha256": None if diff is None else hashlib.sha256(diff.encode()).hexdigest(),
         # One line per submodule: "<sha> <path> (<describe>)"; a leading "+"
         # means the checkout differs from the commit the root repo pins.
         "submodules": None if submodules is None else submodules.splitlines(),
+        "lockfile_sha256": None if root is None else _sha256(Path(root) / "uv.lock"),
+        # TabularARGN, CDTD and Desbordante run in their own environments
+        # (``envs/<name>``, see ``generation.sidecar``), pinned by their own locks.
+        "env_lockfiles_sha256": None
+        if root is None
+        else {p.parent.name: _sha256(p) for p in sorted(Path(root).glob("envs/*/uv.lock"))},
         "packages": versions,
+        "all_packages": dict(sorted(installed.items())),
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "torch": _torch_build(),
+        "gpus": _gpus(),
+        "env": {name: os.environ.get(name) for name in _PROVENANCE_ENV},
     }
 
 
