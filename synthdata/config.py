@@ -462,14 +462,15 @@ class SynthcityModelsConfig:
     #: left out by default: on the wide simulated data it still learns the
     #: columns independently (correlation and MI errors equal the
     #: independent-marginals baseline); add "ddpm" to try it. CDTD
-    #: (``generation.cdtd``) is the diffusion model to use instead.
+    #: (``generation.cdtd``) is the diffusion model to use instead. PATE-GAN is
+    #: left out by default too: its output collapses (a single value per
+    #: column, or columns left blank) until that is fixed.
     names: list = dataclasses.field(
         default_factory=lambda: [
             "ctgan",
             "tvae",
             "adsgan",
             "bayesian_network",
-            "pategan",
             "rtvae",
             "arf",
         ]

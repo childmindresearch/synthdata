@@ -4,6 +4,18 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.24.0 (2026-10-29)
+
+Changes the default generators and the raw data for some columns, so use a new experiment id. No golden re-record is needed: the golden runs use neither PATE-GAN nor True/False columns with blanks.
+
+### Changed
+
+- **PATE-GAN is off by default.** It is no longer in the default `generation.synthcity.names` or in the shipped `config_sim.yaml`, `config_loris.yaml` and `config_hepatitis.yaml`. Its output currently collapses: most columns hold a single value, and some are blank in every row. Add `pategan` back to the list to run it.
+
+### Fixed
+
+- **True/False columns with blanks now match across stages.** pandas reads such a column as Python bools, but every CSV the pipeline writes and reads back holds the text `"True"`/`"False"`. The raw split and the imputed and synthetic data therefore had different labels, so `column_differences.csv` scored the column 1 for every model, the column topped every `<model>_top_columns` figure with real and synthetic bars side by side, and a run that imputed in the same process saw other labels than a resumed one. These columns are now read as `"True"`/`"False"` text from the start.
+
 ## 0.23.2 (2026-10-28)
 
 No config changes and no golden re-record needed. Imputed values change only for binary columns where the imputation model is certain (a predicted probability of exactly 0 or 1), which used to stop the run.

@@ -381,7 +381,28 @@ def _load_local_file(cfg: Config) -> tuple:
             f"Unsupported file extension {suffix!r} for data.path={cfg.data.path!r}; "
             "expected one of .csv, .parquet, .pq"
         )
-    return df, None
+    return _bools_as_text(df), None
+
+
+def _bools_as_text(df: pd.DataFrame) -> pd.DataFrame:
+    """True/False columns with blanks as the text ``"True"``/``"False"``.
+
+    pandas reads a True/False column that has blanks as ``object`` holding
+    Python bools. Every CSV the pipeline writes and reads back with
+    :func:`read_like` turns those into the strings ``"True"``/``"False"``, so
+    the raw split would hold bools while the imputed and synthetic data hold
+    text, and every comparison between them would see two disjoint sets of
+    categories (a distance of 1). Converting at load gives every stage the
+    same labels. Columns without blanks stay ``bool``, which round-trips.
+    """
+    for column in df.columns:
+        values = df[column]
+        if values.dtype != object:
+            continue
+        observed = values.dropna()
+        if len(observed) and observed.map(lambda v: isinstance(v, (bool, np.bool_))).all():
+            df[column] = values.map(lambda v: v if pd.isna(v) else str(bool(v)))
+    return df
 
 
 # ---------------------------------------------------------------------------
