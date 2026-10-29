@@ -579,6 +579,9 @@ def encode_ordinal_columns(df: pd.DataFrame, ordinal_categories: dict) -> pd.Dat
                 f"present in the loaded data. Available columns: {list(out.columns)}"
             )
         cat_to_idx = {cat: idx for idx, cat in enumerate(categories)}
+        # A schema order of [false, true] parses to bools, while a True/False
+        # column with blanks is loaded as the text "True"/"False" (_bools_as_text).
+        cat_to_idx.update({str(c): i for i, c in enumerate(categories) if isinstance(c, bool)})
         observed = set(out[col].dropna().unique().tolist())
         unknown = observed - set(cat_to_idx)
         if unknown:
