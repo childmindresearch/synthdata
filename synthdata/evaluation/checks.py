@@ -187,7 +187,11 @@ def _mean_by_model(series: pd.Series) -> pd.Series:
 
 def _baseline_checks(combined: pd.DataFrame) -> list:
     rows = []
-    columns = {c[1:]: c for c in combined.columns if c[0] == "__all__"}
+    # The anchored primary scores put the baselines at 0 and 1 by
+    # construction, so the min-max composite (kept as "legacy") is what can
+    # show a metric battery that fails to separate them.
+    level = "legacy" if "legacy" in combined.columns.get_level_values(0) else "__all__"
+    columns = {c[1:]: c for c in combined.columns if c[0] == level}
     scores = {
         dim: _mean_by_model(combined[columns[(dim, "rank")]].astype(float))
         for dim in ("utility", "privacy")
@@ -222,7 +226,7 @@ def _baseline_checks(combined: pd.DataFrame) -> list:
                 "" if ok else "utility metrics do not reward the real joint structure",
             )
         )
-    tstr = [c for c in combined.columns if c[2] == "tstr_macro_f1"]
+    tstr = [c for c in combined.columns if c[2] == "tstr_macro_auprc"]
     if tstr:
         f1 = _mean_by_model(combined[tstr[0]].astype(float))
         if {copy_, marginals} <= set(f1.index):

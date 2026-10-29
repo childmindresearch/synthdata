@@ -141,7 +141,9 @@ The settings you will most often change, by section:
 | `generation.hpo.*` | Hyperparameter search budgets | see [section 7](#7-stage-3-generation-and-hyperparameter-search) |
 | `compute.workers`, `compute.cores_per_worker` | How many models generation and evaluation process at once, and the CPU threads each gets | `auto`, `4`; see [Using the machine's cores](#using-the-machines-cores) |
 | `evaluation.baselines` | Reference rows scored next to the models | `[train_copy, marginals]` |
-| `evaluation.rank_weights` | How much utility, privacy and fairness count in the overall rank | `{utility: 1, privacy: 2, fairness: 1}` |
+| `evaluation.primary_metrics` | The short, pre-registered metric set the ranking reads; every other metric is a diagnostic | the default six, see [Ranking](#ranking) |
+| `evaluation.ranking_bootstrap` | Bootstrap draws behind the ranking's intervals and ties | `1000`; `0` = t-intervals over seeds only |
+| `evaluation.rank_weights` | How much utility, privacy and fairness count in the overall score | `{utility: 1, privacy: 2, fairness: 1}` |
 
 The three example configs are templates, not defaults for your data:
 
@@ -665,13 +667,30 @@ Singling-out risk reads low even for `baseline_train_copy`. Anonymeter compares 
 
 ### Ranking
 
-1. Every metric is oriented so higher is better, then min-max scaled across the models in this run. Scores therefore compare models within the run; they are not absolute quality measures. A metric that failed for one model while others have it scores 0, the worst value, for that model, so a failure cannot lift its rank.
-2. Metrics are averaged within each source, then across sources, into a utility, a privacy and a fairness score between 0 and 1.
-3. The overall score is the weighted geometric mean of the three, with weights from `evaluation.rank_weights`. A near-zero score on one dimension cannot be made up by the others.
+The pipeline computes dozens of metrics, many of them measuring nearly the same thing. If they all fed the ranking, the number of metrics of a kind would act as a hidden weight. So the ranking reads a short **primary set**, chosen before seeing results (`evaluation.primary_metrics`), and every other metric is reported as a diagnostic:
+
+| Type | Primary metric | What it asks |
+| --- | --- | --- |
+| Utility | `tstr_macro_auprc` | Does a classifier trained on the synthetic data rank real holdout patients by outcome? Threshold-free, one score per class averaged. |
+| Utility | `corr_mat_diff` (SynthEval) | Are the pairwise associations between columns kept (Pearson, correlation ratio, Cramér's V)? |
+| Privacy | `distance_mia_auc` | Can an attacker tell training patients from unseen ones by how close they are to a synthetic row? |
+| Privacy | `anonymeter_linkability_risk`, `anonymeter_inference_risk` | Can the synthetic data link records or reveal a sensitive value, above Anonymeter's control baseline? |
+| Fairness | `demographic_parity_gap_error` | Does a model trained on the synthetic data treat protected groups as one trained on real data does? |
+
+There is no marginal-fidelity metric in the set: both baselines reproduce every column's distribution, so such a metric cannot be placed on the baseline scale below (it stays a diagnostic, for example `ks_tvd_stat`). The team can change the list after reviewing the metrics on the clinical data; use a new experiment id when you do. `[]` brings back the earlier composite of every metric.
+
+1. **Anchored to the baselines.** Each primary metric is placed on the scale the two baselines span. For utility and fairness, 0 is `baseline_marginals` (each column kept, every relationship lost) and 1 is `baseline_train_copy` (real rows). For privacy it is the other way round: 0 is the train copy and 1 the marginals. A utility score of 0.6 reads "recovers 60% of what separates the real data from the marginals", and it does not change when you add or remove models. Scores can go below 0 (worse than a baseline) or above 1 (better than the train copy). Privacy values past the no-leak point earn nothing extra (an attack AUC below 0.5 counts as 0.5). A metric whose baselines are not in the expected order (or tie) has no scale in that run; it is left out with a warning in the log and the report.
+2. The anchored metrics of a type are averaged into the utility, privacy and fairness scores. A metric that failed for one model scores 0 (the worse baseline) for that model.
+3. The overall score is the weighted geometric mean of the three, each clipped to [0.01, 1], with weights from `evaluation.rank_weights`. A near-zero score on one dimension cannot be made up by the others.
+4. **Pareto front.** The report lists the models no other model beats on both utility and privacy. The overall score picks one point on that front with your weights; read the front first when the weights are in question.
+
+The earlier composite (every ranked metric min-max scaled across the run's models) is kept for one release as the `legacy` columns of `combined_evaluation.csv` and `legacy_overall_mean` in `ranking_summary.csv`, so the team can compare the two after the clinical run. `primary_metrics.csv` lists every primary metric per replicate with its raw value, the two anchors and the anchored score.
+
+In the TSTR scores, macro AUPRC and Cohen's kappa feed the composite; macro-F1 and balanced accuracy are reported only. Under class-balanced weights those two depend on where the classifier's decision threshold falls, so they can move without the model ranking patients any better (see [verification.md](verification.md#custom-metrics-and-scoring)).
 
 A few reported metrics are left out of the ranking because they cannot tell a copy of the training data from a fresh draw (synthcity's k-anonymization, the subgroup privacy gap, k-map, distinct l-diversity, delta-presence, alpha-precision coverage, data_leakage linear and mlp, DomiasMIA accuracy, and the augmentation scores), cannot tell generators apart on wide data (synthcity's XGBoost and MLP detection: on the simulated clinical dataset XGBoost detection was 1.000 for every generator, and MLP detection scored the independent-marginals baseline like a copy; GMM detection ignores its labels), reward a dataset with no class signal (SynthEval's statistical parity, equalized odds and equal opportunity; the holdout fairness gaps are ranked instead), or only qualify another score (the feat_rank_distance p-value). They still appear in `combined_evaluation.csv`; [verification.md](verification.md) says why.
 
-With replicates, each score is the mean over seeds with a 95% confidence interval, and a model is "tied with best" when a one-sided Welch t-test cannot place its overall score below the best model's. When no HPO trial of a model passes the screens, the tuned model would get the untuned settings and the same seeds and only repeat the untuned one, so it is neither fitted nor evaluated: the ranking lists it under *Not ranked*, and the dashboard marks it *none passed*. Check the `hpo` log lines for why every trial failed. (If `hpo.final_n_iter_override` changes its training length, it is a different model and is fitted and ranked as usual.)
+**Noise.** Each score is the mean over seed replicates. Its 95% interval comes from a bootstrap (`evaluation.ranking_bootstrap` draws): each draw resamples the holdout patients, the same patients for every model, and each model's seed replicates, then recomputes every score, including the baseline anchors. The holdout TSTR AUPRC, the distance membership attack and the demographic parity gap error are recomputed on the resampled patients; the other primary metrics vary with the seeds only. So the interval covers both "another seed would give a different dataset" and "another holdout would give a different score". "Behind best" is the best candidate's overall score minus a model's, from the same draws, so the shared holdout noise cancels (a paired comparison); a model is "tied with best" when the one-sided 95% bound of that difference reaches 0. With one seed the intervals still cover the holdout. `ranking_bootstrap: 0` falls back to t-intervals over seeds and a Welch t-test. [verification.md](verification.md#custom-metrics-and-scoring) explains the choice. When no HPO trial of a model passes the screens, the tuned model would get the untuned settings and the same seeds and only repeat the untuned one, so it is neither fitted nor evaluated: the ranking lists it under *Not ranked*, and the dashboard marks it *none passed*. Check the `hpo` log lines for why every trial failed. (If `hpo.final_n_iter_override` changes its training length, it is a different model and is fitted and ranked as usual.)
 
 ### Running on large data
 
@@ -686,7 +705,7 @@ Evaluation scores several synthetic datasets at once, each in its own process, u
 `report.md` sits in the evaluation folder and is the one page to read after a run. Every table and figure it mentions is linked. A figure taller than 3000 pixels, such as a per-column grid of a wide dataset, is linked instead of shown so the page stays readable. Its seven sections:
 
 1. **At a glance.** Dataset, experiment, seed, the recommended model and its overall score, how it compares with the two baselines, the [output checks](#output-checks) count, and a "Read with care" list of warnings (for example, a single seed, a failed output check, a metric that failed for a model and is scored as its worst value, or an Anonymeter attack whose 95% interval is above 0).
-2. **Ranking.** One row per model with overall, utility, privacy and fairness scores (with intervals and "tied with best" when there are replicates), followed by how the scores were built and the trade-off plots.
+2. **Ranking.** One row per model with overall, utility, privacy and fairness scores, their intervals, the gap to the best model, "tied with best" and the Pareto front, then the anchored primary metrics, the earlier composite for comparison, and the trade-off plots (the utility-privacy plot draws the Pareto front).
 3. **Utility.** How far each model's columns are from the real ones (a table with each model's median and mean difference and its three worst columns; total variation distance for categorical columns, Kolmogorov-Smirnov statistic for continuous ones), a figure per model of its 12 columns that differ most, a link to its every-column figure and to `column_differences.csv` (every column and model). These compare the real values that were recorded with the synthetic values as released (blanked where the synthetic missing indicator says missing), so imputed values are on neither side; each panel title gives both sides' share of blanks. `plots/generation/<model>_filled` shows the filled data the metrics score. Then come the holdout TSTR and TSTS table (the `baseline_train_copy` rows are the real-data ceiling), and a plot of every utility metric.
 4. **Privacy evidence.** The attack and distance results next to the baselines, with how to read each column, and a plot of every privacy metric.
 5. **Fairness.** Subgroup gap metrics, log disparity (with links to sunburst pages that show which subgroups are over- or under-represented), privacy by protected group (the gap and worst-group columns, each group's membership AUC and its patient counts), and a plot of every fairness metric.
@@ -698,7 +717,7 @@ With seed replicates, every table shows one row per model with the mean and its 
 How to interpret it:
 
 - **Start with the baselines.** A generator with utility close to `baseline_marginals` has not learned the relationships between columns. A generator with privacy close to `baseline_train_copy` is close to releasing the real rows.
-- **Look at real numbers, not only ranks.** Ranked scores are relative to this run. Check the TSTR table: a generator's macro-F1 near the real-data ceiling means a model trained on it predicts real outcomes nearly as well as one trained on real data.
+- **Look at real numbers, not only ranks.** The anchored scores are relative to the baselines; the earlier composite is relative to this run. Check the TSTR table: a generator's macro AUPRC near the real-data ceiling means a model trained on it predicts real outcomes nearly as well as one trained on real data.
 - **Treat small gaps with suspicion.** With one seed there are no intervals. Use `n_replicates: 3` or more before choosing between close models.
 - **Privacy results are not a guarantee.** A low risk means these attacks, with these settings, did not find a leak. Any flagged attack deserves a closer look, and any real release needs a privacy review.
 - **Check the HPO plots.** If the best trial is at the edge of an epoch range, or the score is still rising at the last trial, the budget may be too small.

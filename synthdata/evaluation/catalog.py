@@ -359,7 +359,10 @@ LOG_DISPARITY_METRICS = {
 #: Holdout TSTR scores (fit the fixed XGBoost on a synthetic dataset, score
 #: on the test split; synthdata.evaluation.tstr), all higher-is-better.
 #: Per-class F1 is reported next to them but not ranked.
-TSTR_METRICS = ("tstr_macro_f1", "tstr_balanced_accuracy", "tstr_macro_auprc")
+TSTR_METRICS = ("tstr_macro_auprc", "tstr_kappa")
+#: Reported next to them, not ranked: argmax scores whose value under
+#: class-balanced weights depends on the decision threshold (S12).
+TSTR_UNRANKED_METRICS = ("tstr_macro_f1", "tstr_balanced_accuracy")
 
 #: Name of the holdout TSTR evaluator in ``evaluation.custom`` selection.
 TSTR_NAME = "tstr"

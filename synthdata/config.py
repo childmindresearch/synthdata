@@ -1044,6 +1044,20 @@ CLASS_AVERAGING = ("ovr_macro", "binary")
 #: synthdata.evaluation.baselines.
 EVALUATION_BASELINES = ("train_copy", "marginals")
 
+#: Default ``evaluation.primary_metrics``: holdout TSTR macro AUPRC and the
+#: mixed-type correlation difference (utility), the holdout distance
+#: membership attack and Anonymeter linkability and inference (privacy),
+#: and the holdout demographic parity gap error (fairness). Reasons in
+#: docs/verification.md ("Primary metric set").
+DEFAULT_PRIMARY_METRICS = (
+    "tstr_macro_auprc",
+    "corr_mat_diff",
+    "distance_mia_auc",
+    "anonymeter_linkability_risk",
+    "anonymeter_inference_risk",
+    "demographic_parity_gap_error",
+)
+
 
 @dataclasses.dataclass
 class EvaluationConfig:
@@ -1129,6 +1143,25 @@ class EvaluationConfig:
     rank_weights: dict = dataclasses.field(
         default_factory=lambda: {"utility": 1.0, "privacy": 1.0, "fairness": 1.0}
     )
+    #: The pre-registered primary metrics the ranking is built from (see
+    #: synthdata.evaluation.primary). Each is a metric name as it appears in
+    #: combined_evaluation.csv (``tstr_macro_auprc``), or
+    #: ``framework/type/metric`` when a name is not unique. Every metric is
+    #: scored against the two baselines: 1 = as good as ``baseline_train_copy``
+    #: on a utility or fairness metric (``baseline_marginals`` on a privacy
+    #: metric), 0 = as good as the other baseline. The metrics of one type are
+    #: averaged into the utility, privacy and fairness scores, and those into
+    #: the overall score with ``rank_weights``. Every other metric is still
+    #: computed and reported as a diagnostic. Needs both baselines; without
+    #: them, and with an empty list, the ranking is the earlier composite of
+    #: every metric, min-max scaled across the models of the run. Changing it changes the ranking: use a new
+    #: experiment id.
+    primary_metrics: list = dataclasses.field(default_factory=lambda: list(DEFAULT_PRIMARY_METRICS))
+    #: Draws of the hierarchical bootstrap behind the ranking's intervals and
+    #: ties: each draw resamples the holdout patients (shared by every model)
+    #: and each model's seed replicates, then recomputes the primary scores.
+    #: 0 = Student-t intervals over seed replicates only.
+    ranking_bootstrap: int = 1000
     #: Whether to write report.md (alongside combined_evaluation.csv): the one
     #: page that summarizes the run, embeds its plots and links every output.
     #: ``synthdata-plot`` rewrites it once the plots exist.
@@ -1812,6 +1845,16 @@ def _validate(cfg: Config) -> None:
         raise ValueError(
             f"evaluation.baselines must be drawn from {list(EVALUATION_BASELINES)}, "
             f"got {unknown_baselines}"
+        )
+    primary = cfg.evaluation.primary_metrics
+    if not isinstance(primary, list) or not all(isinstance(m, str) and m for m in primary):
+        raise ValueError(
+            f"evaluation.primary_metrics must be a list of metric names, got {primary!r}"
+        )
+    boot = cfg.evaluation.ranking_bootstrap
+    if isinstance(boot, bool) or not isinstance(boot, int) or boot < 0:
+        raise ValueError(
+            f"evaluation.ranking_bootstrap must be a non-negative integer, got {boot!r}"
         )
     rank_weight_keys = set(cfg.evaluation.rank_weights)
     if rank_weight_keys != {"utility", "privacy", "fairness"}:

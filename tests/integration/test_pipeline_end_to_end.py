@@ -424,18 +424,43 @@ def test_tstr_has_signal_on_the_fixture(pipeline_run, dataset):
 
 def test_ranks_are_normalised_and_overall_is_their_geometric_mean(pipeline_run):
     combined = pipeline_run.combined()
+    weights = pipeline_run.cfg.evaluation.rank_weights
+    # The earlier composite, kept as "legacy": min-max scores in [0, 1].
     dims = ["utility", "privacy", "fairness"]
     for dim in dims:
-        rank = combined[("__all__", dim, "rank")].astype(float)
+        rank = combined[("legacy", dim, "rank")].astype(float)
         assert ((rank >= 0) & (rank <= 1)).all(), dim
-    overall = combined[("__all__", "overall", "rank")].astype(float)
-    weights = pipeline_run.cfg.evaluation.rank_weights
+    # The ranking: anchored type scores, overall = their weighted geometric
+    # mean with each clipped to [0.01, 1].
+    present = [d for d in dims if ("__all__", d, "rank") in combined.columns]
+    assert {"utility", "privacy"} <= set(present), present
     logs = sum(
-        weights[d] * np.log(combined[("__all__", d, "rank")].astype(float).clip(lower=0.01))
-        for d in dims
+        weights[d] * np.log(combined[("__all__", d, "rank")].astype(float).clip(0.01, 1.0))
+        for d in present
     )
-    expected = np.exp(logs / sum(weights[d] for d in dims))
+    expected = np.exp(logs / sum(weights[d] for d in present))
+    overall = combined[("__all__", "overall", "rank")].astype(float)
     np.testing.assert_allclose(overall, expected, rtol=1e-6)
+
+
+def test_primary_scores_are_anchored_to_the_baselines(pipeline_run):
+    combined = pipeline_run.combined()
+    for dim, copy_score in (("utility", 1.0), ("privacy", 0.0)):
+        score = combined[("__all__", dim, "rank")].astype(float)
+        copies = score[[m for m in score.index if m.startswith("baseline_train_copy")]]
+        marginals = score[[m for m in score.index if m.startswith("baseline_marginals")]]
+        # Anchors are the means over replicates, so the replicate means sit on them.
+        assert copies.mean() == pytest.approx(copy_score, abs=1e-9), dim
+        assert marginals.mean() == pytest.approx(1.0 - copy_score, abs=1e-9), dim
+    table = pd.read_csv(pipeline_run.evaluation_dir / "primary_metrics.csv")
+    assert {"tstr_macro_auprc", "distance_mia_auc"} <= set(table["metric"])
+    summary = pd.read_csv(pipeline_run.evaluation_dir / "ranking_summary.csv", index_col=0)
+    assert {"diff_vs_best", "diff_ci_low", "pareto_front", "legacy_overall_mean"} <= set(
+        summary.columns
+    )
+    candidates = summary[~summary.index.str.startswith("baseline_")]
+    assert candidates["pareto_front"].astype(bool).any()
+    assert (summary["overall_ci_low"] <= summary["overall_ci_high"]).all()
 
 
 def test_copying_training_rows_does_not_pay_off_overall(pipeline_run):
@@ -485,7 +510,10 @@ def test_holdout_tstr_is_ranked_and_reported_per_class(pipeline_run):
     assert ("custom", "utility", "tsts_macro_f1") in combined.columns
     directions = pd.read_csv(pipeline_run.evaluation_dir / "metric_directions.csv", index_col=2)
     assert directions.loc["tsts_macro_f1", "direction"] == "unranked"
-    assert directions.loc["tstr_macro_f1", "direction"] == "higher"
+    # S12: macro AUPRC and kappa are ranked, the threshold scores reported only.
+    assert directions.loc["tstr_macro_auprc", "direction"] == "higher"
+    assert directions.loc["tstr_kappa", "direction"] == "higher"
+    assert directions.loc["tstr_macro_f1", "direction"] == "unranked"
     assert "tsts_macro_f1" in (pipeline_run.evaluation_dir / "report.md").read_text()
 
 

@@ -111,7 +111,7 @@ class TestBuildEvaluationReport:
         assert "2.100 [" in ranked
         glance = _section(text, "1. At a glance")
         assert "Recommended model: `a`" in glance or "Recommended model: `b`" in glance
-        assert "Tied with it within seed noise:" in glance
+        assert "Tied with it within noise:" in glance
         assert "`c`" not in glance.split("Tied with it")[1]
         assert "Single seed" not in glance
 

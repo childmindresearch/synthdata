@@ -176,6 +176,7 @@ def tstr_and_tsts_scores(
         seeds,
         ordinal=ordinal,
         xgb_params=xgb_params,
+        keep_rows=True,
     )
     counts = synthetic_df[target].value_counts()
     if len(synthetic_df) < 10:
@@ -348,6 +349,7 @@ def build_tstr_table(tstr_result: dict) -> pd.DataFrame:
                 "tsts_macro_f1": t.macro_f1 if t else float("nan"),
                 "tsts_balanced_accuracy": t.balanced_accuracy if t else float("nan"),
                 "tsts_macro_auprc": t.macro_auprc if t else float("nan"),
+                "tsts_kappa": t.kappa if t else float("nan"),
             }
         )
         return row

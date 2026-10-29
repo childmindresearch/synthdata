@@ -85,6 +85,10 @@ class TSTRScores:
     #: Macro AUPRC within each group of each ``groups`` column (groups with
     #: at least ``MIN_GROUP_ROWS`` rows): ``{column: {group: auprc}}``.
     group_auprc: dict = dataclasses.field(default_factory=dict)
+    #: Class codes of the scored rows and the first seed's class probabilities,
+    #: kept so the ranking can resample the holdout (evaluation.primary).
+    holdout_labels: np.ndarray | None = None
+    holdout_proba: np.ndarray | None = None
 
 
 #: Smallest group scored by ``group_auprc``; smaller groups are too noisy.
@@ -284,6 +288,7 @@ def tstr_scores(
     groups: dict | None = None,
     ordinal: bool = False,
     xgb_params: dict | None = None,
+    keep_rows: bool = False,
 ) -> TSTRScores:
     """Fit the fixed XGBoost on ``fit_df`` once per seed and score on ``score_df``.
 
@@ -298,6 +303,7 @@ def tstr_scores(
     ``groups`` (``{column: labels aligned with score_df}``) adds the macro
     AUPRC within each group (``group_auprc``), from the first seed's fit.
     ``xgb_params`` overrides keys of :data:`XGB_PARAMS` (see :func:`tstr_xgb_params`).
+    ``keep_rows`` keeps the scored rows' labels and first-seed probabilities.
     """
     y_true, predict_proba = tstr_predictor(
         fit_df, score_df, target_column, nominal_columns, classes, xgb_params
@@ -345,6 +351,8 @@ def tstr_scores(
         group_auprc=group_auprc,
         balanced_accuracy=float(np.mean(balanced)),
         kappa=float(np.mean(kappas)),
+        holdout_labels=y_true if keep_rows else None,
+        holdout_proba=first_proba if keep_rows else None,
         per_class_f1={
             str(c): float(v) for c, v in zip(classes, np.mean(per_class, axis=0), strict=True)
         },

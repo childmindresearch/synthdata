@@ -4,6 +4,23 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.30.0 (2026-10-29)
+
+The ranking changes: it now reads a short primary metric set, anchored to the baselines, with bootstrap intervals. Metric values are unchanged except two new reported columns, but the overall, utility, privacy and fairness scores, the recommended model and the ties are computed differently, so use a new experiment id. Golden runs need re-recording (new `tstr_kappa`/`tsts_kappa` columns, `legacy` columns, new rank values). No config edit is needed; the example configs list the two new keys.
+
+### Added
+
+- **Primary metric set** (`evaluation.primary_metrics`): the ranking reads `tstr_macro_auprc`, `corr_mat_diff`, `distance_mia_auc`, `anonymeter_linkability_risk`, `anonymeter_inference_risk` and `demographic_parity_gap_error` by default; every other metric is still computed and reported as a diagnostic, including the new `domias_mia_auc` (it matched `distance_mia_auc` on the known-answer checks without beating it). The list is configurable (`framework/type/metric` when a name is not unique); `[]` restores the earlier composite. Needs both baselines.
+- **Baseline-anchored scores**: each primary metric is scored between the baselines (utility and fairness: 0 = `baseline_marginals`, 1 = `baseline_train_copy`; privacy the reverse), so scores no longer change when models are added. `primary_metrics.csv` lists every primary metric per replicate with its raw value, anchors and anchored score.
+- **Utility-privacy Pareto front**: `pareto_front` and `pareto_share` in `ranking_summary.csv`, listed in the report and drawn on the utility-vs-privacy plot.
+- **Bootstrap intervals and paired ties** (`evaluation.ranking_bootstrap`, default 1000): each draw resamples the holdout patients (shared by all models) and each model's seed replicates and recomputes the scores. `ranking_summary.csv` gains `diff_vs_best`, `diff_ci_low`, `diff_ci_high`; intervals are bootstrap percentiles and `tied_with_best` uses the paired difference. `0` keeps the old Student-t intervals and Welch test.
+
+### Changed
+
+- **TSTR scores in the composite**: macro AUPRC and Cohen's kappa are ranked; macro-F1 and balanced accuracy are reported only (they depend on the decision threshold). `tstr_kappa` is now a column of `combined_evaluation.csv`, and `tsts_kappa` of `tstr_holdout.csv`.
+- The earlier composite moves to the `legacy` columns of `combined_evaluation.csv` and `legacy_overall_mean` in `ranking_summary.csv`, kept for one release for comparison. The baseline output checks still use it, and `train_copy_beats_marginals_on_tstr` now compares macro AUPRC.
+- Trade-off plots say "score" instead of "rank" and widen their axes when an anchored score leaves [0, 1].
+
 ## 0.29.0 (2026-10-29)
 
 A new ranked privacy metric changes the privacy scores and ranks, so use a new experiment id. The golden runs need re-recording. No config edits are needed.

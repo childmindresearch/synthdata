@@ -35,6 +35,7 @@ from sklearn.neighbors import NearestNeighbors
 from synthdata.compute import run_per_model
 from synthdata.config import ComputeConfig
 from synthdata.data import Dataset
+from synthdata.evaluation.primary import mia_rows
 from synthdata.utils import get_logger
 
 logger = get_logger(__name__)
@@ -149,8 +150,13 @@ def holdout_distance_scores(
     train_patients: pd.Series,
     holdout_patients: pd.Series,
     seed: int,
-) -> dict:
+    keep_rows: bool = False,
+):
     """Holdout-referenced DCR/NNDR heuristics for one synthetic dataset.
+
+    ``keep_rows`` also returns the attack's per-unit closest distances,
+    ``(member, nonmember)`` Series indexed by train and holdout unit id, so
+    the ranking can resample them (evaluation.primary).
 
     ``dcr_closer_to_train_share``: share of synthetic rows nearer to a
     training row than to any test row (ties count half), against a random
@@ -201,12 +207,15 @@ def holdout_distance_scores(
             return 1.0 if value == 0 else float("inf")
         return float(value / reference)
 
-    return {
+    scores = {
         "dcr_closer_to_train_share": closer,
         "distance_mia_auc": auc,
         "dcr_holdout_ratio": _ratio(syn_train[:, 0], hold_train[:, 0]),
         "nndr_holdout_ratio": _ratio(_nndr(syn_train), _nndr(hold_train)),
     }
+    if keep_rows:
+        return scores, (member, nonmember)
+    return scores
 
 
 def _hanley_mcneil_se(auc: float, n_pos: int, n_neg: int) -> float:
@@ -660,13 +669,19 @@ def run_privacy_attack_evaluation(
         n_columns=train.shape[1],
         label="privacy attacks",
     )
-    scores = {name: row for name, (row, _, _) in run.results.items()}
-    attack_rows = [r for _, (_, rows, _) in run.results.items() for r in rows]
-    subgroup_rows = [r for _, (_, _, rows) in run.results.items() for r in rows]
+    scores = {name: result[0] for name, result in run.results.items()}
+    attack_rows = [r for result in run.results.values() for r in result[1]]
+    subgroup_rows = [r for result in run.results.values() for r in result[2]]
+    distance_rows = {
+        name: mia_rows(result[3][0], result[3][1], holdout_patients)
+        for name, result in run.results.items()
+        if result[3] is not None
+    }
     return {
         "scores": scores,
         "attacks": pd.DataFrame(attack_rows),
         "subgroups": pd.DataFrame(subgroup_rows),
+        "distance_rows": distance_rows,
         "unit": unit,
     }
 
@@ -690,16 +705,15 @@ def _score_one(
     seed,
     domias_rows,
     domias_n_components,
-) -> tuple[dict, list, list]:
-    """Privacy scores, Anonymeter attack rows and per-group membership rows
-    for one synthetic dataset."""
-    row, attack_rows, subgroup_rows = {}, [], []
+) -> tuple[dict, list, list, tuple | None]:
+    """Privacy scores, Anonymeter attack rows, per-group membership rows and
+    the distance attack's per-unit distances for one synthetic dataset."""
+    row, attack_rows, subgroup_rows, distance_rows = {}, [], [], None
     if run_distances:
-        row.update(
-            holdout_distance_scores(
-                train, holdout, syn_df, categorical, train_patients, holdout_patients, seed
-            )
+        scores, distance_rows = holdout_distance_scores(
+            train, holdout, syn_df, categorical, train_patients, holdout_patients, seed, True
         )
+        row.update(scores)
         if group_masks:
             subgroup_scores, rows = subgroup_privacy_scores(
                 train, holdout, syn_df, categorical, train_patients, holdout_patients, group_masks
@@ -724,4 +738,4 @@ def _score_one(
         )
         row.update(summarize_anonymeter(risks))
         attack_rows = [{"model": name, **dataclasses.asdict(r)} for r in risks]
-    return row, attack_rows, subgroup_rows
+    return row, attack_rows, subgroup_rows, distance_rows

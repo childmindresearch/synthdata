@@ -201,11 +201,20 @@ def _summary(combined: pd.DataFrame, ranking_summary) -> pd.DataFrame:
 
 
 def _has_replicates(ranking_summary) -> bool:
-    return (
-        ranking_summary is not None
-        and "overall_mean" in ranking_summary.columns
-        and ranking_summary["n_replicates"].max() >= 2
-    )
+    """Whether the ranking carries intervals: seed replicates, or the bootstrap's."""
+    if ranking_summary is None or "overall_mean" not in ranking_summary.columns:
+        return False
+    if (
+        "overall_ci_low" in ranking_summary.columns
+        and ranking_summary["overall_ci_low"].notna().any()
+    ):
+        return True
+    return ranking_summary["n_replicates"].max() >= 2
+
+
+def _anchored(combined: pd.DataFrame) -> bool:
+    """Whether the scores are baseline-anchored primary scores (evaluation.primary)."""
+    return "legacy" in combined.columns.get_level_values(0)
 
 
 def _collapse_replicates(table: pd.DataFrame) -> pd.DataFrame:
@@ -337,15 +346,31 @@ def _glance_section(cfg, dataset, combined, extras, model_names, experiment) -> 
         lines.append("**No candidate model to recommend** (only baselines, or no overall score).")
     else:
         row = summary.loc[best]
+        scale = (
+            "anchored to the baselines: on each primary metric 0 is the worse and 1 the "
+            "better of `baseline_marginals` and `baseline_train_copy`"
+            if _anchored(combined)
+            else "0 to 1, higher is better; relative to the other models in this run"
+        )
         lines.append(
             f"**Recommended model: `{best}`**, overall score "
-            f"{_score_with_interval(row, 'overall')} (0 to 1, higher is better; "
-            "relative to the other models in this run)."
+            f"{_score_with_interval(row, 'overall')} ({scale})."
         )
+        front = (
+            summary.index[summary["pareto_front"].astype(bool)] if "pareto_front" in summary else []
+        )
+        if len(front):
+            lines += [
+                "",
+                "Utility-privacy Pareto front (no other candidate is better on both): "
+                + ", ".join(f"`{m}`" for m in front)
+                + ". The overall score picks one point on it with `evaluation.rank_weights`; "
+                "another weighting can pick another.",
+            ]
         if tied:
             lines += [
                 "",
-                "Tied with it within seed noise: "
+                "Tied with it within noise: "
                 + ", ".join(f"`{m}`" for m in tied)
                 + ". Choose among these on cost or on the score that matters most to you.",
             ]
@@ -391,7 +416,14 @@ def _glance_section(cfg, dataset, combined, extras, model_names, experiment) -> 
             "Single seed: scores carry no uncertainty estimate, so small gaps may be noise. "
             "Set `generation.n_replicates` to 2 or more for confidence intervals."
         )
-    raw = combined[[c for c in combined.columns if c[0] != "__all__" and c[2] != "rank"]]
+    elif "n_replicates" in summary and int(summary["n_replicates"].max()) < 2:
+        cautions.append(
+            "Single seed: the intervals cover holdout sampling only, not generator seed "
+            "variance. Set `generation.n_replicates` to 2 or more to include it."
+        )
+    raw = combined[
+        [c for c in combined.columns if c[0] not in ("__all__", "legacy") and c[2] != "rank"]
+    ]
     raw = raw.loc[_candidates(raw.index), raw.notna().any()]
     missing = raw.isna().sum(axis=1)
     for model in missing.index[missing > 0]:
@@ -431,6 +463,64 @@ def _untuned_fallbacks(cfg) -> dict[str, str]:
     return untuned_fallbacks(path)
 
 
+def _primary_lines(combined, ranking_summary, weights: str, paths, links) -> list[str]:
+    """How the anchored scores are built, the primary metrics, and the composite for comparison."""
+    lines = [
+        "**How the scores are built.** The ranking reads a short, pre-registered set of "
+        "primary metrics (`evaluation.primary_metrics`); every other metric is a diagnostic "
+        "(section 3 onwards). Each primary metric is placed on the scale the two baselines "
+        "span: for utility and fairness 0 = `baseline_marginals` (no relationship between "
+        "columns kept) and 1 = `baseline_train_copy` (real rows); for privacy 0 = the train "
+        "copy and 1 = the marginals. A utility score of 0.6 means the model recovers 60% of "
+        "what separates the real data from the marginals, whatever else was run. Scores can "
+        "fall below 0 or rise above 1. The metrics of one type are averaged into its score; "
+        f"the overall score is the weighted geometric mean of the type scores (weights: {weights}; "
+        "`evaluation.rank_weights`), each clipped to [0.01, 1] there, so a near-zero score on "
+        "one dimension cannot be bought back by the others.",
+        "",
+    ]
+    anchored = combined.attrs.get("primary_anchored")
+    spec = combined.attrs.get("primary_spec")
+    if anchored is not None and spec is not None:
+        models = [split_replicate_name(str(m))[0] for m in anchored.index]
+        means = anchored.groupby(models, sort=False).mean()
+        if ranking_summary is not None:
+            means = means.reindex([m for m in ranking_summary.index if m in means.index])
+        means.columns = [f"{c[1]}: {c[2]}" for c in means.columns]
+        lines += [
+            "Primary metrics, anchored (mean over seeds):",
+            "",
+            _dataframe_to_markdown(means.round(3).reset_index(names="model")),
+        ]
+        if spec.dropped:
+            lines += [
+                "",
+                "Left out of the primary set in this run: "
+                + "; ".join(f"`{m}` ({why})" for m, why in spec.dropped.items())
+                + ".",
+            ]
+        lines += [
+            "",
+            f"Raw values and anchors: {links.maybe(paths.evaluation / 'primary_metrics.csv')}.",
+        ]
+    if ranking_summary is not None and "legacy_overall_mean" in ranking_summary.columns:
+        legacy = ranking_summary["legacy_overall_mean"].sort_values(ascending=False)
+        order = ", ".join(f"`{m}` {v:.3f}" for m, v in legacy.items() if pd.notna(v))
+        lines += [
+            "",
+            "**For comparison, the earlier composite** (every ranked metric min-max scaled "
+            "across this run's models, averaged by framework and type, geometric mean; kept for "
+            f"one release, columns `legacy` in `combined_evaluation.csv`): {order}.",
+        ]
+    lines += [
+        "",
+        f"Tables: {links.maybe(paths.evaluation / 'ranking_summary.csv')} (one row per model), "
+        f"{links.maybe(paths.evaluation / 'combined_evaluation.csv')} (every metric, raw and "
+        "per-group scores).",
+    ]
+    return lines
+
+
 def _ranking_section(cfg, combined, extras, paths: _Paths, links: _Links) -> str:
     ranking_summary = extras.get("ranking_summary")
     lines = ["## 2. Ranking", ""]
@@ -449,13 +539,31 @@ def _ranking_section(cfg, combined, extras, paths: _Paths, links: _Links) -> str
                     "tied with best": "" if pd.isna(tied) else ("yes" if tied else "no"),
                 }
             )
-        lines += [
-            "Each score is the mean over seed replicates with its 95% confidence interval. "
-            '"Tied with best" is yes when a one-sided Welch t-test (5% level) cannot place the '
-            "model's overall score below the best candidate's.",
-            "",
-            _dataframe_to_markdown(pd.DataFrame(rows)),
-        ]
+        if "diff_ci_low" in ranking_summary.columns:
+            for entry, (_, row) in zip(rows, ranking_summary.iterrows(), strict=True):
+                if not pd.isna(row.get("diff_vs_best")):
+                    entry["behind best"] = (
+                        f"{row['diff_vs_best']:.3f} [{row['diff_ci_low']:.3f}, {row['diff_ci_high']:.3f}]"
+                    )
+                if "pareto_front" in row and bool(row["pareto_front"]):
+                    entry["Pareto"] = "yes"
+            explanation = (
+                "Each score is the mean over seed replicates with a 95% percentile interval from "
+                f"{cfg.evaluation.ranking_bootstrap} bootstrap draws; each draw resamples the "
+                "holdout patients (the same resample for every model) and each model's seed "
+                'replicates, then recomputes every score. "Behind best" is the best '
+                "candidate's overall score minus this model's, with its interval from the same "
+                'draws (a paired difference). "Tied with best" is yes when the one-sided 95% '
+                'bound of that difference reaches 0. "Pareto" marks the candidates no other '
+                "candidate beats on both utility and privacy."
+            )
+        else:
+            explanation = (
+                "Each score is the mean over seed replicates with its 95% confidence interval. "
+                '"Tied with best" is yes when a one-sided Welch t-test (5% level) cannot place '
+                "the model's overall score below the best candidate's."
+            )
+        lines += [explanation, "", _dataframe_to_markdown(pd.DataFrame(rows))]
         index = ranking_summary.index
     else:
         summary = simple_rank_summary(combined)
@@ -496,6 +604,13 @@ def _ranking_section(cfg, combined, extras, paths: _Paths, links: _Links) -> str
             "column independently: the utility floor a useful generator must beat.",
         ]
     weights = ", ".join(f"{k} {v:g}" for k, v in cfg.evaluation.rank_weights.items())
+    if _anchored(combined):
+        lines += ["", *_primary_lines(combined, ranking_summary, weights, paths, links)]
+        plots = links.plots(paths.evaluation_plots, "*_vs_*") + links.plots(
+            paths.evaluation_plots, "rank_tradeoff*"
+        )
+        lines += ["", *(plots or ["_Trade-off plots not rendered yet: run `synthdata-plot`._"])]
+        return "\n".join(lines).rstrip()
     lines += [
         "",
         "**How the scores are built.** Every metric is oriented so higher is better and "
@@ -997,7 +1112,8 @@ def _data_section(cfg, paths: _Paths, links: _Links) -> str:
 #: File name -> what it holds, for the file index.
 _FILE_DESCRIPTIONS = {
     "combined_evaluation.csv": "Every metric for every model: raw values and per-group scores.",
-    "ranking_summary.csv": "One row per model: mean scores, confidence intervals, ties.",
+    "ranking_summary.csv": "One row per model: mean scores, intervals, gap to the best, ties, Pareto front.",
+    "primary_metrics.csv": "Each primary metric per replicate: raw value, the two baseline anchors, anchored score.",
     "tstr_holdout.csv": "Holdout TSTR scores per class, and TSTS (train and test on synthetic).",
     "fairness_gaps.csv": "Holdout fairness gap errors per model, with the classifier's holdout balanced accuracy and interval.",
     "fairness_gaps_by_group.csv": "Synthetic- and real-trained subgroup gaps per model, class and protected group.",
