@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from synthdata.dependencies import (
+    ANY_RULE,
     BLANK,
     DERIVE,
     ID_LIKE,
@@ -235,8 +236,33 @@ def test_rules_file_and_evaluation_check(tmp_path):
     violations = rule_violations(loaded, {"holdout": real, "good": good, "bad": bad})
     assert violations["holdout"].max() == 0 and violations["good"].max() == 0
     assert violations.loc[0, "bad"] > 0.5
+    # The last row is the share of all rows breaking any rule; only sub -> major is broken.
+    assert violations["kind"].iloc[-1] == ANY_RULE
+    applies = bad[["sub", "major"]].notna().all(axis=1).mean()
+    assert violations["bad"].iloc[-1] == pytest.approx(violations.loc[0, "bad"] * applies)
     rows = {r["model"]: r for r in rule_check_rows(violations, "holdout", ["good", "bad"])}
     assert rows["good"]["status"] == "pass" and rows["bad"]["status"] == "warn"
+    assert rows["bad"]["value"] == violations["bad"].iloc[-1]
+
+
+def test_rule_breaks_marks_the_g3_rows_and_counts_a_row_once():
+    from synthdata.dependencies import rule_breaks
+
+    # x=1 maps to y=a twice and y=b once: the one b row breaks x -> y.
+    frame = pd.DataFrame({"x": [1, 1, 1, 2], "y": ["a", "a", "b", "c"], "z": ["k", "k", "m", "k"]})
+    fd = make_rule([["x", None]], ["y", None])
+    found = rule_breaks(frame, fd)
+    assert found is not None
+    applies, breaks = found
+    assert applies.all() and breaks.tolist() == [False, False, True, False]
+    assert rule_error(frame, fd) == (4, 0.25)
+    # Row 2 breaks both rules but counts once in the any-rule share.
+    cfd = make_rule([["x", "1"]], ["z", "k"])
+    loaded = pd.DataFrame(
+        {"kind": ["fd", "cfd"], "lhs": ["x", "x=1"], "rhs": ["y", "z=k"], "rule": [fd, cfd]}
+    )
+    table = rule_violations(loaded, {"real": frame})
+    assert table["real"].tolist() == [0.25, pytest.approx(1 / 3), 0.25]
 
 
 def test_skip_logic_comparison_shows_which_method_found_what():

@@ -134,6 +134,9 @@ evaluation:
   ranking_strategy: linear
   generate_report: true
   save_per_model_syntheval_plots: false
+  # Two rules that do not hold on this data, so every model breaks them a little:
+  # enough to exercise the check end to end.
+  dependency_rules: "{fixtures}/clinic_rules.csv"
 
   synthcity: { enabled: true, categories: null, metrics: null }
   syntheval: { enabled: true, categories: null, metrics: null }

@@ -547,6 +547,33 @@ def test_report_covers_every_model(pipeline_run):
         assert model in report
 
 
+def test_model_cards_cover_every_candidate_and_are_linked(pipeline_run):
+    from synthdata.evaluation.model_cards import SECTIONS
+
+    folder = pipeline_run.evaluation_dir / "model_cards"
+    assert sorted(p.stem for p in folder.glob("*.md")) == MODELS
+    card = (folder / "ctgan_hpo.md").read_text()
+    assert [line[3:] for line in card.splitlines() if line.startswith("## ")] == list(SECTIONS)
+    # Filled from the run: the tuned settings, the baselines next to the model.
+    assert '"n_iter"' in card and "`baseline_train_copy`" in card and "n/a | n/a" not in card
+    report = (pipeline_run.evaluation_dir / "report.md").read_text()
+    assert "(model_cards/ctgan_hpo.md)" in report
+
+
+def test_dependency_rules_are_scored_per_model_and_on_the_holdout(pipeline_run):
+    table = pd.read_csv(pipeline_run.evaluation_dir / "dependency_violations.csv")
+    assert table["kind"].tolist() == ["fd", "cfd", "any_rule"]
+    assert {"holdout", *DATASETS} <= set(table.columns)
+    assert all(any(c.startswith(b) for c in table.columns) for b in BASELINES)
+    shares = table.drop(columns=["kind", "lhs", "rhs"])
+    assert shares.notna().all().all() and ((shares >= 0) & (shares <= 1)).all().all()
+    # The FD applies to every row, so the share breaking any rule is at least its error.
+    assert (shares.iloc[2] >= shares.iloc[0] - 1e-12).all()
+    checks = pd.read_csv(pipeline_run.evaluation_dir / "checks.csv")
+    rows = checks[checks["check"] == "dependency_rules"]
+    assert sorted(rows["model"]) == DATASETS
+
+
 def test_privacy_attacks_table_has_every_attack_with_an_interval(pipeline_run):
     table = pd.read_csv(pipeline_run.evaluation_dir / "privacy_attacks.csv")
     assert set(table["model"]) == set(DATASETS + [f"{b}__rep1" for b in BASELINES])
