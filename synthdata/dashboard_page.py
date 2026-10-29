@@ -818,10 +818,13 @@ def _ranking(ranking: list[dict]) -> str:
         '<h3>Ranking</h3><div class="scroll"><table><thead><tr><th class="num">Rank</th><th>Model</th>'
         f'<th class="num">Overall</th><th>95% CI <span class="muted small">{_num(lo, 2)} to {_num(hi, 2)}</span></th>'
         f'<th></th><th>vs best</th>{head}<th class="num">Replicates</th></tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
-        '<p class="muted small">Scores are rank scores, higher is better; each is the mean over seed '
-        "replicates. The bar is the 95% interval of the overall score and the dashed line the best model's "
-        "mean. <b>tied</b>: a one-sided Welch t-test at the 5% level cannot place the model below the best "
-        "one; <b>below</b>: it can; <b>n/a</b>: one side has a single replicate. Baselines are reference rows, "
+        '<p class="muted small">Scores are anchored to the baselines (utility and fairness: 0 = marginals, '
+        "1 = train copy; privacy the other way round), higher is better; each is the mean over seed "
+        "replicates. The bar is the 95% interval of the overall score, from a bootstrap over holdout "
+        "patients and seed replicates, and the dashed line the best model's mean. <b>tied</b>: the "
+        "one-sided 95% bound of the paired difference to the best model reaches 0; <b>below</b>: it does "
+        "not; <b>n/a</b>: no interval (with <code>evaluation.ranking_bootstrap: 0</code>, ties come from a "
+        "Welch t-test over seeds and need two replicates). Baselines are reference rows, "
         "never ranked against the models. <b>untuned</b>: no HPO trial passed the screens, so the "
         "tuned model was fitted with the untuned settings and repeats the untuned one.</p>"
     )

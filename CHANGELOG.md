@@ -4,6 +4,16 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.31.1 (2026-10-29)
+
+A fix to the anchored ranking. Scores change only where a primary metric's baselines were within noise of each other (that metric is now left out, so its type score can disappear); use a new experiment id if that happens on your data. No config edit is needed.
+
+### Fixed
+
+- **A primary metric whose baselines are not told apart beyond noise is left out of the scores.** Anchoring divides by the gap between the two baselines; when that gap is about the size of its noise, the anchored score turns noise into large values of either sign (on the integration fixture the demographic parity gap gave a fairness interval reaching -47). With `evaluation.ranking_bootstrap` above 0, a metric is now anchored only when the bootstrap's one-sided 95% lower bound of the baseline gap is above 0; otherwise it is dropped with a warning, listed in the report, and the scores and intervals are recomputed without it. With `ranking_bootstrap: 0` only the order check applies.
+- The dashboard's ranking footnote described the Welch t-test; it now describes the anchored scores and the bootstrap ties.
+- A report rewritten by `synthdata-plot` lost the anchored primary-metric table and the list of left-out metrics; it now reads them from `primary_metrics.csv`, which gains a `dropped` column (one row per left-out metric).
+
 ## 0.31.0 (2026-10-29)
 
 Two new outputs and a changed check value. No metric or score changes, so results stay comparable and goldens need no re-recording. No config edit is needed.

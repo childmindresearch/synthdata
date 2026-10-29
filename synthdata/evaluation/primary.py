@@ -76,6 +76,9 @@ KNOWN_SIGNS = {
 #: File (in the evaluation folder) with each primary metric's raw and anchored value.
 PRIMARY_FILENAME = "primary_metrics.csv"
 
+#: One-sided level at which the baselines must differ for a metric to be anchored.
+SPAN_CONFIDENCE = 0.95
+
 #: Holdout draws are computed in chunks of this many to bound memory.
 _CHUNK = 200
 
@@ -200,7 +203,8 @@ def _scores(
     # baseline (as a missing metric scores worst in the composite).
     anchored = np.where(np.isnan(values) & valid[:, None, :], 0.0, anchored)
 
-    out: dict = {"anchored": anchored}
+    # The baselines' gap in the better direction, per draw and metric.
+    out: dict = {"anchored": anchored, "span": span * signs}
     log_total = np.zeros(values.shape[:2])
     weight_total = np.zeros(values.shape[:2])
     for type_ in TYPES:
@@ -303,8 +307,13 @@ def primary_table(combined: pd.DataFrame) -> pd.DataFrame:
                     "anchor_0": means.get(worst, np.nan),
                     "anchor_1": means.get(best, np.nan),
                     "anchored": anchored.loc[name, column],
+                    "dropped": None,
                 }
             )
+    # Configured metrics left out, one row each, so a report rebuilt from
+    # this file can say why.
+    for metric, reason in spec.dropped.items():
+        rows.append({"model": None, "metric": metric, "anchored": np.nan, "dropped": reason})
     return pd.DataFrame(rows)
 
 
@@ -468,7 +477,9 @@ def bootstrap_draws(
     n_draws: int,
     seed: int,
 ) -> dict:
-    """Bootstrap distribution of every model's scores: ``{dim: DataFrame (draws x models)}``.
+    """Bootstrap distribution of every model's scores: ``{dim: DataFrame (draws x models)}``,
+    plus ``"span"``: the baselines' gap per draw and primary column (see
+    :func:`unseparated_metrics`).
 
     Each draw resamples the holdout patients once for all models (and the
     distance attack's member units), recomputes :data:`RESAMPLED_METRICS`
@@ -491,6 +502,7 @@ def bootstrap_draws(
         pd.factorize(pd.Series(rows.holdout_keys)) if rows is not None else (None, [])
     )
     draws: dict = {}
+    spans: list = []
     for start in range(0, n_draws, _CHUNK):
         b = min(_CHUNK, n_draws - start)
         values = np.repeat(base[None], b, axis=0)
@@ -519,9 +531,35 @@ def bootstrap_draws(
         for dim in ("overall", *TYPES):
             if dim in out:
                 draws.setdefault(dim, []).append(out[dim])
-    return {
+        spans.append(out["span"])
+    result = {
         dim: pd.DataFrame(np.concatenate(parts), columns=list(groups))
         for dim, parts in draws.items()
+    }
+    result["span"] = pd.DataFrame(
+        np.concatenate(spans), columns=pd.MultiIndex.from_tuples(spec.columns)
+    )
+    return result
+
+
+def unseparated_metrics(span_draws: pd.DataFrame, confidence: float = SPAN_CONFIDENCE) -> dict:
+    """Primary metrics whose baselines are not told apart beyond noise.
+
+    A metric is anchored only when the one-sided ``confidence`` lower bound
+    of the baselines' gap in its better direction (``span`` of
+    :func:`bootstrap_draws`) is above 0. When the gap is within noise,
+    dividing by it turns noise into arbitrarily large scores of either sign,
+    so the metric has no usable scale in this run. Returns ``{column: reason}``.
+    """
+    lower = span_draws.quantile(1 - confidence)
+    share = (span_draws > 0).mean()
+    return {
+        column: (
+            f"its baselines are not separated beyond noise (gap above 0 in {share[column]:.0%} "
+            f"of bootstrap draws, needs {confidence:.0%}), so it has no stable scale"
+        )
+        for column in span_draws.columns
+        if not lower[column] > 0
     }
 
 
@@ -563,6 +601,8 @@ def summarize_draws(
     tail = (1 - confidence) / 2
     table = pd.DataFrame(index=point.index)
     for dim, frame in draws.items():
+        if dim not in point.columns:
+            continue
         frame = frame.reindex(columns=point.index)
         table[f"{dim}_ci_low"] = frame.quantile(tail).to_numpy()
         table[f"{dim}_ci_high"] = frame.quantile(1 - tail).to_numpy()

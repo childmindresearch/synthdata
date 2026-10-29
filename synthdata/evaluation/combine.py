@@ -504,13 +504,8 @@ def build_combined_table(
     elif primary_metrics:
         spec = resolve_primary(primary_metrics, raw_df, directions)
         if spec.columns:
-            point = point_scores(raw_df, spec, rank_weights)
-            anchored = point["anchored"]
             combined = combined.rename(columns={_ALL: LEGACY}, level=0)
-            for dim in ("overall", *_TYPES):
-                # A type whose every primary metric lost its scale has no score.
-                if dim in point["replicates"].columns and point["replicates"][dim].notna().any():
-                    combined[(_ALL, dim, _RANK)] = point["replicates"][dim]
+            anchored = _set_primary_scores(combined, raw_df, spec, rank_weights)
         else:
             logger.warning("[ranking] no primary metric available; ranking on the composite")
             spec = None
@@ -524,6 +519,49 @@ def build_combined_table(
     if spec is not None and anchored is not None:
         combined.attrs["primary_spec"] = spec
         combined.attrs["primary_anchored"] = anchored.reindex(combined.index)
+    return combined
+
+
+def _set_primary_scores(combined, raw, spec, weights) -> pd.DataFrame:
+    """Write the anchored primary scores into ``combined``'s ``__all__`` columns
+    (in place); return the anchored value of each primary metric."""
+    point = point_scores(raw, spec, weights or DEFAULT_RANK_WEIGHTS)
+    for dim in ("overall", *_TYPES):
+        key = (_ALL, dim, _RANK)
+        # A type whose every primary metric lost its scale has no score.
+        if dim in point["replicates"].columns and point["replicates"][dim].notna().any():
+            combined[key] = point["replicates"][dim].reindex(combined.index)
+        elif key in combined.columns:
+            combined.drop(columns=[key], inplace=True)
+    return point["anchored"]
+
+
+def drop_primary_metrics(
+    combined: pd.DataFrame, reasons: dict, weights: dict | None
+) -> pd.DataFrame:
+    """Leave ``reasons`` (``{column: why}``) out of the primary scores and rescore.
+
+    Used when the ranking bootstrap finds a metric whose baselines are not
+    separated beyond noise (:func:`synthdata.evaluation.primary.unseparated_metrics`).
+    """
+    spec = combined.attrs["primary_spec"]
+    for column, reason in reasons.items():
+        spec.columns.remove(column)
+        spec.dropped[column[2]] = reason
+        logger.warning("[ranking] primary metric %s left out: %s", column[2], reason)
+    combined = combined.copy()
+    combined.attrs = dict(combined.attrs)
+    if not spec.columns:
+        logger.warning("[ranking] no primary metric has a stable scale; ranking on the composite")
+        combined = combined.drop(columns=[c for c in combined.columns if c[0] == _ALL])
+        combined = combined.rename(columns={LEGACY: _ALL}, level=0)
+        for key in ("primary_spec", "primary_anchored"):
+            combined.attrs.pop(key, None)
+        return combined.sort_values((_ALL, "overall", _RANK), ascending=False)
+    anchored = _set_primary_scores(combined, combined[spec.columns], spec, weights)
+    combined = combined.sort_values((_ALL, "overall", _RANK), ascending=False)
+    combined.attrs["primary_spec"] = spec
+    combined.attrs["primary_anchored"] = anchored.reindex(combined.index)
     return combined
 
 

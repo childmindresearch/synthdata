@@ -24,6 +24,7 @@ from synthdata.evaluation.combine import (
 )
 from synthdata.evaluation.fairness_gaps import FAIRNESS_GAP_METRICS, FAIRNESS_SIGNAL_COLUMN
 from synthdata.evaluation.model_cards import CARDS_DIRNAME, write_model_cards
+from synthdata.evaluation.primary import PRIMARY_FILENAME, primary_table
 from synthdata.evaluation.privacy_attacks import (
     ANONYMETER_METRICS,
     MEMBERSHIP_METRICS,
@@ -489,29 +490,41 @@ def _primary_lines(combined, ranking_summary, weights: str, paths, links) -> lis
         "one dimension cannot be bought back by the others.",
         "",
     ]
-    anchored = combined.attrs.get("primary_anchored")
-    spec = combined.attrs.get("primary_spec")
-    if anchored is not None and spec is not None:
-        models = [split_replicate_name(str(m))[0] for m in anchored.index]
-        means = anchored.groupby(models, sort=False).mean()
+    # From the run's attributes, or primary_metrics.csv when the report is
+    # rewritten from the saved tables (synthdata-plot).
+    table = None
+    if combined.attrs.get("primary_spec") is not None:
+        table = primary_table(combined)
+    elif (paths.evaluation / PRIMARY_FILENAME).exists():
+        table = pd.read_csv(paths.evaluation / PRIMARY_FILENAME)
+    if table is not None and not table.empty:
+        kept = table[table["dropped"].isna()] if "dropped" in table else table
+        means = kept.pivot_table(
+            index="model", columns=["type", "metric"], values="anchored", aggfunc="mean", sort=False
+        )
         if ranking_summary is not None:
             means = means.reindex([m for m in ranking_summary.index if m in means.index])
-        means.columns = [f"{c[1]}: {c[2]}" for c in means.columns]
+        means.columns = [f"{t}: {m}" for t, m in means.columns]
         lines += [
             "Primary metrics, anchored (mean over seeds):",
             "",
             _dataframe_to_markdown(means.round(3).reset_index(names="model")),
         ]
-        if spec.dropped:
-            lines += [
-                "",
-                "Left out of the primary set in this run: "
-                + "; ".join(f"`{m}` ({why})" for m, why in spec.dropped.items())
-                + ".",
-            ]
+        if "dropped" in table:
+            dropped = table.dropna(subset=["dropped"]).drop_duplicates("metric")
+            if not dropped.empty:
+                lines += [
+                    "",
+                    "Left out of the primary set in this run: "
+                    + "; ".join(
+                        f"`{m}` ({why})"
+                        for m, why in zip(dropped["metric"], dropped["dropped"], strict=True)
+                    )
+                    + ".",
+                ]
         lines += [
             "",
-            f"Raw values and anchors: {links.maybe(paths.evaluation / 'primary_metrics.csv')}.",
+            f"Raw values and anchors: {links.maybe(paths.evaluation / PRIMARY_FILENAME)}.",
         ]
     if ranking_summary is not None and "legacy_overall_mean" in ranking_summary.columns:
         legacy = ranking_summary["legacy_overall_mean"].sort_values(ascending=False)
