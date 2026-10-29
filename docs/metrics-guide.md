@@ -97,10 +97,10 @@ Protected columns are set in `data.protected_columns`, and the groups of a numer
 
 | Metric | What it measures | Read it as |
 | --- | --- | --- |
-| `demographic_parity_gap_error` | The holdout TSTR classifier, trained once on the synthetic and once on the real data, predicts the holdout. For each class and protected group: the group's share of predictions in that class minus everyone else's. The score is the average distance between the synthetic-trained and the real-trained gap. | 0 is ideal (the real disparity kept). Blank when `fairness_signal` is 0. |
+| `demographic_parity_gap_error` | The holdout TSTR classifier, trained once on the synthetic and once on the real data, predicts the holdout. For each class and protected group: the group's share of predictions in that class minus everyone else's. The score is the average distance between the synthetic-trained and the real-trained gap. | 0 is ideal (the real disparity kept). A model with no class signal scores about the size of the real gap. |
 | `equal_opportunity_gap_error` | The same for the true-positive rate (recall). | 0 is ideal. |
 | `equalized_odds_gap_error` | The same, taking the larger of the true- and false-positive rate differences. | 0 is ideal. |
-| `fairness_signal` | 1 when the synthetic-trained classifier beats chance on the holdout (bootstrap 95% interval of balanced accuracy above 1 / classes); otherwise the three scores above are blank and not ranked. | Not ranked. |
+| `fairness_signal` | 1 when the synthetic-trained classifier beats chance on the holdout (bootstrap 95% interval of balanced accuracy above 1 / classes). It says which models' gaps come from a classifier that learned almost nothing. | Not ranked. |
 | `statistical_parity` | A classifier trained and tested on the synthetic data: difference in the share of positive predictions between a protected group and everyone else. Exactly 0 when the synthetic data has no class signal (the classifier predicts one class), so it is not ranked. | 0 means equal rates. Not ranked. |
 | `equal_opportunity` | Difference in true-positive rate (recall) between a group and everyone else, as above. | Not ranked. |
 | `equalized_odds` | Mean of the differences in true-positive and false-positive rates, as above. | Not ranked. |

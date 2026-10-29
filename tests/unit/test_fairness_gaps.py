@@ -55,12 +55,16 @@ def test_erasing_or_inverting_the_gap_scores_high(real):
         assert inverted[metric] > erased[metric] + 0.08, metric
 
 
-def test_a_dataset_with_no_class_signal_gets_nan_and_a_flag(real):
+def test_a_dataset_with_no_class_signal_scores_like_one_that_erased_the_gaps(real):
+    kept = _score(real, _draw(4000, 2))
     result = _score(real, _draw(4000, 5, group_effect=0.0, signal=0.0))
     assert not result.signal
-    assert all(np.isnan(v) for v in result.errors.values())
-    # The gaps behind it stay in the detail table.
-    assert not result.gaps.empty
+    # Its classifier has no group effect to copy, so each error is at least
+    # about the size of the real gap: no gate is needed to keep it from looking fair.
+    real_gap = result.gaps["dp_real"].abs().mean()
+    assert result.errors["demographic_parity_gap_error"] > 0.8 * real_gap
+    for metric in fg.FAIRNESS_GAP_METRICS:
+        assert result.errors[metric] > kept.errors[metric] + 0.08, metric
 
 
 def test_a_constant_prediction_has_no_signal(real):
@@ -92,27 +96,20 @@ def test_gaps_are_group_minus_rest_per_class():
     assert gaps.loc[1, "fpr"] == pytest.approx(0.6 - 0.0)
 
 
-def test_a_gated_model_is_left_out_of_the_fairness_rank_not_scored_worst():
+def test_gap_errors_are_ranked_and_the_signal_flag_is_not():
     table = pd.DataFrame(
         {
-            fg.FAIRNESS_SIGNAL_COLUMN: [1, 1, 0],
-            **{m: [0.01, 0.30, np.nan] for m in fg.FAIRNESS_GAP_METRICS},
+            fg.FAIRNESS_SIGNAL_COLUMN: [1, 0, 1],
+            **{m: [0.01, 0.09, 0.30] for m in fg.FAIRNESS_GAP_METRICS},
         },
-        index=["good", "bad", "nosignal"],
+        index=["kept", "nosignal", "inverted"],
     )
-    # Every model ties on privacy (scaled 0.5), so only fairness separates them.
     privacy = {"scores": {m: {ANONYMETER_METRICS[0]: 0.1} for m in table.index}}
     combined = build_combined_table(
         {}, None, None, {}, list(table.index), privacy_result=privacy, fairness_gap_table=table
     )
     fairness = combined[("__all__", "fairness", "rank")]
-    assert fairness["good"] == pytest.approx(1.0)
-    assert fairness["bad"] == pytest.approx(0.0)
-    assert np.isnan(fairness["nosignal"])
-    overall = combined[("__all__", "overall", "rank")]
-    # The gated model is scored on privacy alone, not given the worst fairness.
-    assert overall["nosignal"] == pytest.approx(0.5)
-    assert overall["good"] > overall["nosignal"] > overall["bad"]
+    assert fairness["kept"] > fairness["nosignal"] > fairness["inverted"]
     directions = combined.attrs["metric_directions"]
     assert directions.loc[("custom", "fairness", fg.FAIRNESS_SIGNAL_COLUMN), "direction"] == (
         "unranked"

@@ -65,7 +65,7 @@ class TestBuildEvaluationReport:
                 "balanced_accuracy_ci_low": [0.58, 0.31],
                 "balanced_accuracy_ci_high": [0.64, 0.35],
                 "chance_balanced_accuracy": [1 / 3, 1 / 3],
-                **{m: [0.04, float("nan")] for m in FAIRNESS_GAP_METRICS},
+                **{m: [0.04, 0.09] for m in FAIRNESS_GAP_METRICS},
             },
             index=pd.Index(["model_a", "model_b"], name="model"),
         )
@@ -74,7 +74,7 @@ class TestBuildEvaluationReport:
         fairness = _section(text, "5. Fairness")
         assert "### Holdout fairness gaps" in fairness
         assert "demographic_parity_gap_error" in fairness
-        assert "reaches chance (0.333)" in fairness
+        assert "reaches chance (0.333)" in fairness and "erased the disparities" in fairness
         assert "### Subgroup gap metrics (reported, not ranked)" in fairness
         assert "fairness_gaps_by_group.csv" in fairness
 
