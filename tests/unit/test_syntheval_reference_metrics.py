@@ -219,3 +219,75 @@ class TestAnalysisConfigTargetTypes:
         frame = pd.DataFrame({"x": [0.1, 0.2, 0.3], "y": [0.5, 1.5, 2.5]})
 
         assert AnalysisConfig(dataset=frame, target_vars="y").target_types == {"y": "num"}
+
+
+class TestCorrelationRatio:
+    def test_is_eta_not_eta_squared(self):
+        from syntheval.metrics.utility.metric_mixed_correlation import _correlation_ratio
+
+        cats = np.array([0, 1, 0, 1])
+        values = np.array([1.0, 2.0, 3.0, 4.0])
+        between = 2 * (2.0 - 2.5) ** 2 + 2 * (3.0 - 2.5) ** 2
+        total = np.sum((values - 2.5) ** 2)
+        assert _correlation_ratio(cats, values) == pytest.approx(np.sqrt(between / total))
+
+
+class TestMixedCorrelationConstantColumn:
+    def test_constant_synthetic_column_counts_as_no_association(self):
+        from syntheval.metrics.utility.metric_mixed_correlation import MixedCorrelation
+
+        rng = np.random.default_rng(0)
+        x = rng.normal(size=500)
+        real = pd.DataFrame({"x": x, "y": x + rng.normal(scale=0.5, size=500)})
+        synthetic = real.assign(y=0.0)
+
+        result = MixedCorrelation(
+            real,
+            synthetic,
+            cat_cols=[],
+            num_cols=["x", "y"],
+            do_preprocessing=False,
+            plot_figures=False,
+        ).evaluate(mixed_corr=False)
+
+        # Frobenius norm of [[0, r], [r, 0]] with r the real x-y correlation.
+        r = real.corr().loc["x", "y"]
+        assert result["corr_mat_diff"] == pytest.approx(np.sqrt(2) * r)
+
+
+class TestPropensityMSE:
+    def test_sees_category_shares_that_keep_the_mean_code(self):
+        from syntheval.metrics.utility.metric_propensity_mse import (
+            PropensityMeanSquaredError,
+        )
+
+        rng = np.random.default_rng(0)
+        real = pd.DataFrame({"c": rng.choice(3, size=2000), "x": rng.normal(size=2000)})
+        fresh = pd.DataFrame({"c": rng.choice(3, size=2000), "x": rng.normal(size=2000)})
+        # Middle category dropped, mean code unchanged: invisible to a
+        # logistic model on the label codes.
+        swapped = fresh.assign(c=rng.choice([0, 2], size=2000))
+
+        def pmse(synthetic: pd.DataFrame) -> float:
+            return PropensityMeanSquaredError(
+                real, synthetic, cat_cols=["c"], num_cols=["x"], do_preprocessing=False
+            ).evaluate()["avg pMSE"]
+
+        assert pmse(swapped) > 10 * pmse(fresh)
+
+
+class TestMIAPrecision:
+    def test_silent_attacker_scores_chance_not_worst(self):
+        from syntheval.metrics.privacy.metric_MIA_classification import MIAClassifier
+
+        metric = MIAClassifier.__new__(MIAClassifier)
+        metric.hout_data = pd.DataFrame()
+        for precision, expected in [(0.5, 1.0), (0.1, 1.0), (0.75, 0.5), (1.0, 0.0)]:
+            metric.results = {
+                "MIA recall": 0.0,
+                "MIA recall se": 0.0,
+                "MIA precision": precision,
+                "MIA precision se": 0.0,
+            }
+            row = {r["metric"]: r for r in metric.normalize_output()}["mia_precision"]
+            assert row["n_val"] == pytest.approx(expected)

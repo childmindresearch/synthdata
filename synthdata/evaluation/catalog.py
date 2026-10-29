@@ -65,7 +65,29 @@ SYNTHCITY_METRIC_CONFIG = {
 #: Gaussian over the whole data and cannot see local overfitting. SynthEval's
 #: mia, Anonymeter and the holdout DCR/NNDR cover membership inference
 #: (docs/verification.md).
-SYNTHCITY_OPT_IN_METRICS = frozenset({"DomiasMIA_prior"})
+#:
+#: The others failed the known-answer checks (KA-07, N2; see
+#: SYNTHCITY_UNRANKED_SUBMETRICS) and were already reported but not ranked.
+#: They are off by default since 2026-10-29 because they cost fits and KMeans
+#: runs for numbers nobody should read as evidence: the augmentation scores
+#: (the real half of the training set carries them), the KMeans k-anonymity
+#: family (a collapsed generator scores best), detection_gmm (ignores the
+#: labels) and data_leakage linear/mlp (score a copy like a fresh draw).
+SYNTHCITY_OPT_IN_METRICS = frozenset(
+    {
+        "DomiasMIA_prior",
+        "linear_model_augmentation",
+        "mlp_augmentation",
+        "xgb_augmentation",
+        "detection_gmm",
+        "delta-presence",
+        "k-anonymization",
+        "k-map",
+        "distinct l-diversity",
+        "data_leakage_linear",
+        "data_leakage_mlp",
+    }
+)
 
 #: synthcity's own "category" (sanity/stats/.../attack) rolled up to utility/privacy.
 #: Detection metrics are the AUC of a classifier telling real rows from
@@ -138,8 +160,28 @@ SYNTHCITY_REDUNDANT_SUBMETRIC_SUFFIXES = ("_naive",)
 #: (0.966) the best and every generator equally worst. The MLP detector scored
 #: the marginals baseline 0.51, as hard to spot as a copy (0.50), so it cannot
 #: see dependence between columns. Both stay in the table (docs/verification.md).
+#:
+#: ``stats.ks_test`` duplicates SynthEval's ks_test but also runs the KS test
+#: on label-encoded nominal columns, where the statistic depends on the code
+#: order (SC-11); SynthEval's version uses the total variation distance for
+#: them and stays ranked.
+#:
+#: The sanity distance scores (nearest-neighbour distance, close and distant
+#: values probability) min-max scale each model's own distance vector before
+#: averaging or thresholding it, so a generator whose rows are all far from
+#: the real ones scores like one whose rows are all close: only the shape of
+#: the distance distribution is left (SC-17). ``common_rows_proportion`` is
+#: the share of exact copies, a privacy property, ranked as utility with
+#: "minimize" while the neighbour distance (also "minimize") rewards copies.
+#: The holdout DCR and distance MIA measure closeness to the training rows
+#: against a holdout reference.
 SYNTHCITY_UNRANKED_SUBMETRICS = frozenset(
     {
+        "stats.ks_test.marginal",
+        "sanity.common_rows_proportion.score",
+        "sanity.nearest_syn_neighbor_distance.mean",
+        "sanity.close_values_probability.score",
+        "sanity.distant_values_probability.score",
         "performance.feat_rank_distance.pvalue",
         "detection.detection_gmm.mean",
         "detection.detection_xgb.mean",
@@ -277,6 +319,16 @@ SYNTHEVAL_CUSTOM_FAIRNESS_KEYS = {"equalized_odds", "equal_opportunity"}
 #: (synthdata.evaluation.fairness_gaps) are ranked instead.
 SYNTHEVAL_FAIRNESS_GAP_KEYS = {"statistical_parity", *SYNTHEVAL_CUSTOM_FAIRNESS_KEYS}
 _SYNTHEVAL_FAIRNESS_GAP_PREFIXES = ("sp_", *_SYNTHEVAL_CUSTOM_SUBMETRIC_PREFIXES)
+
+
+#: SynthEval result columns reported but not ranked. ``mia_recall`` is the
+#: share of training rows a classifier flags as members, at a fixed
+#: threshold, without its precision: an attacker that flags no one scores
+#: best, so it rewarded synthetic data that looks unlike every real row (in
+#: the known-answer checks a one-SD shift looked more private than a fresh
+#: draw, 0.27 vs 0.50). ``mia_precision`` (only precision above chance counts,
+#: fork) and the holdout distance MIA AUC stay ranked.
+SYNTHEVAL_UNRANKED_METRICS = frozenset({"mia_recall"})
 
 
 def is_syntheval_fairness_gap(name: str) -> bool:

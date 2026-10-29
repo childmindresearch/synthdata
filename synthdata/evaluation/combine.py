@@ -17,6 +17,7 @@ from synthdata.evaluation.catalog import (
     LOG_DISPARITY_METRICS,
     SYNTHCITY_CATEGORY_TO_TYPE,
     SYNTHCITY_UNRANKED_SUBMETRICS,
+    SYNTHEVAL_UNRANKED_METRICS,
     TSTR_METRICS,
     is_custom_syntheval_metric,
     is_redundant_synthcity_submetric,
@@ -134,7 +135,13 @@ def _syntheval_frames(
     # Their classifier is fitted and scored inside the synthetic data, so a
     # dataset with no class signal gets a perfect 0; the holdout fairness
     # gaps (_fairness_gap_frames) are ranked instead.
-    oriented = oriented[[c for c in oriented.columns if not is_syntheval_fairness_gap(c[2])]]
+    oriented = oriented[
+        [
+            c
+            for c in oriented.columns
+            if not is_syntheval_fairness_gap(c[2]) and c[2] not in SYNTHEVAL_UNRANKED_METRICS
+        ]
+    ]
     return raw, oriented
 
 

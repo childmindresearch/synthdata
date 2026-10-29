@@ -184,6 +184,14 @@ class TestSyntheEvalFrames:
         with pytest.raises(ValueError, match="mia_recall"):
             _syntheval_frames(untyped, self._benchmark_ranks(), model_names=["model_a"])
 
+    def test_mia_recall_is_reported_but_not_ranked(self):
+        raw, oriented = _syntheval_frames(
+            self._benchmark_results(), self._benchmark_ranks(), model_names=["model_a", "model_b"]
+        )
+        assert ("syntheval", "privacy", "mia_recall") in list(raw.columns)
+        assert ("syntheval", "privacy", "mia_recall") not in list(oriented.columns)
+        assert ("syntheval", "utility", "ks_test") in list(oriented.columns)
+
     def test_raw_values_extracted_correctly(self):
         raw, _ = _syntheval_frames(
             self._benchmark_results(), self._benchmark_ranks(), model_names=["model_a", "model_b"]

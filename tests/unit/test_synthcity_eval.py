@@ -6,7 +6,6 @@ import pytest
 
 from synthdata.config import FrameworkSelectionConfig
 from synthdata.evaluation import synthcity_eval
-from synthdata.evaluation.catalog import SYNTHCITY_METRIC_CONFIG
 from synthdata.evaluation.synthcity_eval import resolve_metric_config
 
 pytestmark = pytest.mark.unit
@@ -16,8 +15,16 @@ class TestResolveMetricConfig:
     def test_default_selection_uses_native_attack_category(self):
         result = resolve_metric_config(FrameworkSelectionConfig())
 
-        assert result["attack"] == SYNTHCITY_METRIC_CONFIG["attack"]
+        # data_leakage linear/mlp are opt-in (SYNTHCITY_OPT_IN_METRICS).
+        assert result["attack"] == ["data_leakage_xgb"]
         assert "attacks" not in result
+
+    def test_failed_known_answer_metrics_run_only_when_named(self):
+        default = resolve_metric_config(FrameworkSelectionConfig())
+        selected = {name for names in default.values() for name in names}
+        assert not selected & {"xgb_augmentation", "k-anonymization", "detection_gmm"}
+        named = resolve_metric_config(FrameworkSelectionConfig(metrics=["k-anonymization"]))
+        assert named == {"privacy": ["k-anonymization"]}
 
     def test_domias_runs_only_when_named(self):
         # Fails on wide data (singular KDE covariance); see SYNTHCITY_OPT_IN_METRICS.
@@ -30,7 +37,7 @@ class TestResolveMetricConfig:
     def test_privacy_category_includes_attack_metrics(self):
         result = resolve_metric_config(FrameworkSelectionConfig(categories=["privacy"]))
 
-        assert result["attack"] == SYNTHCITY_METRIC_CONFIG["attack"]
+        assert result["attack"] == ["data_leakage_xgb"]
 
     def test_explicit_attack_metric_uses_native_category(self):
         result = resolve_metric_config(FrameworkSelectionConfig(metrics=["data_leakage_linear"]))

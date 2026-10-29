@@ -9,13 +9,18 @@ import numpy as np
 import pandas as pd
 import pytest
 from scipy.stats import chisquare
-from synthcity.metrics._utils import get_frequency
+from sklearn.metrics import roc_auc_score
+from synthcity.metrics._utils import evaluate_auc, get_frequency
 from synthcity.metrics.eval_statistical import (
     AlphaPrecision,
     ChiSquaredTest,
     InverseKLDivergence,
+    JensenShannonDistance,
+    MaximumMeanDiscrepancy,
+    PRDCScore,
 )
 from synthcity.plugins.core.dataloader import GenericDataLoader
+from synthcity.utils.dataframe import declared_discrete_columns
 
 pytestmark = pytest.mark.unit
 
@@ -105,3 +110,74 @@ class TestAuthenticity:
         expected = np.mean(syn_d.min(axis=1) > real_radius[nearest])
 
         assert self._authenticity(real, synthetic) == pytest.approx(expected)
+
+
+def _wide(seed: int, n: int = 300, shift_narrow: float = 0.0) -> pd.DataFrame:
+    """60 columns: wide-range (sd 100) and narrow (sd 1) columns alternate."""
+    rng = np.random.default_rng(seed)
+    x = rng.normal(size=(n, 60)) * np.where(np.arange(60) % 2 == 0, 100.0, 1.0)
+    x[:, 1:20:2] += shift_narrow  # shift ten narrow columns by one SD
+    return pd.DataFrame(x, columns=[f"x{i}" for i in range(60)])
+
+
+class TestMaximumMeanDiscrepancy:
+    def test_ranks_a_shift_behind_an_independent_draw_on_wide_data(self, no_cache):
+        # With upstream's gamma = 1 on unscaled columns the kernel was ~0 off
+        # the diagonal, so both scores were 2/n and only a copy scored better.
+        real = GenericDataLoader(_wide(1))
+        metric = MaximumMeanDiscrepancy(**no_cache)
+        same = metric.evaluate(real, GenericDataLoader(_wide(2)))["joint"]
+        shifted = metric.evaluate(real, GenericDataLoader(_wide(2, shift_narrow=1.0)))["joint"]
+
+        assert same < shifted
+        assert shifted > 2 / 300 * 1.5
+
+    def test_copy_scores_zero(self, no_cache):
+        real = GenericDataLoader(_wide(1))
+        score = MaximumMeanDiscrepancy(**no_cache).evaluate(real, real)["joint"]
+        assert score == pytest.approx(0.0, abs=1e-9)
+
+
+class TestPRDC:
+    def test_sees_narrow_columns(self, no_cache):
+        # Unscaled, the neighbour radii only saw the sd-100 columns and a
+        # shift of the sd-1 columns left density unchanged.
+        real = GenericDataLoader(_wide(1))
+        metric = PRDCScore(**no_cache)
+        same = metric.evaluate(real, GenericDataLoader(_wide(2)))
+        shifted = metric.evaluate(real, GenericDataLoader(_wide(2, shift_narrow=1.0)))
+        assert shifted["density"] < same["density"] - 0.05
+
+
+class TestJensenShannonDistance:
+    def test_nominal_column_gets_one_bin_per_category(self, no_cache):
+        # 12 categories: equal-width bins over the codes merged neighbours, so
+        # moving rows from category 0 to 1 was invisible.
+        real = pd.DataFrame({"c": np.repeat(np.arange(12), 20)})
+        moved = real.assign(c=real["c"].replace({0: 1}))
+        with declared_discrete_columns(["c"]):
+            score = JensenShannonDistance(**no_cache).evaluate(
+                GenericDataLoader(real), GenericDataLoader(moved)
+            )["marginal"]
+        p = np.full(12, 1 / 12)
+        q = p.copy()
+        q[1] += q[0]
+        q[0] = 0
+        m = (p + q) / 2
+        expected = np.sqrt(
+            (np.sum(p * np.log(p / m)) + np.sum(q[q > 0] * np.log(q[q > 0] / m[q > 0]))) / 2
+        )
+        assert score == pytest.approx(expected, rel=1e-6)
+
+
+class TestEvaluateAuc:
+    def test_multiclass_is_macro_one_vs_rest(self):
+        rng = np.random.default_rng(0)
+        y = rng.choice(3, size=400, p=[0.8, 0.15, 0.05])
+        proba = rng.dirichlet(np.ones(3), size=400)
+        proba[np.arange(400), y] += 0.3 * (y == 0)  # only the majority class is learned
+        proba /= proba.sum(axis=1, keepdims=True)
+
+        aucroc, _ = evaluate_auc(y, proba)
+
+        assert aucroc == pytest.approx(roc_auc_score(y, proba, multi_class="ovr", average="macro"))
