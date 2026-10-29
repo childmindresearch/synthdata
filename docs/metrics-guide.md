@@ -68,6 +68,7 @@ Privacy numbers are evidence from specific attacks, not guarantees. Compare ever
 | `anonymeter_inference_risk` | Knowing a person's quasi-identifiers, can the attacker guess their sensitive columns better than from unseen real rows? Worst sensitive column. | 0 to 1, lower is better. |
 | `dcr_closer_to_train_share` | For each synthetic row, is its nearest training row closer than its nearest unseen (test) row? Share of rows where it is. | 0.5 is ideal: synthetic rows are as close to unseen people as to training ones. Above 0.5 means they hug the training rows. |
 | `distance_mia_auc` | A membership attack that guesses "was this person in training?" from their distance to the synthetic data. | 0.5 is ideal (a coin flip). Higher means membership leaks. |
+| `domias_mia_auc` | DOMIAS, a second membership attack: it guesses "was this person in training?" from whether the synthetic data is denser around them than real data from the same population is. | 0.5 is ideal (a coin flip). Higher means membership leaks. It catches the same copies as `distance_mia_auc` by a different route, so the two should agree; read a disagreement as a reason to look closer. |
 | `dcr_holdout_ratio`, `nndr_holdout_ratio` | Distance from synthetic rows to their closest training row, divided by the same for test rows, at the closest 5% (DCR: distance to closest record; NNDR: nearest-neighbour distance ratio). | 1 or above is ideal. Below 1 means synthetic rows sit closer to training rows than to unseen ones. |
 
 ### SynthEval

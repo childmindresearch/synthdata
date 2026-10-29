@@ -4,6 +4,18 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.29.0 (2026-10-29)
+
+A new ranked privacy metric changes the privacy scores and ranks, so use a new experiment id. The golden runs need re-recording. No config edits are needed.
+
+### Added
+
+- **DOMIAS membership attack** (custom evaluator `domias`, metric `domias_mia_auc` in the privacy section, on by default). A second membership attack, built differently from `distance_mia_auc`: it asks whether the synthetic data is denser around a training patient than real data from the same population is (van Breugel et al., 2023). Half of the test split is that population sample and the other half are the unseen patients. 0.5 means no leak. It is ranked like `distance_mia_auc`, with no credit below 0.5. A new setting, `evaluation.privacy_attacks.domias.n_components` (default `null`, meaning all components that carry variance), sets the dimensions the densities are estimated in. Why DOMIAS and not another attack, the two deviations from synthcity's version that make it work on wide data, and the known-answer results are in `docs/verification.md`. In short, it matches the distance attack on known answers but does not beat it, so read it as corroboration.
+
+### Changed
+
+- synthcity's `DomiasMIA_prior` stays off by default. It still fails on wide data, and the docs now point to the `domias` evaluator instead.
+
 ## 0.28.0 (2026-10-29)
 
 No config edits are needed. Metric values are unchanged, but a search that the new headroom gate skips leaves out that model's `<model>_hpo` row, so use a new experiment id when comparing with earlier runs. Golden runs that include HPO need re-recording only if the gate now skips one of their searches (the metric code is unchanged).

@@ -11,6 +11,7 @@ from synthdata.evaluation.privacy_attacks import (
     AttackRisk,
     _hanley_mcneil_se,
     _one_row_per_patient,
+    domias_scores,
     holdout_distance_scores,
     protected_group_masks,
     subgroup_privacy_scores,
@@ -76,6 +77,91 @@ class TestHoldoutDistances:
             train, holdout, copy, NOMINAL, patients, _ids(holdout), seed=0
         )
         assert scores["distance_mia_auc"] > 0.6
+
+
+def _latent_frame(n: int, seed: int, n_numeric: int, n_binary: int) -> pd.DataFrame:
+    """Correlated columns driven by four latent factors, plus binary codes."""
+    rng = np.random.default_rng(seed)
+    z = rng.normal(size=(n, 4))
+    columns = {
+        f"x{i}": z @ np.random.default_rng(i).normal(size=4) + 0.3 * rng.normal(size=n)
+        for i in range(n_numeric)
+    }
+    columns.update(
+        {f"c{i}": (z[:, i % 4] + rng.normal(size=n) > 0).astype(int) for i in range(n_binary)}
+    )
+    return pd.DataFrame(columns)
+
+
+@pytest.fixture(scope="module")
+def narrow():
+    train, holdout = _latent_frame(600, 0, 20, 5), _latent_frame(400, 1, 20, 5)
+    holdout.index = holdout.index + 10_000
+    return train, holdout, [f"c{i}" for i in range(5)]
+
+
+class TestDomias:
+    def test_a_copy_and_a_noisy_copy_are_flagged_and_fresh_data_is_not(self, narrow):
+        train, holdout, nominal = narrow
+        numeric = [c for c in train.columns if c.startswith("x")]
+        noisy = train.copy()
+        noisy[numeric] += 0.3 * np.random.default_rng(3).normal(size=(len(train), len(numeric)))
+        fresh = _latent_frame(600, 2, 20, 5)
+        auc = {
+            name: domias_scores(train, holdout, syn, nominal, None, seed=0)["domias_mia_auc"]
+            for name, syn in {"copy": train, "noisy": noisy, "fresh": fresh}.items()
+        }
+        assert auc["copy"] > 0.95
+        assert auc["noisy"] > 0.8
+        assert auc["fresh"] == pytest.approx(0.5, abs=0.08)
+
+    def test_wide_data_with_constant_and_duplicated_columns(self):
+        # The case that broke synthcity's DomiasMIA_prior (singular covariance)
+        # and, at full width, underflowed both densities to 0 (AUC 0.5 for a copy).
+        def wide(n, seed):
+            frame = _latent_frame(n, seed, 300, 60)
+            frame["dup"], frame["const"] = frame["c0"], 0
+            return frame
+
+        train, holdout = wide(800, 0), wide(600, 1)
+        nominal = [c for c in train.columns if not c.startswith("x")]
+        copy = domias_scores(train, holdout, train, nominal, None, seed=0)["domias_mia_auc"]
+        fresh = domias_scores(train, holdout, wide(800, 2), nominal, None, seed=0)
+        assert copy > 0.9
+        assert fresh["domias_mia_auc"] == pytest.approx(0.5, abs=0.08)
+
+    def test_matches_synthcitys_domias_kde(self, narrow, tmp_path):
+        """Same AUC as the reference implementation where its densities do not
+        underflow. A KDE is affine-invariant, so on numeric columns the
+        min-max encoding and full-rank projection change nothing."""
+        pytest.importorskip("synthcity")
+        from synthcity.metrics.eval_privacy import DomiasMIAKDE
+        from synthcity.plugins.core.dataloader import GenericDataLoader
+
+        train, holdout, _ = narrow
+        numeric = [f"x{i}" for i in range(6)]
+        train, holdout = train[numeric], holdout[numeric]
+        syn = train.copy()
+        syn += 0.1 * np.random.default_rng(4).normal(size=syn.shape)
+        ours = domias_scores(train, holdout, syn, [], None, seed=0)["domias_mia_auc"]
+
+        # The same members, non-members and reference rows as domias_scores.
+        rng = np.random.default_rng(0)
+        order = rng.permutation(len(holdout))
+        n_ref = len(holdout) // 2
+        members = train.iloc[rng.choice(len(train), size=n_ref, replace=False)]
+        x_gt = pd.concat([holdout.iloc[order[n_ref : 2 * n_ref]], holdout.iloc[order[:n_ref]]])
+        metric = DomiasMIAKDE(workspace=tmp_path, use_cache=False)
+        reference = metric.evaluate(
+            GenericDataLoader(x_gt.reset_index(drop=True)),
+            GenericDataLoader(syn),
+            GenericDataLoader(members.reset_index(drop=True)),
+            GenericDataLoader(syn),
+            reference_size=n_ref,
+        )["aucroc"]
+        assert ours > 0.7
+        # Agrees up to rounding: its ratio adds 1e-10 to p_R, ours is in log space.
+        assert ours == pytest.approx(reference, abs=1e-3)
 
 
 class TestSubgroupPrivacy:
@@ -171,6 +257,17 @@ def test_combined_frames_give_no_credit_past_the_holdout_reference():
     assert (oriented.loc["close"] < oriented.loc["same"]).all()
 
 
+def test_domias_is_ranked_like_the_distance_attack():
+    scores = {
+        "low": {"domias_mia_auc": 0.3},
+        "same": {"domias_mia_auc": 0.5},
+        "high": {"domias_mia_auc": 0.9},
+    }
+    _, oriented = _privacy_attack_frames({"scores": scores}, ["low", "same", "high"])
+    column = oriented[("custom", "privacy", "domias_mia_auc")]
+    assert column["low"] == column["same"] > column["high"]
+
+
 def test_combined_frames_report_the_subgroup_gap_unranked_under_fairness():
     scores = {
         "a": {"distance_mia_auc": 0.6, "subgroup_distance_mia_auc_gap": 0.2},
@@ -220,6 +317,7 @@ class TestRunPrivacyEvaluation:
         copy, fresh = result["scores"]["copy"], result["scores"]["fresh"]
         assert copy["anonymeter_linkability_risk"] > fresh["anonymeter_linkability_risk"]
         assert copy["distance_mia_auc"] > fresh["distance_mia_auc"]
+        assert copy["domias_mia_auc"] > fresh["domias_mia_auc"]
         assert result["subgroups"].empty  # no protected columns declared
 
     def test_is_reproducible_for_a_seed(self, dataset):

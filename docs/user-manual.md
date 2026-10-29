@@ -607,7 +607,7 @@ Metrics come from three sources, each switched on in `evaluation.synthcity`, `ev
 
 | Source | Examples |
 | --- | --- |
-| [synthcity](https://github.com/vanderschaarlab/synthcity) | Distribution distances (Wasserstein, KL, PRDC), detection AUC (can a classifier tell real from synthetic?), identifiability (DOMIAS only when named in `metrics`; it fails on wide data, see [verification.md](verification.md#synthcity-metrics)) |
+| [synthcity](https://github.com/vanderschaarlab/synthcity) | Distribution distances (Wasserstein, KL, PRDC), detection AUC (can a classifier tell real from synthetic?), identifiability (synthcity's DOMIAS only when named in `metrics`; it fails on wide data, so the custom `domias` evaluator runs instead, see [verification.md](verification.md#synthcity-metrics)) |
 | [SynthEval](https://github.com/schneiderkamplab/syntheval) | Correlation and distribution differences, classifier accuracy and AUROC difference, nearest-neighbour adversarial accuracy, epsilon risk, statistical parity and other subgroup gaps |
 | Custom (this project) | Holdout TSTR, Anonymeter attacks, holdout distance checks, holdout fairness gaps (`fairness_gaps`), log disparity, equalized odds and equal opportunity |
 
@@ -643,6 +643,7 @@ Privacy is reported as evidence next to the baselines. There is no pass/fail gat
   - *Linkability*: can the attacker use the synthetic data to link a person's quasi-identifiers to their sensitive columns, when the two are held in separate records?
   - *Inference*: knowing a person's quasi-identifiers, can the attacker guess their sensitive columns?
 - **Holdout distance checks**: are synthetic rows closer to training rows than to unseen real rows? (`dcr_*`, `nndr_*`, `distance_mia_auc`).
+- **DOMIAS** (van Breugel et al., 2023): a second membership attack. Is the synthetic data denser around a training patient than real data from the same population is? (`domias_mia_auc`). Half of the test split serves as that population sample, the other half as the unseen patients. Settings are under `evaluation.privacy_attacks.domias`.
 
 With `evaluation.privacy_attacks.unit: row` (the default), every row counts as an individual, since each synthetic row is released as a record of its own. With `unit: patient`, each patient counts once, even if they had many visits. Settings for the attacks are under `evaluation.privacy_attacks.anonymeter`.
 

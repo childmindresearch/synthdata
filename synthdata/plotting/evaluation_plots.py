@@ -409,6 +409,7 @@ METRIC_PRIORITY = {
     ],
     "privacy": [
         "anonymeter_",
+        "domias_mia_auc",
         "distance_mia_auc",
         "dcr_closer_to_train_share",
         "dcr_holdout_ratio",

@@ -27,7 +27,7 @@ from synthdata.evaluation.custom_eval import build_log_disparity_summary_table
 from synthdata.evaluation.fairness_gaps import FAIRNESS_GAP_METRICS, FAIRNESS_SIGNAL_COLUMN
 from synthdata.evaluation.privacy_attacks import (
     ANONYMETER_METRICS,
-    HOLDOUT_DISTANCE_METRICS,
+    MEMBERSHIP_METRICS,
     SUBGROUP_PRIVACY_METRICS,
 )
 from synthdata.evaluation.syntheval_eval import (
@@ -219,7 +219,7 @@ def _privacy_attack_frames(
     if not scores:
         empty = pd.DataFrame(index=model_names)
         return empty, empty
-    metrics = [*ANONYMETER_METRICS, *HOLDOUT_DISTANCE_METRICS]
+    metrics = [*ANONYMETER_METRICS, *MEMBERSHIP_METRICS]
     table = pd.DataFrame.from_dict(scores, orient="index").reindex(index=model_names)
     raw = table[[m for m in metrics if m in table.columns]].astype(float)
     fairness = table[[m for m in SUBGROUP_PRIVACY_METRICS if m in table.columns]].astype(float)
@@ -227,7 +227,7 @@ def _privacy_attack_frames(
     for metric in raw.columns:
         if metric in ANONYMETER_METRICS:
             oriented[metric] = -raw[metric]
-        elif HOLDOUT_DISTANCE_METRICS[metric]:
+        elif MEMBERSHIP_METRICS[metric]:
             oriented[metric] = -raw[metric].clip(lower=0.5)
         else:
             oriented[metric] = raw[metric].clip(upper=1.0)
@@ -312,6 +312,7 @@ _KNOWN_IDEALS = {
     **{name: 0.0 for name in ANONYMETER_METRICS},
     "dcr_closer_to_train_share": 0.5,
     "distance_mia_auc": 0.5,
+    "domias_mia_auc": 0.5,
     "dcr_holdout_ratio": 1.0,
     "nndr_holdout_ratio": 1.0,
     "subgroup_distance_mia_auc_gap": 0.0,
