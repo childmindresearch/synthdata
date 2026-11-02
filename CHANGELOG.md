@@ -4,6 +4,14 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.31.2 (2026-11-02)
+
+Documentation only: no pipeline code, config key or output changes, so old results stay comparable.
+
+### Added
+
+- **`notebooks/classification_metrics.py`**, an interactive marimo notebook for entry-level data scientists on the classifier scores the pipeline reports (macro-F1, balanced accuracy, Cohen's kappa unweighted and with inverse-frequency class weights, macro AUROC, macro AUPRC, plus accuracy as a warning). It uses a generic 82% / 13% / 5% three-class readmission example, compares threshold metrics with ranking metrics across nine confusion-matrix scenarios (always the majority class, random guessing, high precision, high sensitivity with many false alarms, near misses and more), works one calculation through by hand, plots per-class ROC and precision-recall curves (for each scenario, the separation slider and the playground), shows a threshold shift moving macro-F1 while AUPRC stays put, and ends with an editable confusion matrix. AUROC and AUPRC need scores, so the notebook simulates class probabilities whose argmax reproduces each matrix, and says so. Run it with `uv run marimo edit notebooks/classification_metrics.py`.
+
 ## 0.31.1 (2026-10-29)
 
 A fix to the anchored ranking. Scores change only where a primary metric's baselines were within noise of each other (that metric is now left out, so its type score can disappear); use a new experiment id if that happens on your data. No config edit is needed.
