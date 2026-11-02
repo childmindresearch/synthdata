@@ -939,9 +939,22 @@ class AnonymeterConfig:
 
 
 @dataclasses.dataclass
+class DomiasConfig:
+    """DOMIAS membership attack (van Breugel et al., AISTATS 2023)."""
+
+    #: Principal components the densities are estimated in. null (default):
+    #: every component of the encoded test rows that carries variance, so no
+    #: detail is dropped; constant and duplicated columns are left out
+    #: because they make the density estimate singular. An integer keeps
+    #: only the first n (see docs/verification.md).
+    n_components: int | None = None
+
+
+@dataclasses.dataclass
 class PrivacyAttacksConfig:
-    """Custom privacy metrics: Anonymeter attacks and holdout-referenced
-    distance heuristics (DCR/NNDR; see synthdata.evaluation.privacy_attacks)."""
+    """Custom privacy metrics: Anonymeter attacks, the DOMIAS membership
+    attack and holdout-referenced distance heuristics (DCR/NNDR; see
+    synthdata.evaluation.privacy_attacks)."""
 
     #: "row" (default): every row is an individual, as each synthetic row is
     #: released as its own record. "patient": attacks target one encounter
@@ -950,6 +963,8 @@ class PrivacyAttacksConfig:
     unit: str = "row"
     #: Anonymeter attack settings (see AnonymeterConfig).
     anonymeter: AnonymeterConfig = dataclasses.field(default_factory=AnonymeterConfig)
+    #: DOMIAS settings (see DomiasConfig).
+    domias: DomiasConfig = dataclasses.field(default_factory=DomiasConfig)
 
 
 @dataclasses.dataclass
@@ -1277,6 +1292,7 @@ _NESTED_DATACLASSES = {
     (EvaluationConfig, "binary_target"): BinaryTargetConfig,
     (EvaluationConfig, "privacy_attacks"): PrivacyAttacksConfig,
     (PrivacyAttacksConfig, "anonymeter"): AnonymeterConfig,
+    (PrivacyAttacksConfig, "domias"): DomiasConfig,
 }
 
 
@@ -1769,6 +1785,14 @@ def _validate(cfg: Config) -> None:
         raise ValueError(
             "evaluation.privacy_attacks.anonymeter.confidence_level must be in (0, 1), "
             f"got {anonymeter.confidence_level!r}"
+        )
+    n_components = attacks.domias.n_components
+    if n_components is not None and (
+        isinstance(n_components, bool) or not isinstance(n_components, int) or n_components < 1
+    ):
+        raise ValueError(
+            "evaluation.privacy_attacks.domias.n_components must be null or a positive integer, "
+            f"got {n_components!r}"
         )
     if cfg.evaluation.binary_target.enabled:
         bt = cfg.evaluation.binary_target

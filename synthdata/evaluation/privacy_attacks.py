@@ -1,5 +1,5 @@
-"""Custom privacy metrics: Anonymeter attacks and holdout-referenced distance
-heuristics, both counting a patient (not an encounter) as the individual by
+"""Custom privacy metrics: Anonymeter attacks, the DOMIAS membership attack and
+holdout-referenced distance heuristics, all counting a patient (not an encounter) as the individual by
 default (``evaluation.privacy_attacks.unit``).
 
 Anonymeter (Giomi et al., PoPETs 2023) runs singling-out, linkability and
@@ -14,6 +14,14 @@ them. They are reported only relative to unseen real rows (Platzer &
 Reutterer, 2021): synthetic rows should be no closer to the training rows
 than the test rows are, and a nearest-synthetic-row membership check should
 not tell training patients from test patients apart.
+
+DOMIAS (van Breugel et al., AISTATS 2023) is the stronger membership attack:
+it flags a real record as a training member when the synthetic data is
+denser around it than real data from the same population is, which catches
+local overfitting that a nearest-row distance can miss. It follows
+synthcity's ``DomiasMIAKDE`` (Gaussian KDEs from scipy), on a PCA
+projection and in log space so that it works on wide data
+(docs/verification.md).
 """
 
 import dataclasses
@@ -34,6 +42,7 @@ logger = get_logger(__name__)
 #: Name of each evaluator in ``evaluation.custom`` selection.
 ANONYMETER_NAME = "anonymeter"
 HOLDOUT_DISTANCE_NAME = "holdout_distance"
+DOMIAS_NAME = "domias"
 
 #: Anonymeter risks: attack success above the baseline attack, in [0, 1];
 #: lower is better. ``anonymeter_inference_risk`` is the worst secret.
@@ -53,6 +62,14 @@ HOLDOUT_DISTANCE_METRICS = {
     "dcr_holdout_ratio": False,
     "nndr_holdout_ratio": False,
 }
+
+#: DOMIAS membership attack -> True (lower is better): AUC of telling unseen
+#: test patients from training patients; 0.5 = no signal.
+DOMIAS_METRICS = {"domias_mia_auc": True}
+
+#: Holdout-referenced membership metrics that are ranked like a membership
+#: AUC: 0.5 (or a ratio of 1) is the no-memorization value.
+MEMBERSHIP_METRICS = {**HOLDOUT_DISTANCE_METRICS, **DOMIAS_METRICS}
 
 #: Subgroup privacy gap (fairness of privacy): the distance membership attack
 #: run within each protected group. Reported under fairness, unranked: a copy
@@ -307,6 +324,75 @@ def subgroup_privacy_scores(
 
 
 # ---------------------------------------------------------------------------
+# DOMIAS
+# ---------------------------------------------------------------------------
+
+
+def domias_scores(
+    train: pd.DataFrame,
+    holdout: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    nominal: list,
+    n_components: int | None,
+    seed: int,
+) -> dict:
+    """DOMIAS membership AUC for one synthetic dataset (van Breugel et al., 2023).
+
+    ``train`` and ``holdout`` hold one row per individual. The test rows are
+    split in half at random: one half is the attacker's reference data (real
+    rows from the population the generator never saw), the other the
+    non-members; as many training rows are drawn as members. Every row is
+    encoded as for the distance metrics (min-max numeric, one-hot nominal,
+    fitted on train) and projected onto the principal components of the
+    reference half: all of them that carry variance, or the first
+    ``n_components``. Gaussian KDEs (``scipy.stats.gaussian_kde``, Scott's
+    bandwidth, as in synthcity's ``DomiasMIAKDE``) are fitted to the
+    synthetic rows (p_G) and the reference rows (p_R), and each member and
+    non-member is scored by log p_G - log p_R. ``domias_mia_auc`` is the AUC
+    of that score (0.5 = no signal, 1 = every member found), reported as is:
+    the direction is fixed by the attack, so a value below 0.5 is noise.
+
+    Two deviations from synthcity's ``DomiasMIAKDE``, both needed on wide
+    data (docs/verification.md): the projection drops directions without
+    variance, which made its covariance singular, and the ratio is taken in
+    log space, because in hundreds of dimensions both densities underflow to
+    0 and every record then ties at the same score (AUC 0.5 for a copy).
+    """
+    from scipy.stats import gaussian_kde
+    from sklearn.decomposition import PCA
+
+    columns = list(train.columns)
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(holdout))
+    n_ref = min(len(holdout) // 2, len(train))
+    reference = holdout.iloc[order[:n_ref]]
+    nonmembers = holdout.iloc[order[n_ref : 2 * n_ref]]
+    members = train.iloc[rng.choice(len(train), size=n_ref, replace=False)]
+
+    encode = _encoder(train, [c for c in nominal if c in columns])
+    x_ref = encode(reference)
+    pca = PCA(random_state=seed).fit(x_ref)
+    # Directions without variance in the reference rows (constant or
+    # duplicated columns, or more columns than rows) make a KDE singular.
+    variance = pca.explained_variance_
+    k = int(np.sum(variance > 1e-9 * variance[0])) if variance[0] > 0 else 0
+    if n_components is not None:
+        k = min(k, n_components)
+    if k < 1:
+        return {"domias_mia_auc": np.nan}
+
+    def project(frame: pd.DataFrame) -> np.ndarray:
+        return pca.transform(encode(frame[columns]))[:, :k].T
+
+    p_g = gaussian_kde(project(synthetic))
+    p_r = gaussian_kde(project(reference))
+    targets = np.hstack([project(members), project(nonmembers)])
+    score = p_g.logpdf(targets) - p_r.logpdf(targets)
+    labels = np.r_[np.ones(len(members)), np.zeros(len(nonmembers))]
+    return {"domias_mia_auc": float(roc_auc_score(labels, score))}
+
+
+# ---------------------------------------------------------------------------
 # Anonymeter
 # ---------------------------------------------------------------------------
 
@@ -481,6 +567,7 @@ def run_privacy_attack_evaluation(
     run_distances: bool,
     seed: int,
     compute_cfg=None,
+    run_domias: bool = False,
 ) -> dict:
     """Score every synthetic dataset with the selected privacy evaluators.
 
@@ -492,7 +579,7 @@ def run_privacy_attack_evaluation(
     selected or there is no test split to act as unseen data. A model whose
     scoring fails is logged and left out (NaN in the combined table).
     """
-    if not (run_anonymeter or run_distances):
+    if not (run_anonymeter or run_distances or run_domias):
         return {}
     if dataset.test_imputed_df is None or dataset.test_imputed_df.empty:
         logger.warning("[custom] privacy attacks need a test split as the control set; skipping")
@@ -521,6 +608,15 @@ def run_privacy_attack_evaluation(
 
     else:
         ori = control = None
+    # DOMIAS scores individuals, so each patient keeps one random encounter.
+    domias_rows = (
+        (
+            _one_row_per_patient(train, train_patients, seed),
+            _one_row_per_patient(holdout, holdout_patients, seed),
+        )
+        if run_domias
+        else None
+    )
     group_masks = (
         protected_group_masks(
             train,
@@ -555,6 +651,8 @@ def run_privacy_attack_evaluation(
                 run_distances,
                 group_masks,
                 seed,
+                domias_rows,
+                attacks_cfg.domias.n_components,
             )
             for name, syn_df in synthetic_datasets.items()
         },
@@ -590,6 +688,8 @@ def _score_one(
     run_distances,
     group_masks,
     seed,
+    domias_rows,
+    domias_n_components,
 ) -> tuple[dict, list, list]:
     """Privacy scores, Anonymeter attack rows and per-group membership rows
     for one synthetic dataset."""
@@ -606,6 +706,11 @@ def _score_one(
             )
             row.update(subgroup_scores)
             subgroup_rows = [{"model": name, **r} for r in rows]
+    if domias_rows is not None:
+        members, nonmembers = domias_rows
+        row.update(
+            domias_scores(members, nonmembers, syn_df, categorical, domias_n_components, seed)
+        )
     if run_anonymeter:
         risks = anonymeter_risks(
             ori,

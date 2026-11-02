@@ -365,7 +365,7 @@ TSTR_METRICS = ("tstr_macro_f1", "tstr_balanced_accuracy", "tstr_macro_auprc")
 TSTR_NAME = "tstr"
 
 #: Custom privacy evaluators (synthdata.evaluation.privacy_attacks).
-PRIVACY_ATTACK_NAMES = ("anonymeter", "holdout_distance")
+PRIVACY_ATTACK_NAMES = ("anonymeter", "holdout_distance", "domias")
 
 #: Name of the holdout fairness-gap evaluator (synthdata.evaluation.fairness_gaps).
 FAIRNESS_GAPS_NAME = "fairness_gaps"

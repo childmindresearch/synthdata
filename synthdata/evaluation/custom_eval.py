@@ -27,6 +27,7 @@ from synthdata.evaluation.catalog import (
 from synthdata.evaluation.fairness_gaps import fairness_gap_scores, real_holdout_predictions
 from synthdata.evaluation.privacy_attacks import (
     ANONYMETER_NAME,
+    DOMIAS_NAME,
     HOLDOUT_DISTANCE_NAME,
     protected_group_masks,
     run_privacy_attack_evaluation,
@@ -45,6 +46,7 @@ _CUSTOM_EVALUATORS = {
     TSTR_NAME: "utility",
     ANONYMETER_NAME: "privacy",
     HOLDOUT_DISTANCE_NAME: "privacy",
+    DOMIAS_NAME: "privacy",
 }
 
 
@@ -363,7 +365,7 @@ def run_privacy_evaluation(
     seed: int,
     compute_cfg=None,
 ) -> dict:
-    """Anonymeter attacks and holdout-referenced DCR/NNDR, as selected in
+    """Anonymeter attacks, DOMIAS and holdout-referenced DCR/NNDR, as selected in
     ``evaluation.custom`` (see synthdata.evaluation.privacy_attacks)."""
     return run_privacy_attack_evaluation(
         synthetic_datasets,
@@ -373,4 +375,5 @@ def run_privacy_evaluation(
         run_distances=_selected(selection_cfg, HOLDOUT_DISTANCE_NAME),
         seed=seed,
         compute_cfg=compute_cfg,
+        run_domias=_selected(selection_cfg, DOMIAS_NAME),
     )

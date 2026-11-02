@@ -25,7 +25,7 @@ from synthdata.evaluation.combine import (
 from synthdata.evaluation.fairness_gaps import FAIRNESS_GAP_METRICS, FAIRNESS_SIGNAL_COLUMN
 from synthdata.evaluation.privacy_attacks import (
     ANONYMETER_METRICS,
-    HOLDOUT_DISTANCE_METRICS,
+    MEMBERSHIP_METRICS,
     SUBGROUP_MIN_PATIENTS,
     SUBGROUP_PRIVACY_METRICS,
 )
@@ -647,7 +647,7 @@ def _privacy_section(cfg, combined, extras, paths: _Paths, links: _Links) -> str
         "the other models, and get a privacy review before releasing any data.",
         "",
     ]
-    metrics = [*ANONYMETER_METRICS, *HOLDOUT_DISTANCE_METRICS]
+    metrics = [*ANONYMETER_METRICS, *MEMBERSHIP_METRICS]
     columns = [("custom", "privacy", m) for m in metrics if ("custom", "privacy", m) in combined]
     if columns:
         table = combined[columns].copy()
@@ -663,6 +663,10 @@ def _privacy_section(cfg, combined, extras, paths: _Paths, links: _Links) -> str
             "- `dcr_closer_to_train_share`, `distance_mia_auc`: near 0.5 when synthetic rows "
             "are no closer to the training rows than to unseen real rows; higher means closer "
             "to training rows.",
+            "- `domias_mia_auc`: the DOMIAS membership attack, which looks for places where "
+            "the synthetic data is denser than real data from the same population; 0.5 = it "
+            "cannot tell training patients from unseen ones, higher = membership leaks. It "
+            "catches local overfitting that the distance checks can miss.",
             "- `dcr_holdout_ratio`, `nndr_holdout_ratio`: near or above 1 when synthetic rows "
             "keep the same distance from training rows as unseen real rows do; below 1 means "
             "closer.",

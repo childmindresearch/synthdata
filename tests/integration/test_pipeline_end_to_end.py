@@ -369,6 +369,7 @@ BOUNDED_METRICS = {
     ("custom", "privacy", "anonymeter_inference_risk"): (0, 1),
     ("custom", "privacy", "dcr_closer_to_train_share"): (0, 1),
     ("custom", "privacy", "distance_mia_auc"): (0, 1),
+    ("custom", "privacy", "domias_mia_auc"): (0, 1),
     ("custom", "privacy", "dcr_holdout_ratio"): (0, math.inf),
     ("custom", "privacy", "nndr_holdout_ratio"): (0, math.inf),
 }
