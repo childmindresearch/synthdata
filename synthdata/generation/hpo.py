@@ -36,6 +36,7 @@ from synthdata.evaluation.tstr import (
     XGB_PARAMS,
     _encode,
     chance_scores,
+    paired_gap,
     target_classes,
     tstr_scores,
 )
@@ -128,6 +129,10 @@ SCREENS = (
 #: Study user attribute holding the objective a study optimizes (the choice of
 #: ``objective: auto``); trials take their value from that logged score.
 STUDY_OBJECTIVE_ATTR = "objective"
+#: Study user attribute set when the search was skipped for lack of headroom
+#: (see :func:`objective_headroom_skip` and :func:`defaults_headroom_skip`):
+#: ``{"reason": ..., "detail": {...}}``.
+HEADROOM_SKIP_ATTR = "headroom_skip"
 #: User attribute that makes an objective function fit with another seed
 #: (the top-k refit; see :func:`trial_seed`).
 REFIT_SEED_ATTR = "refit_seed"
@@ -761,6 +766,12 @@ def build_hpo_eval_fn(
                 "trtr_balanced_accuracy": trtr.balanced_accuracy,
                 "trtr_kappa": trtr.kappa,
                 "trtr_worst_group_auprc": _worst_group(trtr),
+                # How far this candidate is below the real-data ceiling, in
+                # paired bootstrap SEs (read by the headroom gate).
+                "ceiling_gap": {
+                    objective: _gap_row(*paired_gap(trtr, scores, objective.removeprefix("tstr_")))
+                    for objective in TSTR_GAP_OBJECTIVES
+                },
             }
         if tstr:
             value = float(attrs[objective_name])
@@ -782,6 +793,110 @@ def build_hpo_eval_fn(
     # generation stage for its log (see HPOEvalFn).
     eval_fn.headroom = headroom  # ty: ignore[unresolved-attribute]
     return cast(HPOEvalFn, eval_fn)
+
+
+#: TSTR objectives whose gap to the real-data ceiling every trial logs.
+TSTR_GAP_OBJECTIVES = ("tstr_macro_auprc", "tstr_macro_auroc", "tstr_macro_f1", "tstr_kappa")
+
+
+def _gap_row(gap: float, se: float) -> dict:
+    if np.isfinite(se) and se > 0:
+        z = gap / se
+    elif np.isfinite(se):  # identical bootstrap scores: no noise in the gap
+        z = float("inf") if gap > 0 else float("-inf")
+    else:
+        z = float("nan")
+    return {"gap": gap, "se": se, "z": z}
+
+
+def _gated_objectives(hpo_cfg: HPOConfig, headroom: dict) -> list:
+    """The TSTR objectives the search could optimize: the fixed one, or the
+    ``objective: auto`` candidates (empty for a composite objective)."""
+    names = hpo_cfg.objective_candidates if hpo_cfg.objective == "auto" else [hpo_cfg.objective]
+    return [n for n in names if n.startswith("tstr_") and n in headroom]
+
+
+def objective_headroom_skip(hpo_cfg: HPOConfig, headroom: dict) -> dict | None:
+    """The skip record when no objective the search could optimize has headroom.
+
+    Headroom is the real-data ceiling over chance in bootstrap SEs
+    (``build_hpo_eval_fn``). Under ``min_headroom_z`` for every objective the
+    search could use, even real training rows can't be told apart from a
+    constant predictor on the tuning split, so trials differ only by noise and
+    the "best" one is picked by chance. None when the search should run (or
+    ``hpo.skip_without_headroom`` is off, or there is no TSTR objective).
+    """
+    names = _gated_objectives(hpo_cfg, headroom)
+    if not hpo_cfg.skip_without_headroom or not names:
+        return None
+    if any(headroom[n].get("z", float("nan")) >= hpo_cfg.min_headroom_z for n in names):
+        return None
+    return {
+        "reason": "objective has no headroom",
+        "detail": {n: headroom[n] for n in names},
+    }
+
+
+def defaults_headroom_skip(
+    hpo_cfg: HPOConfig, headroom: dict, trial: optuna.trial.FrozenTrial
+) -> dict | None:
+    """The skip record when the library defaults already reach the ceiling.
+
+    ``trial`` is the enqueued default configuration. The search is skipped
+    when, for every objective the search could optimize (and that has headroom
+    over chance), the defaults are less than ``min_headroom_z`` paired
+    bootstrap SEs below the real-data ceiling (TRTR, the same classifier
+    trained on the real search-train rows): a tuned configuration could only
+    beat them by noise. Not skipped when the defaults failed an enforced
+    screen (the search may find a feasible one), when the trial failed, or
+    when ``hpo.skip_without_headroom`` is off.
+    """
+    if not hpo_cfg.skip_without_headroom or not _feasible(trial):
+        return None
+    gaps = trial.user_attrs.get("ceiling_gap") or {}
+    names = [
+        n
+        for n in _gated_objectives(hpo_cfg, headroom)
+        if headroom[n].get("z", float("nan")) >= hpo_cfg.min_headroom_z
+    ]
+    if not names or any(n not in gaps for n in names):
+        return None
+    # A NaN z (no bootstrap) fails the comparison and so counts as headroom.
+    if any(not gaps[n]["z"] < hpo_cfg.min_headroom_z for n in names):
+        return None
+    return {
+        "reason": "defaults reach the ceiling",
+        "detail": {"trial": trial.number} | {n: gaps[n] for n in names},
+    }
+
+
+def _format_skip(skip: dict) -> str:
+    rows = []
+    for name, row in skip["detail"].items():
+        if not isinstance(row, dict):
+            continue
+        if "gap" in row:
+            rows.append(
+                f"{name.removeprefix('tstr_')}: {row['gap']:+.4f} below the real-data ceiling "
+                f"({row['z']:.1f} paired SEs)"
+            )
+        else:
+            rows.append(
+                f"{name.removeprefix('tstr_')}: ceiling {row['trtr']:.4f} vs chance "
+                f"{row['chance']:.4f} ({row['z']:.1f} SEs)"
+            )
+    return "; ".join(rows)
+
+
+def headroom_skip(hpo_cfg: HPOConfig, output_dir: str | Path, study_name: str) -> dict | None:
+    """The headroom skip recorded on a stored study, or None."""
+    try:
+        study = optuna.load_study(
+            study_name=study_name, storage=create_storage(hpo_cfg, output_dir)
+        )
+    except KeyError:
+        return None
+    return study.user_attrs.get(HEADROOM_SKIP_ATTR)
 
 
 def score_candidate(
@@ -1419,6 +1534,23 @@ def run_study(
     study = create_study(study_name, hpo_cfg, output_dir, seed)
     started = time.monotonic()
 
+    def skip_search(skip: dict) -> dict:
+        study.set_user_attr(HEADROOM_SKIP_ATTR, skip)
+        # Read by the dashboard as the reason the search stopped.
+        logger.info(
+            "[%s] skipping the search: %s; %s. The untuned model stands for the tuned one",
+            study_name,
+            skip["reason"],
+            _format_skip(skip),
+        )
+        return {}
+
+    stored_skip = study.user_attrs.get(HEADROOM_SKIP_ATTR)
+    if hpo_cfg.skip_without_headroom and stored_skip:
+        return skip_search(stored_skip)
+    if not study.trials and (skip := objective_headroom_skip(hpo_cfg, headroom or {})):
+        return skip_search(skip)
+
     def n_finished(s: optuna.Study) -> int:
         return len([t for t in s.trials if t.state.is_finished()])
 
@@ -1465,6 +1597,29 @@ def run_study(
                 len(initial) - bool(hpo_cfg.enqueue_defaults and default_params),
             )
 
+    def defaults_skip(s: optuna.Study, callbacks: list) -> dict | None:
+        """Run the enqueued defaults (the first trial) alone and check the
+        headroom gate on them (:func:`defaults_headroom_skip`)."""
+        if not (hpo_cfg.skip_without_headroom and hpo_cfg.enqueue_defaults and default_params):
+            return None
+        if n_finished(s) == 0 and n_remaining > 0 and time_left() != 0:
+            s.optimize(
+                objective_fn,
+                n_trials=1,
+                timeout=time_left(),
+                catch=(ValueError, RuntimeError),
+                show_progress_bar=False,
+                callbacks=callbacks,
+            )
+        first = min(s.trials, key=lambda t: t.number, default=None)
+        if (
+            first is None
+            or not first.state.is_finished()
+            or first.system_attrs.get("fixed_params") != initial[0]
+        ):
+            return None
+        return defaults_headroom_skip(hpo_cfg, headroom or {}, first)
+
     objective = study.user_attrs.get(STUDY_OBJECTIVE_ATTR)
     if objective is None and study.trials:
         # A study from before the objective was stored optimized macro-F1.
@@ -1485,6 +1640,11 @@ def run_study(
         if not probe.trials:
             enqueue(probe)
         n_probe = min(hpo_cfg.n_startup_trials, n_trials)
+        probe_progress = _TrialProgress(
+            probe.study_name, hpo_cfg.objective_candidates[0], n_probe, search_deadline, refit_fits
+        )
+        if skip := defaults_skip(probe, [probe_progress]):
+            return skip_search(skip)
         if n_remaining > 0 and n_finished(probe) < n_probe and time_left() != 0:
             logger.info(
                 "[%s] objective: auto; %d random start-up trial(s) first",
@@ -1497,15 +1657,7 @@ def run_study(
                 timeout=time_left(),
                 catch=(ValueError, RuntimeError),
                 show_progress_bar=False,
-                callbacks=[
-                    _TrialProgress(
-                        probe.study_name,
-                        hpo_cfg.objective_candidates[0],
-                        n_probe,
-                        search_deadline,
-                        refit_fits,
-                    )
-                ],
+                callbacks=[probe_progress],
             )
         objective, table = choose_objective(
             hpo_cfg.objective_candidates, headroom or {}, probe.trials, hpo_cfg.min_headroom_z
@@ -1524,7 +1676,12 @@ def run_study(
         _copy_trials(probe, study, objective)
     elif objective is None:
         objective = hpo_cfg.objective
-        enqueue(study)
+        if not study.trials:
+            enqueue(study)
+        progress = _TrialProgress(study_name, objective, n_trials, search_deadline, refit_fits)
+        if skip := defaults_skip(study, [progress]):
+            study.set_user_attr(STUDY_OBJECTIVE_ATTR, objective)
+            return skip_search(skip)
     study.set_user_attr(STUDY_OBJECTIVE_ATTR, objective)
 
     n_remaining = 0 if n_remaining == 0 else max(n_trials - n_finished(study), 0)

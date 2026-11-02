@@ -665,8 +665,18 @@ class HPOConfig:
         ]
     )
     #: Headroom a candidate needs: (TRTR - chance) / bootstrap SE of TRTR.
-    #: A fixed objective under it only gets a warning.
+    #: A fixed objective under it only gets a warning, unless
+    #: ``skip_without_headroom`` skips the search.
     min_headroom_z: float = 2.0
+    #: Skip a model's search when tuning has nothing to gain, judged with
+    #: ``min_headroom_z`` (see docs/verification.md, "HPO headroom gate"):
+    #: (1) no objective the search could optimize has headroom over chance on
+    #: the real data, or (2) the library defaults (the first, enqueued trial)
+    #: are already within ``min_headroom_z`` paired bootstrap SEs of the
+    #: real-data ceiling (TRTR) on every such objective. The untuned model
+    #: then stands for the tuned one (no ``<model>_hpo`` fit) and the reason is
+    #: logged and stored on the study. Needs ``enqueue_defaults`` for (2).
+    skip_without_headroom: bool = True
     #: XGBoost seeds averaged per TSTR score. The classifier is deterministic
     #: (no row or column subsampling), so more seeds only repeat the fit.
     tstr_seeds: int = 1

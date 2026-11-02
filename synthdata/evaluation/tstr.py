@@ -77,6 +77,11 @@ class TSTRScores:
     #: seed's predictions; ``n_bootstrap`` > 0 only): the evaluation's
     #: sampling noise, against which a difference between candidates is judged.
     boot_se: dict = dataclasses.field(default_factory=dict)
+    #: The bootstrap scores behind ``boot_se`` (``{score: array}``). The
+    #: resamples depend only on the scored rows' labels and the first seed, so
+    #: two fits scored on the same rows share them: the SE of their difference
+    #: is the SD of the paired differences (see :func:`paired_gap`).
+    boot_draws: dict = dataclasses.field(default_factory=dict, repr=False)
     #: Macro AUPRC within each group of each ``groups`` column (groups with
     #: at least ``MIN_GROUP_ROWS`` rows): ``{column: {group: auprc}}``.
     group_auprc: dict = dataclasses.field(default_factory=dict)
@@ -135,8 +140,8 @@ def chance_scores(score_df: pd.DataFrame, target_column: str, classes: list) -> 
     }
 
 
-def _bootstrap_se(y_true, proba, n_classes, n_bootstrap, seed, ordinal=False) -> dict:
-    """Stratified bootstrap standard errors of the threshold and ranking scores."""
+def _bootstrap_draws(y_true, proba, n_classes, n_bootstrap, seed, ordinal=False) -> dict:
+    """Stratified bootstrap scores (``{score: array}``) of the threshold and ranking scores."""
     rng = np.random.default_rng(seed)
     by_class = [np.flatnonzero(y_true == i) for i in np.unique(y_true)]
     draws = {
@@ -155,7 +160,22 @@ def _bootstrap_se(y_true, proba, n_classes, n_bootstrap, seed, ordinal=False) ->
         draws["macro_auroc"].append(_macro_auroc(y, p))
         draws["balanced_accuracy"].append(balanced_accuracy_score(y, y_pred[idx]))
         draws["kappa"].append(_kappa(y, y_pred[idx], n_classes, ordinal))
-    return {name: float(np.nanstd(values, ddof=1)) for name, values in draws.items()}
+    return {name: np.asarray(values, dtype=float) for name, values in draws.items()}
+
+
+def paired_gap(better: TSTRScores, other: TSTRScores, score: str) -> tuple[float, float]:
+    """``better - other`` on ``score`` and its paired bootstrap standard error.
+
+    Both must be scored on the same rows with the same first seed and
+    ``n_bootstrap``, so their bootstrap resamples are the same rows (the SE is
+    NaN without draws). Pairing removes the noise the two share (which rows
+    were drawn), so the SE is smaller than combining their two SEs.
+    """
+    gap = float(getattr(better, score)) - float(getattr(other, score))
+    a, b = better.boot_draws.get(score), other.boot_draws.get(score)
+    if a is None or b is None or len(a) != len(b) or len(a) < 2:
+        return gap, float("nan")
+    return gap, float(np.nanstd(a - b, ddof=1))
 
 
 def _encode(
@@ -301,11 +321,12 @@ def tstr_scores(
     if first_proba is None:
         raise ValueError("TSTR needs at least one seed")
 
-    boot_se = (
-        _bootstrap_se(y_true, first_proba, len(classes), n_bootstrap, seeds[0], ordinal)
+    boot_draws = (
+        _bootstrap_draws(y_true, first_proba, len(classes), n_bootstrap, seeds[0], ordinal)
         if n_bootstrap > 0
         else {}
     )
+    boot_se = {name: float(np.nanstd(values, ddof=1)) for name, values in boot_draws.items()}
     group_auprc = {}
     for column, labels in (groups or {}).items():
         labels = pd.Series(np.asarray(labels))
@@ -320,6 +341,7 @@ def tstr_scores(
         macro_auprc=float(np.mean(auprcs)),
         macro_auroc=float(np.mean(aurocs)),
         boot_se=boot_se,
+        boot_draws=boot_draws,
         group_auprc=group_auprc,
         balanced_accuracy=float(np.mean(balanced)),
         kappa=float(np.mean(kappas)),

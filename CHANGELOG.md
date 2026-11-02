@@ -4,6 +4,19 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.28.0 (2026-10-29)
+
+No config edits are needed. Metric values are unchanged, but a search that the new headroom gate skips leaves out that model's `<model>_hpo` row, so use a new experiment id when comparing with earlier runs. Golden runs that include HPO need re-recording only if the gate now skips one of their searches (the metric code is unchanged).
+
+### Added
+
+- **HPO headroom gate** (`generation.hpo.skip_without_headroom`, default `true`). A model's search is skipped when tuning has nothing to gain: (1) no objective the search could optimize has a real-data ceiling at least `min_headroom_z` (2) bootstrap SEs above chance, checked before any trial; or (2) the library defaults, the first trial, are within `min_headroom_z` paired bootstrap SEs of the real-data ceiling on every such objective. The untuned model is still evaluated and ranked; only its tuned copy is left out. Every trial now logs `ceiling_gap`, and the decision is logged as `[hpo_<model>] skipping the search: ...` and stored on the study (`headroom_skip`). Set it to `false` to keep the old behaviour. The rule and why the threshold is not arbitrary are in `docs/verification.md` ("headroom gate").
+- **Full provenance in `manifest.json`**: each stage's `provenance` now also has the full git commit, a hash of uncommitted changes, hashes of `uv.lock` and `envs/*/uv.lock`, every installed package version (`all_packages`), the Python version and platform, the torch build with its CUDA and cuDNN versions, the GPUs and driver from `nvidia-smi`, and the environment variables that affect reproducibility. Each entry also records `config_sha256`; a stage run with a different config than the first saves `config_snapshot_<hash>.json` next to `config_snapshot.json`.
+
+### Changed
+
+- The dashboard calls a tuned model that was not fitted "untuned kept" (was "none passed"), since that now also happens when the search was skipped for lack of headroom; the HPO table gives the reason.
+
 ## 0.27.0 (2026-10-29)
 
 TabularARGN and CDTD are now on by default. Results of the other models are unchanged, but a run with the default config now also trains these two, so use a new experiment id. The golden runs need re-recording on the Linux GPU machine, because the fixture's baseline run now uses miceforest.

@@ -470,7 +470,20 @@ def run_generation(
         clinical data) and be evaluated twice. The empty entry in the
         best-params cache records the fallback (``hpo.untuned_fallbacks``);
         evaluation leaves out any ``<name>_hpo`` set an earlier version saved.
+        The same holds when the headroom gate skipped the search
+        (``hpo.skip_without_headroom``).
         """
+        skip = hpo_mod.headroom_skip(gen_cfg.hpo, output_dir, f"hpo_{name}")
+        if skip:
+            logger.info(
+                "[%s_hpo] no headroom: the search was skipped (%s), so %s_hpo would repeat "
+                "%s; it is not fitted or evaluated",
+                name,
+                skip["reason"],
+                name,
+                name,
+            )
+            return
         logger.info(
             "[%s_hpo] none passed: no HPO trial passed the screens, so %s_hpo would repeat "
             "%s; it is not fitted or evaluated",

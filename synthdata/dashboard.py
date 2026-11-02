@@ -125,10 +125,12 @@ def syntheval_pass(label: str) -> str | None:
 #: Step of the fits in the runner's own process (every model when
 #: ``compute.workers`` is 1, and the baselines): they count as generation.
 MAIN_STEP = "generation"
-#: "[ctgan_hpo] none passed: ..." (or the older "no trial passed the screens:
-#: reusing the untuned sets"): the tuned model is not fitted or evaluated.
+#: "[ctgan_hpo] none passed: ..." or "[ctgan_hpo] no headroom: ..." (or the
+#: older "no trial passed the screens: reusing the untuned sets"): the tuned
+#: model is not fitted or evaluated.
 _NONE_PASSED = re.compile(
-    r"^\[(?P<model>[^\]\s]+)\] (?:none passed:|no trial passed the screens: reusing)"
+    r"^\[(?P<model>[^\]\s]+)\] "
+    r"(?:none passed:|no headroom:|no trial passed the screens: reusing)"
 )
 _HPO_START = re.compile(
     r"^\[(?P<study>[^\]]+)\] starting hyperparameter optimization(?: of (?P<objective>\S+))?: "
@@ -147,6 +149,10 @@ _HPO_STOPS = (
     ),
     (re.compile(r"^\[(?P<study>[^\]]+)\] no time left for the search"), "stage time limit"),
     (re.compile(r"^\[(?P<study>[^\]]+)\] search ended at its time budget"), "time budget"),
+    (
+        re.compile(r"^\[(?P<study>[^\]]+)\] skipping the search: (?P<reason>[^;]+);"),
+        "skipped: {reason}",
+    ),
     (
         re.compile(r"^\[(?P<study>[^\]]+)\] the start-up trials used the study's time budget"),
         "time budget",

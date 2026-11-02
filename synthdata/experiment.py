@@ -13,11 +13,15 @@ unless they explicitly want to target a different, earlier experiment via
 
 A JSON manifest at
 ``<generation.output_dir>/../experiments/data_v_<dataset-version>/exp_v_<experiment_id>/manifest.json``
-records what each stage produced (dataset version, git commit, artifact paths),
-so any artifact can be traced back to exactly the run that produced it.
+records what each stage produced (dataset version, git commit, artifact paths)
+and its provenance (:func:`synthdata.utils.provenance`: commit, submodule
+SHAs, lockfile hash, installed packages, torch/CUDA build, GPUs) plus the hash
+of the config it ran with, so any artifact can be traced back to exactly the
+code, environment and settings that produced it.
 """
 
 import dataclasses
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -109,6 +113,10 @@ class Experiment:
     #: resolved before the scripts nest ``generation.output_dir`` under the
     #: experiment, which would otherwise move it.
     imputation_dir: Path | None = None
+    #: SHA-256 of this stage's config (``config_hash``); the config itself is
+    #: in ``config_snapshot.json``, or ``config_snapshot_<hash[:12]>.json``
+    #: when a later stage ran with a different one.
+    config_sha256: str | None = None
 
     def record(self, stage: str, artifacts: dict[str, Any] | None = None, **extra: Any) -> None:
         """Append a stage entry to this experiment's manifest.json."""
@@ -116,6 +124,7 @@ class Experiment:
             "stage": stage,
             "timestamp": datetime.now(UTC).isoformat(),
             "git_commit": git_commit(),
+            "config_sha256": self.config_sha256,
             "provenance": provenance(),
             "artifacts": artifacts or {},
             **extra,
@@ -143,6 +152,16 @@ class Experiment:
         ensure_dir(self.manifest_path.parent)
         with open(self.manifest_path, "w") as f:
             json.dump(manifest, f, indent=2, default=str)
+
+
+def _config_json(cfg: Config) -> str:
+    return json.dumps(dataclasses.asdict(cfg), indent=2, default=str)
+
+
+def config_hash(cfg: Config) -> str:
+    """SHA-256 of the config's values (key order ignored)."""
+    canonical = json.dumps(dataclasses.asdict(cfg), sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def _build_experiment(experiment_id: str, cfg: Config) -> Experiment:
@@ -179,12 +198,22 @@ def _build_experiment(experiment_id: str, cfg: Config) -> Experiment:
         created_at=datetime.now(UTC).isoformat(),
         git_commit=git_commit(),
         imputation_dir=imputation_output_dir(cfg),
+        config_sha256=config_hash(cfg),
     )
 
+    # The first stage's config is the snapshot; a later stage resumed with a
+    # different config keeps its own copy, named by its hash, next to it.
     config_snapshot_path = experiment_root / "config_snapshot.json"
+    if config_snapshot_path.exists():
+        with open(config_snapshot_path) as f:
+            first = json.dumps(json.load(f), sort_keys=True, default=str)
+        if hashlib.sha256(first.encode()).hexdigest() != experiment.config_sha256:
+            assert experiment.config_sha256 is not None
+            config_snapshot_path = (
+                experiment_root / f"config_snapshot_{experiment.config_sha256[:12]}.json"
+            )
     if not config_snapshot_path.exists():
-        with open(config_snapshot_path, "w") as f:
-            json.dump(dataclasses.asdict(cfg), f, indent=2, default=str)
+        config_snapshot_path.write_text(_config_json(cfg))
 
     return experiment
 

@@ -29,7 +29,7 @@ STATUS_LABEL = {
     "paused": ("paused", "warn"),
     "not run": ("no trials", "muted"),
     "no pass": ("none passed, defaults used", "warn"),
-    "none passed": ("none passed", "warn"),
+    "none passed": ("untuned kept", "warn"),
     "waiting": ("waiting", "muted"),
 }
 #: Categorical colors for the steps on the model timeline (--k1 ...).
@@ -490,7 +490,8 @@ def _timeline(d: dict) -> str:
         "Striped: running; red outline: failed; amber outline: finished, but some metrics failed "
         "(listed under Problems). Generation: the untuned model's bar is its untuned fits; the "
         "tuned model's bar is the HPO search (light) and the tuned fits (dark), and says "
-        '"none passed" when no trial passed the screens. SynthEval: the plain part is the main '
+        '"untuned kept" when no trial passed the screens or the search was skipped for lack '
+        "of headroom (the HPO table says which). SynthEval: the plain part is the main "
         "pass, the shaded part the one-vs-rest or binary-target passes.</p>"
     )
     return (
