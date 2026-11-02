@@ -226,14 +226,9 @@ def run_evaluation(
         primary_metrics=eval_cfg.primary_metrics,
     )
 
-    combined.to_csv(output_dir / "combined_evaluation.csv")
-    directions = combined.attrs.get("metric_directions")
-    if directions is not None:
-        directions.to_csv(output_dir / combine.METRIC_DIRECTIONS_FILENAME)
     draws = None
     spec = combined.attrs.get("primary_spec")
     if spec is not None:
-        primary.primary_table(combined).to_csv(output_dir / primary.PRIMARY_FILENAME)
         if eval_cfg.ranking_bootstrap > 0:
             holdout_keys = (
                 dataset.patient_ids.loc[test_df.index].to_numpy()
@@ -247,14 +242,33 @@ def run_evaluation(
                 privacy_result,
                 ordinal=dataset.target_column in dataset.ordinal_columns,
             )
-            draws = primary.bootstrap_draws(
-                combined[spec.columns],
-                spec,
-                eval_cfg.rank_weights,
-                rows,
-                eval_cfg.ranking_bootstrap,
-                cfg.seed,
-            )
+
+            def bootstrap(table):
+                spec = table.attrs["primary_spec"]
+                return primary.bootstrap_draws(
+                    table[spec.columns],
+                    spec,
+                    eval_cfg.rank_weights,
+                    rows,
+                    eval_cfg.ranking_bootstrap,
+                    cfg.seed,
+                )
+
+            draws = bootstrap(combined)
+            # A metric whose baselines are within noise of each other has no
+            # stable scale: leave it out, rescore and redraw.
+            unseparated = primary.unseparated_metrics(draws["span"])
+            if unseparated:
+                combined = combine.drop_primary_metrics(
+                    combined, unseparated, eval_cfg.rank_weights
+                )
+                draws = bootstrap(combined) if "primary_spec" in combined.attrs else None
+        if "primary_spec" in combined.attrs:
+            primary.primary_table(combined).to_csv(output_dir / primary.PRIMARY_FILENAME)
+    combined.to_csv(output_dir / "combined_evaluation.csv")
+    directions = combined.attrs.get("metric_directions")
+    if directions is not None:
+        directions.to_csv(output_dir / combine.METRIC_DIRECTIONS_FILENAME)
     ranking_summary = combine.summarize_replicates(combined, draws=draws)
     ranking_summary.to_csv(output_dir / "ranking_summary.csv")
 

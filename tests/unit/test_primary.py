@@ -237,3 +237,56 @@ def test_build_combined_table_ranks_on_primary_and_keeps_the_composite():
     summary = summarize_replicates(combined)
     assert "legacy_overall_mean" in summary.columns
     assert summary.index[summary["eligible"].astype(bool)][0] == "a"
+
+
+class TestSeparation:
+    def test_metric_whose_baselines_tie_within_noise_is_left_out(self):
+        rng = np.random.default_rng(0)
+        spans = pd.DataFrame({AUPRC: rng.normal(0.1, 0.01, 500), DP: rng.normal(0.002, 0.01, 500)})
+        spans.columns = pd.MultiIndex.from_tuples(spans.columns)
+        reasons = primary.unseparated_metrics(spans)
+        assert list(reasons) == [DP]
+        assert "not separated beyond noise" in reasons[DP]
+
+    def test_dropping_a_metric_rescores_without_it(self):
+        from synthdata.evaluation.combine import drop_primary_metrics
+
+        raw = _baselines(model=[0.35, 0.60, 0.05])
+        combined = build_combined_table(
+            {},
+            None,
+            None,
+            {},
+            list(raw.index),
+            tstr_result=None,
+            privacy_result={
+                "scores": {m: {"distance_mia_auc": raw.loc[m, MIA]} for m in raw.index}
+            },
+            fairness_gap_table=pd.DataFrame(
+                {"demographic_parity_gap_error": raw[DP], "fairness_signal": 1}
+            ),
+            primary_metrics=["distance_mia_auc", "demographic_parity_gap_error"],
+        )
+        assert ("__all__", "fairness", "rank") in combined.columns
+        dp = combined.attrs["primary_spec"].columns[1]
+        dropped = drop_primary_metrics(combined, {dp: "tied"}, None)
+        assert ("__all__", "fairness", "rank") not in dropped.columns
+        assert dropped.loc["model", ("__all__", "overall", "rank")] == pytest.approx(0.8)
+        assert dropped.attrs["primary_spec"].dropped["demographic_parity_gap_error"] == "tied"
+
+
+def test_primary_table_lists_left_out_metrics():
+    raw = _baselines(model=[0.35, 0.60, 0.05])
+    combined = build_combined_table(
+        {},
+        None,
+        None,
+        {},
+        list(raw.index),
+        privacy_result={"scores": {m: {"distance_mia_auc": raw.loc[m, MIA]} for m in raw.index}},
+        primary_metrics=["distance_mia_auc", "not_a_metric"],
+    )
+    table = primary.primary_table(combined)
+    left_out = table.dropna(subset=["dropped"])
+    assert left_out["metric"].tolist() == ["not_a_metric"]
+    assert table.dropna(subset=["model"])["dropped"].isna().all()
