@@ -4,6 +4,14 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.30.1 (2026-10-29)
+
+Documentation only; results and configs are unchanged, so old results stay comparable and goldens need no re-recording.
+
+### Documentation
+
+- **Conditional generation for ctgan, tvae and arf** (`docs/verification.md`): checked whether synthcity's native conditioning should replace rejection sampling for the class quotas, and kept rejection sampling. For ctgan and tvae, synthcity's `cond` must be given at fit time and then switches off CTGAN's training-by-sampling, so it would train a different model; arf has no conditional sampling in synthcity or `arfpy`. On the simulated data tvae and arf met every quota and ctgan fell 1-4% short on one class, which `class_sampling.csv` and `checks.csv` already report.
+
 ## 0.30.0 (2026-10-29)
 
 The ranking changes: it now reads a short primary metric set, anchored to the baselines, with bootstrap intervals. Metric values are unchanged except two new reported columns, but the overall, utility, privacy and fairness scores, the recommended model and the ties are computed differently, so use a new experiment id. Golden runs need re-recording (new `tstr_kappa`/`tsts_kappa` columns, `legacy` columns, new rank values). No config edit is needed; the example configs list the two new keys.
