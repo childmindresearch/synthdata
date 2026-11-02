@@ -1,0 +1,3 @@
+kind,lhs,rhs,check_rule
+fd,DIAGNOSIS,SEX,"{""lhs"": [[""DIAGNOSIS"", null]], ""rhs"": [""SEX"", null]}"
+cfd,SMOKER=0,SEVERITY=<NA>,"{""lhs"": [[""SMOKER"", ""0""]], ""rhs"": [""SEVERITY"", ""<NA>""]}"

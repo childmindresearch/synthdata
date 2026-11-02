@@ -91,21 +91,22 @@ def make_rule(lhs: list, rhs, answered: list | None = None) -> str:
     return json.dumps(rule)
 
 
-def rule_error(frame: pd.DataFrame, rule: str | dict) -> tuple[int, float]:
-    """Rows the rule applies to, and the share of them to remove for it to hold.
+def rule_breaks(frame: pd.DataFrame, rule: str | dict) -> tuple[pd.Series, pd.Series] | None:
+    """Which rows the rule applies to, and which of them break it (two boolean Series).
 
     The rule applies to rows matching every fixed left-side value where every
-    ``answered`` column (if the rule lists any) is not blank. With a
-    fixed right-side value the error is the share of those rows without it;
-    otherwise it is the g3 error of "the "any" left-side columns fix the
-    right-side column" within them (Kivinen & Mannila 1995). NaN when a
-    column is absent or no row applies.
+    ``answered`` column (if the rule lists any) is not blank. With a fixed
+    right-side value a row breaks it when it lacks that value. Otherwise a row
+    breaks it when its right side is not the most common one among rows with
+    its "any" left-side values, so the breaking rows are the fewest to remove
+    for the rule to hold and their share is the g3 error (Kivinen & Mannila
+    1995). ``None`` when a column is absent.
     """
     rule = json.loads(rule) if isinstance(rule, str) else rule
     lhs, (rhs, rhs_value) = rule["lhs"], rule["rhs"]
     columns = [c for c, _ in lhs] + [rhs] + list(rule.get("answered", []))
-    if frame.empty or any(c not in frame.columns for c in columns):
-        return 0, float("nan")
+    if any(c not in frame.columns for c in columns):
+        return None
     text = _as_text(frame[list(dict.fromkeys(columns))])
     applies = pd.Series(True, index=text.index)
     for column, value in lhs:
@@ -113,16 +114,34 @@ def rule_error(frame: pd.DataFrame, rule: str | dict) -> tuple[int, float]:
             applies &= text[column] == str(value)
     for column in rule.get("answered", []):
         applies &= text[column] != BLANK
+    breaks = pd.Series(False, index=text.index)
     rows = text[applies]
     if rows.empty:
-        return 0, float("nan")
+        return applies, breaks
     if rhs_value is not None:
-        return len(rows), float((rows[rhs] != str(rhs_value)).mean())
+        breaks[applies] = rows[rhs] != str(rhs_value)
+        return applies, breaks
     free = [c for c, value in lhs if value is None]
     if not free:
-        return len(rows), float(1 - rows[rhs].value_counts().iloc[0] / len(rows))
-    kept = rows.groupby([*free, rhs]).size().groupby(level=list(range(len(free)))).max()
-    return len(rows), float(1 - kept.sum() / len(rows))
+        breaks[applies] = rows[rhs] != rows[rhs].value_counts().index[0]
+        return applies, breaks
+    counts = rows.groupby([*free, rhs]).size().sort_values(ascending=False, kind="stable")
+    kept = counts[~counts.index.droplevel(-1).duplicated()].index
+    pairs = pd.MultiIndex.from_frame(rows[[*free, rhs]])
+    breaks[applies] = ~pairs.isin(kept)
+    return applies, breaks
+
+
+def rule_error(frame: pd.DataFrame, rule: str | dict) -> tuple[int, float]:
+    """Rows the rule applies to, and the share of them breaking it (see :func:`rule_breaks`).
+
+    NaN when a column is absent or no row applies.
+    """
+    found = rule_breaks(frame, rule)
+    if found is None or not found[0].any():
+        return 0, float("nan")
+    applies, breaks = found
+    return int(applies.sum()), float(breaks[applies].mean())
 
 
 def g3_error(frame: pd.DataFrame, lhs: list, rhs: str) -> float:
@@ -450,9 +469,12 @@ def report_options(args) -> dict:
     return {name: getattr(args, name) for name in names}
 
 
-#: Evaluation: a model fails the rules check when its mean rule error is more
-#: than this above the real holdout's.
+#: Evaluation: a model fails the rules check when its share of rows breaking at
+#: least one accepted rule is more than this above the real holdout's.
 RULE_ERROR_MARGIN = 0.01
+#: ``dependency_violations.csv``: the row with each frame's share of rows
+#: breaking at least one rule (of all its rows, not of the rows a rule applies to).
+ANY_RULE = "any_rule"
 
 
 def _side(items) -> str:
@@ -493,34 +515,56 @@ def load_rules(path: str | Path) -> pd.DataFrame:
 
 
 def rule_violations(rules: pd.DataFrame, frames: dict) -> pd.DataFrame:
-    """Rule error (share of applicable rows breaking it) of each rule in each frame.
+    """Each rule's error (share of applicable rows breaking it) in each frame.
 
     One row per rule (``kind``, ``lhs``, ``rhs``), one column per frame; NaN
-    where the frame lacks a column or no row applies.
+    where the frame lacks a column or no row applies. A last row, kind
+    ``any_rule``, holds the share of each frame's rows that break at least
+    one rule: a row can break several rules, so it is the measure of how many
+    records a reader would find implausible.
     """
     out = rules[["kind", "lhs", "rhs"]].copy()
+    any_row = {"kind": ANY_RULE, "lhs": "at least one accepted rule", "rhs": ""}
     for name, frame in frames.items():
-        out[name] = [rule_error(frame, rule)[1] for rule in rules["rule"]]
-    return out
+        frame = frame.reset_index(drop=True)
+        errors, broken = [], pd.Series(False, index=frame.index)
+        for rule in rules["rule"]:
+            found = rule_breaks(frame, rule)
+            if found is None or not found[0].any():
+                errors.append(np.nan)
+                continue
+            applies, breaks = found
+            errors.append(float(breaks[applies].mean()))
+            broken |= breaks
+        out[name] = errors
+        any_row[name] = float(broken.mean()) if len(frame) else np.nan
+    return pd.concat([out, pd.DataFrame([any_row])], ignore_index=True)
 
 
 def rule_check_rows(violations: pd.DataFrame, reference: str, models: list) -> list:
-    """``checks.csv`` rows: each model's mean rule error against the reference's plus a margin."""
+    """``checks.csv`` rows: each model's share of rows breaking any rule, against the reference's.
+
+    The limit is the reference's share plus ``RULE_ERROR_MARGIN``. The detail
+    gives the mean rule error and the rule broken most often.
+    """
     from synthdata.evaluation.checks import _row
 
-    limit = float(np.nanmean(violations[reference])) + RULE_ERROR_MARGIN
+    is_any = violations["kind"] == ANY_RULE
+    per_rule, overall = violations[~is_any], violations[is_any].iloc[0]
+    limit = float(overall[reference]) + RULE_ERROR_MARGIN
     rows = []
     for model in models:
-        value = float(np.nanmean(violations[model])) if violations[model].notna().any() else np.nan
-        worst = (
-            violations.loc[violations[model].idxmax()] if violations[model].notna().any() else None
-        )
-        detail = (
-            f"mean share of rows breaking {int(violations[model].notna().sum())} accepted rules; "
-            f"worst: {worst['lhs']} -> {worst['rhs']} ({worst[model]:.1%})"
-            if worst is not None
-            else "no accepted rule applies"
-        )
+        errors = per_rule[model]
+        value = float(overall[model])
+        if errors.notna().any():
+            worst = per_rule.loc[errors.idxmax()]
+            detail = (
+                f"share of rows breaking at least one of {int(errors.notna().sum())} accepted "
+                f"rules (real holdout {overall[reference]:.1%}); mean rule error "
+                f"{errors.mean():.1%}; worst: {worst['lhs']} -> {worst['rhs']} ({worst[model]:.1%})"
+            )
+        else:
+            value, detail = np.nan, "no accepted rule applies"
         rows.append(_row("dependency_rules", model, not value > limit, value, limit, detail))
     return rows
 

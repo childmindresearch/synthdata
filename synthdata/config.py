@@ -1166,6 +1166,12 @@ class EvaluationConfig:
     #: page that summarizes the run, embeds its plots and links every output.
     #: ``synthdata-plot`` rewrites it once the plots exist.
     generate_report: bool = True
+    #: Whether to write a model card per candidate model to
+    #: ``model_cards/<model>.md`` next to report.md (needs ``generate_report``):
+    #: what the model is and how it was built, its primary metrics against the
+    #: baselines, privacy and fairness evidence, and the checks it warned on.
+    #: Layout in docs/model-card-template.md.
+    model_cards: bool = True
 
     #: Sanity checks on every run, written to checks.csv and listed in the
     #: report (synthdata/evaluation/checks.py): synthetic rows that copy train

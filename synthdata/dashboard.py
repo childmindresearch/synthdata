@@ -1037,6 +1037,13 @@ def read_results(eval_dir: Path | None, logs_dir: Path, best_params: Path | None
                 for row in warned[:20]
             ],
         }
+    cards = sorted((eval_dir / "model_cards").glob("*.md"))
+    if cards:
+        with contextlib.suppress(ValueError):
+            out["model_cards"] = [
+                {"model": card.stem, "rel": Path(os.path.relpath(card, logs_dir)).as_posix()}
+                for card in cards
+            ]
     report = eval_dir / "report.md"
     if report.exists():
         out["report"] = str(report.resolve())

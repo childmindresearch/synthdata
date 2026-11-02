@@ -23,6 +23,7 @@ from synthdata.evaluation.combine import (
     summarize_replicates,
 )
 from synthdata.evaluation.fairness_gaps import FAIRNESS_GAP_METRICS, FAIRNESS_SIGNAL_COLUMN
+from synthdata.evaluation.model_cards import CARDS_DIRNAME, write_model_cards
 from synthdata.evaluation.privacy_attacks import (
     ANONYMETER_METRICS,
     MEMBERSHIP_METRICS,
@@ -322,7 +323,7 @@ def _privacy_flags(attacks) -> list[str]:
     return flags
 
 
-def _glance_section(cfg, dataset, combined, extras, model_names, experiment) -> str:
+def _glance_section(cfg, dataset, combined, extras, model_names, experiment, paths, links) -> str:
     summary = _summary(combined, extras.get("ranking_summary"))
     lines = ["## 1. At a glance", ""]
     meta = [
@@ -399,6 +400,15 @@ def _glance_section(cfg, dataset, combined, extras, model_names, experiment) -> 
                 + ". A useful generator beats the marginals on utility and the train copy on "
                 "privacy.",
             ]
+
+    cards = sorted((paths.evaluation / CARDS_DIRNAME).glob("*.md"))
+    if cards:
+        lines += [
+            "",
+            "**Model cards** (what each model is, its evidence and known issues, on one page): "
+            + ", ".join(links.file(card, card.stem) for card in cards)
+            + ".",
+        ]
 
     cautions = []
     from synthdata.generation.pipeline import FAILURES_FILE, read_failures
@@ -1157,6 +1167,7 @@ def _file_index_section(paths: _Paths, links: _Links, report_path: Path) -> str:
         if path.is_file():
             add(path)
     for directory, description in (
+        (paths.evaluation / CARDS_DIRNAME, "One model card per candidate model."),
         (paths.evaluation / "syntheval_benchmark", "SynthEval's raw benchmark output."),
         (paths.evaluation_plots / "syntheval_plots", "SynthEval's per-metric diagnostic plots."),
     ):
@@ -1237,7 +1248,7 @@ def build_evaluation_report(
         "",
         _CONTENTS,
         "",
-        _glance_section(cfg, dataset, combined, extras, model_names, experiment),
+        _glance_section(cfg, dataset, combined, extras, model_names, experiment, paths, links),
         "",
         _ranking_section(cfg, combined, extras, paths, links),
         "",
@@ -1266,6 +1277,20 @@ def save_evaluation_report(
     """Build and write the Markdown evaluation report, returning its path."""
     report_path = Path(path) if path else Path(cfg.evaluation.output_dir) / "report.md"
     report_path.parent.mkdir(parents=True, exist_ok=True)
+    if cfg.evaluation.model_cards:
+        paths = _Paths(cfg, dataset, experiment, report_path.parent)
+        try:
+            write_model_cards(
+                cfg,
+                dataset,
+                combined,
+                report_path.parent,
+                paths.generation,
+                paths.manifest,
+                experiment,
+            )
+        except Exception as exc:  # noqa: BLE001 -- the cards must never stop the report
+            logger.warning("[model cards] could not be written: %s", exc)
     report_text = build_evaluation_report(
         cfg, dataset, combined, extras, experiment, report_dir=report_path.parent
     )

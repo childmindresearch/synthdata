@@ -393,7 +393,7 @@ Use it to decide what to drop or merge in your data preparation.
 
 #### Checking synthetic data against accepted rules
 
-Rows of `dependencies.csv` (`fd`, `cfd`) and of `missing_blocks.csv` (blocks: "the first column is blank, so the others are too") carry a `check_rule`. Copy the file, delete the rows you don't accept (or add an `accept` column set to `false` for them), and point `evaluation.dependency_rules` at the copy. Evaluation then scores each synthetic dataset, as released (blanked by its missing flags), against those rules: `dependency_violations.csv` gives each rule's share of breaking rows per model and for the real holdout, and `checks.csv` gets a `dependency_rules` row per model that warns when its mean is more than 1 percentage point above the holdout's. This needs no Desbordante, so it runs anywhere. A column is only safe to drop if the rule is exact and you recompute it after generation.
+Rows of `dependencies.csv` (`fd`, `cfd`) and of `missing_blocks.csv` (blocks: "the first column is blank, so the others are too") carry a `check_rule`. Copy the file, delete the rows you don't accept (or add an `accept` column set to `false` for them), and point `evaluation.dependency_rules` at the copy. Evaluation then scores each synthetic dataset, as released (blanked by its missing flags), against those rules: `dependency_violations.csv` gives each rule's share of breaking rows (of the rows it applies to) per model and for the real holdout, and a last `any_rule` row with the share of all rows that break at least one rule. A row breaks a rule with a fixed right side when it lacks that value, and an "X fixes Y" rule when its Y is not the most common Y for its X, so a rule's share is its g3 error. `checks.csv` gets a `dependency_rules` row per model whose value is that `any_rule` share; it warns when it is more than 1 percentage point above the holdout's, and the detail names the rule broken most often. The model cards list the warning. This needs no Desbordante, so it runs anywhere. A column is only safe to drop if the rule is exact and you recompute it after generation.
 
 ### Caching
 
@@ -714,6 +714,8 @@ With seed replicates, every table shows one row per model with the mean and its 
 6. **Data and preparation.** The split table, missingness, imputation checks and the HPO results.
 7. **File index.** Every output file with a one-line description.
 
+Next to it, `model_cards/<model>.md` holds one model card per candidate model, linked at the top of the report and from the dashboard. A card puts on one page what the model is (generator, tuned or not and the tuned settings, seeds, data version, code and package versions), what the synthetic data is for and not for, its rank, its primary metrics next to the two baselines, its TSTR/TSTS, Anonymeter and fairness-gap results next to the baselines, the output checks it warned on and the metrics it is missing, and caveats. It is the page to hand someone who asks "can we use this model's data?". Every value comes from the run's own files; the layout is in [model-card-template.md](model-card-template.md). Set `evaluation.model_cards: false` to skip the cards.
+
 How to interpret it:
 
 - **Start with the baselines.** A generator with utility close to `baseline_marginals` has not learned the relationships between columns. A generator with privacy close to `baseline_train_copy` is close to releasing the real rows.
@@ -782,7 +784,7 @@ The data-readiness check (`identifier_like` in `data_readiness.csv`) flags any f
 | `data/<name>/` | Real rows: splits, imputed data | Never. Treat it like the source data. |
 | `output/<name>/synthetic_data/.../released/` | Synthetic rows with missing values put back | This is the release candidate, after you have read the privacy section of the report. |
 | Other files in `synthetic_data/` | The scored synthetic rows, HPO studies, sampling diagnostics | Within the project team. |
-| `output/<name>/evaluation/`, `plots/` and `report.md` | Aggregate metrics, but also real-data distributions in the plots (including extreme values) and subgroup counts in the fairness tables, some of them small | Within the project team. Review before showing outside it: a small subgroup count or an outlier in a plot can identify a patient. |
+| `output/<name>/evaluation/`, `plots/`, `report.md` and `model_cards/` | Aggregate metrics, but also real-data distributions in the plots (including extreme values) and subgroup counts in the fairness tables, some of them small | Within the project team. Review before showing outside it: a small subgroup count or an outlier in a plot can identify a patient. |
 
 All training runs locally: the pipeline downloads the TabPFN weights and, for `data.source: uci`, the UCI data, and uploads nothing. TabPFN's own usage reporting (row and column counts, library versions) is switched off by default; set `TABPFN_DISABLE_TELEMETRY=0` in `.env` to allow it.
 

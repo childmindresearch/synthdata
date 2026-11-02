@@ -4,6 +4,19 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.31.0 (2026-10-29)
+
+Two new outputs and a changed check value. No metric or score changes, so results stay comparable and goldens need no re-recording. No config edit is needed.
+
+### Added
+
+- **Model cards** (`evaluation.model_cards`, default `true`): every evaluation writes `model_cards/<model>.md` next to `report.md`, one per candidate model, linked at the top of the report and from the dashboard. A card puts on one page what the model is (generator, tuned settings, seeds, data version, provenance), its intended use, rank, primary metrics next to the baselines, TSTR/TSTS, Anonymeter and fairness-gap results next to the baselines, the output checks it warned on, missing metrics, and caveats. The layout is in `docs/model-card-template.md`; every value comes from the run's own files.
+- **Rows breaking any accepted rule**: `dependency_violations.csv` (written when `evaluation.dependency_rules` is set) gains a last `any_rule` row with each model's, and the holdout's, share of all rows that break at least one rule.
+
+### Changed
+
+- The `dependency_rules` check in `checks.csv` now reports that `any_rule` share (it was the mean of the per-rule error rates) and warns when it is more than 1 percentage point above the holdout's. The detail still gives the mean rule error and the rule broken most often.
+
 ## 0.30.1 (2026-10-29)
 
 Documentation only; results and configs are unchanged, so old results stay comparable and goldens need no re-recording.

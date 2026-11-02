@@ -851,6 +851,11 @@ def _results(d: dict) -> str:
         parts.append(
             f'<p>Full results: <a href="{href}">report.md</a> <span class="muted small">{_e(r["report"])}</span></p>'
         )
+    if "model_cards" in r:
+        links = ", ".join(
+            f'<a href="{_e(c["rel"])}">{_e(c["model"])}</a>' for c in r["model_cards"]
+        )
+        parts.append(f"<p>Model cards: {links}</p>")
     return f'<section class="card"><h2>Results</h2>{"".join(parts)}</section>'
 
 

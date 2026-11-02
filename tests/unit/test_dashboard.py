@@ -211,6 +211,8 @@ def _write_run(tmp_path, finished: bool = False, host: str | None = None):
             "check,model,status,value,limit,detail\nrows,ctgan,pass,1,1,\nclass_share,ctgan,warn,0.4,0.3,off\n"
         )
         (eval_dir / "report.md").write_text("# Report\n")
+        (eval_dir / "model_cards").mkdir()
+        (eval_dir / "model_cards" / "ctgan.md").write_text("# Model card\n")
         (gen_dir / "hpo_best_params.json").write_text('{"synthcity": {"ctgan": {}}}')
     return cfg, log
 
@@ -316,12 +318,16 @@ def test_finished_run_shows_results_and_page_renders(tmp_path):
     assert [x["untuned"] for x in d["results"]["ranking"]] == [False, True, False]
     assert d["results"]["checks"]["warn"] == 1
     assert d["results"]["report_rel"] == "../evaluation/data_v_1.2/exp_v_1.2/report.md"
+    assert d["results"]["model_cards"] == [
+        {"model": "ctgan", "rel": "../evaluation/data_v_1.2/exp_v_1.2/model_cards/ctgan.md"}
+    ]
 
     path = dashboard.write_dashboard(log, cfg)
     assert path == log.with_name("20261010T220000Z_dashboard.html")
     page = path.read_text(encoding="utf-8")
     assert page.startswith("<!doctype html>") and "Finished" in page
     assert "ctgan" in page and "report.md" in page and "CUDA out of memory" in page
+    assert 'model_cards/ctgan.md">ctgan</a>' in page
     # The ranking draws the interval and says tied in words, not with a status badge.
     assert 'class="cibar"' in page and '<span class="pill good">best</span>' in page
     # One timeline row per model, a segment per step, ticks and the stage bands.
