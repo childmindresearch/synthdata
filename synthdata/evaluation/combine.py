@@ -19,12 +19,19 @@ from synthdata.evaluation.catalog import (
     SYNTHCITY_UNRANKED_SUBMETRICS,
     SYNTHEVAL_UNRANKED_METRICS,
     TSTR_METRICS,
+    TSTR_UNRANKED_METRICS,
     is_custom_syntheval_metric,
     is_redundant_synthcity_submetric,
     is_syntheval_fairness_gap,
 )
 from synthdata.evaluation.custom_eval import build_log_disparity_summary_table
 from synthdata.evaluation.fairness_gaps import FAIRNESS_GAP_METRICS, FAIRNESS_SIGNAL_COLUMN
+from synthdata.evaluation.primary import (
+    pareto_front,
+    point_scores,
+    resolve_primary,
+    summarize_draws,
+)
 from synthdata.evaluation.privacy_attacks import (
     ANONYMETER_METRICS,
     MEMBERSHIP_METRICS,
@@ -41,6 +48,8 @@ logger = get_logger(__name__)
 
 _ALL = "__all__"
 _RANK = "rank"
+#: Level-0 name of the min-max composite when the primary scores rank.
+LEGACY = "legacy"
 
 
 def _synthcity_frames(
@@ -172,8 +181,9 @@ def _tstr_frames(
 ) -> "tuple[pd.DataFrame, pd.DataFrame]":
     """Holdout TSTR macro scores as custom utility columns (all higher-is-better).
 
-    TSTS scores (train and test on synthetic rows) are reported next to them
-    but unranked: a high TSTS is not better in itself, only its gap to TSTR
+    Macro AUPRC and Cohen's kappa are ranked; macro-F1 and balanced accuracy
+    are reported, not ranked (S12, docs/verification.md). TSTS scores (train
+    and test on synthetic rows) are reported next to them but unranked: a high TSTS is not better in itself, only its gap to TSTR
     says something (docs/verification.md).
     """
     scores = (tstr_result or {}).get("scores") or {}
@@ -187,12 +197,13 @@ def _tstr_frames(
             f"{prefix}_macro_f1": {m: s.macro_f1 for m, s in results.items()},
             f"{prefix}_balanced_accuracy": {m: s.balanced_accuracy for m, s in results.items()},
             f"{prefix}_macro_auprc": {m: s.macro_auprc for m, s in results.items()},
+            f"{prefix}_kappa": {m: s.kappa for m, s in results.items()},
         }
 
-    oriented = pd.DataFrame(_scores("tstr", scores)).reindex(
-        index=model_names, columns=list(TSTR_METRICS)
+    raw = pd.DataFrame(_scores("tstr", scores)).reindex(
+        index=model_names, columns=[*TSTR_METRICS, *TSTR_UNRANKED_METRICS]
     )
-    raw = oriented.copy()
+    oriented = raw[list(TSTR_METRICS)].copy()
     if tsts:
         raw = pd.concat([raw, pd.DataFrame(_scores("tsts", tsts)).reindex(model_names)], axis=1)
     raw.columns = pd.MultiIndex.from_tuples([("custom", "utility", c) for c in raw.columns])
@@ -374,8 +385,18 @@ def build_combined_table(
     tstr_result: dict | None = None,
     privacy_result: dict | None = None,
     fairness_gap_table: pd.DataFrame | None = None,
+    primary_metrics: list | None = None,
 ) -> pd.DataFrame:
     """Build the single combined, ranked, multi-index evaluation table.
+
+    With ``primary_metrics`` (``evaluation.primary_metrics``), the
+    ``("__all__", type, "rank")`` and ``("__all__", "overall", "rank")``
+    columns hold the baseline-anchored primary scores
+    (:mod:`synthdata.evaluation.primary`) and the composite described below
+    moves to ``("legacy", ...)`` columns, kept for comparison. The anchored
+    value of each primary metric is in ``attrs["primary_anchored"]`` and the
+    resolved metrics in ``attrs["primary_spec"]``. Without it, the composite
+    is the ranking, as before.
 
     ``tstr_result`` (from :func:`synthdata.evaluation.custom_eval.run_tstr_evaluation`)
     adds the holdout TSTR macro scores as a ``("custom", "utility")`` group, and
@@ -472,12 +493,37 @@ def build_combined_table(
     overall = np.exp(log_total / weight_total) if weight_total else log_total
     combined[(_ALL, "overall", _RANK)] = overall
 
+    directions = metric_directions(raw_df, oriented_df)
+    spec = anchored = None
+    present = {split_replicate_name(str(m))[0] for m in raw_df.index}
+    if primary_metrics and not {"baseline_train_copy", "baseline_marginals"} <= present:
+        logger.warning(
+            "[ranking] the primary scores are anchored to baseline_train_copy and "
+            "baseline_marginals, and this run lacks one; ranking on the composite"
+        )
+    elif primary_metrics:
+        spec = resolve_primary(primary_metrics, raw_df, directions)
+        if spec.columns:
+            point = point_scores(raw_df, spec, rank_weights)
+            anchored = point["anchored"]
+            combined = combined.rename(columns={_ALL: LEGACY}, level=0)
+            for dim in ("overall", *_TYPES):
+                # A type whose every primary metric lost its scale has no score.
+                if dim in point["replicates"].columns and point["replicates"][dim].notna().any():
+                    combined[(_ALL, dim, _RANK)] = point["replicates"][dim]
+        else:
+            logger.warning("[ranking] no primary metric available; ranking on the composite")
+            spec = None
+
     combined.columns = pd.MultiIndex.from_tuples(
         combined.columns, names=["framework", "type", "metric"]
     )
     combined = combined.sort_values((_ALL, "overall", _RANK), ascending=False)
     combined.index.name = "model"
-    combined.attrs["metric_directions"] = metric_directions(raw_df, oriented_df)
+    combined.attrs["metric_directions"] = directions
+    if spec is not None and anchored is not None:
+        combined.attrs["primary_spec"] = spec
+        combined.attrs["primary_anchored"] = anchored.reindex(combined.index)
     return combined
 
 
@@ -540,7 +586,9 @@ def _differs(best: pd.Series, other: pd.Series, alpha: float) -> "bool | float":
     return bool(result.pvalue < alpha)
 
 
-def summarize_replicates(combined: pd.DataFrame, confidence: float = CONFIDENCE) -> pd.DataFrame:
+def summarize_replicates(
+    combined: pd.DataFrame, confidence: float = CONFIDENCE, draws: dict | None = None
+) -> pd.DataFrame:
     """Collapse seed replicates (``<model>__rep<r>``) into one row per model.
 
     For each rank score (overall, utility, privacy, fairness) the table gives
@@ -554,6 +602,14 @@ def summarize_replicates(combined: pd.DataFrame, confidence: float = CONFIDENCE)
     overall score and for every model whose overall score a one-sided Welch
     t-test cannot place below it at ``1 - confidence``; it is NaN when either
     side has a single replicate. ``rank`` orders all rows by mean overall score.
+
+    ``draws`` (:func:`synthdata.evaluation.primary.bootstrap_draws`) replaces
+    the intervals and ties with the bootstrap's: percentile intervals, the
+    paired difference to the best eligible model (``diff_vs_best`` with
+    ``diff_ci_low``/``diff_ci_high``) and ``pareto_share``. ``pareto_front``
+    marks the eligible models no other eligible model beats on both mean
+    utility and mean privacy. ``legacy_overall_mean`` is the composite's
+    overall score when the primary scores rank.
     """
     alpha = 1 - confidence
     models = pd.Series(
@@ -592,4 +648,17 @@ def summarize_replicates(combined: pd.DataFrame, confidence: float = CONFIDENCE)
             differs = _differs(overall_by_model[best], overall_by_model[model], alpha)
             tied[model] = np.nan if pd.isna(differs) else not differs
     summary["tied_with_best"] = tied
+    if (LEGACY, "overall", _RANK) in combined.columns:
+        legacy = combined[(LEGACY, "overall", _RANK)].astype(float).groupby(models).mean()
+        summary["legacy_overall_mean"] = legacy.reindex(summary.index)
+    if {"utility_mean", "privacy_mean"} <= set(summary.columns) and len(eligible):
+        front = pareto_front(
+            summary.loc[eligible, "utility_mean"], summary.loc[eligible, "privacy_mean"]
+        )
+        summary["pareto_front"] = front.reindex(summary.index).fillna(False).astype(bool)
+    if draws:
+        point = summary[[f"{d}_mean" for d in dims]].rename(columns=lambda c: c[: -len("_mean")])
+        boot = summarize_draws(draws, point, list(eligible), confidence)
+        for column in boot.columns:
+            summary[column] = boot[column]
     return summary

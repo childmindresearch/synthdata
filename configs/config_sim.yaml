@@ -231,8 +231,21 @@ evaluation:
     anonymeter: { n_attacks: 500 }
 
 
-  # Overall rank = weighted geometric mean of the utility, privacy and
-  # fairness ranks.
+  # Pre-registered primary metrics the ranking reads, each scored between
+  # the baselines (0 = marginals, 1 = train copy; reversed for privacy).
+  # Everything else is a diagnostic. [] = the earlier min-max composite.
+  primary_metrics:
+    - tstr_macro_auprc
+    - corr_mat_diff
+    - distance_mia_auc
+    - anonymeter_linkability_risk
+    - anonymeter_inference_risk
+    - demographic_parity_gap_error
+  # Bootstrap draws (holdout patients x seed replicates) behind the
+  # intervals and ties; 0 = t-intervals over seeds only.
+  ranking_bootstrap: 1000
+  # Overall score = weighted geometric mean of the utility, privacy and
+  # fairness scores.
   rank_weights: { utility: 1.0, privacy: 1.0, fairness: 1.0 }
 
 plots:

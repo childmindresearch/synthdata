@@ -4,6 +4,7 @@ disparity / fork-only fairness) evaluators, combined into one ranked table.
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from synthdata.config import Config
@@ -15,6 +16,7 @@ from synthdata.evaluation import (
     combine,
     custom_eval,
     fairness_gaps,
+    primary,
     report,
     synthcity_eval,
     syntheval_eval,
@@ -221,13 +223,39 @@ def run_evaluation(
         tstr_result=tstr_result,
         privacy_result=privacy_result,
         fairness_gap_table=fairness_gap_table,
+        primary_metrics=eval_cfg.primary_metrics,
     )
 
     combined.to_csv(output_dir / "combined_evaluation.csv")
     directions = combined.attrs.get("metric_directions")
     if directions is not None:
         directions.to_csv(output_dir / combine.METRIC_DIRECTIONS_FILENAME)
-    ranking_summary = combine.summarize_replicates(combined)
+    draws = None
+    spec = combined.attrs.get("primary_spec")
+    if spec is not None:
+        primary.primary_table(combined).to_csv(output_dir / primary.PRIMARY_FILENAME)
+        if eval_cfg.ranking_bootstrap > 0:
+            holdout_keys = (
+                dataset.patient_ids.loc[test_df.index].to_numpy()
+                if dataset.patient_ids is not None
+                else np.arange(len(test_df))
+            )
+            rows = primary.holdout_rows(
+                holdout_keys,
+                tstr_result,
+                fairness_gap_result,
+                privacy_result,
+                ordinal=dataset.target_column in dataset.ordinal_columns,
+            )
+            draws = primary.bootstrap_draws(
+                combined[spec.columns],
+                spec,
+                eval_cfg.rank_weights,
+                rows,
+                eval_cfg.ranking_bootstrap,
+                cfg.seed,
+            )
+    ranking_summary = combine.summarize_replicates(combined, draws=draws)
     ranking_summary.to_csv(output_dir / "ranking_summary.csv")
 
     checks_table = None

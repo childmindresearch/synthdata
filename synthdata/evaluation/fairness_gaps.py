@@ -75,6 +75,12 @@ class FairnessGaps:
     chance: float
     #: One row per (class, column, group): synthetic and real gaps.
     gaps: pd.DataFrame
+    #: Holdout classes predicted by the synthetic- and the real-trained
+    #: classifier, and the group masks, kept so the ranking can resample the
+    #: holdout (evaluation.primary).
+    holdout_pred: np.ndarray | None = None
+    real_pred: np.ndarray | None = None
+    masks: dict = dataclasses.field(default_factory=dict)
 
 
 def balanced_accuracy_interval(
@@ -182,7 +188,17 @@ def fairness_gap_scores(
         group_gaps(y_true, real_predictions, masks, len(classes)),
     )
     joined["class"] = [str(classes[c]) for c in joined["class"]]
-    return FairnessGaps(errors, bool(signal), accuracy, interval, chance, joined)
+    return FairnessGaps(
+        errors,
+        bool(signal),
+        accuracy,
+        interval,
+        chance,
+        joined,
+        holdout_pred=y_syn,
+        real_pred=np.asarray(real_predictions),
+        masks={key: np.asarray(mask, dtype=bool) for key, mask in masks.items()},
+    )
 
 
 def real_holdout_predictions(

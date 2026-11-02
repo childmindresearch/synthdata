@@ -39,12 +39,12 @@ def _status(table, check, model):
 
 
 def _combined(scores: dict) -> pd.DataFrame:
-    """Combined-table stand-in: model -> (utility, privacy, tstr_macro_f1)."""
+    """Combined-table stand-in: model -> (utility, privacy, tstr_macro_auprc)."""
     frame = pd.DataFrame(
         {
             ("__all__", "utility", "rank"): {m: v[0] for m, v in scores.items()},
             ("__all__", "privacy", "rank"): {m: v[1] for m, v in scores.items()},
-            ("custom", "utility", "tstr_macro_f1"): {m: v[2] for m, v in scores.items()},
+            ("custom", "utility", "tstr_macro_auprc"): {m: v[2] for m, v in scores.items()},
         }
     )
     frame.columns = pd.MultiIndex.from_tuples(frame.columns)
@@ -132,3 +132,22 @@ def test_baselines_out_of_place_warn():
     table = run_output_checks(dataset, {}, combined, True)
     assert (table["status"] == "warn").all(), table
     assert len(table) == 3
+
+
+def test_baseline_checks_read_the_composite_when_the_primary_scores_rank():
+    from synthdata.evaluation.checks import _baseline_checks
+
+    combined = pd.DataFrame(
+        {
+            # Anchored scores put the baselines at 0 and 1 whatever the metrics do...
+            ("__all__", "utility", "rank"): {"baseline_train_copy": 1.0, "baseline_marginals": 0.0},
+            ("__all__", "privacy", "rank"): {"baseline_train_copy": 0.0, "baseline_marginals": 1.0},
+            # ...so the checks read the min-max composite, where the copy fails here.
+            ("legacy", "utility", "rank"): {"baseline_train_copy": 0.2, "baseline_marginals": 0.8},
+            ("legacy", "privacy", "rank"): {"baseline_train_copy": 0.9, "baseline_marginals": 0.1},
+        }
+    )
+    combined.columns = pd.MultiIndex.from_tuples(combined.columns)
+    table = pd.DataFrame(_baseline_checks(combined))
+    assert len(table) == 2
+    assert (table["status"] == "warn").all(), table

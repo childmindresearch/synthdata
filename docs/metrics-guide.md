@@ -7,7 +7,7 @@ A plain-language guide to every number in `report.md` and `combined_evaluation.c
 - **Compare with the two baselines first.** Every run scores two fixed reference datasets next to the generators. `baseline_train_copy` is the real training rows released as is: the best utility and fairness you can get and the worst privacy. `baseline_marginals` samples each column on its own, so it keeps every column's distribution but no relationship between columns: the utility a generator must beat. A metric is only informative if those two land far apart.
 - **Look at the direction.** Each panel of the `metrics_<type>.png` plots says whether higher, lower or closer to 0 is better, and draws a green dashed line at the ideal value where one exists. `metric_directions.csv` lists the same for every metric.
 - **Look at the interval.** With several seeds (`generation.n_replicates`), each model shows a mean and a 95% interval. Two models whose intervals overlap a lot are not clearly different.
-- **Ranks are relative.** The utility, privacy, fairness and overall scores rescale every metric between the worst and the best model of this run. A score of 1 means "best here", not "perfect".
+- **Scores are anchored to the baselines.** The utility, privacy, fairness and overall scores read only the primary metrics (`evaluation.primary_metrics`, marked below), each placed between the two baselines: for utility and fairness 0 = `baseline_marginals` and 1 = `baseline_train_copy`, for privacy the other way round. Every other metric is a diagnostic. The earlier composite, which rescaled every metric between the worst and the best model of the run, is kept as `legacy` columns for comparison.
 
 ## Utility: is the synthetic data as useful as the real data?
 
@@ -15,8 +15,8 @@ A plain-language guide to every number in `report.md` and `combined_evaluation.c
 
 | Metric | What it measures | Read it as |
 | --- | --- | --- |
-| `tstr_macro_f1`, `tstr_balanced_accuracy`, `tstr_macro_auprc` | **Train on synthetic, test on real.** A fixed XGBoost classifier learns the target from the synthetic rows and predicts the real holdout. Macro and balanced scores weigh every class equally. | Higher is better. The `baseline_train_copy` row is the ceiling (train on real, test on real). Chance level is about 1 / number of classes for macro-F1 and balanced accuracy. |
-| `tstr_kappa` | Agreement between predictions and truth beyond chance (Cohen's kappa). | 0 = chance, 1 = perfect. Reported, not ranked. |
+| `tstr_macro_auprc` (primary), `tstr_macro_f1`, `tstr_balanced_accuracy` | **Train on synthetic, test on real.** A fixed XGBoost classifier learns the target from the synthetic rows and predicts the real holdout. Macro and balanced scores weigh every class equally. Macro AUPRC asks how well each class's patients are ranked above the rest, at every threshold; macro-F1 and balanced accuracy score one decision (the most likely class), so they move when the threshold moves and are reported, not ranked. | Higher is better. The `baseline_train_copy` row is the ceiling (train on real, test on real). Chance level is the class share for AUPRC and about 1 / number of classes for macro-F1 and balanced accuracy. |
+| `tstr_kappa` | Agreement between predictions and truth beyond chance (Cohen's kappa). | 0 = chance, 1 = perfect. Ranked in the legacy composite. |
 | `f1_<class>` | F1 of one class. | Shows which class the synthetic data gets wrong. |
 | `tsts_*` | **Train on synthetic, test on synthetic**: the same classifier fitted and scored inside the synthetic data (80/20 split). | Not ranked. TSTS far above TSTR means the synthetic data holds a pattern that real rows don't share; TSTS near chance means the generator lost the target. |
 
@@ -27,7 +27,7 @@ A plain-language guide to every number in `report.md` and `combined_evaluation.c
 | `avg_dwm_diff` | Dimension-wise means: average difference between real and synthetic column means (scaled). | Lower |
 | `pca_eigval_diff`, `pca_eigvec_ang` | Whether the main directions of variation (principal components) match. | Lower |
 | `avg_cio` | Confidence-interval overlap of column means. | Higher |
-| `corr_mat_diff` | Difference between the real and synthetic correlation matrices (mixed: numeric and categorical). | Lower |
+| `corr_mat_diff` (primary) | Difference between the real and synthetic correlation matrices (mixed: numeric and categorical). | Lower |
 | `mutual_inf_diff` | Same, with mutual information instead of correlation. | Lower |
 | `ks_tvd_stat`, `frac_ks_sigs` | Kolmogorov-Smirnov distance per column (TVD for categories) and the share of columns that differ significantly. | Lower |
 | `avg_h_dist` | Hellinger distance between column distributions (0 = identical, 1 = no overlap). | Lower |
@@ -64,10 +64,10 @@ Privacy numbers are evidence from specific attacks, not guarantees. Compare ever
 | Metric | What it measures | Read it as |
 | --- | --- | --- |
 | `anonymeter_singling_out_risk` | Can an attacker write a rule (for example "born 1950, female, region 4") that matches exactly one real training patient, using only the synthetic data? | 0 = no better than an attacker who never saw the synthetic data; 1 = always succeeds. Lower is better. A lower bound: even a copy of train scores low here (see the user manual). |
-| `anonymeter_linkability_risk` | Given two partial records of the same person (some columns each), can the attacker link them through the synthetic data? | 0 to 1, lower is better. Catches copies well. |
-| `anonymeter_inference_risk` | Knowing a person's quasi-identifiers, can the attacker guess their sensitive columns better than from unseen real rows? Worst sensitive column. | 0 to 1, lower is better. |
+| `anonymeter_linkability_risk` (primary) | Given two partial records of the same person (some columns each), can the attacker link them through the synthetic data? | 0 to 1, lower is better. Catches copies well. |
+| `anonymeter_inference_risk` (primary) | Knowing a person's quasi-identifiers, can the attacker guess their sensitive columns better than from unseen real rows? Worst sensitive column. | 0 to 1, lower is better. |
 | `dcr_closer_to_train_share` | For each synthetic row, is its nearest training row closer than its nearest unseen (test) row? Share of rows where it is. | 0.5 is ideal: synthetic rows are as close to unseen people as to training ones. Above 0.5 means they hug the training rows. |
-| `distance_mia_auc` | A membership attack that guesses "was this person in training?" from their distance to the synthetic data. | 0.5 is ideal (a coin flip). Higher means membership leaks. |
+| `distance_mia_auc` (primary) | A membership attack that guesses "was this person in training?" from their distance to the synthetic data. | 0.5 is ideal (a coin flip). Higher means membership leaks. |
 | `domias_mia_auc` | DOMIAS, a second membership attack: it guesses "was this person in training?" from whether the synthetic data is denser around them than real data from the same population is. | 0.5 is ideal (a coin flip). Higher means membership leaks. It catches the same copies as `distance_mia_auc` by a different route, so the two should agree; read a disagreement as a reason to look closer. |
 | `dcr_holdout_ratio`, `nndr_holdout_ratio` | Distance from synthetic rows to their closest training row, divided by the same for test rows, at the closest 5% (DCR: distance to closest record; NNDR: nearest-neighbour distance ratio). | 1 or above is ideal. Below 1 means synthetic rows sit closer to training rows than to unseen ones. |
 
@@ -98,7 +98,7 @@ Protected columns are set in `data.protected_columns`, and the groups of a numer
 
 | Metric | What it measures | Read it as |
 | --- | --- | --- |
-| `demographic_parity_gap_error` | The holdout TSTR classifier, trained once on the synthetic and once on the real data, predicts the holdout. For each class and protected group: the group's share of predictions in that class minus everyone else's. The score is the average distance between the synthetic-trained and the real-trained gap. | 0 is ideal (the real disparity kept). A model with no class signal scores about the size of the real gap. |
+| `demographic_parity_gap_error` (primary) | The holdout TSTR classifier, trained once on the synthetic and once on the real data, predicts the holdout. For each class and protected group: the group's share of predictions in that class minus everyone else's. The score is the average distance between the synthetic-trained and the real-trained gap. | 0 is ideal (the real disparity kept). A model with no class signal scores about the size of the real gap. |
 | `equal_opportunity_gap_error` | The same for the true-positive rate (recall). | 0 is ideal. |
 | `equalized_odds_gap_error` | The same, taking the larger of the true- and false-positive rate differences. | 0 is ideal. |
 | `fairness_signal` | 1 when the synthetic-trained classifier beats chance on the holdout (bootstrap 95% interval of balanced accuracy above 1 / classes). It says which models' gaps come from a classifier that learned almost nothing. | Not ranked. |

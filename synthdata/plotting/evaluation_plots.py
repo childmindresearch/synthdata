@@ -29,8 +29,12 @@ def plot_rank_tradeoff(
     x_label: str,
     y_label: str,
     title: str,
+    pareto: bool = False,
 ):
     """Build a two-dimensional rank trade-off scatter plot.
+
+    ``pareto`` draws the front of the non-baseline models: those no other
+    model beats on both axes (synthdata.evaluation.primary.pareto_front).
 
     One labelled point per model: the mean over its seed replicates, with
     95% interval bars on both axes when it has two or more. Single seeds are
@@ -52,6 +56,7 @@ def plot_rank_tradeoff(
 
     fig, ax = plt.subplots(figsize=(11, 7))
     any_interval = False
+    means: dict = {}
     by_model = groups.groupby(groups, sort=False).groups
     for model in sorted(by_model, key=lambda m: model_sort_key(str(m))):
         names = by_model[model]
@@ -65,9 +70,6 @@ def plot_rank_tradeoff(
             ax.scatter(xs, ys, s=18, color=color, alpha=0.35, linewidths=0, zorder=2)
         if pd.notna(x_low):
             any_interval = True
-            # Ranks live in [0, 1]; a t-interval from few seeds can overshoot.
-            x_low, x_high = max(x_low, 0.0), min(x_high, 1.0)
-            y_low, y_high = max(y_low, 0.0), min(y_high, 1.0)
             ax.errorbar(
                 x_mean,
                 y_mean,
@@ -79,6 +81,7 @@ def plot_rank_tradeoff(
                 alpha=0.8,
                 zorder=3,
             )
+        means[str(model)] = (x_mean, y_mean)
         ax.scatter(
             x_mean,
             y_mean,
@@ -99,8 +102,33 @@ def plot_rank_tradeoff(
             zorder=5,
         )
 
-    ax.set_xlim(-0.03, 1.05)
-    ax.set_ylim(-0.03, 1.05)
+    # Anchored scores can leave [0, 1] (worse than a baseline, or better than
+    # the train copy), so the axes widen to show every point.
+    xs_all = [x for x, _ in means.values() if pd.notna(x)]
+    ys_all = [y for _, y in means.values() if pd.notna(y)]
+    ax.set_xlim(min([-0.03, *(x - 0.05 for x in xs_all)]), max([1.05, *(x + 0.05 for x in xs_all)]))
+    ax.set_ylim(min([-0.03, *(y - 0.05 for y in ys_all)]), max([1.05, *(y + 0.05 for y in ys_all)]))
+    front_handle = None
+    if pareto:
+        from synthdata.evaluation.baselines import is_baseline
+        from synthdata.evaluation.primary import pareto_front
+
+        candidates = {m: v for m, v in means.items() if not is_baseline(m)}
+        if candidates:
+            table = pd.DataFrame(candidates, index=["x", "y"]).T
+            on_front = table[pareto_front(table["x"], table["y"])].sort_values("x")
+            ax.plot(
+                on_front["x"],
+                on_front["y"],
+                linestyle="--",
+                color="black",
+                lw=1.2,
+                drawstyle="steps-post" if len(on_front) > 1 else "default",
+                zorder=1,
+            )
+            front_handle = Line2D(
+                [0], [0], color="black", lw=1.2, linestyle="--", label="Pareto front (candidates)"
+            )
     ax.annotate(
         "better",
         xy=(0.97, 0.97),
@@ -155,6 +183,8 @@ def plot_rank_tradeoff(
             ),
             Line2D([0], [0], color="grey", lw=1.2, label="95% interval over seeds"),
         ]
+    if front_handle is not None:
+        handles.append(front_handle)
     ax.legend(handles=handles, loc="lower left", fontsize=8)
     fig.tight_layout()
     return fig
@@ -275,9 +305,9 @@ def plot_rank_tradeoff_3d(combined: pd.DataFrame):
     fig.update_layout(
         title="Utility, Privacy, and Fairness Rank Trade-off",
         scene={
-            "xaxis_title": "Utility rank",
-            "yaxis_title": "Privacy rank",
-            "zaxis_title": "Fairness rank",
+            "xaxis_title": "Utility score",
+            "yaxis_title": "Privacy score",
+            "zaxis_title": "Fairness score",
         },
         legend_title_text="Base model / variant",
         margin={"l": 0, "r": 0, "b": 0, "t": 50},
@@ -288,31 +318,38 @@ def plot_rank_tradeoff_3d(combined: pd.DataFrame):
 def save_rank_tradeoff_plots(cfg: Config, combined: pd.DataFrame, output_dir: str | Path) -> None:
     """Save interactive 3D and static pairwise rank trade-off plots."""
     output_dir = Path(output_dir) / "evaluation"
-    fig = plot_rank_tradeoff_3d(combined)
-    save_plotly_figure(fig, output_dir / "rank_tradeoff_3d", ("html",))
+    dims = [("__all__", d, "rank") for d in ("utility", "privacy", "fairness")]
+    if all(key in combined.columns for key in dims):
+        fig = plot_rank_tradeoff_3d(combined)
+        save_plotly_figure(fig, output_dir / "rank_tradeoff_3d", ("html",))
+    else:
+        logger.warning(
+            "Skipping rank_tradeoff_3d; missing score columns: %s",
+            [key for key in dims if key not in combined.columns],
+        )
 
     pairs = [
         (
             ("__all__", "utility", "rank"),
             ("__all__", "privacy", "rank"),
-            "Utility rank",
-            "Privacy rank",
+            "Utility score",
+            "Privacy score",
             "Utility vs Privacy Trade-off",
             "utility_vs_privacy",
         ),
         (
             ("__all__", "utility", "rank"),
             ("__all__", "fairness", "rank"),
-            "Utility rank",
-            "Fairness rank",
+            "Utility score",
+            "Fairness score",
             "Utility vs Fairness Trade-off",
             "utility_vs_fairness",
         ),
         (
             ("__all__", "privacy", "rank"),
             ("__all__", "fairness", "rank"),
-            "Privacy rank",
-            "Fairness rank",
+            "Privacy score",
+            "Fairness score",
             "Privacy vs Fairness Trade-off",
             "privacy_vs_fairness",
         ),
@@ -322,7 +359,9 @@ def save_rank_tradeoff_plots(cfg: Config, combined: pd.DataFrame, output_dir: st
         if missing_keys:
             logger.warning("Skipping %s; missing rank columns: %s", filename, missing_keys)
             continue
-        figure = plot_rank_tradeoff(combined, x_key, y_key, x_label, y_label, title)
+        figure = plot_rank_tradeoff(
+            combined, x_key, y_key, x_label, y_label, title, pareto=filename == "utility_vs_privacy"
+        )
         try:
             save_matplotlib_figure(figure, output_dir / filename, cfg.plots.dpi, cfg.plots.formats)
         finally:
@@ -498,7 +537,7 @@ def plot_metric_overview(
     metrics = [
         key
         for key in combined.columns
-        if key[0] != "__all__"
+        if key[0] not in ("__all__", "legacy")
         and key[1] == metric_type
         and key[2] != "rank"
         and pd.to_numeric(combined[key], errors="coerce").notna().any()
