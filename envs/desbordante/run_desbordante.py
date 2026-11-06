@@ -39,7 +39,9 @@ def main() -> None:
                     "rhs": json.dumps([]),
                 }
             )
-        print(f"HyUCC: {len(rows)} unique column combinations on {len(columns)} columns in {time.time() - start:.1f}s")
+        print(
+            f"HyUCC: {len(rows)} unique column combinations on {len(columns)} columns in {time.time() - start:.1f}s"
+        )
     pd.DataFrame(rows, columns=["kind", "lhs", "rhs"]).to_parquet(args.out, index=False)
 
 

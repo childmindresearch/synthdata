@@ -146,6 +146,22 @@ def test_columns_without_a_model_are_rejected():
         miceforest_backend.transform(state, _blanked(frame, [0], ["x"]))
 
 
+def test_holdout_categories_unseen_in_train_are_imputed(make_config, make_dataset):
+    from synthdata.imputation.pipeline import _fit_and_apply
+
+    frame = _frame(300)
+    dataset = make_dataset(df=frame, feature_columns=FEATURES, nominal_columns=NOMINAL)
+    cfg = make_config()
+    fit_df = frame.iloc[:200]
+    apply_to = frame.iloc[200:].copy()
+    # No missing values anywhere: only the unseen levels need a model.
+    apply_to.loc[apply_to.index[:3], "colour"] = "purple"
+    apply_to.loc[apply_to.index[:3], "const"] = "b"
+    _, applied = _fit_and_apply(cfg, dataset, fit_df, apply_to, "cpu")
+    # Observed holdout values, unseen ones included, are returned unchanged.
+    pd.testing.assert_frame_equal(applied, apply_to)
+
+
 def test_pipeline_dispatch_fills_train_and_holdout(make_config, make_dataset):
     from synthdata.imputation.pipeline import _impute_splits
 

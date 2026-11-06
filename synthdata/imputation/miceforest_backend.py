@@ -102,10 +102,14 @@ def _encode(frame: pd.DataFrame, state: FittedMiceForest) -> pd.DataFrame:
     parts = {}
     for column in state.columns:
         values = frame[column]
-        if column in state.constants:
-            values = values.fillna(state.constants[column])
         if column in state.categories:
-            parts[column] = pd.Categorical(values, categories=state.categories[column])
+            values = pd.Series(
+                pd.Categorical(values, categories=state.categories[column]), index=frame.index
+            )
+            if column in state.constants:
+                # After the cast, so an unseen value is filled like a missing one.
+                values = values.fillna(state.constants[column])
+            parts[column] = values
         else:
             parts[column] = pd.to_numeric(values).astype(float)
     return pd.DataFrame(parts, index=frame.index)

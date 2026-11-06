@@ -84,10 +84,16 @@ def _fit_and_apply(
             dataset.nominal_columns,
             seed=cfg.seed,
             miceforest_cfg=cfg.imputation.miceforest,
+            # A category unseen in fit_df is encoded as missing, so it needs a model too.
             model_columns=[
                 c
                 for c in dataset.feature_columns
-                if fit_df[c].isna().any() or apply_to[c].isna().any()
+                if fit_df[c].isna().any()
+                or apply_to[c].isna().any()
+                or (
+                    c in dataset.categorical_columns
+                    and not apply_to[c].dropna().isin(fit_df[c].dropna()).all()
+                )
             ],
         )
 

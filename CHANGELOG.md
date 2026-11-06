@@ -4,6 +4,14 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.31.3 (2026-11-06)
+
+A fix to `imputation.method: miceforest`. Runs that worked before give the same numbers; no config edit, new experiment id or golden re-record is needed.
+
+### Fixed
+
+- **Imputation no longer stops with "miceforest has no model for these columns with missing values"** when the holdout (or the tuning split) has a category the training rows lack, the case the `unseen_category` readiness warning reports. The imputer reads such a value as missing when it predicts the other columns, but only fitted models for columns with actual missing values. Those columns now get a model too, and a column constant in training no longer fails on a new value. Observed values, unseen ones included, are still returned unchanged.
+
 ## 0.31.2 (2026-11-02)
 
 Documentation only: no pipeline code, config key or output changes, so old results stay comparable.
