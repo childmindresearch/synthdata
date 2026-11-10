@@ -17,6 +17,9 @@ dependencies = [
     # Listed directly so the Windows source below applies (uv sources only
     # cover direct dependencies); mostlyai-engine still sets the version.
     "torch",
+    # Same index as torch: a PyPI torchvision is built for PyPI torch and its
+    # compiled ops fail to load next to a CUDA-index torch.
+    "torchvision",
 ]
 
 [tool.uv]
@@ -31,6 +34,10 @@ package = false
 # cu128 index stops at 2.11).
 [tool.uv.sources]
 torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+    { index = "pytorch-cu129", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+torchvision = [
     { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
     { index = "pytorch-cu129", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
