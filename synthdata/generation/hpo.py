@@ -791,7 +791,7 @@ def build_hpo_eval_fn(
 
     # The real-data ceiling and chance level per objective, read by the
     # generation stage for its log (see HPOEvalFn).
-    eval_fn.headroom = headroom  # ty: ignore[unresolved-attribute]
+    eval_fn.headroom = headroom  # ty: ignore[missing-attribute]
     return cast(HPOEvalFn, eval_fn)
 
 

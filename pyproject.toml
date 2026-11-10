@@ -84,7 +84,7 @@ dev = [
     "ruff",
     "pre-commit",
     # Type checker and language server (beta, so pinned: new releases add rules).
-    "ty==0.0.86",
+    "ty==0.0.100",
 ]
 
 [tool.uv]
@@ -193,7 +193,8 @@ invalid-assignment = "warn"
 not-subscriptable = "warn"
 parameter-already-assigned = "warn"
 too-many-positional-arguments = "warn"
-unresolved-attribute = "warn"
+missing-attribute = "warn"
+missing-union-attribute = "warn"
 unsupported-operator = "warn"
 
 [tool.pytest.ini_options]

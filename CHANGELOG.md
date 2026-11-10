@@ -11,6 +11,7 @@ Two evaluation fixes, a new config check and a TabularARGN environment fix. A co
 ### Changed
 
 - **A numeric protected column without bins stops the run when the data is loaded.** Before, it was left out of the fairness metrics with a warning; when it was the only protected column, every model's fairness metrics were skipped and only the log said so. The message names the column and says to set `data.protected_bins`, declare the column categorical in the variable schema, or remove it from `data.protected_columns`. Categorical and two-valued protected columns are unaffected.
+- For developers: ty is pinned to 0.0.100, which renamed `unresolved-attribute` to `missing-attribute` and split off `missing-union-attribute`; the test overrides in `pyproject.toml` and the `ty: ignore` comments use the new names, so `uv run ty check` no longer prints rename warnings.
 
 ### Fixed
 

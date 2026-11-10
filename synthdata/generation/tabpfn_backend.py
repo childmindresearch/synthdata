@@ -163,7 +163,7 @@ def _patch_regression_prediction_device():
         return pred, pred_sampled.cpu()
 
     cls.sample_from_model_prediction_ = sample_from_model_prediction_
-    cls._synthdata_cpu_prediction_patched = True  # ty: ignore[unresolved-attribute]  # our marker
+    cls._synthdata_cpu_prediction_patched = True  # ty: ignore[missing-attribute]  # our marker
 
 
 def set_model_version(version: str) -> None:
@@ -216,7 +216,7 @@ def _make_experiment(seed: int):
     # Disable the internal auto-plot: should_plot=False is not respected by this
     # version and self.data has duplicate indices after pd.concat, which breaks
     # seaborn reindex.
-    experiment.plot = lambda **kwargs: None  # ty: ignore[invalid-assignment]  # silence on purpose
+    experiment.plot = lambda **kwargs: None  # silence on purpose
     return experiment, model_unsupervised
 
 
