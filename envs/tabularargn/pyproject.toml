@@ -24,12 +24,13 @@ package = false
 
 # PyPI's torch is CPU-only on Windows; take the CUDA 13.0 build there.
 # PyPI's Linux torch is a CUDA 13 build, which needs an NVIDIA driver for
-# CUDA 13; take the CUDA 12.8 build on Linux x86_64 so the drivers on shared
-# clusters (CUDA 12.8+) can run it, as the main environment does.
+# CUDA 13; take the CUDA 12.6 build on Linux x86_64 so the drivers on shared
+# clusters (CUDA 12.6+) can run it. PyTorch publishes no CUDA 12.8 build of
+# torch 2.13 (the main environment's cu128 index stops at 2.11).
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
-    { index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
 
 [[tool.uv.index]]
@@ -38,6 +39,6 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
