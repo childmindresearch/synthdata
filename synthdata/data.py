@@ -667,6 +667,37 @@ def identifier_like_columns(
     return flagged
 
 
+def check_protected_bins(
+    df: pd.DataFrame, protected_columns: list, protected_bins: dict, categorical_columns: list
+) -> None:
+    """Fail when a numeric protected column has no ``data.protected_bins`` entry.
+
+    Fairness metrics, the HPO protected-group screens and log disparity compare
+    groups. A categorical or two-valued protected column already has groups; a
+    numeric one with more values has none until it is cut into bins, and the
+    fairness metrics would otherwise leave it out (or, with no other protected
+    column, skip every model) only at the end of a long run. The rule matches
+    the grouping in :func:`synthdata.evaluation.syntheval_eval.binarize_protected`.
+    """
+    unbinned = [
+        column
+        for column in protected_columns
+        if column not in (protected_bins or {})
+        and column not in categorical_columns
+        and pd.api.types.is_numeric_dtype(df[column])
+        and df[column].dropna().nunique() > 2
+    ]
+    if unbinned:
+        example = ", ".join(f"{c}: [edge1, edge2, ...]" for c in unbinned)
+        raise ValueError(
+            f"data.protected_columns lists numeric column(s) {unbinned} with no bin edges, so "
+            "the fairness metrics have no groups to compare for them. Set increasing bin edges "
+            "that cover the column's range in data.protected_bins (for example "
+            f"protected_bins: {{{example}}}), declare the column categorical in the variable "
+            "schema if its values are already groups, or remove it from data.protected_columns."
+        )
+
+
 def warn_non_numeric_feature_columns(
     df: pd.DataFrame, feature_columns: list, categorical_columns: list
 ) -> list:
@@ -1259,6 +1290,9 @@ def load_dataset(cfg: Config) -> Dataset:
         missing = [c for c in getattr(cfg.data, key) or [] if c not in df.columns]
         if missing:
             raise KeyError(f"data.{key} not found in data: {missing}")
+    check_protected_bins(
+        df, list(cfg.data.protected_columns or []), cfg.data.protected_bins, categorical_columns
+    )
 
     fractions = (cfg.data.train_fraction, cfg.data.tuning_fraction, cfg.data.holdout_fraction)
     groups = (

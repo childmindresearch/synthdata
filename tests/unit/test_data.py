@@ -11,6 +11,7 @@ from synthdata.config import Config, DataConfig
 from synthdata.data import (
     _load_local_file,
     cast_integer_like_columns,
+    check_protected_bins,
     decode_label_encoded_columns,
     decode_ordinal_columns,
     encode_ordinal_columns,
@@ -208,6 +209,58 @@ class TestVariableSchema:
         assert dataset.target_is_categorical is False
         assert dataset.all_categorical_columns == []
         assert pd.api.types.is_float_dtype(dataset.full_df["target"])
+
+
+class TestCheckProtectedBins:
+    @staticmethod
+    def _df():
+        return pd.DataFrame(
+            {
+                "year": [1950, 1960, 1970, 1980, 1990],
+                "sex": [0, 1, 0, 1, 0],
+                "site": [1, 2, 3, 1, 2],
+                "group": ["a", "b", "c", "a", "b"],
+            }
+        )
+
+    def test_numeric_protected_column_without_bins_fails_with_the_fix(self):
+        with pytest.raises(ValueError, match=r"\['year'\].*data\.protected_bins"):
+            check_protected_bins(self._df(), ["year", "sex"], {}, [])
+
+    def test_bins_binary_and_categorical_columns_pass(self):
+        check_protected_bins(
+            self._df(),
+            ["year", "sex", "site", "group"],
+            {"year": [1940, 1970, 2000]},
+            ["site"],
+        )
+
+    def test_load_dataset_fails_before_anything_runs(self, tmp_path):
+        raw_path = tmp_path / "raw.csv"
+        pd.DataFrame(
+            {"year": [1950, 1960, 1970, 1980], "x": [1.0, 2.0, 3.0, 4.0], "target": [0, 1, 0, 1]}
+        ).to_csv(raw_path, index=False)
+        schema_path = tmp_path / "variable_schema.csv"
+        schema_path.write_text(
+            "column,kind,ordinal_order\nyear,continuous,\nx,continuous,\ntarget,categorical,\n"
+        )
+        cfg = Config(
+            name="protected_bins",
+            data=DataConfig(
+                source="csv",
+                path=str(raw_path),
+                target_column="target",
+                variable_schema_path=str(schema_path),
+                data_dir=str(tmp_path / "derived"),
+                protected_columns=["year"],
+                train_fraction=0.5,
+                tuning_fraction=0.0,
+                holdout_fraction=0.5,
+            ),
+        )
+        with pytest.raises(ValueError, match="protected_bins"):
+            load_dataset(cfg)
+        assert not (tmp_path / "derived").exists() or not any((tmp_path / "derived").rglob("*.csv"))
 
 
 class TestSplitByPatient:

@@ -17,18 +17,37 @@ dependencies = [
     # Listed directly so the Windows source below applies (uv sources only
     # cover direct dependencies); mostlyai-engine still sets the version.
     "torch",
+    # Same index as torch: a PyPI torchvision is built for PyPI torch and its
+    # compiled ops fail to load next to a CUDA-index torch.
+    "torchvision",
 ]
 
 [tool.uv]
 package = false
 
 # PyPI's torch is CPU-only on Windows; take the CUDA 13.0 build there.
+# PyPI's Linux torch is a CUDA 13 build, which needs an NVIDIA driver for
+# CUDA 13; take the CUDA 12.9 build on Linux x86_64 instead. For torch 2.13,
+# CUDA 12.9 is the oldest build with Blackwell (sm_120) kernels (the cu126
+# build stops at sm_90), and it runs on drivers for CUDA 12.9 or newer.
+# PyTorch publishes no CUDA 12.8 build of torch 2.13 (the main environment's
+# cu128 index stops at 2.11).
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+    { index = "pytorch-cu129", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+torchvision = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+    { index = "pytorch-cu129", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
 explicit = true

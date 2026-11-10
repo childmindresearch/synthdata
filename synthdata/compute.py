@@ -187,7 +187,7 @@ class _Prefixed(io.TextIOBase):
 
     # typeshed declares TextIOBase.encoding writable; at runtime it is read-only.
     @property
-    def encoding(self):  # ty: ignore[invalid-property-type-override]
+    def encoding(self):  # ty: ignore[incompatible-property-override]
         return getattr(self._stream, "encoding", "utf-8")
 
 

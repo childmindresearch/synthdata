@@ -4,6 +4,21 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.32.0 (2026-11-10)
+
+Two evaluation fixes, a new config check and a TabularARGN environment fix. A config with a numeric protected column and no bins now stops at the start and needs `data.protected_bins` (or the column declared categorical, or removed). One-vs-rest scores change only for models whose synthetic data lacks a target class; use a new experiment id if any of your models do. The golden references (Linux CPU and CUDA) are re-recorded: the old ones predated v0.26.0's metric changes and the DOMIAS and kappa metrics.
+
+### Changed
+
+- **A numeric protected column without bins stops the run when the data is loaded.** Before, it was left out of the fairness metrics with a warning; when it was the only protected column, every model's fairness metrics were skipped and only the log said so. The message names the column and says to set `data.protected_bins`, declare the column categorical in the variable schema, or remove it from `data.protected_columns`. Categorical and two-valued protected columns are unaffected.
+- For developers: ty is pinned to 0.0.100, which renamed `unresolved-attribute` to `missing-attribute` and split off `missing-union-attribute`; the test overrides in `pyproject.toml` and the `ty: ignore` comments use the new names, so `uv run ty check` no longer prints rename warnings.
+
+### Fixed
+
+- **Evaluation no longer stops when a model's synthetic data lacks a target class.** In a one-vs-rest pass, SynthEval refuses the AUROC difference when the synthetic target holds one value; with no other metric in that pass, the model had no result and the whole evaluation stage failed after hours of work (seen with collapsed PATE-GAN fits). The model is now kept: the metric is missing for it and it ranks as worst on it, and the per-class values stay in `ovr_per_class.csv`. A model missing any class now gets no macro average for that metric instead of an average over the classes it passed. A pass in which no model gets any result still fails.
+- A metric that the first model in a SynthEval pass lacked was dropped for every model; every model now gets a row for every metric any model produced.
+- **TabularARGN on Linux takes the CUDA 12.9 PyTorch build** (`envs/tabularargn`). The default PyPI build needs a CUDA 13 driver, so on clusters with older drivers every TabularARGN fit failed with "The NVIDIA driver on your system is too old". The 12.9 build runs on drivers for CUDA 12.9 or newer and, unlike the 12.6 build, has kernels for Blackwell GPUs (sm_120). Run `uv sync --project envs/tabularargn` (or let `synthdata-run` sync it) after updating.
+
 ## 0.31.3 (2026-11-06)
 
 A fix to `imputation.method: miceforest`. Runs that worked before give the same numbers; no config edit, new experiment id or golden re-record is needed.

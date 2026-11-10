@@ -214,3 +214,76 @@ def test_role_metrics_are_skipped_when_their_role_is_empty(roleless_run):
     # Anonymeter falls back to singling out, which needs no roles.
     assert np.isfinite(_metric(roleless_run, "anonymeter_singling_out_risk")["copy"])
     assert "mia_recall" in metrics
+
+
+@pytest.fixture(scope="module")
+def collapsed_run(imputed_run, tmp_path_factory) -> tuple[pd.DataFrame, dict]:
+    """The copy next to a collapsed "generator" whose rows all hold one target class.
+
+    A collapsed generator leaves the one-vs-rest target constant in its
+    synthetic data, so SynthEval's AUROC difference refuses it in every pass.
+    The run must finish and score that model as missing, not stop.
+
+    The fixture's target is binary, so the positive class is split by ``SEX``
+    into two classes in every frame: with three classes the evaluation runs
+    the one-vs-rest passes (``class_averaging: ovr_macro``) this test is about.
+    No protected columns are declared, so the fairness metrics (which still
+    score a one-class synthetic set) leave the passes and ``auroc_diff`` is
+    their only metric: every metric refuses the collapsed model, the case that
+    stopped the stage.
+    """
+    cfg = copy_module.deepcopy(imputed_run.cfg)
+    cfg.evaluation.output_dir = str(tmp_path_factory.mktemp("collapsed"))
+    cfg.evaluation.generate_report = False
+    cfg.evaluation.save_per_model_syntheval_plots = False
+    cfg.evaluation.baselines = []
+    cfg.evaluation.synthcity.enabled = False
+    cfg.evaluation.class_averaging = "ovr_macro"
+    cfg.evaluation.log_disparity.protected_columns = []
+    cfg.evaluation.log_disparity.protected_map = []
+    cfg.evaluation.log_disparity.protected_bins = []
+    cfg.data.protected_columns = []
+    dataset = dataclasses.replace(load_imputed_splits(load_dataset(cfg)), protected_columns=[])
+    target = dataset.target_column
+    sex = dataset.train_imputed_df["SEX"]
+    first_sex = sorted(sex.dropna().unique())[0]
+
+    def three_classes(frame):
+        if frame is None or target not in frame or "SEX" not in frame:
+            return frame
+        frame = frame.copy()
+        split = (frame[target] == 1) & (frame["SEX"] != first_sex)
+        frame.loc[split, target] = 2
+        return frame
+
+    dataset = dataclasses.replace(
+        dataset,
+        **{
+            field.name: three_classes(getattr(dataset, field.name))
+            for field in dataclasses.fields(dataset)
+            if isinstance(getattr(dataset, field.name), pd.DataFrame)
+        },
+    )
+    real = dataset.train_imputed_df.reset_index(drop=True)
+    assert real[target].nunique() == 3
+    majority = real[target].value_counts().idxmax()
+    one_class = real[real[target] == majority]
+    collapsed = one_class.sample(n=N_ROWS, replace=len(one_class) < N_ROWS, random_state=0)
+    return run_evaluation(
+        cfg,
+        dataset,
+        {
+            "copy": real.sample(n=N_ROWS, random_state=0).reset_index(drop=True),
+            "collapsed": collapsed.reset_index(drop=True),
+        },
+    )
+
+
+def test_a_collapsed_model_is_scored_as_missing_not_a_crash(collapsed_run):
+    combined, extras = collapsed_run
+    assert {"copy", "collapsed"} <= set(combined.index)
+    auroc = _metric(combined, "auroc")
+    assert np.isfinite(auroc["copy"]) and np.isnan(auroc["collapsed"])
+    per_class = extras["ovr_per_class"]
+    assert per_class.loc["collapsed"].xs("auroc", level="metric").isna().all()
+    assert per_class.loc["copy"].xs("auroc", level="metric").notna().all()

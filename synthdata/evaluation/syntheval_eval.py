@@ -511,7 +511,18 @@ def _model_worker(
             protected_eval=protected_eval,
         )
         if result is None:
-            raise RuntimeError("SynthEval returned no normalized metric results")
+            # Every metric was skipped or refused this model's data (e.g.
+            # auroc_diff on a synthetic set holding one class of a one-vs-rest
+            # target). That is a result about the model, not a crash: keep an
+            # empty checkpoint so the model is scored as missing (worst) on
+            # these metrics instead of failing the whole stage.
+            logger.warning(
+                "[syntheval] %s: no metric produced a result (failed: %s); it is kept and "
+                "scored as missing on them",
+                model_name,
+                failed_metrics or "none",
+            )
+            result = pd.DataFrame({column: [] for column in _RESULT_COLUMNS})
         _atomic_parquet(result_path, result)
         plot_files = (
             sorted(
@@ -689,6 +700,9 @@ def _load_syntheval_cache(
 #: can newly enable; every other metric already runs fine against a 3+ class
 #: target and must NOT be re-run against the collapsed binary one (which
 #: would silently double-count/duplicate their results).
+#: Columns of the normalized frame SynthEval.evaluate returns per model.
+_RESULT_COLUMNS = ("metric", "dim", "val", "err", "n_val", "n_err")
+
 BINARY_ONLY_METRICS = frozenset(
     {"auroc_diff", "statistical_parity", "equalized_odds", "equal_opportunity"}
 )
@@ -879,11 +893,36 @@ def _run_resumable_syntheval(
                 f"Completed model checkpoints remain resumable under {checkpoint_root}."
             )
 
-    ordered_results = {name: results[name] for name in synthetic_datasets}
+    ordered_results = _align_metric_rows({name: results[name] for name in synthetic_datasets})
     benchmark_results, benchmark_ranks = aggregate_benchmark_results(
         ordered_results, ranking_strategy
     )
     return _attach_metric_types(benchmark_results, ordered_results), benchmark_ranks
+
+
+def _align_metric_rows(model_results: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """Give every model a row for every metric any model produced.
+
+    SynthEval's ``aggregate_benchmark_results`` takes its metric columns from
+    the first model only, so a metric that first model lacks would vanish for
+    everyone, and a model with no rows at all could not be aggregated. Missing
+    rows get NaN values, which the combined table scores as worst
+    (``combine._missing_as_worst``). Fails when no model has any metric row.
+    """
+    rows = pd.concat(
+        [frame[["metric", "dim"]] for frame in model_results.values()], ignore_index=True
+    ).drop_duplicates("metric")
+    if rows.empty:
+        raise RuntimeError(
+            "SynthEval produced no metric result for any model in this pass; see the "
+            "warnings above for why each metric did not run"
+        )
+    aligned = {}
+    for name, frame in model_results.items():
+        frame = frame.drop_duplicates("metric").set_index("metric")
+        out = rows.set_index("metric").join(frame.drop(columns="dim"), how="left")
+        aligned[name] = out.reset_index().reindex(columns=list(_RESULT_COLUMNS))
+    return aligned
 
 
 def _attach_metric_types(
@@ -1201,7 +1240,8 @@ def average_ovr_results(
 
     ``per_class_results``/``per_class_ranks`` map each class to that pass's
     SynthEval ``(results, ranks)``. A metric's value, error and oriented score
-    are each averaged over the classes it ran for. The oriented score is
+    are each averaged over the classes it ran for on at least one model; a
+    model missing any of those classes gets NaN (scored as worst downstream). The oriented score is
     averaged per class, not recomputed from the mean value: for ``auroc``
     (1 - |diff|) opposite per-class gaps must not cancel. Returns ``(results, ranks, per_class)`` where ``per_class`` is a
     models x (metric, class) table of the raw values, so a failing minority
@@ -1223,11 +1263,20 @@ def average_ovr_results(
         oriented = pd.concat(
             [per_class_ranks[c][metric].rename(c) for c in classes], axis=1
         ).astype(float)
-        results[(metric, "value")] = values.mean(axis=1)
+        # A class the metric ran for on no model drops out of the average. A
+        # class it ran for on some models only means the others failed it
+        # (e.g. a synthetic set with no rows of that class): their macro
+        # value is missing, scored as worst downstream, rather than an average
+        # over the easier classes they happened to pass.
+        ran = [c for c in classes if values[c].notna().any()]
+        incomplete = values[ran].isna().any(axis=1)
+        results[(metric, "value")] = values[ran].mean(axis=1).mask(incomplete)
         # Standard error of a mean of K estimates (treated as independent).
-        results[(metric, "error")] = np.sqrt((errors**2).sum(axis=1, min_count=1)) / len(classes)
+        results[(metric, "error")] = (
+            np.sqrt((errors[ran] ** 2).sum(axis=1, min_count=1)) / max(len(ran), 1)
+        ).mask(incomplete)
         results[(metric, "type")] = first[(metric, "type")]
-        ranks[metric] = oriented.mean(axis=1)
+        ranks[metric] = oriented[ran].mean(axis=1).mask(incomplete)
         for c in classes:
             per_class[(metric, str(c))] = values[c]
     results.columns = pd.MultiIndex.from_tuples(results.columns)
