@@ -653,3 +653,106 @@ class TestBinarizeProtected:
         )
         result = _run(real_b, syn_b, protected, cats)
         assert result is not None and not result.empty
+
+
+def test_a_model_every_metric_refuses_is_kept_with_an_empty_checkpoint(tmp_path):
+    """auroc_diff refuses a one-class synthetic target; the model is kept, not a crash."""
+    from synthdata.evaluation.syntheval_eval import _checkpoint_paths, _model_worker
+
+    rng = np.random.default_rng(0)
+
+    def frame(n, y):
+        return pd.DataFrame({"x": rng.normal(size=n), "z": rng.normal(size=n), "y": y})
+
+    real = frame(120, rng.integers(0, 2, 120))
+    holdout = frame(60, rng.integers(0, 2, 60))
+    synthetic = frame(120, np.zeros(120, dtype=int))
+    preset = tmp_path / "preset.json"
+    preset.write_text(json.dumps({"auroc_diff": {"model": "log_reg"}}))
+    _model_worker(
+        "m",
+        synthetic,
+        real,
+        holdout,
+        ["y"],
+        "y",
+        [],
+        [],
+        {},
+        str(preset),
+        str(tmp_path / "ckpt"),
+        "ovr_0",
+        "ctx",
+        "model",
+        None,
+        1,
+        0,
+    )
+    _, status_path, result_path = _checkpoint_paths(tmp_path / "ckpt", "ovr_0", "m")
+    status = json.loads(status_path.read_text())
+    assert status["state"] == "succeeded"
+    assert status["failed_metrics"] == ["auroc_diff"]
+    assert pd.read_parquet(result_path).empty
+
+
+class TestAlignMetricRows:
+    @staticmethod
+    def _rows(metrics):
+        return pd.DataFrame(
+            {
+                "metric": metrics,
+                "dim": ["u"] * len(metrics),
+                "val": [0.1] * len(metrics),
+                "err": [0.0] * len(metrics),
+                "n_val": [0.9] * len(metrics),
+                "n_err": [0.0] * len(metrics),
+            }
+        )
+
+    def test_missing_metrics_become_nan_rows_even_for_the_first_model(self):
+        from synthdata.evaluation.syntheval_eval import _align_metric_rows
+
+        empty = self._rows([]).iloc[0:0]
+        aligned = _align_metric_rows(
+            {"broken": empty, "partial": self._rows(["a"]), "full": self._rows(["a", "b"])}
+        )
+        assert [list(f["metric"]) for f in aligned.values()] == [["a", "b"]] * 3
+        assert aligned["broken"]["val"].isna().all()
+        assert aligned["broken"]["dim"].tolist() == ["u", "u"]
+        assert aligned["partial"]["val"].isna().tolist() == [False, True]
+
+    def test_no_metric_for_any_model_still_fails(self):
+        from synthdata.evaluation.syntheval_eval import _align_metric_rows
+
+        empty = self._rows([]).iloc[0:0]
+        with pytest.raises(RuntimeError, match="no metric result for any model"):
+            _align_metric_rows({"m1": empty, "m2": empty})
+
+
+class TestAverageOvrMissingClasses:
+    def test_a_model_missing_one_class_gets_no_macro_value(self):
+        nan = float("nan")
+        per_class = {
+            0: _pass_frames({"auroc_diff": ([0.1, nan], [0.0, nan])}, {"auroc_diff": [0.9, nan]}),
+            1: _pass_frames({"auroc_diff": ([0.3, 0.0], [0.0, 0.0])}, {"auroc_diff": [0.7, 1.0]}),
+        }
+        results, ranks, table = average_ovr_results(
+            {c: r for c, (r, _) in per_class.items()}, {c: k for c, (_, k) in per_class.items()}
+        )
+        # m2 failed class 0: no average over the class it happened to pass.
+        assert results[("auroc_diff", "value")].tolist()[0] == pytest.approx(0.2)
+        assert np.isnan(results[("auroc_diff", "value")].tolist()[1])
+        assert np.isnan(ranks["auroc_diff"].tolist()[1])
+        assert table[("auroc_diff", "1")].tolist() == [0.3, 0.0]
+
+    def test_a_class_no_model_ran_for_drops_out(self):
+        nan = float("nan")
+        per_class = {
+            0: _pass_frames({"auroc_diff": ([nan, nan], [nan, nan])}, {"auroc_diff": [nan, nan]}),
+            1: _pass_frames({"auroc_diff": ([0.3, 0.1], [0.0, 0.0])}, {"auroc_diff": [0.7, 0.9]}),
+        }
+        results, ranks, _ = average_ovr_results(
+            {c: r for c, (r, _) in per_class.items()}, {c: k for c, (_, k) in per_class.items()}
+        )
+        assert results[("auroc_diff", "value")].tolist() == pytest.approx([0.3, 0.1])
+        assert ranks["auroc_diff"].tolist() == pytest.approx([0.7, 0.9])
