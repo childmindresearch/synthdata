@@ -223,6 +223,14 @@ def collapsed_run(imputed_run, tmp_path_factory) -> tuple[pd.DataFrame, dict]:
     A collapsed generator leaves the one-vs-rest target constant in its
     synthetic data, so SynthEval's AUROC difference refuses it in every pass.
     The run must finish and score that model as missing, not stop.
+
+    The fixture's target is binary, so the positive class is split by ``SEX``
+    into two classes in every frame: with three classes the evaluation runs
+    the one-vs-rest passes (``class_averaging: ovr_macro``) this test is about.
+    No protected columns are declared, so the fairness metrics (which still
+    score a one-class synthetic set) leave the passes and ``auroc_diff`` is
+    their only metric: every metric refuses the collapsed model, the case that
+    stopped the stage.
     """
     cfg = copy_module.deepcopy(imputed_run.cfg)
     cfg.evaluation.output_dir = str(tmp_path_factory.mktemp("collapsed"))
@@ -230,9 +238,34 @@ def collapsed_run(imputed_run, tmp_path_factory) -> tuple[pd.DataFrame, dict]:
     cfg.evaluation.save_per_model_syntheval_plots = False
     cfg.evaluation.baselines = []
     cfg.evaluation.synthcity.enabled = False
-    dataset = load_imputed_splits(load_dataset(cfg))
-    real = dataset.train_imputed_df.reset_index(drop=True)
+    cfg.evaluation.class_averaging = "ovr_macro"
+    cfg.evaluation.log_disparity.protected_columns = []
+    cfg.evaluation.log_disparity.protected_map = []
+    cfg.evaluation.log_disparity.protected_bins = []
+    cfg.data.protected_columns = []
+    dataset = dataclasses.replace(load_imputed_splits(load_dataset(cfg)), protected_columns=[])
     target = dataset.target_column
+    sex = dataset.train_imputed_df["SEX"]
+    first_sex = sorted(sex.dropna().unique())[0]
+
+    def three_classes(frame):
+        if frame is None or target not in frame or "SEX" not in frame:
+            return frame
+        frame = frame.copy()
+        split = (frame[target] == 1) & (frame["SEX"] != first_sex)
+        frame.loc[split, target] = 2
+        return frame
+
+    dataset = dataclasses.replace(
+        dataset,
+        **{
+            field.name: three_classes(getattr(dataset, field.name))
+            for field in dataclasses.fields(dataset)
+            if isinstance(getattr(dataset, field.name), pd.DataFrame)
+        },
+    )
+    real = dataset.train_imputed_df.reset_index(drop=True)
+    assert real[target].nunique() == 3
     majority = real[target].value_counts().idxmax()
     one_class = real[real[target] == majority]
     collapsed = one_class.sample(n=N_ROWS, replace=len(one_class) < N_ROWS, random_state=0)
