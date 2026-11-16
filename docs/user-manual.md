@@ -363,12 +363,22 @@ Whether a value is missing often carries information (a test that was not ordere
 
 | Column | Meaning |
 | --- | --- |
-| `columns`, `n_columns` | The columns of the pattern |
-| `missing_share` | Rows missing any of them |
-| `whole_share` | Of those, rows missing all of them |
-| `rule_auc`, `rule` | How well a depth-2 decision tree on the other columns predicts the missingness (cross-validated ROC AUC), and the tree's splits. The target and any column blank in more than 10% of the pattern's missing rows are left out, so another form missing in the same rows cannot pass for a rule |
-| `indicator_only` | The column is missing so often that only its flag is kept; such columns are never put in a block |
 | `label` | `skip_logic_candidate` (`rule_auc` at least 0.95: a rule such as "no substance use" may decide it), `form_not_given_candidate` (a block missing as a whole in at least 80% of its missing rows, no clear rule), or `item_missing` (ordinary missing answers) |
+| `summary` | The row in one or two plain sentences: what the label means here and where most of the gaps are. Start reading here |
+| `columns`, `n_columns` | The columns of the pattern |
+| `missing_rows`, `missing_share` | Rows missing any of them, as a count and a share |
+| `whole_share` | Of those, the share missing all of them |
+| `rule_auc`, `rule` | How well a depth-2 decision tree on the other columns predicts the missingness (cross-validated ROC AUC), and the tree's groups of rows. The target and any column blank in more than 10% of the pattern's missing rows are left out, so another form missing in the same rows cannot pass for a rule |
+| `indicator_only` | The column is missing so often that only its flag is kept; such columns are never put in a block |
+| `check_rule` | For blocks: the rule "the first column is blank, so the others are too", for checking synthetic data (below) |
+
+Reading `rule`: the tree splits the rows into up to four groups, listed most-missing first and separated by ` | `. Each group reads `<condition>: <missing> of <rows> rows missing (<share>%)`, for example
+
+```
+visit_year <= 2019 and stay_days <= 30: 412 of 420 rows missing (98%) | visit_year >= 2020 and diagnosis = no: 51 of 60 rows missing (85%) | ...
+```
+
+Text columns are named by their values (`site in {north, south}`, or `site is not north` when that is shorter), 0/1 columns by their value and whole-number columns by whole bounds (`visits 3 to 5`). `(visits >= 3 or blank)` means rows with a blank `visits` fell in that group too: the tree sends blanks down whichever side fits best. `visits blank` / `visits answered` is a split on whether the column is filled in at all. The counts are of the rows the report uses, so they add up to `missing_rows` and to the number of rows. A group that is 100% (or 0%) missing names a clean rule; look for it in the codebook before treating the gaps as "not assessed".
 
 The labels are guesses to check against the codebook: the data cannot show why a value is missing. Blocks labelled skip logic or form not given are candidates for treating as "not assessed" rather than imputing.
 
