@@ -1,5 +1,7 @@
 """Unit tests for missing-block detection, labels and block indicators."""
 
+import re
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -147,3 +149,56 @@ def test_indicator_only_columns_stay_out_of_blocks_and_other_forms_are_not_rules
     assert bool(table.loc["form_z", "indicator_only"])
     # The other co-missing columns are not usable predictors, so no "rule" is found.
     assert table.loc["form_x; form_y; form2_a", "label"] == FORM_NOT_GIVEN
+
+
+def test_rule_reads_as_conditions_with_counts_and_a_summary():
+    table = describe_patterns(_clinic(), FEATURES, exclude_from_rules=["target"]).set_index(
+        "columns"
+    )
+    skip = table.loc["freq_a; freq_b"]
+    # Most-missing leaf first, the text column named by its value, counts per leaf.
+    assert skip["rule"].startswith(f"uses_substances = no: {skip['missing_rows']} of ")
+    assert "rows missing (100%)" in skip["rule"]
+    assert "uses_substances = no" in skip["summary"] and "codebook" in skip["summary"]
+    assert "form or section not given" in table.loc["form_x; form_y; form_z", "summary"]
+    assert "ordinary missing answers" in table.loc["lab", "summary"]
+    # The leaves cover every row once and every missing row once.
+    for row in table.itertuples():
+        counts = re.findall(r": (\d+) of (\d+) rows missing", row.rule)
+        assert sum(int(m) for m, _ in counts) == row.missing_rows
+        assert sum(int(n) for _, n in counts) == len(_clinic())
+
+
+def test_conditions_name_values_bounds_and_blanks():
+    from synthdata.missing_blocks import _condition
+
+    x = pd.DataFrame(
+        {
+            "flag": [0.0, 1.0, 1.0],
+            "visits": [0.0, 3.0, np.nan],
+            "dose": [0.5, 1.25, 2.0],
+            "site": [0.0, 1.0, 2.0],
+        }
+    )
+    levels = {"site": ["north", "south", "east", "west", "ward 5", "ward 6"]}
+    assert _condition("flag", [(0.5, True)], x, levels, False) == "flag = 0"
+    assert _condition("flag", [(0.5, False)], x, levels, False) == "flag = 1"
+    assert _condition("visits", [(2.5, True)], x, levels, False) == "visits <= 2"
+    assert _condition("visits", [(2.5, False)], x, levels, True) == "(visits >= 3 or blank)"
+    # Two splits on one column along a path become one range.
+    assert _condition("visits", [(5.5, True), (2.5, False)], x, levels, False) == "visits 3 to 5"
+    assert _condition("visits", [(3.5, True), (2.5, False)], x, levels, False) == "visits = 3"
+    assert _condition("dose", [(1.125, True)], x, levels, False) == "dose <= 1.125"
+    assert _condition("dose", [(2.0, True), (0.875, False)], x, levels, False) == (
+        "0.875 < dose <= 2"
+    )
+    # Text columns list their values, or the shorter complement.
+    assert _condition("site", [(0.5, True)], x, levels, False) == "site = north"
+    assert _condition("site", [(1.5, True)], x, levels, False) == "site in {north, south}"
+    assert _condition("site", [(0.5, False)], x, levels, False) == "site is not north"
+    assert _condition("site", [(1.5, False)], x, levels, False) == (
+        "site in {east, west, ward 5, ward 6}"
+    )
+    # A split on blanks alone (threshold infinity) reads as answered / blank.
+    assert _condition("visits", [(np.inf, True)], x, levels, False) == "visits answered"
+    assert _condition("visits", [(np.inf, False)], x, levels, True) == "visits blank"

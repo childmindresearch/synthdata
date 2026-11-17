@@ -4,6 +4,19 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.33.0 (2026-11-16)
+
+`missing_blocks.csv` is easier to read. Only the report changes: imputation, generation and evaluation results stay the same, so no new experiment id or golden re-record is needed. Scripts that read the old `rule` text (scikit-learn's tree printout) need updating.
+
+### Changed
+
+- **The `rule` column reads as plain conditions with counts.** Each group of rows the tree finds is one self-contained line, most-missing first, separated by ` | `: `visit_year <= 2019 and stay_days <= 30: 412 of 420 rows missing (98%)`. Before, it was the tree printout with its line breaks replaced by ` | `, which looked the same as the tree's indentation, gave text columns as internal codes (`site <= 3.50`) and showed counts only as `weights: [observed, missing]`.
+- Text columns are named by their values (`site in {north, south}`, `site is not north`), 0/1 columns by their value (`flag = 1`) and whole-number columns by whole bounds (`visits 3 to 5`); two splits on one column along a path become one range.
+- **Where blank values went is now shown.** The tree sends rows with a blank predictor down whichever side fits best and its printout never said which, so a condition like `count <= 0` could silently include blank counts. Such conditions now read `(count <= 0 or blank)`, and a split on blanks alone reads `column blank` / `column answered` instead of `column <= inf`.
+- **New `summary` column**: one or two plain sentences per row saying what the label means there and where most of the gaps are (e.g. "Most gaps (412 of 530) are where ...").
+- New `missing_rows` column (the count behind `missing_share`). `label` and `summary` now come right after `kind`; shares and the AUC are rounded to three decimals.
+- `synthdata-missing-blocks` prints each row's summary under the table.
+
 ## 0.32.0 (2026-11-10)
 
 Two evaluation fixes, a new config check and a TabularARGN environment fix. A config with a numeric protected column and no bins now stops at the start and needs `data.protected_bins` (or the column declared categorical, or removed). One-vs-rest scores change only for models whose synthetic data lacks a target class; use a new experiment id if any of your models do. The golden references (Linux CPU and CUDA) are re-recorded: the old ones predated v0.26.0's metric changes and the DOMIAS and kappa metrics.

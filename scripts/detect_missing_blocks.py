@@ -39,7 +39,12 @@ def main() -> None:
     table = save_blocks_report(cfg, load_dataset(cfg))
 
     with pd.option_context("display.max_rows", None, "display.width", 200):
-        print(table.drop(columns=["rule"]).to_string(index=False))
+        print(
+            table.drop(columns=["summary", "columns", "rule", "check_rule"]).to_string(index=False)
+        )
+    print()
+    for pattern, summary in zip(table["pattern"], table["summary"], strict=True):
+        print(f"{pattern}: {summary}")
     blocks = table[table["kind"] == "block"]
     if len(blocks):
         print(
