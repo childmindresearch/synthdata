@@ -6,7 +6,7 @@ Each entry says what a user sees change, which config keys or output files are n
 
 ## 0.34.0 (2026-11-19)
 
-Extends TabularARGN's compatibility to CUDA 12.8 drivers. Its environment now uses mostlyai-engine 2.6.2 with PyTorch 2.11, so TabularARGN results can differ slightly from v0.33.0: use a new experiment id when comparing TabularARGN runs, and re-record the golden references on the GPU machine. Other generators and all metrics are unchanged.
+Extends TabularARGN's compatibility to CUDA 12.8 drivers. Its environment now uses mostlyai-engine 2.6.2 with PyTorch 2.11, so TabularARGN results can differ slightly from v0.33.0: use a new experiment id when comparing TabularARGN runs. Other generators and all metrics are unchanged, and the golden references still match (Linux CUDA, along with the TabularARGN and CDTD tests), so no re-record is needed.
 
 ### Changed
 
