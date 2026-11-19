@@ -4,6 +4,14 @@ What changed in each release, for people running the pipeline. Every pull reques
 
 Each entry says what a user sees change, which config keys or output files are new, renamed or removed, and whether old results stay comparable (a change to a metric or generator needs a new experiment id and a re-recorded golden run).
 
+## 0.34.0 (2026-11-19)
+
+Extends TabularARGN's compatibility to CUDA 12.8 drivers. Its environment now uses mostlyai-engine 2.6.2 with PyTorch 2.11, so TabularARGN results can differ slightly from v0.33.0: use a new experiment id when comparing TabularARGN runs, and re-record the golden references on the GPU machine. Other generators and all metrics are unchanged.
+
+### Changed
+
+- **TabularARGN on Linux takes the CUDA 12.8 PyTorch build** (`envs/tabularargn`), which runs on drivers for CUDA 12.8 or newer (before: 12.9 or newer) and has kernels for Blackwell GPUs (sm_120). PyTorch publishes no CUDA 12.8 build of torch 2.13, which mostlyai-engine 2.7.x requires, so the environment pins mostlyai-engine 2.6.2 (torch 2.11, torchvision 0.26). The 2.7.x releases mostly upgraded dependencies; see the mostlyai-engine row in `docs/verification.md`. Run `uv sync --project envs/tabularargn` (or let `synthdata-run` sync it) after updating.
+
 ## 0.33.0 (2026-11-16)
 
 `missing_blocks.csv` is easier to read. Only the report changes: imputation, generation and evaluation results stay the same, so no new experiment id or golden re-record is needed. Scripts that read the old `rule` text (scikit-learn's tree printout) need updating.

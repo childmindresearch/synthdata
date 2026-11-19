@@ -1,6 +1,6 @@
 # Separate environment for MOSTLY AI's TabularARGN (mostlyai-engine).
 #
-# mostlyai-engine pins one torch minor per release (2.7.x: torch 2.13) and
+# mostlyai-engine pins one torch minor per release (2.6.x: torch 2.11) and
 # psutil<6, while synthcity needs psutil>=6.1 (via tsai) and this repo keeps
 # torch 2.7.1+cu128 on Linux. They cannot share one environment without
 # overriding the library's own pins, so the pipeline runs TabularARGN here,
@@ -11,7 +11,7 @@ name = "synthdata-tabularargn"
 version = "0.1.0"
 requires-python = "==3.11.*"
 dependencies = [
-    "mostlyai-engine==2.7.3",
+    "mostlyai-engine==2.6.2",
     "pandas",
     "pyarrow",
     # Listed directly so the Windows source below applies (uv sources only
@@ -27,19 +27,19 @@ package = false
 
 # PyPI's torch is CPU-only on Windows; take the CUDA 13.0 build there.
 # PyPI's Linux torch is a CUDA 13 build, which needs an NVIDIA driver for
-# CUDA 13; take the CUDA 12.9 build on Linux x86_64 instead. For torch 2.13,
-# CUDA 12.9 is the oldest build with Blackwell (sm_120) kernels (the cu126
-# build stops at sm_90), and it runs on drivers for CUDA 12.9 or newer.
-# PyTorch publishes no CUDA 12.8 build of torch 2.13 (the main environment's
-# cu128 index stops at 2.11).
+# CUDA 13; take the CUDA 12.8 build on Linux x86_64 instead. It runs on
+# drivers for CUDA 12.8 or newer and has Blackwell (sm_120) kernels (the
+# cu126 build stops at sm_90). mostlyai-engine stays at 2.6.2 because 2.7.x
+# needs torch 2.13, for which PyTorch publishes no CUDA 12.8 build (the cu128
+# index stops at torch 2.11).
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
-    { index = "pytorch-cu129", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
 torchvision = [
     { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
-    { index = "pytorch-cu129", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
 
 [[tool.uv.index]]
@@ -48,6 +48,6 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true

@@ -536,7 +536,8 @@ class TabularARGNConfig:
     env_dir: str = "envs/tabularargn"
     #: Arguments for ``TabularARGN()`` (e.g. ``model: MOSTLY_AI/Large``,
     #: ``max_epochs``, ``max_training_time`` in minutes). Value protection is
-    #: off by default: mostlyai-engine 2.7.3 still writes its ``_RARE_`` token
+    #: off by default: mostlyai-engine 2.7.3 (tested before the pin moved to
+    #: 2.6.2) still writes its ``_RARE_`` token
     #: with ``rare_category_replacement_method: sample``, and that token is not
     #: a value of the column, so the run stops (see docs/verification.md).
     params: dict = dataclasses.field(default_factory=lambda: {"value_protection": False})
